@@ -53,6 +53,12 @@ What works today:
     storage for ≤ 60-byte targets), `Ext::add_device_to` (char / block /
     FIFO / socket).
   - `Ext::flush(dev)` — persists metadata, primary superblock last.
+  - `Ext::populate_rootdevs(dev, kind, uid, gid, mtime)` — drops a
+    `Minimal` or `Standard` `/dev/*` tree into the image (console, null,
+    zero, ptmx, tty, fuse, random, urandom — plus tty0..15, ttyS0..3,
+    kmsg, mem, port, hda..hdd + 4 partitions, sda..sdd + 4 partitions for
+    `Standard`). Lets a non-root user build a Linux root FS without
+    needing CAP_MKNOD.
 
 ## Architecture
 

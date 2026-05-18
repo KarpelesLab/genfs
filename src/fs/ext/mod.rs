@@ -36,6 +36,7 @@ use superblock::Superblock;
 
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::fs::rootdevs::{RootDevs, device_table};
 use crate::fs::{DeviceKind, FileMeta, FileSource};
 
 /// Options accepted by [`Ext::format_with`].
@@ -638,6 +639,60 @@ impl Ext {
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         self.recompute_free_counts();
         self.flush_metadata(dev)
+    }
+
+    /// Create `/dev` with the standard set of device nodes for `kind` —
+    /// the building block for `--rootdevs minimal | standard`. The `/dev`
+    /// directory is owned by `root:root` mode 0755; each node's permissions
+    /// follow the conventional Linux defaults from the device-numbers
+    /// registry (e.g. `console` is 0600, `null` is 0666).
+    ///
+    /// Pass [`RootDevs::None`] to do nothing (returns `Ok(None)`).
+    /// Returns the inode number of `/dev` on success.
+    pub fn populate_rootdevs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        kind: RootDevs,
+        owner_uid: u32,
+        owner_gid: u32,
+        mtime: u32,
+    ) -> Result<Option<u32>> {
+        if kind == RootDevs::None {
+            return Ok(None);
+        }
+        let entries = device_table(kind);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let dir_meta = FileMeta {
+            mode: 0o755,
+            uid: owner_uid,
+            gid: owner_gid,
+            mtime,
+            atime: mtime,
+            ctime: mtime,
+        };
+        let dev_ino = self.add_dir_to(dev, INO_ROOT_DIR, b"dev", dir_meta)?;
+        for e in entries {
+            let meta = FileMeta {
+                mode: e.mode,
+                uid: owner_uid,
+                gid: owner_gid,
+                mtime,
+                atime: mtime,
+                ctime: mtime,
+            };
+            self.add_device_to(
+                dev,
+                dev_ino,
+                e.name.as_bytes(),
+                e.kind,
+                e.major,
+                e.minor,
+                meta,
+            )?;
+        }
+        Ok(Some(dev_ino))
     }
 }
 

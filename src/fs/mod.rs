@@ -20,6 +20,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub mod ext;
+pub mod rootdevs;
+
+pub use rootdevs::{DeviceEntry, RootDevs};
 
 /// Permissions + ownership + timestamps for a new filesystem entry. All
 /// fields have sensible defaults via [`Default`] so callers only need to set

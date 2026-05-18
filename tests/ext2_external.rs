@@ -8,6 +8,7 @@ use std::process::Command;
 
 use genfs::block::FileBackend;
 use genfs::fs::ext::{Ext, FormatOpts};
+use genfs::fs::rootdevs::RootDevs;
 use genfs::fs::{DeviceKind, FileMeta, FileSource};
 use tempfile::NamedTempFile;
 
@@ -226,6 +227,84 @@ fn populated_ext2_passes_e2fsck_and_debugfs() {
     assert!(
         stat.contains("Fast symlink") || stat.contains("/usr/bin"),
         "symlink not recognised:\n{stat}"
+    );
+}
+
+/// Build an image with the Standard root-dev set, verify e2fsck passes and
+/// debugfs sees every expected node.
+#[test]
+fn ext2_with_standard_rootdevs_passes_e2fsck() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    use genfs::block::BlockDevice;
+    let tmp = NamedTempFile::new().unwrap();
+    // Standard set is 71 nodes + /dev dir + lost+found + root + 10 reserved
+    // → ~84 inodes. Round up to 128 to leave headroom.
+    let opts = FormatOpts {
+        blocks_count: 4096,
+        inodes_count: 128,
+        ..FormatOpts::default()
+    };
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    ext.populate_rootdevs(&mut dev, RootDevs::Standard, 0, 0, 0)
+        .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // e2fsck must be clean.
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "e2fsck failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Spot-check via debugfs ls /dev for both essentials and standard-only
+    // nodes (a serial port, an IDE disk partition, a SCSI disk partition).
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg("ls /dev")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    for entry in [
+        "console", "null", "zero", "ptmx", "tty", "fuse", "random", "urandom", "tty0", "tty15",
+        "ttyS0", "ttyS3", "kmsg", "mem", "port", "hda", "hda4", "hdd", "sda", "sda1", "sdd4",
+    ] {
+        assert!(
+            listing.contains(entry),
+            "missing /dev/{entry} in:\n{listing}"
+        );
+    }
+
+    // Verify a specific device has the right major/minor (stat /dev/null).
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg("stat /dev/null")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stat.contains("Device major/minor number: 01:03")
+            || stat.contains("Major: 1") && stat.contains("Minor: 3"),
+        "wrong device numbers for /dev/null:\n{stat}"
     );
 }
 

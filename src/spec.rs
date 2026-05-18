@@ -15,9 +15,10 @@
 //!    ```
 //!
 //! 2. **Partitioned disk image** — an `[image]` table plus `[[partitions]]`
-//!    entries. Each partition optionally carries a filesystem. (Landing in
-//!    a follow-up; the schema is parsed today but `build` rejects it with
-//!    a clear "not yet implemented" error.)
+//!    entries. Partitions are laid out 1 MiB-aligned in declaration order;
+//!    exactly one may use `size = "remaining"` (and it must be last). Each
+//!    partition optionally carries a nested `[partitions.filesystem]` table
+//!    whose ext filesystem is formatted to fill the partition.
 //!
 //! Sizes accept a human suffix: `512`, `4KiB`, `256MiB`, `1GiB`, `2GB`
 //! (decimal `KB/MB/GB` and binary `KiB/MiB/GiB`; bare numbers are bytes).
@@ -86,8 +87,9 @@ pub struct PartitionSpec {
 }
 
 /// Filesystem configuration. Used both as the top-level `[filesystem]`
-/// table (bare-FS mode) and flattened into each `[[partitions]]` entry.
+/// table (bare-FS mode) and as the nested `[partitions.filesystem]` table.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilesystemSpec {
     /// `"ext2"`, `"ext3"`, or `"ext4"`. (FAT32 is post-v1.)
     #[serde(rename = "type")]
@@ -156,21 +158,38 @@ impl Spec {
 pub fn build(spec: &Spec, output: &Path) -> Result<()> {
     if let Some(fs) = &spec.filesystem {
         build_bare_fs(fs, output)
+    } else if let Some(image) = &spec.image {
+        build_partitioned(image, &spec.partitions, output)
     } else {
-        // image + partitions path
-        Err(crate::Error::Unsupported(
-            "spec: partitioned disk images are not yet implemented (bare [filesystem] only)".into(),
-        ))
+        // validate() guarantees one of the two is set.
+        unreachable!("Spec::validate ensures filesystem xor image")
     }
 }
 
 fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     let kind = parse_fs_kind(&fs.fs_type)?;
     let block_size = fs.block_size.unwrap_or(1024);
+    let opts = ext_format_opts(fs, kind, block_size, None)?;
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(output, size)?;
+    format_ext_into(&mut dev, fs, &opts)?;
+    dev.sync()?;
+    Ok(())
+}
+
+/// Build the [`crate::fs::ext::FormatOpts`] for a [`FilesystemSpec`].
+/// `blocks_count_override` forces a specific block count (used to make a
+/// partition's filesystem fill the partition exactly); `None` auto-sizes
+/// from the source tree.
+fn ext_format_opts(
+    fs: &FilesystemSpec,
+    kind: FsKind,
+    block_size: u32,
+    blocks_count_override: Option<u32>,
+) -> Result<crate::fs::ext::FormatOpts> {
     let rootdevs = parse_rootdevs(fs.rootdevs.as_deref())?;
     let mtime = fs.mtime.unwrap_or(0);
 
-    // Size the filesystem from the source tree (plus rootdevs + journal).
     let mut plan = crate::fs::ext::BuildPlan::new(block_size, kind);
     if let Some(j) = fs.journal_blocks {
         plan.journal_blocks = j;
@@ -178,7 +197,6 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     if let Some(src) = &fs.source {
         plan.scan_host_path(src)?;
     }
-    // Account for the /dev tree if requested.
     for _ in 0..rootdevs_entry_count(rootdevs) {
         plan.add_device();
     }
@@ -193,19 +211,194 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
         let n = bytes.len().min(16);
         opts.volume_label[..n].copy_from_slice(&bytes[..n]);
     }
+    if let Some(bc) = blocks_count_override {
+        if bc < opts.blocks_count {
+            return Err(crate::Error::InvalidArgument(format!(
+                "spec: partition holds {bc} blocks but its contents need at least {}",
+                opts.blocks_count
+            )));
+        }
+        opts.blocks_count = bc;
+        // The auto-sized inode count was computed for the source tree only.
+        // When filling a (potentially much larger) partition, scale up to
+        // mke2fs's default density of one inode per 16 KiB so the partition
+        // isn't inode-starved.
+        let by_density = (bc as u64 * block_size as u64 / 16_384) as u32;
+        opts.inodes_count = opts.inodes_count.max(by_density);
+    }
+    Ok(opts)
+}
 
-    let size = opts.blocks_count as u64 * opts.block_size as u64;
-    let mut dev = FileBackend::create(output, size)?;
-    let mut ext = Ext::format_with(&mut dev, &opts)?;
+/// Format + populate an ext filesystem into `dev` from `fs`.
+fn format_ext_into(
+    dev: &mut dyn BlockDevice,
+    fs: &FilesystemSpec,
+    opts: &crate::fs::ext::FormatOpts,
+) -> Result<()> {
+    let rootdevs = parse_rootdevs(fs.rootdevs.as_deref())?;
+    let mut ext = Ext::format_with(dev, opts)?;
     if let Some(src) = &fs.source {
-        ext.populate_from_host_dir(&mut dev, 2, src)?;
+        ext.populate_from_host_dir(dev, 2, src)?;
     }
     if rootdevs != RootDevs::None {
-        ext.populate_rootdevs(&mut dev, rootdevs, 0, 0, mtime)?;
+        ext.populate_rootdevs(dev, rootdevs, 0, 0, opts.mtime)?;
     }
-    ext.flush(&mut dev)?;
+    ext.flush(dev)?;
+    Ok(())
+}
+
+/// Logical sector size for partition-table geometry. Both MBR and our v1
+/// GPT writer assume 512-byte sectors.
+const SECTOR: u64 = 512;
+/// Partition-start alignment: 1 MiB, the modern convention.
+const ALIGN_LBA: u64 = 2048;
+
+fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &Path) -> Result<()> {
+    use crate::part::{Gpt, Mbr, Partition, PartitionTable, slice_partition};
+
+    let total_bytes = parse_size(&image.size)?;
+    let total_lba = total_bytes / SECTOR;
+    let table = image.partition_table.to_ascii_lowercase();
+
+    // Reserve space for the partition table's own metadata.
+    //   GPT: LBA 0 protective MBR + 1..33 primary + last 33 backup.
+    //   MBR: just LBA 0.
+    let (first_free, last_usable) = match table.as_str() {
+        "gpt" => (ALIGN_LBA, total_lba.saturating_sub(34)),
+        "mbr" => (ALIGN_LBA, total_lba.saturating_sub(1)),
+        other => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "spec: unknown partition_table {other:?} (want gpt or mbr)"
+            )));
+        }
+    };
+    if table == "mbr" && partitions.len() > 4 {
+        return Err(crate::Error::InvalidArgument(
+            "spec: MBR supports at most 4 partitions".into(),
+        ));
+    }
+
+    // Lay out partitions sequentially. Exactly one may use size
+    // "remaining", and it must be the last entry.
+    let remaining_idx = partitions
+        .iter()
+        .position(|p| p.size.eq_ignore_ascii_case("remaining"));
+    if let Some(idx) = remaining_idx
+        && idx != partitions.len() - 1
+    {
+        return Err(crate::Error::InvalidArgument(
+            "spec: size = \"remaining\" is only allowed on the last partition".into(),
+        ));
+    }
+
+    let mut placed: Vec<Partition> = Vec::with_capacity(partitions.len());
+    let mut cursor = first_free;
+    for p in partitions {
+        let start = cursor.div_ceil(ALIGN_LBA) * ALIGN_LBA;
+        let size_lba = if p.size.eq_ignore_ascii_case("remaining") {
+            if last_usable < start {
+                return Err(crate::Error::InvalidArgument(
+                    "spec: no space left for the \"remaining\" partition".into(),
+                ));
+            }
+            last_usable + 1 - start
+        } else {
+            let bytes = parse_size(&p.size)?;
+            bytes / SECTOR
+        };
+        if size_lba == 0 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "spec: partition {:?} has zero size",
+                p.name.as_deref().unwrap_or("?")
+            )));
+        }
+        if start + size_lba - 1 > last_usable {
+            return Err(crate::Error::InvalidArgument(format!(
+                "spec: partition {:?} (LBA {}..{}) overflows the {}-LBA disk",
+                p.name.as_deref().unwrap_or("?"),
+                start,
+                start + size_lba - 1,
+                total_lba
+            )));
+        }
+        let kind = parse_partition_kind(&p.kind)?;
+        let mut part = Partition::new(start, size_lba, kind);
+        part.name = p.name.clone();
+        placed.push(part);
+        cursor = start + size_lba;
+    }
+
+    // Create the backing file and write the partition table.
+    let mut dev = FileBackend::create(output, total_bytes)?;
+    match table.as_str() {
+        "gpt" => {
+            let gpt = Gpt::build(placed.clone())?;
+            gpt.write(&mut dev)?;
+        }
+        "mbr" => {
+            let mbr = Mbr::new(placed.clone())?;
+            mbr.write(&mut dev)?;
+        }
+        _ => unreachable!(),
+    }
+
+    // Rebuild a PartitionTable trait object once so slice_partition can
+    // compute each partition's byte range. (The Gpt/Mbr built above were
+    // consumed by write(); rebuilding from `placed` is cheap.)
+    let table_obj: Box<dyn PartitionTable> = match table.as_str() {
+        "gpt" => Box::new(Gpt::build(placed.clone())?),
+        "mbr" => Box::new(Mbr::new(placed.clone())?),
+        _ => unreachable!(),
+    };
+
+    // Format + populate each partition that carries a filesystem.
+    for (i, p) in partitions.iter().enumerate() {
+        let Some(fs) = &p.filesystem else {
+            continue;
+        };
+        let kind = parse_fs_kind(&fs.fs_type)?;
+        let block_size = fs.block_size.unwrap_or(1024);
+        let part_bytes = placed[i].size_lba * SECTOR;
+        // Fill the partition: blocks_count = partition_bytes / fs_block_size,
+        // rounded DOWN to a multiple of 8 (the byte-aligned-group invariant).
+        let blocks = ((part_bytes / block_size as u64) / 8 * 8) as u32;
+        let opts = ext_format_opts(fs, kind, block_size, Some(blocks))?;
+        let mut slice = slice_partition(table_obj.as_ref(), &mut dev, i)?;
+        format_ext_into(&mut slice, fs, &opts)?;
+    }
+
     dev.sync()?;
     Ok(())
+}
+
+/// Map a partition-type string to a [`crate::part::PartitionKind`].
+fn parse_partition_kind(s: &str) -> Result<crate::part::PartitionKind> {
+    use crate::part::PartitionKind;
+    let lower = s.to_ascii_lowercase();
+    Ok(match lower.as_str() {
+        "esp" | "efi" | "efi-system" => PartitionKind::EfiSystem,
+        "linux" | "linux-filesystem" => PartitionKind::LinuxFilesystem,
+        "linux-swap" | "swap" => PartitionKind::LinuxSwap,
+        "bios-boot" | "bios" => PartitionKind::BiosBoot,
+        "fat" | "fat32" => PartitionKind::Fat32,
+        "msdata" | "microsoft-basic-data" | "basic-data" => PartitionKind::MicrosoftBasicData,
+        "empty" => PartitionKind::Empty,
+        other => {
+            // Accept a raw MBR byte ("0x83") or a GPT type UUID.
+            if let Some(hex) = other.strip_prefix("0x") {
+                let b = u8::from_str_radix(hex, 16).map_err(|_| {
+                    crate::Error::InvalidArgument(format!("spec: bad MBR type byte {other:?}"))
+                })?;
+                PartitionKind::from_mbr_byte(b)
+            } else if let Ok(uuid) = uuid::Uuid::parse_str(other) {
+                PartitionKind::from_gpt_uuid(uuid)
+            } else {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "spec: unknown partition type {s:?}"
+                )));
+            }
+        }
+    })
 }
 
 fn parse_fs_kind(s: &str) -> Result<FsKind> {
@@ -363,10 +556,45 @@ mod tests {
         let root_fs = spec.partitions[1].filesystem.as_ref().unwrap();
         assert_eq!(root_fs.fs_type, "ext4");
         assert_eq!(root_fs.block_size, Some(4096));
-        // build() rejects the partitioned path for now.
-        assert!(matches!(
-            build(&spec, std::path::Path::new("/dev/null")),
-            Err(crate::Error::Unsupported(_))
-        ));
+    }
+
+    #[test]
+    fn remaining_must_be_last_partition() {
+        let toml = r#"
+            [image]
+            size = "64MiB"
+            partition_table = "gpt"
+
+            [[partitions]]
+            name = "a"
+            type = "linux"
+            size = "remaining"
+
+            [[partitions]]
+            name = "b"
+            type = "linux"
+            size = "16MiB"
+        "#;
+        let spec = Spec::parse(toml).unwrap();
+        let err = build(&spec, std::path::Path::new("/tmp/fstool-test-unused.img")).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn partition_kind_strings() {
+        use crate::part::PartitionKind;
+        assert_eq!(
+            parse_partition_kind("esp").unwrap(),
+            PartitionKind::EfiSystem
+        );
+        assert_eq!(
+            parse_partition_kind("linux").unwrap(),
+            PartitionKind::LinuxFilesystem
+        );
+        assert_eq!(
+            parse_partition_kind("0x83").unwrap(),
+            PartitionKind::LinuxFilesystem
+        );
+        assert!(parse_partition_kind("nonsense").is_err());
     }
 }

@@ -301,7 +301,7 @@ impl Ext {
 
         if consumed < n {
             // Single-indirect.
-            let ind = self.alloc_data_block(0)?;
+            let ind = self.alloc_data_block()?;
             allocated_meta += 1;
             inode.block[constants::IDX_INDIRECT] = ind;
             let take = (n - consumed).min(ptrs_per_block);
@@ -316,7 +316,7 @@ impl Ext {
 
         if consumed < n {
             // Double-indirect.
-            let dind = self.alloc_data_block(0)?;
+            let dind = self.alloc_data_block()?;
             allocated_meta += 1;
             inode.block[constants::IDX_DOUBLE_INDIRECT] = dind;
             let mut dind_buf = vec![0u8; bs as usize];
@@ -327,7 +327,7 @@ impl Ext {
                         "ext: file exceeds direct+single+double indirection capacity".into(),
                     ));
                 }
-                let ind = self.alloc_data_block(0)?;
+                let ind = self.alloc_data_block()?;
                 allocated_meta += 1;
                 let off = dind_slot * 4;
                 dind_buf[off..off + 4].copy_from_slice(&ind.to_le_bytes());
@@ -357,7 +357,7 @@ impl Ext {
         let bs = self.layout.block_size;
         let mut data = Vec::with_capacity(blocks as usize);
         for _ in 0..blocks {
-            data.push(self.alloc_data_block(0)?);
+            data.push(self.alloc_data_block()?);
         }
         let mut inode = Inode::regular(blocks * bs, 0o600, 0, 0, mtime);
         let meta_blocks = self.fill_block_pointers(&mut inode, &data)?;
@@ -377,7 +377,7 @@ impl Ext {
         let ino = INO_ROOT_DIR;
         set_bit(&mut self.groups[0].inode_bitmap, ino - 1);
 
-        let blk = self.alloc_data_block(0)?;
+        let blk = self.alloc_data_block()?;
         let block_bytes = dir::make_initial_dir_block(ino, ino, self.layout.block_size, false);
 
         let mut inode = Inode::directory(self.layout.block_size, 0o755, 0, 0, mtime);
@@ -401,7 +401,7 @@ impl Ext {
         // Allocate data blocks sequentially.
         let mut data_blocks = Vec::with_capacity(target_data_blocks as usize);
         for _ in 0..target_data_blocks {
-            data_blocks.push(self.alloc_data_block(0)?);
+            data_blocks.push(self.alloc_data_block()?);
         }
 
         let mut inode = Inode::directory(16384, 0o700, 0, 0, mtime);
@@ -504,8 +504,9 @@ impl Ext {
         Ok(())
     }
 
-    /// Reserve the next available inode. Currently only allocates from
-    /// group 0; multi-group allocation lands once we have tests for it.
+    /// Reserve the next available inode. Inode `N` lives in group
+    /// `(N-1) / inodes_per_group` at bitmap bit `(N-1) % inodes_per_group`,
+    /// so a monotonic `next_inode` counter spans all groups.
     fn alloc_inode(&mut self) -> Result<u32> {
         if self.next_inode > self.layout.inodes_count {
             return Err(crate::Error::Unsupported(format!(
@@ -514,33 +515,34 @@ impl Ext {
                 self.layout.inodes_count
             )));
         }
-        if self.next_inode > self.layout.inodes_per_group {
-            return Err(crate::Error::Unsupported(
-                "ext: inode allocation past group 0 not yet implemented".into(),
-            ));
-        }
         let ino = self.next_inode;
-        set_bit(&mut self.groups[0].inode_bitmap, ino - 1);
+        let g = ((ino - 1) / self.layout.inodes_per_group) as usize;
+        let idx = (ino - 1) % self.layout.inodes_per_group;
+        set_bit(&mut self.groups[g].inode_bitmap, idx);
         self.next_inode += 1;
         Ok(ino)
     }
 
-    /// Allocate a single data block in `group`. Returns its absolute block
-    /// number.
-    fn alloc_data_block(&mut self, group: usize) -> Result<u32> {
-        let layout_g = &self.layout.groups[group];
-        let state = &mut self.groups[group];
-        let start_rel = layout_g.data_start - layout_g.start_block;
-        let group_blocks = layout_g.end_block - layout_g.start_block + 1;
-        for bit in start_rel..group_blocks {
-            if !test_bit(&state.block_bitmap, bit) {
-                set_bit(&mut state.block_bitmap, bit);
-                return Ok(layout_g.start_block + bit);
+    /// Allocate a single data block. Scans groups in order and returns the
+    /// first free data block, so callers get contiguous runs within a group
+    /// (good for extent coalescing) and spill into later groups when a group
+    /// fills up.
+    fn alloc_data_block(&mut self) -> Result<u32> {
+        for gi in 0..self.layout.groups.len() {
+            let layout_g = self.layout.groups[gi];
+            let start_rel = layout_g.data_start - layout_g.start_block;
+            let group_blocks = layout_g.end_block - layout_g.start_block + 1;
+            let bitmap = &mut self.groups[gi].block_bitmap;
+            for bit in start_rel..group_blocks {
+                if !test_bit(bitmap, bit) {
+                    set_bit(bitmap, bit);
+                    return Ok(layout_g.start_block + bit);
+                }
             }
         }
-        Err(crate::Error::Unsupported(format!(
-            "ext: group {group} has no free data blocks"
-        )))
+        Err(crate::Error::Unsupported(
+            "ext: filesystem has no free data blocks".into(),
+        ))
     }
 
     fn recompute_free_counts(&mut self) {
@@ -660,7 +662,7 @@ impl Ext {
         let n_data_blocks = len.div_ceil(bs as u64) as u32;
         let mut data_blocks = Vec::with_capacity(n_data_blocks as usize);
         for _ in 0..n_data_blocks {
-            data_blocks.push(self.alloc_data_block(0)?);
+            data_blocks.push(self.alloc_data_block()?);
         }
 
         let ino = self.alloc_inode()?;
@@ -702,7 +704,7 @@ impl Ext {
     ) -> Result<u32> {
         let bs = self.layout.block_size;
         let ino = self.alloc_inode()?;
-        let blk = self.alloc_data_block(0)?;
+        let blk = self.alloc_data_block()?;
         let mut inode = Inode::directory(bs, meta.mode & 0o7777, meta.uid, meta.gid, meta.mtime);
         // For ext4, encode the single data block as an inline extent tree;
         // for ext2/3, store the block number directly in i_block[0].
@@ -761,7 +763,7 @@ impl Ext {
             // blocks_512 stays 0; no data block.
         } else {
             // Slow symlink: target gets a data block.
-            let blk = self.alloc_data_block(0)?;
+            let blk = self.alloc_data_block()?;
             inode.block[0] = blk;
             inode.blocks_512 = bs / 512;
             let mut buf = vec![0u8; bs as usize];

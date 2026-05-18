@@ -120,4 +120,4 @@ there's a use case that demands them.
 
 ## Licence
 
-Dual-licensed under MIT OR Apache-2.0.
+MIT. Copyright © 2026 Karpelès Lab Inc. See [LICENSE](LICENSE).

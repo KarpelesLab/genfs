@@ -308,6 +308,54 @@ fn ext2_with_standard_rootdevs_passes_e2fsck() {
     );
 }
 
+/// Build an image, drop the Ext handle, reopen it, and verify the reader
+/// API sees the same tree we wrote.
+#[test]
+fn ext2_open_lists_and_reads_what_was_written() {
+    use genfs::block::BlockDevice;
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        inodes_count: 64,
+        ..FormatOpts::default()
+    };
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    {
+        let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut()
+            .write_all(b"the quick brown fox\n")
+            .unwrap();
+        ext.add_file_to(
+            &mut dev,
+            2,
+            b"fox.txt",
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        ext.add_dir_to(&mut dev, 2, b"etc", FileMeta::with_mode(0o755))
+            .unwrap();
+        ext.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    // Reopen.
+    let ext = Ext::open(&mut dev).unwrap();
+    let entries = ext.list_inode(&mut dev, 2).unwrap();
+    let names: std::collections::HashSet<_> = entries.iter().map(|e| e.name.clone()).collect();
+    for n in ["lost+found", "fox.txt", "etc"] {
+        assert!(names.contains(n), "missing {n}: {names:?}");
+    }
+    // Resolve a path.
+    let fox = ext.path_to_inode(&mut dev, "/fox.txt").unwrap();
+    let mut reader = ext.open_file_reader(&mut dev, fox).unwrap();
+    let mut content = Vec::new();
+    use std::io::Read as _;
+    reader.read_to_end(&mut content).unwrap();
+    assert_eq!(content, b"the quick brown fox\n");
+}
+
 #[test]
 fn empty_ext2_dumpe2fs_clean() {
     let Some(_) = which("dumpe2fs") else {

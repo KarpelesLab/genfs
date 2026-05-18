@@ -178,6 +178,67 @@ pub fn plan(block_size: u32, blocks_count: u32, inodes_count: u32) -> crate::Res
     })
 }
 
+/// Build a [`Layout`] from a parsed [`super::superblock::Superblock`]. Used
+/// by [`super::Ext::open`] to reconstruct the geometry of an existing image
+/// without re-running the planner's defaulting heuristics.
+pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layout> {
+    let block_size = sb.block_size();
+    if !block_size.is_power_of_two() || block_size < 1024 {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext: bad block_size {block_size}"
+        )));
+    }
+    let group_input_blocks = sb.blocks_count - sb.first_data_block;
+    let num_groups = group_input_blocks.div_ceil(sb.blocks_per_group);
+
+    let inode_table_blocks =
+        (sb.inodes_per_group as u64 * sb.inode_size as u64).div_ceil(block_size as u64) as u32;
+    let gdt_blocks =
+        (num_groups as u64 * GROUP_DESC_SIZE as u64).div_ceil(block_size as u64) as u32;
+
+    let mut groups = Vec::with_capacity(num_groups as usize);
+    for g in 0..num_groups {
+        let start = sb.first_data_block + g * sb.blocks_per_group;
+        let nominal_end = start + sb.blocks_per_group - 1;
+        let end = nominal_end.min(sb.blocks_count - 1);
+        // For an existing image we don't yet know which groups have a
+        // superblock copy (depends on SPARSE_SUPER); for v1 we assume every
+        // group has one when reading too. The descriptor's bitmap/table
+        // pointers (which we read from disk separately) are the source of
+        // truth for actual positions.
+        let has_sb = true;
+        let meta_first = start + if has_sb { 1 + gdt_blocks } else { 0 };
+        let block_bitmap = meta_first;
+        let inode_bitmap = meta_first + 1;
+        let inode_table = meta_first + 2;
+        let data_start = inode_table + inode_table_blocks;
+        let meta_blocks = data_start - start;
+        groups.push(GroupLayout {
+            start_block: start,
+            end_block: end,
+            has_superblock: has_sb,
+            block_bitmap,
+            inode_bitmap,
+            inode_table,
+            data_start,
+            meta_blocks,
+        });
+    }
+
+    Ok(Layout {
+        block_size,
+        blocks_count: sb.blocks_count,
+        inodes_count: sb.inodes_count,
+        first_data_block: sb.first_data_block,
+        blocks_per_group: sb.blocks_per_group,
+        inodes_per_group: sb.inodes_per_group,
+        inode_size: sb.inode_size,
+        inode_table_blocks,
+        gdt_blocks,
+        groups,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

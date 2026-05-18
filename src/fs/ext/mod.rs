@@ -694,6 +694,264 @@ impl Ext {
         }
         Ok(Some(dev_ino))
     }
+
+    // ──────────────────────────────── reader API ─────────────────────────
+    //
+    // These methods do NOT touch the staged write state; they read directly
+    // from the device every time.
+
+    /// Open an existing ext filesystem from `dev`. Parses the primary
+    /// superblock, every group descriptor, and both bitmaps per group.
+    /// Inode-table and data-block contents are read lazily.
+    pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        let mut sb_buf = [0u8; constants::SUPERBLOCK_SIZE];
+        dev.read_at(constants::SUPERBLOCK_OFFSET, &mut sb_buf)?;
+        let sb = Superblock::decode(&sb_buf)?;
+        let layout = layout::from_superblock(&sb)?;
+
+        // GDT location: same logic as the writer.
+        let bs = layout.block_size as u64;
+        let gdt_off = if layout.first_data_block == 1 {
+            2 * bs
+        } else {
+            bs
+        };
+        let mut gdt = vec![0u8; layout.gdt_blocks as usize * bs as usize];
+        dev.read_at(gdt_off, &mut gdt)?;
+
+        let mut groups = Vec::with_capacity(layout.groups.len());
+        for i in 0..layout.groups.len() {
+            let off = i * constants::GROUP_DESC_SIZE;
+            let desc = GroupDesc::decode(
+                gdt[off..off + constants::GROUP_DESC_SIZE]
+                    .try_into()
+                    .unwrap(),
+            );
+            let mut block_bitmap = vec![0u8; bs as usize];
+            dev.read_at(desc.block_bitmap as u64 * bs, &mut block_bitmap)?;
+            let mut inode_bitmap = vec![0u8; bs as usize];
+            dev.read_at(desc.inode_bitmap as u64 * bs, &mut inode_bitmap)?;
+            groups.push(GroupState {
+                block_bitmap,
+                inode_bitmap,
+                desc,
+            });
+        }
+
+        // next_inode: first clear bit in group 0's inode bitmap past the
+        // reserved range. (Subsequent groups can be tackled later.)
+        let mut next_inode = sb.first_ino;
+        while next_inode <= layout.inodes_per_group
+            && test_bit(&groups[0].inode_bitmap, next_inode - 1)
+        {
+            next_inode += 1;
+        }
+
+        Ok(Self {
+            sb,
+            layout,
+            groups,
+            next_inode,
+            inodes: Vec::new(),
+            data_blocks: Vec::new(),
+        })
+    }
+
+    /// Read inode number `ino` from the on-disk inode table.
+    pub fn read_inode(&self, dev: &mut dyn BlockDevice, ino: u32) -> Result<Inode> {
+        if ino == 0 || ino > self.layout.inodes_count {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: inode {ino} out of range"
+            )));
+        }
+        let (group, idx) = self.inode_location(ino);
+        let table_block = self.layout.groups[group as usize].inode_table;
+        let bs = self.layout.block_size as u64;
+        let off = table_block as u64 * bs + idx as u64 * self.layout.inode_size as u64;
+        let mut buf = [0u8; inode::INODE_BASE_SIZE];
+        dev.read_at(off, &mut buf)?;
+        Ok(Inode::decode(&buf))
+    }
+
+    /// Return the absolute block number for the `n`-th block (0-indexed) of
+    /// the file at inode `ino`. Handles direct + single-indirect; returns
+    /// [`Error::Unsupported`] for double/triple indirection (deferred).
+    pub fn file_block(&self, dev: &mut dyn BlockDevice, ino: &Inode, n: u32) -> Result<u32> {
+        if (n as usize) < constants::N_DIRECT {
+            return Ok(ino.block[n as usize]);
+        }
+        let ptrs_per_block = self.layout.block_size / 4;
+        let n_off = n - constants::N_DIRECT as u32;
+        if n_off < ptrs_per_block {
+            let ind = ino.block[constants::IDX_INDIRECT];
+            if ind == 0 {
+                return Err(crate::Error::InvalidImage(
+                    "ext: indirect block index unset".into(),
+                ));
+            }
+            let bs = self.layout.block_size as u64;
+            let mut buf = vec![0u8; self.layout.block_size as usize];
+            dev.read_at(ind as u64 * bs, &mut buf)?;
+            let off = (n_off as usize) * 4;
+            return Ok(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()));
+        }
+        Err(crate::Error::Unsupported(
+            "ext: double/triple indirection not yet supported in reader".into(),
+        ))
+    }
+
+    /// List the entries of the directory inode `ino`. Returns
+    /// [`Error::InvalidArgument`] if `ino` is not a directory.
+    pub fn list_inode(
+        &self,
+        dev: &mut dyn BlockDevice,
+        ino: u32,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let inode = self.read_inode(dev, ino)?;
+        if inode.mode & constants::S_IFMT != constants::S_IFDIR {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: inode {ino} is not a directory"
+            )));
+        }
+        let bs = self.layout.block_size;
+        let n_blocks = inode.size.div_ceil(bs);
+        let mut out = Vec::new();
+        let with_filetype = self.sb.feature_incompat & constants::feature::INCOMPAT_FILETYPE != 0;
+        let mut block_buf = vec![0u8; bs as usize];
+        for n in 0..n_blocks {
+            let blk = self.file_block(dev, &inode, n)?;
+            if blk == 0 {
+                continue;
+            }
+            dev.read_at(blk as u64 * bs as u64, &mut block_buf)?;
+            let mut off = 0usize;
+            while off < block_buf.len() {
+                let Some(entry) = dir::decode_entry(&block_buf[off..], with_filetype) else {
+                    break;
+                };
+                if entry.inode != 0 && !entry.name.is_empty() {
+                    let child = self.read_inode(dev, entry.inode)?;
+                    out.push(crate::fs::DirEntry {
+                        name: String::from_utf8_lossy(entry.name).into_owned(),
+                        inode: entry.inode,
+                        kind: kind_from_mode(child.mode),
+                    });
+                }
+                off += entry.rec_len;
+                if entry.rec_len == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve an absolute path (must start with '/') to its inode number.
+    /// Each component is matched exactly; symlinks are NOT followed in v1.
+    pub fn path_to_inode(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<u32> {
+        if !path.starts_with('/') {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: path must be absolute, got {path:?}"
+            )));
+        }
+        let mut cur = constants::INO_ROOT_DIR;
+        for comp in path.split('/').filter(|c| !c.is_empty()) {
+            let entries = self.list_inode(dev, cur)?;
+            let next = entries
+                .iter()
+                .find(|e| e.name == comp)
+                .map(|e| e.inode)
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!("ext: no such entry {comp:?} in path"))
+                })?;
+            cur = next;
+        }
+        Ok(cur)
+    }
+
+    /// Open a streaming reader over the regular file at `ino`. The reader
+    /// holds a mutable borrow of `dev` for its lifetime; reads pull the
+    /// file's data blocks lazily through a per-block fetch.
+    pub fn open_file_reader<'a>(
+        &'a self,
+        dev: &'a mut dyn BlockDevice,
+        ino: u32,
+    ) -> Result<FileReader<'a>> {
+        let inode = self.read_inode(dev, ino)?;
+        if inode.mode & constants::S_IFMT != constants::S_IFREG {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: inode {ino} is not a regular file"
+            )));
+        }
+        Ok(FileReader {
+            ext: self,
+            dev,
+            inode,
+            pos: 0,
+            block_buf: vec![0u8; self.layout.block_size as usize],
+            cached_block: u32::MAX,
+        })
+    }
+}
+
+/// Streaming reader over a regular file's data blocks. Constructed via
+/// [`Ext::open_file_reader`]. Reads pull one FS block at a time from the
+/// device into an internal buffer; no full-file allocation.
+pub struct FileReader<'a> {
+    ext: &'a Ext,
+    dev: &'a mut dyn BlockDevice,
+    inode: Inode,
+    pos: u64,
+    block_buf: Vec<u8>,
+    /// Block number currently in `block_buf`, or `u32::MAX` if empty.
+    cached_block: u32,
+}
+
+impl<'a> Read for FileReader<'a> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let total = self.inode.size as u64;
+        if self.pos >= total {
+            return Ok(0);
+        }
+        let bs = self.ext.layout.block_size as u64;
+        let block_idx = (self.pos / bs) as u32;
+        let block_off = (self.pos % bs) as usize;
+        if self.cached_block != block_idx {
+            let abs = self
+                .ext
+                .file_block(self.dev, &self.inode, block_idx)
+                .map_err(std::io::Error::other)?;
+            if abs == 0 {
+                self.block_buf.fill(0);
+            } else {
+                self.dev
+                    .read_at(abs as u64 * bs, &mut self.block_buf)
+                    .map_err(std::io::Error::other)?;
+            }
+            self.cached_block = block_idx;
+        }
+        let remaining_in_block = bs as usize - block_off;
+        let remaining_in_file = (total - self.pos) as usize;
+        let n = out.len().min(remaining_in_block).min(remaining_in_file);
+        out[..n].copy_from_slice(&self.block_buf[block_off..block_off + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+/// Translate an ext mode word into a [`crate::fs::EntryKind`].
+fn kind_from_mode(mode: u16) -> crate::fs::EntryKind {
+    use crate::fs::EntryKind;
+    match mode & constants::S_IFMT {
+        constants::S_IFREG => EntryKind::Regular,
+        constants::S_IFDIR => EntryKind::Dir,
+        constants::S_IFLNK => EntryKind::Symlink,
+        constants::S_IFCHR => EntryKind::Char,
+        constants::S_IFBLK => EntryKind::Block,
+        constants::S_IFIFO => EntryKind::Fifo,
+        constants::S_IFSOCK => EntryKind::Socket,
+        _ => EntryKind::Unknown,
+    }
 }
 
 /// Append a dir entry to a 4 KiB-aligned directory block by shrinking the

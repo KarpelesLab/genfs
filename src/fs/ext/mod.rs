@@ -80,10 +80,10 @@ struct GroupState {
 
 /// An open / under-construction ext filesystem.
 ///
-/// During the build phase the on-disk state may be inconsistent: bitmaps and
-/// inode-table entries are only written when [`Ext::flush_metadata`] runs
+/// During the build phase the on-disk state may be inconsistent: bitmaps
+/// and inode-table entries are only written when [`Ext::flush`] runs
 /// (called automatically at the end of [`Ext::format_with`] for the empty
-/// FS case, and explicitly by `create_*` paths once those land).
+/// FS case, and explicitly after a batch of `add_*` calls).
 #[derive(Debug)]
 pub struct Ext {
     pub sb: Superblock,
@@ -600,7 +600,7 @@ impl Ext {
     }
 
     /// Create a device node, FIFO, or socket. No data blocks are allocated;
-    /// for char/block devices the major+minor are encoded into i_block[0].
+    /// for char/block devices the major+minor are encoded into `i_block\[0\]`.
     #[allow(clippy::too_many_arguments)]
     pub fn add_device_to(
         &mut self,

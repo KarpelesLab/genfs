@@ -65,7 +65,7 @@ pub struct GroupLayout {
 
 /// Compute a layout for `(block_size, blocks_count, inodes_count)`.
 ///
-/// Returns [`Error::InvalidArgument`] if the requested geometry cannot fit
+/// Returns [`crate::Error::InvalidArgument`] if the requested geometry cannot fit
 /// the metadata overhead.
 pub fn plan(block_size: u32, blocks_count: u32, inodes_count: u32) -> crate::Result<Layout> {
     if !block_size.is_power_of_two() || block_size < 1024 {

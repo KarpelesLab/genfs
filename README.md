@@ -26,7 +26,7 @@ Early in development. Public API is **unstable** until v0.5.
 |------------------------------------------|---------------|
 | 1. `BlockDevice` foundation              | ✅ done        |
 | 2. MBR + GPT partition tables            | ✅ done        |
-| 3. ext2 writer                           | 🚧 in progress |
+| 3. ext2 writer                           | ✅ done        |
 | 4. ext2 reader + ext3/4 feature matrix   | planned       |
 | 5. TOML spec + CLI                       | planned       |
 | 6. FAT32                                 | post-v1        |
@@ -40,6 +40,19 @@ What works today:
   layouts. GPT includes the protective MBR, primary and backup headers, and
   CRC32 on both the header and the partition entry array. Cross-checked
   against `sgdisk -v`.
+- `genfs::fs::ext::Ext` — write ext2 images from in-memory geometry plus a
+  populate API:
+  - `Ext::format_with(dev, opts)` → an empty FS with the root directory
+    (and `/lost+found` if requested). Layout matches `genext2fs -d <dir>
+    -f -q -B 1024` structurally; verified with `e2fsck -fn` and a
+    `dumpe2fs -h` diff.
+  - `Ext::add_file_to(dev, parent, name, FileSource, meta)` — regular
+    files via direct + single-indirect blocks. File data is streamed
+    straight to the device; never fully resident in memory.
+  - `Ext::add_dir_to`, `Ext::add_symlink_to` (with fast-symlink inline
+    storage for ≤ 60-byte targets), `Ext::add_device_to` (char / block /
+    FIFO / socket).
+  - `Ext::flush(dev)` — persists metadata, primary superblock last.
 
 ## Architecture
 

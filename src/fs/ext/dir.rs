@@ -38,8 +38,8 @@ pub fn min_rec_len(name_len: usize) -> usize {
 
 /// Append a single entry to `out` with the given `rec_len`. Caller is
 /// responsible for choosing `rec_len` — for non-final entries it should be
-/// [`min_rec_len(name.len())`]; the final entry in a block must absorb the
-/// trailing slack so it reaches the block boundary.
+/// [`min_rec_len`] of the name length; the final entry in a block must
+/// absorb the trailing slack so it reaches the block boundary.
 ///
 /// The `file_type` argument is the dirent type byte (`DENT_REG`, `DENT_DIR`,
 /// ...) which is only used when the FILETYPE incompat feature is enabled —

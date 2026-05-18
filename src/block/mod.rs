@@ -10,7 +10,7 @@
 //! - `total_size()` is the logical capacity in bytes; reads and writes outside
 //!   `[0, total_size())` MUST be rejected (the trait returns a short read /
 //!   short write at the boundary via the standard `Read`/`Write` contract, and
-//!   genfs's explicit positional helpers return [`Error::OutOfBounds`]).
+//!   genfs's explicit positional helpers return [`crate::Error::OutOfBounds`]).
 //! - Implementations are free to back themselves with sparse storage. Bytes
 //!   that have never been written MUST read as zero.
 //! - `block_size()` reports the *logical* sector size — usually 512 — and is
@@ -80,7 +80,7 @@ pub trait BlockDevice: Read + Write + Seek + Send {
     /// implicit stream cursor across calls (the cursor IS seeked, but callers
     /// should not rely on its position after this method returns).
     ///
-    /// Returns [`Error::OutOfBounds`] if `offset + buf.len()` exceeds
+    /// Returns [`crate::Error::OutOfBounds`] if `offset + buf.len()` exceeds
     /// [`total_size`](Self::total_size). Implementations that can do a true
     /// `pread` (positional read without modifying the cursor) are encouraged
     /// to override this.
@@ -105,8 +105,8 @@ pub trait BlockDevice: Read + Write + Seek + Send {
         Ok(())
     }
 
-    /// Positional write — writes `buf` at `offset`. Mirrors [`read_at`]'s
-    /// semantics.
+    /// Positional write — writes `buf` at `offset`. Mirrors
+    /// [`read_at`](Self::read_at)'s semantics.
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
         let size = self.total_size();
         let end = offset

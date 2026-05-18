@@ -10,8 +10,8 @@ use crate::Result;
 const SOFT_MAX_CAPACITY: u64 = 256 * 1024 * 1024;
 
 /// A [`BlockDevice`] backed by a fixed-capacity `Vec<u8>`. Bytes default to
-/// zero. Intended for unit tests; emit a `log::warn!` if larger than
-/// [`SOFT_MAX_CAPACITY`].
+/// zero. Intended for unit tests; emits a `log::warn!` if larger than the
+/// 256 MiB soft cap.
 #[derive(Debug, Clone)]
 pub struct MemoryBackend {
     buf: Vec<u8>,

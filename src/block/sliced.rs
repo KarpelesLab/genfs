@@ -32,7 +32,7 @@ pub struct SlicedBackend<'a, B: BlockDevice + ?Sized> {
 impl<'a, B: BlockDevice + ?Sized> SlicedBackend<'a, B> {
     /// Construct a slice covering `[start, start + len)` of `parent`.
     ///
-    /// Returns [`Error::OutOfBounds`] if the slice extends past the parent's
+    /// Returns [`crate::Error::OutOfBounds`] if the slice extends past the parent's
     /// `total_size()` or if the arithmetic overflows.
     pub fn new(parent: &'a mut B, start: u64, len: u64) -> Result<Self> {
         let parent_size = parent.total_size();

@@ -24,7 +24,7 @@ pub use mbr::Mbr;
 ///
 /// MBR ignores `uuid`, `name`, and `attributes`; the high bits of `start_lba`
 /// and `size_lba` must fit in 32 bits or [`Mbr::write`] returns
-/// [`Error::Unsupported`]. GPT writes them all.
+/// [`crate::Error::Unsupported`]. GPT writes them all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Partition {
     /// First LBA of the partition (inclusive).

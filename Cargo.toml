@@ -21,6 +21,8 @@ path = "src/bin/genfs.rs"
 [dependencies]
 thiserror = "2"
 log = "0.4"
+uuid = { version = "1", features = ["v4"] }
+crc32fast = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -234,7 +234,7 @@ impl Ext {
 
         // Optional /lost+found.
         if opts.create_lost_found {
-            ext.create_lost_found(opts.mtime)?;
+            ext.create_lost_found(dev, opts.mtime)?;
         }
 
         // Optional journal (ext3 / ext4).
@@ -390,7 +390,7 @@ impl Ext {
     }
 
     /// Create the conventional /lost+found directory pre-allocated to 16 KiB.
-    fn create_lost_found(&mut self, mtime: u32) -> Result<()> {
+    fn create_lost_found(&mut self, dev: &mut dyn BlockDevice, mtime: u32) -> Result<()> {
         let bs = self.layout.block_size;
         let target_data_blocks: u32 = 16384u32.div_ceil(bs);
 
@@ -421,8 +421,8 @@ impl Ext {
 
         // Add to root dir + bump root's link count (a new subdir's ".." is
         // a fresh link to the parent).
-        self.add_entry_to_dir_block_for(INO_ROOT_DIR, b"lost+found", ino)?;
-        self.patch_inode(INO_ROOT_DIR, |i| i.links_count += 1);
+        self.add_entry_to_dir_block_for(dev, INO_ROOT_DIR, b"lost+found", ino)?;
+        self.patch_inode(dev, INO_ROOT_DIR, |i| i.links_count += 1)?;
         Ok(())
     }
 
@@ -431,34 +431,76 @@ impl Ext {
     /// data block; full-block error if it doesn't fit.
     fn add_entry_to_dir_block_for(
         &mut self,
+        dev: &mut dyn BlockDevice,
         dir_inode: u32,
         name: &[u8],
         child_ino: u32,
     ) -> Result<()> {
-        let dir_block_num = self
+        self.ensure_inode_staged(dev, dir_inode)?;
+        // Resolve the dir's first data block via file_block (handles both
+        // direct-pointer ext2 dirs and extent-encoded ext4 dirs uniformly).
+        let inode_copy = self
             .inodes
             .iter()
             .find(|(i, _)| *i == dir_inode)
-            .map(|(_, inode)| inode.block[0])
-            .ok_or_else(|| crate::Error::InvalidArgument("dir inode not staged".into()))?;
+            .map(|(_, i)| *i)
+            .unwrap();
+        let dir_block_num = self.file_block(dev, &inode_copy, 0)?;
+        if dir_block_num == 0 {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: dir inode {dir_inode} has no first data block"
+            )));
+        }
+        self.ensure_block_staged(dev, dir_block_num)?;
         let block = self
             .data_blocks
             .iter_mut()
             .find(|(b, _)| *b == dir_block_num)
             .map(|(_, bytes)| bytes)
-            .ok_or_else(|| crate::Error::InvalidImage("dir data block missing".into()))?;
+            .unwrap();
         append_dir_entry(block, name, child_ino, constants::DENT_DIR, false)
     }
 
-    /// Mutate a staged inode entry in place. Panics if absent.
-    fn patch_inode<F: FnOnce(&mut Inode)>(&mut self, ino: u32, f: F) {
+    /// Mutate an inode in place. If the inode isn't already in the staged
+    /// cache, reads it from disk first so the mutation is preserved across
+    /// the next flush.
+    fn patch_inode<F: FnOnce(&mut Inode)>(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u32,
+        f: F,
+    ) -> Result<()> {
+        self.ensure_inode_staged(dev, ino)?;
         for (i_no, i) in self.inodes.iter_mut() {
             if *i_no == ino {
                 f(i);
-                return;
+                return Ok(());
             }
         }
-        panic!("inode {ino} not staged");
+        unreachable!("ensure_inode_staged guarantees the inode is present")
+    }
+
+    /// Ensure inode `ino` is in the staged write set, fetching from disk if
+    /// not. No-op if already staged.
+    fn ensure_inode_staged(&mut self, dev: &mut dyn BlockDevice, ino: u32) -> Result<()> {
+        if self.inodes.iter().any(|(i, _)| *i == ino) {
+            return Ok(());
+        }
+        let inode = self.read_inode(dev, ino)?;
+        self.inodes.push((ino, inode));
+        Ok(())
+    }
+
+    /// Ensure block `blk` is in the staged write set, fetching from disk
+    /// if not. No-op if already staged.
+    fn ensure_block_staged(&mut self, dev: &mut dyn BlockDevice, blk: u32) -> Result<()> {
+        if self.data_blocks.iter().any(|(b, _)| *b == blk) {
+            return Ok(());
+        }
+        let mut buf = vec![0u8; self.layout.block_size as usize];
+        self.read_block(dev, blk, &mut buf)?;
+        self.data_blocks.push((blk, buf));
+        Ok(())
     }
 
     /// Reserve the next available inode. Currently only allocates from
@@ -644,7 +686,7 @@ impl Ext {
         debug_assert_eq!(remaining, 0);
 
         self.inodes.push((ino, inode));
-        self.add_entry_to_dir_block_for(parent_ino, name, ino)?;
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino)?;
         Ok(ino)
     }
 
@@ -652,7 +694,7 @@ impl Ext {
     /// holding "." / "..", patches the parent's link count.
     pub fn add_dir_to(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         parent_ino: u32,
         name: &[u8],
         meta: FileMeta,
@@ -661,15 +703,21 @@ impl Ext {
         let ino = self.alloc_inode()?;
         let blk = self.alloc_data_block(0)?;
         let mut inode = Inode::directory(bs, meta.mode & 0o7777, meta.uid, meta.gid, meta.mtime);
-        inode.block[0] = blk;
+        // For ext4, encode the single data block as an inline extent tree;
+        // for ext2/3, store the block number directly in i_block[0].
+        if matches!(self.kind, FsKind::Ext4) {
+            self.fill_block_pointers_extent(&mut inode, &[blk])?;
+        } else {
+            inode.block[0] = blk;
+        }
         inode.blocks_512 = bs / 512;
         let block_bytes = dir::make_initial_dir_block(ino, parent_ino, bs, false);
         self.data_blocks.push((blk, block_bytes));
         self.inodes.push((ino, inode));
         self.groups[0].desc.used_dirs_count += 1;
 
-        self.add_entry_to_dir_block_for(parent_ino, name, ino)?;
-        self.patch_inode(parent_ino, |i| i.links_count += 1);
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino)?;
+        self.patch_inode(dev, parent_ino, |i| i.links_count += 1)?;
         Ok(ino)
     }
 
@@ -721,7 +769,7 @@ impl Ext {
         }
 
         self.inodes.push((ino, inode));
-        self.add_entry_to_dir_block_for(parent_ino, name, ino)?;
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino)?;
         Ok(ino)
     }
 
@@ -730,7 +778,7 @@ impl Ext {
     #[allow(clippy::too_many_arguments)]
     pub fn add_device_to(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         parent_ino: u32,
         name: &[u8],
         kind: DeviceKind,
@@ -755,7 +803,7 @@ impl Ext {
             meta.mtime,
         );
         self.inodes.push((ino, inode));
-        self.add_entry_to_dir_block_for(parent_ino, name, ino)?;
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino)?;
         Ok(ino)
     }
 

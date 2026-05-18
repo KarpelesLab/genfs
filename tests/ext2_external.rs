@@ -410,6 +410,104 @@ fn ext2_via_filesystem_trait() {
     assert_eq!(body, b"trait-impl content\n");
 }
 
+/// Open an ext2 image created by an external `mke2fs`, add a file via
+/// fstool, flush, and verify the result is fsck-clean and debugfs can read
+/// the file we wrote. This is the "modify someone else's image" path —
+/// exercises Ext::open + add_file_to + flush against a third-party writer.
+#[test]
+fn fstool_can_modify_a_mke2fs_image() {
+    let Some(_) = which("mke2fs") else {
+        eprintln!("skipping: mke2fs not installed");
+        return;
+    };
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    let tmp = NamedTempFile::new().unwrap();
+    // 8 MiB image. `-O none` disables every feature so the layout matches
+    // our classic ext2 reader; once 64bit / metadata_csum / sparse_super /
+    // flex_bg land we'll drop the -O none and exercise the full surface.
+    let out = Command::new("mke2fs")
+        .args([
+            "-F",
+            "-t",
+            "ext2",
+            "-b",
+            "1024",
+            "-L",
+            "",
+            "-U",
+            "00000000-0000-0000-0000-000000000000",
+            "-E",
+            "nodiscard",
+            "-O",
+            "none",
+            "-N",
+            "64",
+        ])
+        .arg(tmp.path())
+        .arg("8192")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Open with fstool, add a file under /, flush.
+    use fstool::block::BlockDevice;
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let mut ext = Ext::open(&mut dev).unwrap();
+    let mut src = NamedTempFile::new().unwrap();
+    src.as_file_mut()
+        .write_all(b"injected by fstool\n")
+        .unwrap();
+    ext.add_file_to(
+        &mut dev,
+        2,
+        b"injected.txt",
+        FileSource::HostPath(src.path().to_path_buf()),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // e2fsck clean.
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck failed after fstool modify:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // debugfs should see the new file with the right contents.
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg("cat /injected.txt")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.contains("injected by fstool"),
+        "injected file body wrong:\n{body}"
+    );
+}
+
 /// Drive build_from_host_dir + BuildPlan auto-sizing end-to-end against
 /// a small fixture tree on the host.
 #[test]

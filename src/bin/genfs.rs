@@ -4,6 +4,9 @@
 //! so `cargo build` produces a runnable binary while the library lands.
 
 fn main() {
-    eprintln!("genfs {} — CLI not yet implemented (see roadmap)", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "genfs {} — CLI not yet implemented (see roadmap)",
+        env!("CARGO_PKG_VERSION")
+    );
     std::process::exit(2);
 }

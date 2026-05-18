@@ -22,11 +22,7 @@ fn which(tool: &str) -> Option<std::path::PathBuf> {
     }
     let s = String::from_utf8(out.stdout).ok()?;
     let p = s.trim();
-    if p.is_empty() {
-        None
-    } else {
-        Some(p.into())
-    }
+    if p.is_empty() { None } else { Some(p.into()) }
 }
 
 fn write_gpt_image(path: &Path, size: u64) {
@@ -87,7 +83,11 @@ fn gpt_validates_with_sgdisk() {
     write_gpt_image(tmp.path(), 64 * 1024 * 1024);
 
     // -p prints the partition table; non-zero exit means the GPT is broken.
-    let out = Command::new("sgdisk").arg("-p").arg(tmp.path()).output().unwrap();
+    let out = Command::new("sgdisk")
+        .arg("-p")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -95,11 +95,21 @@ fn gpt_validates_with_sgdisk() {
         "sgdisk -p failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     // Should list two partitions named EFI System and root.
-    assert!(stdout.contains("EFI System"), "missing EFI System in sgdisk output:\n{stdout}");
-    assert!(stdout.contains("root"), "missing root in sgdisk output:\n{stdout}");
+    assert!(
+        stdout.contains("EFI System"),
+        "missing EFI System in sgdisk output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("root"),
+        "missing root in sgdisk output:\n{stdout}"
+    );
 
     // -v verifies all CRCs and structures.
-    let out = Command::new("sgdisk").arg("-v").arg(tmp.path()).output().unwrap();
+    let out = Command::new("sgdisk")
+        .arg("-v")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -123,7 +133,11 @@ fn mbr_validates_with_fdisk() {
     let tmp = NamedTempFile::new().unwrap();
     write_mbr_image(tmp.path(), 16 * 1024 * 1024);
 
-    let out = Command::new("fdisk").arg("-l").arg(tmp.path()).output().unwrap();
+    let out = Command::new("fdisk")
+        .arg("-l")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -137,7 +151,10 @@ fn mbr_validates_with_fdisk() {
     );
     // Linux type ("83") and Linux swap ("82") should both appear.
     let lower = stdout.to_lowercase();
-    assert!(lower.contains("linux"), "missing 'Linux' partition type:\n{stdout}");
+    assert!(
+        lower.contains("linux"),
+        "missing 'Linux' partition type:\n{stdout}"
+    );
     assert!(
         lower.contains("swap") || lower.contains(" 82 "),
         "missing swap partition:\n{stdout}"

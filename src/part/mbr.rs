@@ -81,7 +81,10 @@ impl Mbr {
             // last non-empty.
             parts.push(p);
         }
-        while parts.last().is_some_and(|p| p.kind == PartitionKind::Empty && p.size_lba == 0) {
+        while parts
+            .last()
+            .is_some_and(|p| p.kind == PartitionKind::Empty && p.size_lba == 0)
+        {
             parts.pop();
         }
         Ok(Self { partitions: parts })
@@ -239,7 +242,12 @@ mod tests {
     #[test]
     fn signature_present_after_write() {
         let mut dev = MemoryBackend::new(mb(8));
-        let mbr = Mbr::new(vec![Partition::new(2048, 1024, PartitionKind::LinuxFilesystem)]).unwrap();
+        let mbr = Mbr::new(vec![Partition::new(
+            2048,
+            1024,
+            PartitionKind::LinuxFilesystem,
+        )])
+        .unwrap();
         mbr.write(&mut dev).unwrap();
         let mut sig = [0u8; 2];
         dev.read_at(510, &mut sig).unwrap();
@@ -250,7 +258,11 @@ mod tests {
     fn rejects_too_many_partitions() {
         let mut parts = Vec::new();
         for i in 0..5 {
-            parts.push(Partition::new(i * 1024 + 2048, 512, PartitionKind::LinuxFilesystem));
+            parts.push(Partition::new(
+                i * 1024 + 2048,
+                512,
+                PartitionKind::LinuxFilesystem,
+            ));
         }
         let err = Mbr::new(parts).unwrap_err();
         assert!(matches!(err, crate::Error::InvalidArgument(_)));

@@ -147,12 +147,7 @@ impl Gpt {
         })
     }
 
-    fn header_for(
-        &self,
-        is_primary: bool,
-        total_lba: u64,
-        entries_crc: u32,
-    ) -> Header {
+    fn header_for(&self, is_primary: bool, total_lba: u64, entries_crc: u32) -> Header {
         let primary_lba = 1;
         let backup_lba = total_lba - 1;
         let (my_lba, alt_lba, entries_start_lba) = if is_primary {
@@ -529,12 +524,7 @@ mod tests {
     #[test]
     fn rejects_too_small_device() {
         let mut dev = MemoryBackend::new(64 * 1024); // 64 KiB = 128 LBAs
-        let gpt = Gpt::build(vec![Partition::new(
-            34,
-            32,
-            PartitionKind::LinuxFilesystem,
-        )])
-        .unwrap();
+        let gpt = Gpt::build(vec![Partition::new(34, 32, PartitionKind::LinuxFilesystem)]).unwrap();
         // 128 LBAs is plenty for the GPT itself (66 LBAs of metadata) but we
         // want to make sure it works with a tight fit.
         gpt.write(&mut dev).unwrap();

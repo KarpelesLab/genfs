@@ -28,7 +28,10 @@ impl MemoryBackend {
     /// Create a backend of exactly `size` bytes with a custom advisory
     /// sector size.
     pub fn with_block_size(size: u64, block_size: u32) -> Self {
-        assert!(block_size.is_power_of_two(), "block_size must be a power of two");
+        assert!(
+            block_size.is_power_of_two(),
+            "block_size must be a power of two"
+        );
         if size > SOFT_MAX_CAPACITY {
             log::warn!(
                 "MemoryBackend created with size {size} bytes (> {SOFT_MAX_CAPACITY} soft cap); \

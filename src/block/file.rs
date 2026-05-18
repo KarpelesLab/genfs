@@ -36,7 +36,10 @@ impl FileBackend {
         size: u64,
         block_size: u32,
     ) -> Result<Self> {
-        assert!(block_size.is_power_of_two(), "block_size must be a power of two");
+        assert!(
+            block_size.is_power_of_two(),
+            "block_size must be a power of two"
+        );
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -59,7 +62,10 @@ impl FileBackend {
 
     /// Open with an explicit advisory sector size.
     pub fn open_with_block_size<P: AsRef<Path>>(path: P, block_size: u32) -> Result<Self> {
-        assert!(block_size.is_power_of_two(), "block_size must be a power of two");
+        assert!(
+            block_size.is_power_of_two(),
+            "block_size must be a power of two"
+        );
         let file = OpenOptions::new()
             .read(true)
             .write(true)

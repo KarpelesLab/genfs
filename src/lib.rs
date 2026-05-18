@@ -13,6 +13,7 @@
 
 pub mod block;
 pub mod error;
+pub mod fs;
 pub mod part;
 
 pub use error::{Error, Result};

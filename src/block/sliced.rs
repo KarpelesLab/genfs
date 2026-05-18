@@ -36,13 +36,11 @@ impl<'a, B: BlockDevice + ?Sized> SlicedBackend<'a, B> {
     /// `total_size()` or if the arithmetic overflows.
     pub fn new(parent: &'a mut B, start: u64, len: u64) -> Result<Self> {
         let parent_size = parent.total_size();
-        let end = start
-            .checked_add(len)
-            .ok_or(crate::Error::OutOfBounds {
-                offset: start,
-                len,
-                size: parent_size,
-            })?;
+        let end = start.checked_add(len).ok_or(crate::Error::OutOfBounds {
+            offset: start,
+            len,
+            size: parent_size,
+        })?;
         if end > parent_size {
             return Err(crate::Error::OutOfBounds {
                 offset: start,
@@ -204,9 +202,15 @@ mod tests {
         parent.read_at(0, &mut leading).unwrap();
         parent.read_at(256, &mut middle).unwrap();
         parent.read_at(768, &mut trailing).unwrap();
-        assert!(leading.iter().all(|&b| b == 0x11), "slice leaked before its start");
+        assert!(
+            leading.iter().all(|&b| b == 0x11),
+            "slice leaked before its start"
+        );
         assert!(middle.iter().all(|&b| b == 0x33));
-        assert!(trailing.iter().all(|&b| b == 0x22), "slice leaked past its end");
+        assert!(
+            trailing.iter().all(|&b| b == 0x22),
+            "slice leaked past its end"
+        );
     }
 
     #[test]

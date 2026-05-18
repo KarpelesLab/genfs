@@ -980,7 +980,7 @@ impl Ext {
 
     /// Return the absolute block number for the `n`-th block (0-indexed) of
     /// the file at inode `ino`. Handles direct + single-indirect; returns
-    /// [`Error::Unsupported`] for double/triple indirection (deferred).
+    /// [`crate::Error::Unsupported`] for triple indirection (deferred).
     pub fn file_block(&self, dev: &mut dyn BlockDevice, ino: &Inode, n: u32) -> Result<u32> {
         if (n as usize) < constants::N_DIRECT {
             return Ok(ino.block[n as usize]);
@@ -1005,7 +1005,7 @@ impl Ext {
     }
 
     /// List the entries of the directory inode `ino`. Returns
-    /// [`Error::InvalidArgument`] if `ino` is not a directory.
+    /// [`crate::Error::InvalidArgument`] if `ino` is not a directory.
     pub fn list_inode(
         &self,
         dev: &mut dyn BlockDevice,

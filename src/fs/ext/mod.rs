@@ -22,6 +22,7 @@
 pub mod build_plan;
 pub mod constants;
 pub mod dir;
+pub mod extent;
 pub mod group;
 pub mod inode;
 pub mod layout;
@@ -118,6 +119,9 @@ struct GroupState {
 pub struct Ext {
     pub sb: Superblock,
     pub layout: Layout,
+    /// Which ext flavour to write — controls extent-vs-indirect block
+    /// pointers, FILETYPE in dirents, etc.
+    pub kind: FsKind,
     groups: Vec<GroupState>,
     /// Next free inode number to hand out (starts at first_ino).
     next_inode: u32,
@@ -213,6 +217,7 @@ impl Ext {
         let mut ext = Self {
             sb,
             layout,
+            kind: opts.kind,
             groups,
             next_inode: 0,
             inodes: Vec::new(),
@@ -244,19 +249,47 @@ impl Ext {
             ext.sb.feature_compat |= constants::feature::COMPAT_HAS_JOURNAL;
             ext.sb.journal_inum = constants::INO_JOURNAL;
         }
+        // ext4-only feature flags.
+        if matches!(opts.kind, FsKind::Ext4) {
+            ext.sb.feature_incompat |= constants::feature::INCOMPAT_EXTENTS;
+        }
 
         ext.recompute_free_counts();
         ext.flush_metadata(dev)?;
         Ok(ext)
     }
 
-    /// Wire `data_blocks` into an inode's block-pointer array, allocating
-    /// indirect / double-indirect blocks as needed. Returns the number of
-    /// metadata (indirection) blocks allocated.
-    ///
-    /// v1 cap: direct + single + double indirection (no triple). At 1 KiB
-    /// blocks that's up to 12 + 256 + 256² ≈ 65 MiB; at 4 KiB it's ~4 GiB.
+    /// Wire `data_blocks` into an inode's block-pointer array. Picks the
+    /// representation based on the filesystem kind: ext4 uses an extent
+    /// tree (depth 0, up to 4 leaves, no extra metadata blocks); ext2/3 use
+    /// the classic direct + single-indirect + double-indirect scheme.
+    /// Returns the number of metadata (indirection) blocks allocated.
     fn fill_block_pointers(&mut self, inode: &mut Inode, data: &[u32]) -> Result<u32> {
+        if matches!(self.kind, FsKind::Ext4) {
+            return self.fill_block_pointers_extent(inode, data);
+        }
+        self.fill_block_pointers_indirect(inode, data)
+    }
+
+    /// Ext4 path: pack `data` into an extent tree stored directly in
+    /// `i_block` and set `EXT4_EXTENTS_FL` on the inode. Allocates no extra
+    /// metadata blocks for depth-0 trees (the cap is 4 extents per inode).
+    fn fill_block_pointers_extent(&mut self, inode: &mut Inode, data: &[u32]) -> Result<u32> {
+        let runs = extent::coalesce(data);
+        let packed = extent::pack_into_iblock(&runs)?;
+        // Decode the 60 packed bytes back into the 15 u32 slots of i_block.
+        for (i, slot) in inode.block.iter_mut().enumerate() {
+            let off = i * 4;
+            *slot = u32::from_le_bytes(packed[off..off + 4].try_into().unwrap());
+        }
+        inode.flags |= constants::EXT4_EXTENTS_FL;
+        Ok(0)
+    }
+
+    /// Ext2 / Ext3 path: direct + single + double indirection. v1 cap.
+    /// At 1 KiB blocks that's up to 12 + 256 + 256² ≈ 65 MiB; at 4 KiB
+    /// it's ~4 GiB.
+    fn fill_block_pointers_indirect(&mut self, inode: &mut Inode, data: &[u32]) -> Result<u32> {
         let bs = self.layout.block_size;
         let ptrs_per_block = (bs / 4) as usize;
         let n = data.len();
@@ -930,9 +963,20 @@ impl Ext {
             next_inode += 1;
         }
 
+        // Infer kind from feature flags on the parsed superblock so reads
+        // post-open know whether to expect extent trees or indirect blocks.
+        let kind = if sb.feature_incompat & constants::feature::INCOMPAT_EXTENTS != 0 {
+            FsKind::Ext4
+        } else if sb.feature_compat & constants::feature::COMPAT_HAS_JOURNAL != 0 {
+            FsKind::Ext3
+        } else {
+            FsKind::Ext2
+        };
+
         Ok(Self {
             sb,
             layout,
+            kind,
             groups,
             next_inode,
             inodes: Vec::new(),
@@ -979,9 +1023,13 @@ impl Ext {
     }
 
     /// Return the absolute block number for the `n`-th block (0-indexed) of
-    /// the file at inode `ino`. Handles direct + single-indirect; returns
-    /// [`crate::Error::Unsupported`] for triple indirection (deferred).
+    /// the file at inode `ino`. Picks the representation based on the
+    /// inode flags: `EXT4_EXTENTS_FL` → walk the extent tree;
+    /// otherwise → direct + single-indirect (double/triple deferred).
     pub fn file_block(&self, dev: &mut dyn BlockDevice, ino: &Inode, n: u32) -> Result<u32> {
+        if ino.flags & constants::EXT4_EXTENTS_FL != 0 {
+            return self.file_block_extent(ino, n);
+        }
         if (n as usize) < constants::N_DIRECT {
             return Ok(ino.block[n as usize]);
         }
@@ -1002,6 +1050,52 @@ impl Ext {
         Err(crate::Error::Unsupported(
             "ext: double/triple indirection not yet supported in reader".into(),
         ))
+    }
+
+    /// Resolve logical block `n` against an inode that uses an inline
+    /// (depth-0) ext4 extent tree.
+    fn file_block_extent(&self, ino: &Inode, n: u32) -> Result<u32> {
+        // The 15-slot u32 i_block array overlays as a 60-byte extent tree.
+        let mut buf = [0u8; 60];
+        for (i, slot) in ino.block.iter().enumerate() {
+            let off = i * 4;
+            buf[off..off + 4].copy_from_slice(&slot.to_le_bytes());
+        }
+        let magic = u16::from_le_bytes(buf[0..2].try_into().unwrap());
+        if magic != extent::EXT4_EXT_MAGIC {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext4: extent header magic {magic:#06x} != {:#06x}",
+                extent::EXT4_EXT_MAGIC
+            )));
+        }
+        let entries = u16::from_le_bytes(buf[2..4].try_into().unwrap()) as usize;
+        let depth = u16::from_le_bytes(buf[6..8].try_into().unwrap());
+        if depth != 0 {
+            return Err(crate::Error::Unsupported(
+                "ext4: multi-level extent trees not yet supported in reader".into(),
+            ));
+        }
+        for i in 0..entries {
+            let off = 12 + i * 12;
+            let ee_block = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            let ee_len = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap());
+            let ee_start_hi = u16::from_le_bytes(buf[off + 6..off + 8].try_into().unwrap()) as u64;
+            let ee_start_lo = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as u64;
+            // Uninitialized extents have ee_len in the [32768, 65535] range
+            // and represent zero blocks; we don't emit those but tolerate
+            // them on read.
+            let len = if ee_len > extent::MAX_LEN_PER_EXTENT {
+                ee_len - extent::MAX_LEN_PER_EXTENT
+            } else {
+                ee_len
+            };
+            if n >= ee_block && n < ee_block + len as u32 {
+                let phys = (ee_start_hi << 32) | ee_start_lo;
+                return Ok((phys + (n - ee_block) as u64) as u32);
+            }
+        }
+        // Logical block not covered by any extent → sparse hole, reads as zero.
+        Ok(0)
     }
 
     /// List the entries of the directory inode `ino`. Returns

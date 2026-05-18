@@ -108,6 +108,10 @@ pub mod feature {
     pub const RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
 }
 
+/// Inode flag `EXT4_EXTENTS_FL` — set on inodes whose `i_block` array
+/// holds an ext4 extent tree rather than direct/indirect block pointers.
+pub const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+
 /// Number of direct block pointers in an inode (`i_block[0..12]`).
 pub const N_DIRECT: usize = 12;
 /// Index of the single-indirect block in `i_block`.

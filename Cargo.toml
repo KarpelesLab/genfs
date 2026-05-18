@@ -1,0 +1,27 @@
+[package]
+name = "genfs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Build disk images and filesystems (ext2/3/4, MBR, GPT) from a directory tree and TOML spec, in the spirit of genext2fs."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/KarpelesLab/genfs"
+readme = "README.md"
+keywords = ["filesystem", "ext4", "ext2", "gpt", "image"]
+categories = ["filesystem", "command-line-utilities"]
+
+[lib]
+name = "genfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "genfs"
+path = "src/bin/genfs.rs"
+
+[dependencies]
+thiserror = "2"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+env_logger = "0.11"

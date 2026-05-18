@@ -77,6 +77,17 @@ enum Command {
         #[arg(value_name = "IMAGE")]
         image: PathBuf,
     },
+
+    /// Build an image from a TOML spec file. Bare-filesystem specs are
+    /// supported today; partitioned-disk specs land in a follow-up.
+    Build {
+        /// Path to the TOML spec file.
+        #[arg(value_name = "SPEC")]
+        spec: PathBuf,
+        /// Output image file.
+        #[arg(short = 'o', long = "output", value_name = "IMAGE")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -118,7 +129,15 @@ fn run(cli: Cli) -> fstool::Result<()> {
         Command::Ls { image, path } => ls(&image, &path),
         Command::Cat { image, path } => cat(&image, &path),
         Command::Info { image } => info(&image),
+        Command::Build { spec, output } => build(&spec, &output),
     }
+}
+
+fn build(spec_path: &std::path::Path, output: &std::path::Path) -> fstool::Result<()> {
+    let spec = fstool::spec::Spec::parse_file(spec_path)?;
+    fstool::spec::build(&spec, output)?;
+    eprintln!("built {} from {}", output.display(), spec_path.display());
+    Ok(())
 }
 
 fn ext_build(

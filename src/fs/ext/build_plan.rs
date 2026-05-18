@@ -189,12 +189,13 @@ impl BuildPlan {
         // region but still counts toward blocks_count, hence `first_block`.
         let total = first_block as u64 + per_group_meta + data;
 
-        // Round up to a sensible alignment and add 10% slack. Floor at 64
-        // because empirically smaller images run into edge cases in the
-        // ext2 metadata layout (bitmap padding alignment at very small
-        // group sizes) that the kernel and e2fsck reject.
+        // Add 10% slack, floor at 64 blocks. For a single-group FS
+        // blocks_per_group == blocks_count, and that must be a multiple of
+        // 8 (the block bitmap is checked byte-aligned per group) — so round
+        // the final count up to a multiple of 8.
         let with_slack = (total as f64 * 1.10).ceil() as u64;
-        with_slack.max(64) as u32
+        let floored = with_slack.max(64);
+        (floored.div_ceil(8) * 8) as u32
     }
 
     /// Build a [`super::FormatOpts`] populated with the recommended counts.

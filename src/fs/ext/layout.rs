@@ -97,6 +97,19 @@ pub fn plan(block_size: u32, blocks_count: u32, inodes_count: u32) -> crate::Res
     let max_per_group = 8 * block_size;
     let blocks_per_group = max_per_group.min(blocks_count);
 
+    // blocks_per_group MUST be a multiple of 8: the block bitmap is checked
+    // byte-aligned per group, and e2fsck rejects a non-byte-aligned group
+    // size ("Padding at end of block bitmap is not set"). The multi-group
+    // case uses 8*block_size which is always a multiple of 8; the small
+    // single-group case uses blocks_count directly, so blocks_count must be
+    // a multiple of 8 there.
+    if blocks_per_group % 8 != 0 {
+        return Err(crate::Error::InvalidArgument(format!(
+            "ext: blocks_count {blocks_count} must be a multiple of 8 for a \
+             single-group filesystem (blocks_per_group must be byte-aligned)"
+        )));
+    }
+
     // Group 0 covers [first_data_block, first_data_block + blocks_per_group)
     // intersected with [0, blocks_count). Subsequent groups follow.
     let group_input_blocks = blocks_count - first_data_block;

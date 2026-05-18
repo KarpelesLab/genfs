@@ -1,0 +1,32 @@
+# Example fstool spec: a bare ext4 filesystem image (no partition table).
+#
+#   fstool build examples/bare-ext4.toml -o /tmp/rootfs.img
+#   e2fsck -fn /tmp/rootfs.img
+#   fstool ls /tmp/rootfs.img
+#
+# A bare-FS spec has exactly one top-level [filesystem] table. The whole
+# image is that one filesystem. This is the genext2fs-replacement mode.
+
+[filesystem]
+# Filesystem flavour: "ext2", "ext3", or "ext4".
+type = "ext4"
+
+# Host directory whose contents become the image's tree. Optional —
+# omit it for an empty filesystem (just / and /lost+found).
+source = "./rootfs"
+
+# Block size in bytes: 1024, 2048, or 4096. Default 1024.
+block_size = 4096
+
+# Journal size in blocks (ext3/ext4 only). Default 1024 (the JBD2 minimum).
+journal_blocks = 1024
+
+# Pre-populate /dev: "none", "minimal", or "standard".
+# minimal  = console null zero ptmx tty fuse random urandom
+# standard = minimal + tty0..15 ttyS0..3 kmsg mem port hd* sd*
+rootdevs = "standard"
+
+# Volume label (≤ 16 bytes) and inode timestamps. mtime defaults to 0
+# for reproducible output.
+volume_label = "rootfs"
+mtime = 0

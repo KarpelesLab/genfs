@@ -757,12 +757,19 @@ impl Ext {
         })
     }
 
-    /// Read inode number `ino` from the on-disk inode table.
+    /// Read inode number `ino`. Consults the in-memory staged-write cache
+    /// first so a caller can interleave `add_*` and read calls without an
+    /// explicit flush; falls back to the on-disk inode table.
     pub fn read_inode(&self, dev: &mut dyn BlockDevice, ino: u32) -> Result<Inode> {
         if ino == 0 || ino > self.layout.inodes_count {
             return Err(crate::Error::InvalidArgument(format!(
                 "ext: inode {ino} out of range"
             )));
+        }
+        for (i, staged) in &self.inodes {
+            if *i == ino {
+                return Ok(*staged);
+            }
         }
         let (group, idx) = self.inode_location(ino);
         let table_block = self.layout.groups[group as usize].inode_table;
@@ -771,6 +778,21 @@ impl Ext {
         let mut buf = [0u8; inode::INODE_BASE_SIZE];
         dev.read_at(off, &mut buf)?;
         Ok(Inode::decode(&buf))
+    }
+
+    /// Read a single block's contents into `out`. Consults staged data
+    /// blocks first (dir blocks built up during writes) and falls back to
+    /// the device.
+    fn read_block(&self, dev: &mut dyn BlockDevice, blk: u32, out: &mut [u8]) -> Result<()> {
+        for (b, bytes) in &self.data_blocks {
+            if *b == blk {
+                out.copy_from_slice(bytes);
+                return Ok(());
+            }
+        }
+        let bs = self.layout.block_size as u64;
+        dev.read_at(blk as u64 * bs, out)?;
+        Ok(())
     }
 
     /// Return the absolute block number for the `n`-th block (0-indexed) of
@@ -789,9 +811,8 @@ impl Ext {
                     "ext: indirect block index unset".into(),
                 ));
             }
-            let bs = self.layout.block_size as u64;
             let mut buf = vec![0u8; self.layout.block_size as usize];
-            dev.read_at(ind as u64 * bs, &mut buf)?;
+            self.read_block(dev, ind, &mut buf)?;
             let off = (n_off as usize) * 4;
             return Ok(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()));
         }
@@ -823,7 +844,7 @@ impl Ext {
             if blk == 0 {
                 continue;
             }
-            dev.read_at(blk as u64 * bs as u64, &mut block_buf)?;
+            self.read_block(dev, blk, &mut block_buf)?;
             let mut off = 0usize;
             while off < block_buf.len() {
                 let Some(entry) = dir::decode_entry(&block_buf[off..], with_filetype) else {
@@ -936,6 +957,145 @@ impl<'a> Read for FileReader<'a> {
         out[..n].copy_from_slice(&self.block_buf[block_off..block_off + n]);
         self.pos += n as u64;
         Ok(n)
+    }
+}
+
+/// Split an absolute path into (parent path, last component). Errors for
+/// paths that don't start with '/', that ARE just '/', or whose last
+/// component contains a slash (defensive).
+fn split_path(path: &std::path::Path) -> Result<(std::path::PathBuf, String)> {
+    let s = path
+        .to_str()
+        .ok_or_else(|| crate::Error::InvalidArgument(format!("ext: non-UTF-8 path {path:?}")))?;
+    if !s.starts_with('/') {
+        return Err(crate::Error::InvalidArgument(format!(
+            "ext: path must be absolute, got {s:?}"
+        )));
+    }
+    if s == "/" {
+        return Err(crate::Error::InvalidArgument(
+            "ext: cannot create or remove the root".into(),
+        ));
+    }
+    let trimmed = s.trim_end_matches('/');
+    let (parent, name) = match trimmed.rsplit_once('/') {
+        Some((p, n)) => (if p.is_empty() { "/" } else { p }, n),
+        None => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: bad path {s:?}"
+            )));
+        }
+    };
+    Ok((std::path::PathBuf::from(parent), name.to_string()))
+}
+
+impl crate::fs::Filesystem for Ext {
+    type FormatOpts = FormatOpts;
+
+    fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
+        Self::format_with(dev, opts)
+    }
+
+    fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        Self::open(dev)
+    }
+
+    fn create_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        src: FileSource,
+        meta: FileMeta,
+    ) -> Result<()> {
+        let (parent, name) = split_path(path)?;
+        let parent_str = parent
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 parent path".into()))?;
+        let parent_ino = self.path_to_inode(dev, parent_str)?;
+        self.add_file_to(dev, parent_ino, name.as_bytes(), src, meta)?;
+        Ok(())
+    }
+
+    fn create_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        meta: FileMeta,
+    ) -> Result<()> {
+        let (parent, name) = split_path(path)?;
+        let parent_str = parent.to_str().unwrap();
+        let parent_ino = self.path_to_inode(dev, parent_str)?;
+        self.add_dir_to(dev, parent_ino, name.as_bytes(), meta)?;
+        Ok(())
+    }
+
+    fn create_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        target: &std::path::Path,
+        meta: FileMeta,
+    ) -> Result<()> {
+        let (parent, name) = split_path(path)?;
+        let parent_str = parent.to_str().unwrap();
+        let parent_ino = self.path_to_inode(dev, parent_str)?;
+        let target_bytes = target
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 symlink target".into()))?
+            .as_bytes();
+        self.add_symlink_to(dev, parent_ino, name.as_bytes(), target_bytes, meta)?;
+        Ok(())
+    }
+
+    fn create_device(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        kind: DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: FileMeta,
+    ) -> Result<()> {
+        let (parent, name) = split_path(path)?;
+        let parent_str = parent.to_str().unwrap();
+        let parent_ino = self.path_to_inode(dev, parent_str)?;
+        self.add_device_to(dev, parent_ino, name.as_bytes(), kind, major, minor, meta)?;
+        Ok(())
+    }
+
+    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "ext: remove() not yet implemented".into(),
+        ))
+    }
+
+    fn list(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        let ino = self.path_to_inode(dev, s)?;
+        self.list_inode(dev, ino)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        let ino = self.path_to_inode(dev, s)?;
+        let reader = self.open_file_reader(dev, ino)?;
+        Ok(Box::new(reader))
+    }
+
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        Self::flush(self, dev)
     }
 }
 

@@ -356,6 +356,57 @@ fn ext2_open_lists_and_reads_what_was_written() {
     assert_eq!(content, b"the quick brown fox\n");
 }
 
+/// Drive the Filesystem trait against Ext.
+#[test]
+fn ext2_via_filesystem_trait() {
+    use genfs::block::BlockDevice;
+    use genfs::fs::Filesystem;
+    use std::io::Read;
+    use std::path::Path;
+
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        inodes_count: 64,
+        ..FormatOpts::default()
+    };
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = <Ext as Filesystem>::format(&mut dev, &opts).unwrap();
+
+    let mut src = NamedTempFile::new().unwrap();
+    src.as_file_mut()
+        .write_all(b"trait-impl content\n")
+        .unwrap();
+
+    ext.create_dir(&mut dev, Path::new("/etc"), FileMeta::with_mode(0o755))
+        .unwrap();
+    ext.create_file(
+        &mut dev,
+        Path::new("/etc/conf"),
+        FileSource::HostPath(src.path().to_path_buf()),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+    ext.create_symlink(
+        &mut dev,
+        Path::new("/conf"),
+        Path::new("/etc/conf"),
+        FileMeta::with_mode(0o777),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    let entries = ext.list(&mut dev, Path::new("/etc")).unwrap();
+    let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"conf"));
+
+    let mut reader = ext.read_file(&mut dev, Path::new("/etc/conf")).unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"trait-impl content\n");
+}
+
 #[test]
 fn empty_ext2_dumpe2fs_clean() {
     let Some(_) = which("dumpe2fs") else {

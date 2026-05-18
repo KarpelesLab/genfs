@@ -230,10 +230,11 @@ pub trait Filesystem: Sized {
         path: &Path,
     ) -> crate::Result<Vec<DirEntry>>;
 
-    /// Open a regular file for reading. Returns the inode number and a boxed
-    /// streaming reader. The reader holds a borrow of the device.
+    /// Open a regular file for reading. Returns a boxed streaming reader
+    /// that borrows both `self` (for filesystem metadata) and `dev` (for
+    /// actual block reads), so it must outlive both.
     fn read_file<'a>(
-        &mut self,
+        &'a mut self,
         dev: &'a mut dyn crate::block::BlockDevice,
         path: &Path,
     ) -> crate::Result<Box<dyn Read + 'a>>;

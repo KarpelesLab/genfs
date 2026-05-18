@@ -53,6 +53,9 @@ pub struct Superblock {
     pub volume_name: [u8; 16],
     pub last_mounted: [u8; 64],
     pub algorithm_usage_bitmap: u32,
+    /// Inode number of the journal (only meaningful with the HAS_JOURNAL
+    /// compat feature). 0 for ext2.
+    pub journal_inum: u32,
 }
 
 impl Superblock {
@@ -98,6 +101,7 @@ impl Superblock {
             volume_name: [0; 16],
             last_mounted: [0; 64],
             algorithm_usage_bitmap: 0,
+            journal_inum: 0,
         }
     }
 
@@ -150,6 +154,12 @@ impl Superblock {
         p[120..136].copy_from_slice(&self.volume_name);
         p[136..200].copy_from_slice(&self.last_mounted);
         write_u32(p, 200, self.algorithm_usage_bitmap);
+        // 204: s_prealloc_blocks (u8) — left zero
+        // 205: s_prealloc_dir_blocks (u8) — left zero
+        // 206..208: s_padding1 (u16) — left zero
+        // 208..224: s_journal_uuid — left zero
+        write_u32(p, 224, self.journal_inum);
+        // 228..: s_journal_dev, s_last_orphan, s_hash_seed, ... — left zero
         buf
     }
 
@@ -210,6 +220,7 @@ impl Superblock {
             volume_name,
             last_mounted,
             algorithm_usage_bitmap: read_u32(buf, 200),
+            journal_inum: read_u32(buf, 224),
         })
     }
 }

@@ -39,6 +39,26 @@ use crate::block::BlockDevice;
 use crate::fs::rootdevs::{RootDevs, device_table};
 use crate::fs::{DeviceKind, FileMeta, FileSource};
 
+/// Which member of the ext family to produce. Controls which feature flags
+/// are set and whether a journal is allocated. ext4-specific format work
+/// (extent tree, 64-bit, flex_bg, ...) lands incrementally — v1 accepts
+/// `Ext4` but currently emits the same on-disk layout as ext3, which
+/// modern kernels mount as ext4 once the feature flags are set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FsKind {
+    #[default]
+    Ext2,
+    Ext3,
+    Ext4,
+}
+
+impl FsKind {
+    /// Whether this kind uses a journal.
+    pub fn has_journal(self) -> bool {
+        matches!(self, FsKind::Ext3 | FsKind::Ext4)
+    }
+}
+
 /// Options accepted by [`Ext::format_with`].
 ///
 /// Defaults mirror `genext2fs -d <dir> -f -q -B 1024`: 1 KiB blocks, no
@@ -46,6 +66,7 @@ use crate::fs::{DeviceKind, FileMeta, FileSource};
 /// pre-allocated.
 #[derive(Debug, Clone)]
 pub struct FormatOpts {
+    pub kind: FsKind,
     pub block_size: u32,
     pub blocks_count: u32,
     pub inodes_count: u32,
@@ -54,11 +75,15 @@ pub struct FormatOpts {
     pub mtime: u32,
     pub reserved_blocks_percent: u8,
     pub create_lost_found: bool,
+    /// Journal size in FS blocks. Only used when `kind.has_journal()`.
+    /// 0 → pick a sensible default (256 blocks).
+    pub journal_blocks: u32,
 }
 
 impl Default for FormatOpts {
     fn default() -> Self {
         Self {
+            kind: FsKind::Ext2,
             block_size: 1024,
             blocks_count: 1024,
             inodes_count: 16,
@@ -67,6 +92,7 @@ impl Default for FormatOpts {
             mtime: 0,
             reserved_blocks_percent: 5,
             create_lost_found: true,
+            journal_blocks: 0,
         }
     }
 }
@@ -203,9 +229,109 @@ impl Ext {
             ext.create_lost_found(opts.mtime)?;
         }
 
+        // Optional journal (ext3 / ext4).
+        if opts.kind.has_journal() {
+            let blocks = if opts.journal_blocks == 0 {
+                256
+            } else {
+                opts.journal_blocks
+            };
+            ext.allocate_journal(blocks, opts.mtime)?;
+            // Set feature flag + journal_inum on the superblock.
+            ext.sb.feature_compat |= constants::feature::COMPAT_HAS_JOURNAL;
+            ext.sb.journal_inum = constants::INO_JOURNAL;
+        }
+
         ext.recompute_free_counts();
         ext.flush_metadata(dev)?;
         Ok(ext)
+    }
+
+    /// Wire `data_blocks` into an inode's block-pointer array, allocating
+    /// indirect / double-indirect blocks as needed. Returns the number of
+    /// metadata (indirection) blocks allocated.
+    ///
+    /// v1 cap: direct + single + double indirection (no triple). At 1 KiB
+    /// blocks that's up to 12 + 256 + 256² ≈ 65 MiB; at 4 KiB it's ~4 GiB.
+    fn fill_block_pointers(&mut self, inode: &mut Inode, data: &[u32]) -> Result<u32> {
+        let bs = self.layout.block_size;
+        let ptrs_per_block = (bs / 4) as usize;
+        let n = data.len();
+        let n_direct = constants::N_DIRECT.min(n);
+        inode.block[..n_direct].copy_from_slice(&data[..n_direct]);
+        let mut allocated_meta = 0u32;
+        let mut consumed = n_direct;
+
+        if consumed < n {
+            // Single-indirect.
+            let ind = self.alloc_data_block(0)?;
+            allocated_meta += 1;
+            inode.block[constants::IDX_INDIRECT] = ind;
+            let take = (n - consumed).min(ptrs_per_block);
+            let mut buf = vec![0u8; bs as usize];
+            for (i, &b) in data[consumed..consumed + take].iter().enumerate() {
+                let off = i * 4;
+                buf[off..off + 4].copy_from_slice(&b.to_le_bytes());
+            }
+            self.data_blocks.push((ind, buf));
+            consumed += take;
+        }
+
+        if consumed < n {
+            // Double-indirect.
+            let dind = self.alloc_data_block(0)?;
+            allocated_meta += 1;
+            inode.block[constants::IDX_DOUBLE_INDIRECT] = dind;
+            let mut dind_buf = vec![0u8; bs as usize];
+            let mut dind_slot = 0;
+            while consumed < n {
+                if dind_slot >= ptrs_per_block {
+                    return Err(crate::Error::Unsupported(
+                        "ext: file exceeds direct+single+double indirection capacity".into(),
+                    ));
+                }
+                let ind = self.alloc_data_block(0)?;
+                allocated_meta += 1;
+                let off = dind_slot * 4;
+                dind_buf[off..off + 4].copy_from_slice(&ind.to_le_bytes());
+                let take = (n - consumed).min(ptrs_per_block);
+                let mut ind_buf = vec![0u8; bs as usize];
+                for (i, &b) in data[consumed..consumed + take].iter().enumerate() {
+                    let off = i * 4;
+                    ind_buf[off..off + 4].copy_from_slice(&b.to_le_bytes());
+                }
+                self.data_blocks.push((ind, ind_buf));
+                consumed += take;
+                dind_slot += 1;
+            }
+            self.data_blocks.push((dind, dind_buf));
+        }
+
+        Ok(allocated_meta)
+    }
+
+    /// Allocate the journal inode (inode 8) and its data blocks. The first
+    /// data block is initialised with a JBD2 v2 journal superblock marking
+    /// the journal as clean (s_start = 0, so no recovery needed). The rest
+    /// of the journal is zeroed by the up-front zero_range, which JBD2
+    /// reads as empty log blocks.
+    fn allocate_journal(&mut self, blocks: u32, mtime: u32) -> Result<()> {
+        let ino = constants::INO_JOURNAL;
+        let bs = self.layout.block_size;
+        let mut data = Vec::with_capacity(blocks as usize);
+        for _ in 0..blocks {
+            data.push(self.alloc_data_block(0)?);
+        }
+        let mut inode = Inode::regular(blocks * bs, 0o600, 0, 0, mtime);
+        let meta_blocks = self.fill_block_pointers(&mut inode, &data)?;
+        inode.blocks_512 = (blocks + meta_blocks) * (bs / 512);
+
+        // Build the JBD2 v2 journal superblock for block 0 of the journal.
+        let jsb = build_jbd2_superblock(bs, blocks);
+        self.data_blocks.push((data[0], jsb));
+
+        self.inodes.push((ino, inode));
+        Ok(())
     }
 
     /// Allocate inode #2 (the root dir), give it a fresh data block with
@@ -242,21 +368,8 @@ impl Ext {
         }
 
         let mut inode = Inode::directory(16384, 0o700, 0, 0, mtime);
-        let n_direct = (constants::N_DIRECT as u32).min(target_data_blocks) as usize;
-        inode.block[..n_direct].copy_from_slice(&data_blocks[..n_direct]);
-        if target_data_blocks > constants::N_DIRECT as u32 {
-            let ind_block = self.alloc_data_block(0)?;
-            inode.block[constants::IDX_INDIRECT] = ind_block;
-            let mut ind = vec![0u8; bs as usize];
-            for (i, &b) in data_blocks[constants::N_DIRECT..].iter().enumerate() {
-                let off = i * 4;
-                ind[off..off + 4].copy_from_slice(&b.to_le_bytes());
-            }
-            self.data_blocks.push((ind_block, ind));
-            inode.blocks_512 = (target_data_blocks + 1) * (bs / 512);
-        } else {
-            inode.blocks_512 = target_data_blocks * (bs / 512);
-        }
+        let meta_blocks = self.fill_block_pointers(&mut inode, &data_blocks)?;
+        inode.blocks_512 = (target_data_blocks + meta_blocks) * (bs / 512);
 
         // First data block: "." / "..".
         let dir_block = dir::make_initial_dir_block(ino, INO_ROOT_DIR, bs, false);
@@ -460,15 +573,6 @@ impl Ext {
     ) -> Result<u32> {
         let bs = self.layout.block_size;
         let len = src.len()?;
-        // v1 supports direct + single-indirect blocks only. Capacity:
-        //   N_DIRECT + (block_size / 4)  blocks
-        let max_blocks = constants::N_DIRECT as u64 + bs as u64 / 4;
-        let max_bytes = max_blocks * bs as u64;
-        if len > max_bytes {
-            return Err(crate::Error::Unsupported(format!(
-                "ext: file too large in v1 (max {max_bytes} bytes with single-indirect)"
-            )));
-        }
         if len > u32::MAX as u64 {
             return Err(crate::Error::Unsupported(
                 "ext: file > 4 GiB requires LARGE_FILE (deferred to ext4)".into(),
@@ -488,22 +592,7 @@ impl Ext {
             meta.gid,
             meta.mtime,
         );
-
-        // Block pointers.
-        let n_direct = (constants::N_DIRECT as u32).min(n_data_blocks) as usize;
-        inode.block[..n_direct].copy_from_slice(&data_blocks[..n_direct]);
-        let mut allocated_meta_blocks = 0u32;
-        if n_data_blocks as usize > constants::N_DIRECT {
-            let ind = self.alloc_data_block(0)?;
-            allocated_meta_blocks += 1;
-            inode.block[constants::IDX_INDIRECT] = ind;
-            let mut ind_buf = vec![0u8; bs as usize];
-            for (i, &b) in data_blocks[constants::N_DIRECT..].iter().enumerate() {
-                let off = i * 4;
-                ind_buf[off..off + 4].copy_from_slice(&b.to_le_bytes());
-            }
-            self.data_blocks.push((ind, ind_buf));
-        }
+        let allocated_meta_blocks = self.fill_block_pointers(&mut inode, &data_blocks)?;
         inode.blocks_512 = (n_data_blocks + allocated_meta_blocks) * (bs / 512);
 
         // Stream data straight to device.
@@ -958,6 +1047,29 @@ impl<'a> Read for FileReader<'a> {
         self.pos += n as u64;
         Ok(n)
     }
+}
+
+/// Build a JBD2 v2 journal superblock for a clean (never-mounted) journal.
+/// Layout per linux/include/linux/jbd2.h; note that JBD2 fields are
+/// **big-endian** on disk, unlike the rest of the ext filesystem.
+fn build_jbd2_superblock(block_size: u32, journal_blocks: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; block_size as usize];
+    // journal_header_s: h_magic, h_blocktype, h_sequence (each u32 BE)
+    buf[0..4].copy_from_slice(&0xC03B_3998u32.to_be_bytes()); // h_magic
+    buf[4..8].copy_from_slice(&4u32.to_be_bytes()); // h_blocktype = SB v2
+    // 8..12: h_sequence — zero
+    // journal_superblock_s body:
+    buf[12..16].copy_from_slice(&block_size.to_be_bytes()); // s_blocksize
+    buf[16..20].copy_from_slice(&journal_blocks.to_be_bytes()); // s_maxlen
+    buf[20..24].copy_from_slice(&1u32.to_be_bytes()); // s_first = 1
+    buf[24..28].copy_from_slice(&1u32.to_be_bytes()); // s_sequence
+    // 28..32: s_start = 0  →  CLEAN journal, no recovery needed
+    // 32..36: s_errno = 0
+    // 36..48: feature_{compat,incompat,ro_compat} = 0
+    // 48..64: s_uuid = 0
+    buf[64..68].copy_from_slice(&1u32.to_be_bytes()); // s_nr_users = 1
+    // rest zero
+    buf
 }
 
 /// Split an absolute path into (parent path, last component). Errors for

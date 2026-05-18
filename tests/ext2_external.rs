@@ -6,10 +6,10 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use genfs::block::FileBackend;
-use genfs::fs::ext::{Ext, FormatOpts};
-use genfs::fs::rootdevs::RootDevs;
-use genfs::fs::{DeviceKind, FileMeta, FileSource};
+use fstool::block::FileBackend;
+use fstool::fs::ext::{Ext, FormatOpts};
+use fstool::fs::rootdevs::RootDevs;
+use fstool::fs::{DeviceKind, FileMeta, FileSource};
 use tempfile::NamedTempFile;
 
 fn which(tool: &str) -> Option<std::path::PathBuf> {
@@ -30,7 +30,7 @@ fn build_empty_ext2(path: &Path, opts: &FormatOpts) {
     let mut dev = FileBackend::create(path, opts.blocks_count as u64 * opts.block_size as u64)
         .expect("create image");
     Ext::format_with(&mut dev, opts).expect("format ext2");
-    use genfs::block::BlockDevice;
+    use fstool::block::BlockDevice;
     dev.sync().expect("sync");
     drop(dev);
 }
@@ -109,13 +109,16 @@ fn populated_ext2_passes_e2fsck_and_debugfs() {
     };
     let size = opts.blocks_count as u64 * opts.block_size as u64;
 
-    use genfs::block::BlockDevice;
+    use fstool::block::BlockDevice;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
     let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
 
     // /hello.txt
     let mut src_file = NamedTempFile::new().unwrap();
-    src_file.as_file_mut().write_all(b"hello, genfs\n").unwrap();
+    src_file
+        .as_file_mut()
+        .write_all(b"hello, fstool\n")
+        .unwrap();
     let src_path = src_file.path().to_path_buf();
     ext.add_file_to(
         &mut dev,
@@ -212,7 +215,7 @@ fn populated_ext2_passes_e2fsck_and_debugfs() {
         .unwrap();
     let body = String::from_utf8_lossy(&out.stdout);
     assert!(
-        body.contains("hello, genfs"),
+        body.contains("hello, fstool"),
         "hello.txt content mismatch:\n{body}"
     );
 
@@ -243,7 +246,7 @@ fn ext2_with_standard_rootdevs_passes_e2fsck() {
         return;
     };
 
-    use genfs::block::BlockDevice;
+    use fstool::block::BlockDevice;
     let tmp = NamedTempFile::new().unwrap();
     // Standard set is 71 nodes + /dev dir + lost+found + root + 10 reserved
     // → ~84 inodes. Round up to 128 to leave headroom.
@@ -312,7 +315,7 @@ fn ext2_with_standard_rootdevs_passes_e2fsck() {
 /// API sees the same tree we wrote.
 #[test]
 fn ext2_open_lists_and_reads_what_was_written() {
-    use genfs::block::BlockDevice;
+    use fstool::block::BlockDevice;
     let tmp = NamedTempFile::new().unwrap();
     let opts = FormatOpts {
         inodes_count: 64,
@@ -359,8 +362,8 @@ fn ext2_open_lists_and_reads_what_was_written() {
 /// Drive the Filesystem trait against Ext.
 #[test]
 fn ext2_via_filesystem_trait() {
-    use genfs::block::BlockDevice;
-    use genfs::fs::Filesystem;
+    use fstool::block::BlockDevice;
+    use fstool::fs::Filesystem;
     use std::io::Read;
     use std::path::Path;
 
@@ -420,8 +423,8 @@ fn ext2_build_from_host_dir_auto_size() {
         return;
     };
 
-    use genfs::block::BlockDevice;
-    use genfs::fs::ext::{Ext, FsKind};
+    use fstool::block::BlockDevice;
+    use fstool::fs::ext::{Ext, FsKind};
 
     let tmpdir = tempfile::tempdir().unwrap();
     let src = tmpdir.path();
@@ -438,7 +441,7 @@ fn ext2_build_from_host_dir_auto_size() {
 
     let tmp = NamedTempFile::new().unwrap();
     // Probe size needed by the plan.
-    let mut plan = genfs::fs::ext::BuildPlan::new(1024, FsKind::Ext2);
+    let mut plan = fstool::fs::ext::BuildPlan::new(1024, FsKind::Ext2);
     plan.scan_host_path(src).unwrap();
     let opts = plan.to_format_opts();
 

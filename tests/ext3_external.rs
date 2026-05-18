@@ -2,8 +2,8 @@
 
 use std::process::Command;
 
-use genfs::block::{BlockDevice, FileBackend};
-use genfs::fs::ext::{Ext, FormatOpts, FsKind};
+use fstool::block::{BlockDevice, FileBackend};
+use fstool::fs::ext::{Ext, FormatOpts, FsKind};
 use tempfile::NamedTempFile;
 
 fn which(tool: &str) -> Option<std::path::PathBuf> {

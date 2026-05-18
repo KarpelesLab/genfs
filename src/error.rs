@@ -1,6 +1,6 @@
 //! Error type and `Result` alias for the crate.
 //!
-//! All public APIs return `genfs::Result<T>` = `Result<T, genfs::Error>`. The
+//! All public APIs return `fstool::Result<T>` = `Result<T, fstool::Error>`. The
 //! variants are intentionally small at this stage; further variants will be
 //! added as later layers (partition tables, filesystems, spec parsing) come
 //! online.
@@ -26,7 +26,7 @@ pub enum Error {
     InvalidImage(String),
 
     /// The requested feature exists in the format but is not implemented in
-    /// this build of genfs. Used for clean "FAT32 not in v1" type messages.
+    /// this build of fstool. Used for clean "FAT32 not in v1" type messages.
     #[error("unsupported feature: {0}")]
     Unsupported(String),
 

@@ -7,8 +7,8 @@
 use std::path::Path;
 use std::process::Command;
 
-use genfs::block::{BlockDevice, FileBackend};
-use genfs::part::{Gpt, Mbr, Partition, PartitionKind, PartitionTable};
+use fstool::block::{BlockDevice, FileBackend};
+use fstool::part::{Gpt, Mbr, Partition, PartitionKind, PartitionTable};
 use tempfile::NamedTempFile;
 
 fn which(tool: &str) -> Option<std::path::PathBuf> {

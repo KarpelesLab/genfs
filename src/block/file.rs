@@ -198,13 +198,13 @@ mod tests {
         let tmp = temp_path();
         {
             let mut dev = FileBackend::create(tmp.path(), 4096).unwrap();
-            dev.write_at(2000, b"hello, genfs").unwrap();
+            dev.write_at(2000, b"hello, fstool").unwrap();
             dev.sync().unwrap();
         }
         let mut dev = FileBackend::open(tmp.path()).unwrap();
         assert_eq!(dev.total_size(), 4096);
-        let mut buf = [0u8; 12];
+        let mut buf = [0u8; 13];
         dev.read_at(2000, &mut buf).unwrap();
-        assert_eq!(&buf, b"hello, genfs");
+        assert_eq!(&buf, b"hello, fstool");
     }
 }

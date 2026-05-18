@@ -1,4 +1,4 @@
-# genfs
+# fstool
 
 Build disk images and filesystem images from a directory tree and a TOML
 spec — in the spirit of `genext2fs`, but going further:
@@ -11,12 +11,12 @@ spec — in the spirit of `genext2fs`, but going further:
   through a small trait; adding a new partition scheme or filesystem is a
   drop-in plugin.
 - **Inspectable** — the same trait stack reads existing images, so the
-  CLI ships `genfs ls`, `genfs cat`, and `genfs info` alongside `build`.
+  CLI ships `fstool ls`, `fstool cat`, and `fstool info` alongside `build`.
 - **In-place modification** — add, remove, and replace whole files inside an
   existing image without rewriting it.
 
-genfs is implemented in Rust and ships as a library (`genfs`) plus a thin CLI
-binary (`genfs`).
+fstool is implemented in Rust and ships as a library (`fstool`) plus a thin CLI
+binary (`fstool`).
 
 ## Status
 
@@ -33,14 +33,14 @@ Early in development. Public API is **unstable** until v0.5.
 
 What works today:
 
-- `genfs::block::{FileBackend, MemoryBackend, SlicedBackend}` — sparse
+- `fstool::block::{FileBackend, MemoryBackend, SlicedBackend}` — sparse
   file-backed devices, in-memory devices for tests, bounds-checked sub-range
   views for carving partitions.
-- `genfs::part::{Mbr, Gpt}` — write and read 4-primary MBR and 128-entry GPT
+- `fstool::part::{Mbr, Gpt}` — write and read 4-primary MBR and 128-entry GPT
   layouts. GPT includes the protective MBR, primary and backup headers, and
   CRC32 on both the header and the partition entry array. Cross-checked
   against `sgdisk -v`.
-- `genfs::fs::ext::Ext` — write ext2 images from in-memory geometry plus a
+- `fstool::fs::ext::Ext` — write ext2 images from in-memory geometry plus a
   populate API:
   - `Ext::format_with(dev, opts)` → an empty FS with the root directory
     (and `/lost+found` if requested). Layout matches `genext2fs -d <dir>
@@ -64,7 +64,7 @@ What works today:
 
 ```
                 ┌────────────────────────────────────────────┐
-                │           CLI (clap) — bin/genfs           │
+                │           CLI (clap) — bin/fstool           │
                 └────────────────────────────────────────────┘
                                      │
                 ┌────────────────────────────────────────────┐
@@ -111,7 +111,7 @@ The streaming invariant is the project's load-bearing constraint: regardless
 of image size, no file's contents are ever fully resident in memory. The
 writer scans the source twice — once to compute geometry (inode count, block
 count, dir-entry sizes), once to stream bytes from each file directly to the
-image. This is the difference between genfs and a "build a Vec<u8> and dump
+image. This is the difference between fstool and a "build a Vec<u8> and dump
 it" approach.
 
 In-place modification is restricted to whole-file granularity in v1 (add,

@@ -1,4 +1,4 @@
-//! genfs — build disk images and filesystems from a directory tree and TOML spec.
+//! fstool — build disk images and filesystems from a directory tree and TOML spec.
 //!
 //! The crate is organised as a stack of three trait-based layers:
 //!

@@ -9,13 +9,13 @@
 
 use std::path::PathBuf;
 
-use genfs::block::{BlockDevice, FileBackend};
-use genfs::part::{Gpt, Partition, PartitionKind, PartitionTable};
+use fstool::block::{BlockDevice, FileBackend};
+use fstool::part::{Gpt, Partition, PartitionKind, PartitionTable};
 
 fn main() {
     let path: PathBuf = std::env::args_os()
         .nth(1)
-        .unwrap_or_else(|| "/tmp/genfs_demo.img".into())
+        .unwrap_or_else(|| "/tmp/fstool_demo.img".into())
         .into();
     let total: u64 = 64 * 1024 * 1024;
 

@@ -1,4 +1,4 @@
-//! Block-device abstraction — the bottom layer of the genfs stack.
+//! Block-device abstraction — the bottom layer of the fstool stack.
 //!
 //! A [`BlockDevice`] is a seekable byte-addressable store. Every higher layer
 //! (partition table, filesystem) reads and writes through this trait, which
@@ -10,7 +10,7 @@
 //! - `total_size()` is the logical capacity in bytes; reads and writes outside
 //!   `[0, total_size())` MUST be rejected (the trait returns a short read /
 //!   short write at the boundary via the standard `Read`/`Write` contract, and
-//!   genfs's explicit positional helpers return [`crate::Error::OutOfBounds`]).
+//!   fstool's explicit positional helpers return [`crate::Error::OutOfBounds`]).
 //! - Implementations are free to back themselves with sparse storage. Bytes
 //!   that have never been written MUST read as zero.
 //! - `block_size()` reports the *logical* sector size — usually 512 — and is

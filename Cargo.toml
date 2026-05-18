@@ -1,22 +1,22 @@
 [package]
-name = "genfs"
+name = "fstool"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Build disk images and filesystems (ext2/3/4, MBR, GPT) from a directory tree and TOML spec, in the spirit of genext2fs."
 license = "MIT"
-repository = "https://github.com/KarpelesLab/genfs"
+repository = "https://github.com/KarpelesLab/fstool"
 readme = "README.md"
 keywords = ["filesystem", "ext4", "ext2", "gpt", "image"]
 categories = ["filesystem", "command-line-utilities"]
 
 [lib]
-name = "genfs"
+name = "fstool"
 path = "src/lib.rs"
 
 [[bin]]
-name = "genfs"
-path = "src/bin/genfs.rs"
+name = "fstool"
+path = "src/bin/fstool.rs"
 
 [dependencies]
 thiserror = "2"

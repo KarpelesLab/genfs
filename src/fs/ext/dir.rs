@@ -129,6 +129,19 @@ pub fn file_type_byte(k: crate::fs::EntryKind) -> u8 {
     }
 }
 
+/// Build an "empty placeholder" directory data block: a single entry with
+/// inode=0, name_len=0, rec_len=block_size. e2fsck accepts this as a
+/// well-formed (but empty) dir block. genext2fs uses this to pad
+/// pre-allocated dirs like lost+found.
+pub fn make_empty_dir_block(block_size: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; block_size as usize];
+    // inode (4 bytes) is already zero.
+    // rec_len at offset 4..6 = block_size.
+    buf[4..6].copy_from_slice(&(block_size as u16).to_le_bytes());
+    // name_len at offset 6..8 = 0 (already zero).
+    buf
+}
+
 /// Build the directory data block for a fresh directory: just "." and "..".
 /// The "." entry points at `self_inode`, ".." at `parent_inode`. `block_size`
 /// is the FS block size in bytes; the ".." entry's `rec_len` is extended so

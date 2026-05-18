@@ -8,8 +8,8 @@
 //! `mke2fs -t ext2`.
 
 use super::constants::{
-    ERRORS_CONTINUE, EXT2_MAGIC, FIRST_INO_DYNAMIC, FS_VALID, INODE_SIZE_DYNAMIC, OS_LINUX,
-    REV_DYNAMIC, SUPERBLOCK_SIZE,
+    EXT2_MAGIC, FIRST_INO_DYNAMIC, FS_VALID, INODE_SIZE_DYNAMIC, OS_LINUX, REV_DYNAMIC,
+    SUPERBLOCK_SIZE,
 };
 use crate::Result;
 
@@ -77,7 +77,10 @@ impl Superblock {
             max_mnt_count: 20,
             magic: EXT2_MAGIC,
             state: FS_VALID,
-            errors: ERRORS_CONTINUE,
+            // genext2fs sets s_errors to 0 ("undefined" in dumpe2fs); the
+            // kernel treats it as the default behaviour (continue). We
+            // match for byte-exact compatibility.
+            errors: 0,
             minor_rev_level: 0,
             lastcheck: 0,
             checkinterval: 0,

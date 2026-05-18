@@ -1,5 +1,9 @@
 # fstool
 
+[![CI](https://github.com/KarpelesLab/fstool/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/fstool/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/fstool.svg)](https://crates.io/crates/fstool)
+[![docs.rs](https://docs.rs/fstool/badge.svg)](https://docs.rs/fstool)
+
 Build disk images and filesystem images from a directory tree and a TOML
 spec — in the spirit of `genext2fs`, but going further:
 

@@ -407,6 +407,86 @@ fn ext2_via_filesystem_trait() {
     assert_eq!(body, b"trait-impl content\n");
 }
 
+/// Drive build_from_host_dir + BuildPlan auto-sizing end-to-end against
+/// a small fixture tree on the host.
+#[test]
+fn ext2_build_from_host_dir_auto_size() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    use genfs::block::BlockDevice;
+    use genfs::fs::ext::{Ext, FsKind};
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let src = tmpdir.path();
+    std::fs::create_dir_all(src.join("etc")).unwrap();
+    std::fs::create_dir_all(src.join("usr/bin")).unwrap();
+    std::fs::write(src.join("hello.txt"), b"hello, world\n").unwrap();
+    std::fs::write(src.join("etc/conf"), b"answer = 42\n").unwrap();
+    std::os::unix::fs::symlink("/usr/bin", src.join("bin")).unwrap();
+    std::os::unix::fs::symlink(
+        "/very/long/path/that/exceeds/sixty/characters/for/sure/yes/indeed",
+        src.join("slowlink"),
+    )
+    .unwrap();
+
+    let tmp = NamedTempFile::new().unwrap();
+    // Probe size needed by the plan.
+    let mut plan = genfs::fs::ext::BuildPlan::new(1024, FsKind::Ext2);
+    plan.scan_host_path(src).unwrap();
+    let opts = plan.to_format_opts();
+
+    // Pre-allocate the device file at the planned size.
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    Ext::build_from_host_dir(&mut dev, src, FsKind::Ext2, 1024).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // Must be e2fsck-clean.
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Inspect via debugfs.
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg("ls /")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    for entry in ["hello.txt", "etc", "usr", "bin", "slowlink"] {
+        assert!(listing.contains(entry), "missing /{entry}: {listing}");
+    }
+
+    // /etc/conf body
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg("cat /etc/conf")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("answer = 42"),
+        "/etc/conf body wrong"
+    );
+}
+
 #[test]
 fn empty_ext2_dumpe2fs_clean() {
     let Some(_) = which("dumpe2fs") else {

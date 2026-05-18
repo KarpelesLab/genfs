@@ -19,12 +19,15 @@
 //! timestamps, -q = squash uids/perms). See `tests/ext2_genext2fs_compat.rs`
 //! for the diff harness once it lands.
 
+pub mod build_plan;
 pub mod constants;
 pub mod dir;
 pub mod group;
 pub mod inode;
 pub mod layout;
 pub mod superblock;
+
+pub use build_plan::BuildPlan;
 
 use std::io::Read;
 
@@ -728,6 +731,97 @@ impl Ext {
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         self.recompute_free_counts();
         self.flush_metadata(dev)
+    }
+
+    /// Recursively copy a host directory into `parent_ino`. Each file's
+    /// contents are streamed via `FileSource::HostPath` (never fully loaded
+    /// in memory). Mode bits are taken from host metadata; uid, gid, and
+    /// timestamps are squashed to 0 to keep the output reproducible.
+    /// Override per-entry by populating the tree yourself.
+    pub fn populate_from_host_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_ino: u32,
+        src: &std::path::Path,
+    ) -> Result<()> {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            let ft = meta.file_type();
+            let name = entry.file_name();
+            let name_bytes = name.as_encoded_bytes();
+            let mode = (meta.permissions().mode() & 0o7777) as u16;
+            let fmeta = FileMeta {
+                mode,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                atime: 0,
+                ctime: 0,
+            };
+            if ft.is_dir() {
+                let child = self.add_dir_to(dev, parent_ino, name_bytes, fmeta)?;
+                self.populate_from_host_dir(dev, child, &entry.path())?;
+            } else if ft.is_file() {
+                let src_path = entry.path();
+                self.add_file_to(
+                    dev,
+                    parent_ino,
+                    name_bytes,
+                    FileSource::HostPath(src_path),
+                    fmeta,
+                )?;
+            } else if ft.is_symlink() {
+                let target = std::fs::read_link(entry.path())?;
+                let target_str = target.to_string_lossy();
+                self.add_symlink_to(dev, parent_ino, name_bytes, target_str.as_bytes(), fmeta)?;
+            } else if ft.is_block_device() || ft.is_char_device() {
+                use std::os::unix::fs::MetadataExt;
+                let rdev = meta.rdev();
+                // Linux dev_t: major in bits 8..19 and 32..47, minor in 0..7 and 20..31.
+                // For typical small device numbers the canonical formulas:
+                let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+                let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+                let kind = if ft.is_char_device() {
+                    DeviceKind::Char
+                } else {
+                    DeviceKind::Block
+                };
+                self.add_device_to(
+                    dev,
+                    parent_ino,
+                    name_bytes,
+                    kind,
+                    major as u32,
+                    minor as u32,
+                    fmeta,
+                )?;
+            } else if ft.is_fifo() {
+                self.add_device_to(dev, parent_ino, name_bytes, DeviceKind::Fifo, 0, 0, fmeta)?;
+            } else if ft.is_socket() {
+                self.add_device_to(dev, parent_ino, name_bytes, DeviceKind::Socket, 0, 0, fmeta)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One-shot: scan a host directory, compute the needed FS geometry via
+    /// [`BuildPlan`], format the device, populate it, and flush. The closest
+    /// analogue to `genext2fs -d <dir> img.ext2` — except sizing is exact.
+    pub fn build_from_host_dir(
+        dev: &mut dyn BlockDevice,
+        src: &std::path::Path,
+        kind: FsKind,
+        block_size: u32,
+    ) -> Result<Self> {
+        let mut plan = BuildPlan::new(block_size, kind);
+        plan.scan_host_path(src)?;
+        let opts = plan.to_format_opts();
+        let mut ext = Self::format_with(dev, &opts)?;
+        ext.populate_from_host_dir(dev, INO_ROOT_DIR, src)?;
+        ext.flush(dev)?;
+        Ok(ext)
     }
 
     /// Create `/dev` with the standard set of device nodes for `kind` —

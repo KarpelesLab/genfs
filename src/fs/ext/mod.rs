@@ -26,14 +26,17 @@ pub mod inode;
 pub mod layout;
 pub mod superblock;
 
+use std::io::Read;
+
 use constants::{INO_ROOT_DIR, SUPERBLOCK_OFFSET};
 use group::{GroupDesc, set_bit, set_first_n, test_bit};
-use inode::Inode;
+use inode::{Inode, SpecialKind};
 use layout::Layout;
 use superblock::Superblock;
 
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::fs::{DeviceKind, FileMeta, FileSource};
 
 /// Options accepted by [`Ext::format_with`].
 ///
@@ -308,9 +311,16 @@ impl Ext {
         panic!("inode {ino} not staged");
     }
 
-    /// Reserve the next available inode in group 0 (extension to other
-    /// groups deferred until multi-group writes are exercised).
+    /// Reserve the next available inode. Currently only allocates from
+    /// group 0; multi-group allocation lands once we have tests for it.
     fn alloc_inode(&mut self) -> Result<u32> {
+        if self.next_inode > self.layout.inodes_count {
+            return Err(crate::Error::Unsupported(format!(
+                "ext: out of inodes (allocated {}, max {})",
+                self.next_inode - 1,
+                self.layout.inodes_count
+            )));
+        }
         if self.next_inode > self.layout.inodes_per_group {
             return Err(crate::Error::Unsupported(
                 "ext: inode allocation past group 0 not yet implemented".into(),
@@ -428,6 +438,206 @@ impl Ext {
         let g = (ino - 1) / self.layout.inodes_per_group;
         let idx = (ino - 1) % self.layout.inodes_per_group;
         (g, idx)
+    }
+
+    // ──────────────────────────── populate API ───────────────────────────
+    //
+    // These methods stage in-memory state (bitmaps, inode table, dir blocks)
+    // and stream regular-file data straight to the device. Call
+    // [`Ext::flush`] when done to persist the staged metadata.
+
+    /// Create a regular file under `parent_ino` with the given name and
+    /// metadata, streaming bytes from `src` straight to the device through a
+    /// fixed-size buffer. The file is *never* fully resident in memory.
+    pub fn add_file_to(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_ino: u32,
+        name: &[u8],
+        src: FileSource,
+        meta: FileMeta,
+    ) -> Result<u32> {
+        let bs = self.layout.block_size;
+        let len = src.len()?;
+        // v1 supports direct + single-indirect blocks only. Capacity:
+        //   N_DIRECT + (block_size / 4)  blocks
+        let max_blocks = constants::N_DIRECT as u64 + bs as u64 / 4;
+        let max_bytes = max_blocks * bs as u64;
+        if len > max_bytes {
+            return Err(crate::Error::Unsupported(format!(
+                "ext: file too large in v1 (max {max_bytes} bytes with single-indirect)"
+            )));
+        }
+        if len > u32::MAX as u64 {
+            return Err(crate::Error::Unsupported(
+                "ext: file > 4 GiB requires LARGE_FILE (deferred to ext4)".into(),
+            ));
+        }
+        let n_data_blocks = len.div_ceil(bs as u64) as u32;
+        let mut data_blocks = Vec::with_capacity(n_data_blocks as usize);
+        for _ in 0..n_data_blocks {
+            data_blocks.push(self.alloc_data_block(0)?);
+        }
+
+        let ino = self.alloc_inode()?;
+        let mut inode = Inode::regular(
+            len as u32,
+            meta.mode & 0o7777,
+            meta.uid,
+            meta.gid,
+            meta.mtime,
+        );
+
+        // Block pointers.
+        let n_direct = (constants::N_DIRECT as u32).min(n_data_blocks) as usize;
+        inode.block[..n_direct].copy_from_slice(&data_blocks[..n_direct]);
+        let mut allocated_meta_blocks = 0u32;
+        if n_data_blocks as usize > constants::N_DIRECT {
+            let ind = self.alloc_data_block(0)?;
+            allocated_meta_blocks += 1;
+            inode.block[constants::IDX_INDIRECT] = ind;
+            let mut ind_buf = vec![0u8; bs as usize];
+            for (i, &b) in data_blocks[constants::N_DIRECT..].iter().enumerate() {
+                let off = i * 4;
+                ind_buf[off..off + 4].copy_from_slice(&b.to_le_bytes());
+            }
+            self.data_blocks.push((ind, ind_buf));
+        }
+        inode.blocks_512 = (n_data_blocks + allocated_meta_blocks) * (bs / 512);
+
+        // Stream data straight to device.
+        let (mut reader, _) = src.open()?;
+        let mut buf = vec![0u8; bs as usize];
+        let mut remaining = len;
+        for &blk in &data_blocks {
+            let to_read = remaining.min(bs as u64) as usize;
+            reader.read_exact(&mut buf[..to_read])?;
+            dev.write_at(blk as u64 * bs as u64, &buf[..to_read])?;
+            remaining -= to_read as u64;
+        }
+        debug_assert_eq!(remaining, 0);
+
+        self.inodes.push((ino, inode));
+        self.add_entry_to_dir_block_for(parent_ino, name, ino)?;
+        Ok(ino)
+    }
+
+    /// Create a subdirectory under `parent_ino`. Allocates one data block
+    /// holding "." / "..", patches the parent's link count.
+    pub fn add_dir_to(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        parent_ino: u32,
+        name: &[u8],
+        meta: FileMeta,
+    ) -> Result<u32> {
+        let bs = self.layout.block_size;
+        let ino = self.alloc_inode()?;
+        let blk = self.alloc_data_block(0)?;
+        let mut inode = Inode::directory(bs, meta.mode & 0o7777, meta.uid, meta.gid, meta.mtime);
+        inode.block[0] = blk;
+        inode.blocks_512 = bs / 512;
+        let block_bytes = dir::make_initial_dir_block(ino, parent_ino, bs, false);
+        self.data_blocks.push((blk, block_bytes));
+        self.inodes.push((ino, inode));
+        self.groups[0].desc.used_dirs_count += 1;
+
+        self.add_entry_to_dir_block_for(parent_ino, name, ino)?;
+        self.patch_inode(parent_ino, |i| i.links_count += 1);
+        Ok(ino)
+    }
+
+    /// Create a symbolic link. Targets ≤ 60 bytes are stored inline in
+    /// `i_block[0..15]` (the "fast symlink" optimization — no data block
+    /// allocated, blocks_512 stays at zero). Longer targets get a data block.
+    pub fn add_symlink_to(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_ino: u32,
+        name: &[u8],
+        target: &[u8],
+        meta: FileMeta,
+    ) -> Result<u32> {
+        if target.len() > 4095 {
+            return Err(crate::Error::Unsupported(
+                "ext: symlink target > 4095 bytes".into(),
+            ));
+        }
+        let bs = self.layout.block_size;
+        let ino = self.alloc_inode()?;
+        let mut inode = Inode::symlink(
+            target.len() as u32,
+            meta.mode & 0o7777,
+            meta.uid,
+            meta.gid,
+            meta.mtime,
+        );
+
+        // Fast symlink: target fits in i_block (60 bytes = 15 × 4).
+        const FAST_MAX: usize = 60;
+        if target.len() <= FAST_MAX {
+            // Pack target bytes into i_block array.
+            let mut packed = [0u8; FAST_MAX];
+            packed[..target.len()].copy_from_slice(target);
+            for (i, slot) in inode.block.iter_mut().enumerate() {
+                let off = i * 4;
+                *slot = u32::from_le_bytes(packed[off..off + 4].try_into().unwrap());
+            }
+            // blocks_512 stays 0; no data block.
+        } else {
+            // Slow symlink: target gets a data block.
+            let blk = self.alloc_data_block(0)?;
+            inode.block[0] = blk;
+            inode.blocks_512 = bs / 512;
+            let mut buf = vec![0u8; bs as usize];
+            buf[..target.len()].copy_from_slice(target);
+            dev.write_at(blk as u64 * bs as u64, &buf)?;
+        }
+
+        self.inodes.push((ino, inode));
+        self.add_entry_to_dir_block_for(parent_ino, name, ino)?;
+        Ok(ino)
+    }
+
+    /// Create a device node, FIFO, or socket. No data blocks are allocated;
+    /// for char/block devices the major+minor are encoded into i_block[0].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_device_to(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        parent_ino: u32,
+        name: &[u8],
+        kind: DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: FileMeta,
+    ) -> Result<u32> {
+        let ino = self.alloc_inode()?;
+        let special = match kind {
+            DeviceKind::Char => SpecialKind::Char,
+            DeviceKind::Block => SpecialKind::Block,
+            DeviceKind::Fifo => SpecialKind::Fifo,
+            DeviceKind::Socket => SpecialKind::Socket,
+        };
+        let inode = Inode::special(
+            special,
+            major,
+            minor,
+            meta.mode & 0o7777,
+            meta.uid,
+            meta.gid,
+            meta.mtime,
+        );
+        self.inodes.push((ino, inode));
+        self.add_entry_to_dir_block_for(parent_ino, name, ino)?;
+        Ok(ino)
+    }
+
+    /// Persist all staged metadata (bitmaps, inode table, dir blocks,
+    /// superblock) to the device. The primary superblock is written last.
+    pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        self.recompute_free_counts();
+        self.flush_metadata(dev)
     }
 }
 

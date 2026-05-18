@@ -95,6 +95,18 @@ partition table.
 
 ## Try it
 
+CLI quick tour — build an ext4 image from a directory, then inspect it:
+
+```sh
+cargo install fstool                           # or: cargo install --path .
+mkdir -p /tmp/src/etc && echo hi > /tmp/src/greeting.txt
+fstool ext-build --kind ext4 /tmp/src -o /tmp/out.img
+fstool info /tmp/out.img
+fstool ls   /tmp/out.img /
+fstool cat  /tmp/out.img /greeting.txt
+e2fsck -fn  /tmp/out.img                       # must report clean
+```
+
 GPT demo (requires `sgdisk` for the validation step):
 
 ```sh

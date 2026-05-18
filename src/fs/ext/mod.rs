@@ -237,10 +237,11 @@ impl Ext {
             ext.create_lost_found(dev, opts.mtime)?;
         }
 
-        // Optional journal (ext3 / ext4).
+        // Optional journal (ext3 / ext4). JBD2 requires a minimum of 1024
+        // blocks; smaller journals are rejected by the kernel + e2fsck.
         if opts.kind.has_journal() {
             let blocks = if opts.journal_blocks == 0 {
-                256
+                1024
             } else {
                 opts.journal_blocks
             };

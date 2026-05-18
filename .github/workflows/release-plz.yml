@@ -1,0 +1,56 @@
+name: release-plz
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  # Needed for release-plz to open / update the release PR and to create
+  # GitHub Releases.
+  contents: write
+  pull-requests: write
+  # Needed for crates.io trusted publishing (OIDC); release-plz exchanges
+  # this for a short-lived registry token instead of using a long-lived
+  # CARGO_REGISTRY_TOKEN secret.
+  id-token: write
+
+# Don't run two release-plz jobs in parallel.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz-release:
+    name: release-plz release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-plz-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

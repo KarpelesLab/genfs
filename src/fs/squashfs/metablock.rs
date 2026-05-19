@@ -197,9 +197,8 @@ fn compression_label(c: Compression) -> &'static str {
 }
 
 /// Build a metablock prefix (2-byte header + payload) for the given payload,
-/// marking it as uncompressed. Test-only helper, exposed so other modules in
-/// this crate can hand-craft tiny fixtures.
-#[cfg(test)]
+/// marking it as uncompressed. Used by the writer and by hand-crafted test
+/// fixtures elsewhere in this module.
 pub fn encode_uncompressed(payload: &[u8]) -> Vec<u8> {
     assert!(payload.len() <= METABLOCK_SIZE);
     let mut out = Vec::with_capacity(payload.len() + 2);
@@ -207,6 +206,29 @@ pub fn encode_uncompressed(payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&header.to_le_bytes());
     out.extend_from_slice(payload);
     out
+}
+
+/// Encode `payload` as a metablock: try to compress with `compression`
+/// (when the algorithm is known); fall back to uncompressed when
+/// compression is `Unknown(_)`, when the codec is disabled at build time,
+/// or when the compressed form would not be smaller than the input.
+pub fn encode_metablock(payload: &[u8], compression: Compression) -> Result<Vec<u8>> {
+    assert!(payload.len() <= METABLOCK_SIZE);
+    let algo = compression_to_algo(compression);
+    if let Some(a) = algo
+        && a.enabled()
+        && let Ok(c) = crate::compression::compress(a, payload)
+        && !c.is_empty()
+        && c.len() < payload.len()
+        && c.len() <= 0x7FFF
+    {
+        let mut out = Vec::with_capacity(c.len() + 2);
+        let header = c.len() as u16;
+        out.extend_from_slice(&header.to_le_bytes());
+        out.extend_from_slice(&c);
+        return Ok(out);
+    }
+    Ok(encode_uncompressed(payload))
 }
 
 #[cfg(test)]

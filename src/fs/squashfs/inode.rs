@@ -77,6 +77,9 @@ pub struct DirInode {
     /// the true size here. `0` means an empty directory.
     pub file_size: u32,
     pub parent_inode: u32,
+    /// Extended directories carry an xattr index; basic directories store
+    /// `u32::MAX`.
+    pub xattr_index: u32,
 }
 
 /// Regular file inode (basic + extended forms). Sizes are widened to
@@ -93,6 +96,8 @@ pub struct FileInode {
     pub fragment_offset: u32,
     /// One entry per full data block.
     pub block_sizes: Vec<u32>,
+    /// Extended files carry an xattr index; basic files store `u32::MAX`.
+    pub xattr_index: u32,
 }
 
 impl FileInode {
@@ -101,11 +106,13 @@ impl FileInode {
     }
 }
 
-/// Symlink inode (basic + extended forms). We don't expose xattr_index.
+/// Symlink inode (basic + extended forms). Extended symlinks carry an
+/// `xattr_index`; basic symlinks store `u32::MAX` here.
 #[derive(Debug, Clone)]
 pub struct SymlinkInode {
     pub header: InodeHeader,
     pub target: String,
+    pub xattr_index: u32,
 }
 
 /// A decoded inode of any type. For inode kinds we don't fully decode
@@ -138,6 +145,16 @@ impl Inode {
             Inode::File(_) => EntryKind::Regular,
             Inode::Symlink(_) => EntryKind::Symlink,
             Inode::Other { kind, .. } => *kind,
+        }
+    }
+
+    /// Xattr table index, or `u32::MAX` if the inode has no xattrs.
+    pub fn xattr_index(&self) -> u32 {
+        match self {
+            Inode::Dir(d) => d.xattr_index,
+            Inode::File(f) => f.xattr_index,
+            Inode::Symlink(s) => s.xattr_index,
+            Inode::Other { .. } => u32::MAX,
         }
     }
 }
@@ -225,6 +242,7 @@ fn decode_basic_dir(
         block_offset,
         file_size,
         parent_inode,
+        xattr_index: u32::MAX,
     }))
 }
 
@@ -243,7 +261,7 @@ fn decode_ext_dir(
     let parent_inode = u32::from_le_bytes(buf[12..16].try_into().unwrap());
     let _index_count = u16::from_le_bytes(buf[16..18].try_into().unwrap());
     let block_offset = u16::from_le_bytes(buf[18..20].try_into().unwrap());
-    let _xattr_index = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+    let xattr_index = u32::from_le_bytes(buf[20..24].try_into().unwrap());
     // The extended directory's file_size is stored as size+3 too, per the
     // dr-emann reference implementation; subtract to recover the real size.
     let file_size = raw_file_size.saturating_sub(3);
@@ -253,6 +271,7 @@ fn decode_ext_dir(
         block_offset,
         file_size,
         parent_inode,
+        xattr_index,
     }))
 }
 
@@ -279,6 +298,7 @@ fn decode_basic_file(
         fragment_index,
         fragment_offset,
         block_sizes,
+        xattr_index: u32::MAX,
     }))
 }
 
@@ -297,7 +317,7 @@ fn decode_ext_file(
     let _link_count = u32::from_le_bytes(buf[24..28].try_into().unwrap());
     let fragment_index = u32::from_le_bytes(buf[28..32].try_into().unwrap());
     let fragment_offset = u32::from_le_bytes(buf[32..36].try_into().unwrap());
-    let _xattr_index = u32::from_le_bytes(buf[36..40].try_into().unwrap());
+    let xattr_index = u32::from_le_bytes(buf[36..40].try_into().unwrap());
     let num_full_blocks =
         full_block_count(file_size, block_size as u64, fragment_index != 0xFFFF_FFFF);
     let (block_sizes, _, _) = read_block_sizes(dev, mr, b2, o2, num_full_blocks)?;
@@ -308,6 +328,7 @@ fn decode_ext_file(
         fragment_index,
         fragment_offset,
         block_sizes,
+        xattr_index,
     }))
 }
 
@@ -327,11 +348,21 @@ fn decode_symlink(
             "squashfs: symlink target size {target_size} exceeds 65535"
         )));
     }
-    let (raw, _, _) = read_bytes(dev, mr, b2, o2, target_size as usize)?;
+    let (raw, b3, o3) = read_bytes(dev, mr, b2, o2, target_size as usize)?;
     let target = String::from_utf8(raw).map_err(|e| {
         crate::Error::InvalidImage(format!("squashfs: symlink target is not utf-8: {e}"))
     })?;
-    Ok(Inode::Symlink(SymlinkInode { header, target }))
+    let xattr_index = if header.kind == INODE_EXT_SYMLINK {
+        let (xbuf, _, _) = read_bytes(dev, mr, b3, o3, 4)?;
+        u32::from_le_bytes(xbuf[0..4].try_into().unwrap())
+    } else {
+        u32::MAX
+    };
+    Ok(Inode::Symlink(SymlinkInode {
+        header,
+        target,
+        xattr_index,
+    }))
 }
 
 /// Number of full data blocks for a file given its size, the FS block

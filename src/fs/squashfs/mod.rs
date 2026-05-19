@@ -24,19 +24,26 @@
 //! Only major version 4 is accepted. Earlier images open with an
 //! [`crate::Error::Unsupported`] error naming the version.
 
+use std::cell::RefCell;
 use std::io::Read;
 
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::DirEntry;
+use crate::fs::FileSource;
 
 mod directory;
 mod file;
 mod fragment;
+mod idtable;
 mod inode;
 mod metablock;
+mod writer;
+mod xattr;
 
 pub use file::FileReader;
+pub use writer::{DEFAULT_BLOCK_SIZE, EntryMeta};
+pub use xattr::Xattr;
 
 /// SquashFS magic, little-endian: `hsqs` reversed on disk = `0x73717368`.
 const SQUASHFS_MAGIC: u32 = 0x7371_7368;
@@ -159,11 +166,67 @@ pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
     Ok(u32::from_le_bytes(head) == SQUASHFS_MAGIC)
 }
 
-/// Open handle on a SquashFS image. All fields are derived from the
-/// superblock at open time; metadata tables are read lazily.
-#[derive(Debug)]
+/// Format-time options for [`Squashfs::format`].
+#[derive(Debug, Clone)]
+pub struct FormatOpts {
+    /// Data block size, must be a power of two between 4 KiB and 1 MiB.
+    /// Defaults to 128 KiB.
+    pub block_size: u32,
+    /// Compression algorithm used for both metadata + data. Defaults to
+    /// [`Compression::Zstd`] when the `zstd` feature is enabled, else
+    /// [`Compression::Gzip`].
+    pub compression: Compression,
+}
+
+impl Default for FormatOpts {
+    fn default() -> Self {
+        let compression = if cfg!(feature = "zstd") {
+            Compression::Zstd
+        } else if cfg!(feature = "gzip") {
+            Compression::Gzip
+        } else {
+            Compression::Unknown(0)
+        };
+        Self {
+            block_size: writer::DEFAULT_BLOCK_SIZE,
+            compression,
+        }
+    }
+}
+
+/// Resolved metadata for a single inode, returned by
+/// [`Squashfs::inode_meta`].
+#[derive(Debug, Clone)]
+pub struct InodeMeta {
+    pub inode_number: u32,
+    pub kind: crate::fs::EntryKind,
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime: u32,
+    pub file_size: u64,
+    pub xattr_index: u32,
+}
+
+/// Open handle on a SquashFS image. Owns the on-disk superblock plus
+/// lazily-populated caches for the id and xattr tables. Read APIs may
+/// populate those caches on first use. After [`Squashfs::format`] the
+/// instance is in *write* mode; call [`Squashfs::flush`] to materialise
+/// the image, then it switches back to read mode.
 pub struct Squashfs {
     sb: Superblock,
+    id_table: RefCell<idtable::IdTable>,
+    xattr_reader: RefCell<xattr::XattrReader>,
+    write_state: Option<writer::WriteState>,
+}
+
+impl std::fmt::Debug for Squashfs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Squashfs")
+            .field("sb", &self.sb)
+            .field("write_mode", &self.write_state.is_some())
+            .finish()
+    }
 }
 
 impl Squashfs {
@@ -187,7 +250,195 @@ impl Squashfs {
                 sb.major, sb.minor
             )));
         }
-        Ok(Self { sb })
+        Ok(Self {
+            sb,
+            id_table: RefCell::new(idtable::IdTable::new()),
+            xattr_reader: RefCell::new(xattr::XattrReader::new()),
+            write_state: None,
+        })
+    }
+
+    /// Begin building a fresh SquashFS image on `dev`. The returned
+    /// handle is in *write* mode: call [`create_dir`](Self::create_dir),
+    /// [`create_file`](Self::create_file),
+    /// [`create_symlink`](Self::create_symlink) to populate the tree,
+    /// then [`flush`](Self::flush) to materialise it.
+    pub fn format(_dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Self> {
+        if !opts.block_size.is_power_of_two()
+            || opts.block_size < 4096
+            || opts.block_size > 1_048_576
+        {
+            return Err(crate::Error::InvalidArgument(format!(
+                "squashfs: block_size {} must be a power of two between 4 KiB and 1 MiB",
+                opts.block_size
+            )));
+        }
+        let sb = Superblock {
+            magic: SQUASHFS_MAGIC,
+            inode_count: 0,
+            mkfs_time: 0,
+            block_size: opts.block_size,
+            fragment_count: 0,
+            compression: opts.compression,
+            block_log: opts.block_size.trailing_zeros() as u16,
+            flags: 0,
+            id_count: 0,
+            major: 4,
+            minor: 0,
+            root_inode: 0,
+            bytes_used: 0,
+            id_table_start: u64::MAX,
+            xattr_id_table_start: u64::MAX,
+            inode_table_start: u64::MAX,
+            directory_table_start: u64::MAX,
+            fragment_table_start: u64::MAX,
+            export_table_start: u64::MAX,
+        };
+        Ok(Self {
+            sb,
+            id_table: RefCell::new(idtable::IdTable::new()),
+            xattr_reader: RefCell::new(xattr::XattrReader::new()),
+            write_state: Some(writer::WriteState::new(opts.block_size, opts.compression)),
+        })
+    }
+
+    /// Buffer a new directory in the writer's in-memory tree. Parents
+    /// are created implicitly with permissive defaults.
+    pub fn create_dir(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &str,
+        meta: EntryMeta,
+        xattrs: Vec<Xattr>,
+    ) -> Result<()> {
+        let s = self
+            .write_state
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: not in write mode".into()))?;
+        s.create_dir(path, meta, xattrs)
+    }
+
+    /// Buffer a new regular file. Bytes are streamed from `src` at
+    /// [`flush`](Self::flush) time so large [`FileSource`]s are never
+    /// loaded entirely into memory.
+    pub fn create_file(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &str,
+        src: FileSource,
+        meta: EntryMeta,
+        xattrs: Vec<Xattr>,
+    ) -> Result<()> {
+        let s = self
+            .write_state
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: not in write mode".into()))?;
+        s.create_file(path, src, meta, xattrs)
+    }
+
+    /// Buffer a new symbolic link.
+    pub fn create_symlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &str,
+        target: &str,
+        meta: EntryMeta,
+        xattrs: Vec<Xattr>,
+    ) -> Result<()> {
+        let s = self
+            .write_state
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: not in write mode".into()))?;
+        s.create_symlink(path, target, meta, xattrs)
+    }
+
+    /// Lay every buffered entry out on the device. After flushing the
+    /// writer is consumed; read APIs become available.
+    pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let Some(mut state) = self.write_state.take() else {
+            return Ok(());
+        };
+        let new_sb = state.flush(dev)?;
+        self.sb = new_sb;
+        self.id_table = RefCell::new(idtable::IdTable::new());
+        self.xattr_reader = RefCell::new(xattr::XattrReader::new());
+        Ok(())
+    }
+
+    /// Resolve a path to its inode metadata. uid/gid are looked up
+    /// through the id table; uid_idx / gid_idx out of range fall back
+    /// to 0.
+    pub fn inode_meta(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<InodeMeta> {
+        if self.write_state.is_some() {
+            return Err(crate::Error::InvalidArgument(
+                "squashfs: inode_meta() unavailable until flush()".into(),
+            ));
+        }
+        let resolved = directory::resolve_path(
+            dev,
+            self.sb.inode_table_start,
+            self.sb.directory_table_start,
+            self.sb.compression,
+            self.sb.root_inode,
+            self.sb.block_size,
+            path,
+        )?;
+        self.id_table.borrow_mut().ensure_loaded(
+            dev,
+            self.sb.id_table_start,
+            self.sb.id_count,
+            self.sb.compression,
+        )?;
+        let id_table = self.id_table.borrow();
+        let hdr = resolved.header();
+        let kind = resolved.entry_kind();
+        let file_size = match &resolved {
+            inode::Inode::File(f) => f.file_size,
+            inode::Inode::Dir(d) => d.file_size as u64,
+            inode::Inode::Symlink(s) => s.target.len() as u64,
+            inode::Inode::Other { .. } => 0,
+        };
+        Ok(InodeMeta {
+            inode_number: hdr.inode_number,
+            kind,
+            mode: hdr.permissions,
+            uid: id_table.resolve(hdr.uid_idx),
+            gid: id_table.resolve(hdr.gid_idx),
+            mtime: hdr.mtime,
+            file_size,
+            xattr_index: resolved.xattr_index(),
+        })
+    }
+
+    /// Read the extended attributes of the inode at `path`. Returns
+    /// an empty vector when the inode has no xattrs or the image was
+    /// built without an xattr table.
+    pub fn read_xattrs(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<Xattr>> {
+        if self.write_state.is_some() {
+            return Err(crate::Error::InvalidArgument(
+                "squashfs: read_xattrs() unavailable until flush()".into(),
+            ));
+        }
+        let resolved = directory::resolve_path(
+            dev,
+            self.sb.inode_table_start,
+            self.sb.directory_table_start,
+            self.sb.compression,
+            self.sb.root_inode,
+            self.sb.block_size,
+            path,
+        )?;
+        let idx = resolved.xattr_index();
+        if idx == u32::MAX || self.sb.xattr_id_table_start == u64::MAX {
+            return Ok(Vec::new());
+        }
+        self.xattr_reader.borrow_mut().ensure_loaded(
+            dev,
+            self.sb.xattr_id_table_start,
+            self.sb.compression,
+        )?;
+        let reader = self.xattr_reader.borrow();
+        reader.fetch(dev, idx, self.sb.compression)
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -615,5 +866,118 @@ mod tests {
         let err = res.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("gzip"), "unexpected message: {msg}");
+    }
+
+    /// End-to-end writer test: format an image into a memory backend,
+    /// add a directory, file, and symlink with non-zero uid/gid and an
+    /// xattr, flush, then re-open and validate the read path covers id
+    /// resolution and xattr fetch.
+    #[test]
+    fn writer_round_trip_with_id_and_xattr() {
+        let mut dev = crate::block::MemoryBackend::new(2 * 1024 * 1024);
+        // Use Unknown(0) → uncompressed metablocks, so this test stays
+        // codec-agnostic. (Codec round-trips happen in their own modules.)
+        let mut s = Squashfs::format(
+            &mut dev,
+            &FormatOpts {
+                block_size: 4096,
+                compression: Compression::Unknown(0),
+            },
+        )
+        .unwrap();
+        s.create_dir(
+            &mut dev,
+            "/etc",
+            EntryMeta {
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                mtime: 100,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        s.create_file(
+            &mut dev,
+            "/etc/greeting",
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"hi there\n".to_vec())),
+                len: 9,
+            },
+            EntryMeta {
+                mode: 0o644,
+                uid: 1234,
+                gid: 5678,
+                mtime: 200,
+            },
+            vec![
+                Xattr {
+                    key: "user.color".into(),
+                    value: b"orange".to_vec(),
+                },
+                Xattr {
+                    key: "security.selinux".into(),
+                    value: b"unconfined_u:object_r:default_t:s0".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        s.create_symlink(
+            &mut dev,
+            "/lnk",
+            "etc/greeting",
+            EntryMeta {
+                mode: 0o777,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        s.flush(&mut dev).unwrap();
+
+        // Re-open from the same device.
+        let s = Squashfs::open(&mut dev).unwrap();
+        let root = s.list_path(&mut dev, "/").unwrap();
+        let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"etc"));
+        assert!(names.contains(&"lnk"));
+
+        // File contents.
+        let mut r = s.open_file_reader(&mut dev, "/etc/greeting").unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+        drop(r);
+        assert_eq!(buf, b"hi there\n");
+
+        // Symlink target.
+        let tgt = s.read_symlink(&mut dev, "/lnk").unwrap();
+        assert_eq!(tgt, "etc/greeting");
+
+        // Id resolution.
+        let meta = s.inode_meta(&mut dev, "/etc/greeting").unwrap();
+        assert_eq!(meta.uid, 1234);
+        assert_eq!(meta.gid, 5678);
+        assert_eq!(meta.mode, 0o644);
+        assert_eq!(meta.mtime, 200);
+        assert_eq!(meta.file_size, 9);
+
+        // Xattrs.
+        let xs = s.read_xattrs(&mut dev, "/etc/greeting").unwrap();
+        assert_eq!(xs.len(), 2);
+        let mut by_key: std::collections::HashMap<_, _> =
+            xs.into_iter().map(|x| (x.key, x.value)).collect();
+        assert_eq!(by_key.remove("user.color").unwrap(), b"orange");
+        assert!(
+            by_key
+                .remove("security.selinux")
+                .unwrap()
+                .starts_with(b"unconfined_u:object_r:")
+        );
+
+        // An entry without xattrs returns an empty vec.
+        let xs2 = s.read_xattrs(&mut dev, "/lnk").unwrap();
+        assert_eq!(xs2.len(), 0);
     }
 }

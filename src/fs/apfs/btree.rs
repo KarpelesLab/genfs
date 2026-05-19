@@ -28,6 +28,22 @@
 //!   trailing `btree_info_t` lives there).
 //!
 //! A leaf value of 0xFFFF (in a `BTREE_ALLOW_GHOSTS` tree) means "no value".
+//!
+//! ## Internal nodes
+//!
+//! When `btn_level > 0`, the node is *internal*: every value slot holds
+//! the identifier of a child node instead of payload data. For physical
+//! trees (the container omap), this identifier is the child node's
+//! **physical block number** (`u64`, 8 bytes). For virtual trees (the
+//! per-volume fs-tree), it is a **virtual oid** (`u64`, 8 bytes) that
+//! must be resolved through the volume's object map.
+//!
+//! The trailing `btree_info_t` at the root carries `bt_key_size` and
+//! `bt_val_size` for *fixed-KV* leaves; internal nodes always store
+//! 8-byte child pointers regardless of those sizes, so callers walking
+//! internal nodes pass `child_ptr_size = 8` for the value length.
+
+use std::collections::HashMap;
 
 use super::obj::{OBJECT_TYPE_BTREE_NODE, ObjPhys};
 
@@ -302,6 +318,92 @@ struct RawEntry {
     val_len: Option<u16>,
 }
 
+/// Internal-node child-pointer size: every internal node's value slot
+/// holds an 8-byte object identifier (physical block address for a
+/// physical tree, virtual oid for a virtual tree).
+pub const CHILD_PTR_SIZE: usize = 8;
+
+impl<'a> BTreeNode<'a> {
+    /// Convenience for internal nodes: read the i-th entry as
+    /// `(key_bytes, child_oid_u64)`. The value slot must be exactly 8
+    /// bytes — the spec guarantees this for internal nodes regardless of
+    /// the leaf-payload `bt_val_size`. Use this on any node where
+    /// `is_leaf()` is false.
+    pub fn child_entry_at(&self, index: u32, fixed_klen: usize) -> crate::Result<(&'a [u8], u64)> {
+        let (kb, vb) = self.entry_at(index, fixed_klen, CHILD_PTR_SIZE)?;
+        if vb.len() < CHILD_PTR_SIZE {
+            return Err(crate::Error::InvalidImage(format!(
+                "apfs: internal node value slot {} too small (got {}, need {})",
+                index,
+                vb.len(),
+                CHILD_PTR_SIZE
+            )));
+        }
+        let oid = u64::from_le_bytes(vb[..8].try_into().unwrap());
+        Ok((kb, oid))
+    }
+}
+
+/// A small fixed-capacity LRU cache, keyed by physical block address.
+/// We use this to avoid re-fetching B-tree nodes during a single tree
+/// walk while honouring the streaming invariant. Capacity is bounded so
+/// the cache never grows unbounded over long range scans.
+///
+/// Implementation: a `HashMap<u64, (Vec<u8>, u64)>` where the second
+/// `u64` is a monotonic access counter; on insert past capacity we
+/// evict the entry with the smallest counter. This is O(n) on eviction
+/// but `n` is tiny (default 64) and evictions are rare relative to
+/// hits, so it's fine.
+#[derive(Debug)]
+pub struct NodeCache {
+    cap: usize,
+    tick: u64,
+    map: HashMap<u64, (Vec<u8>, u64)>,
+}
+
+impl NodeCache {
+    /// Default capacity used by the multi-level walkers.
+    pub const DEFAULT_CAP: usize = 64;
+
+    /// Create a cache with the given capacity. A capacity of zero
+    /// disables caching: `get` always misses and `put` is a no-op.
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            tick: 0,
+            map: HashMap::new(),
+        }
+    }
+
+    /// Fetch a cached block by physical address. Bumps the recency
+    /// counter on hit.
+    pub fn get(&mut self, paddr: u64) -> Option<&[u8]> {
+        if self.cap == 0 {
+            return None;
+        }
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        let entry = self.map.get_mut(&paddr)?;
+        entry.1 = tick;
+        Some(&entry.0)
+    }
+
+    /// Insert a block. Evicts the least-recently-used entry when full.
+    pub fn put(&mut self, paddr: u64, block: Vec<u8>) {
+        if self.cap == 0 {
+            return;
+        }
+        self.tick = self.tick.wrapping_add(1);
+        if !self.map.contains_key(&paddr) && self.map.len() >= self.cap {
+            // Evict LRU.
+            if let Some((&victim, _)) = self.map.iter().min_by_key(|(_, (_, t))| *t) {
+                self.map.remove(&victim);
+            }
+        }
+        self.map.insert(paddr, (block, self.tick));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +465,73 @@ mod tests {
         assert_eq!(v0, b"vv");
         assert_eq!(k1, b"BB");
         assert_eq!(v1, b"VV");
+    }
+
+    /// Verify the LRU cache evicts the oldest entry when capacity is hit.
+    #[test]
+    fn node_cache_evicts_lru() {
+        let mut c = NodeCache::new(2);
+        c.put(1, vec![1]);
+        c.put(2, vec![2]);
+        // Touch 1 so it becomes more recent than 2.
+        assert!(c.get(1).is_some());
+        c.put(3, vec![3]); // should evict 2
+        assert!(c.get(2).is_none());
+        assert!(c.get(1).is_some());
+        assert!(c.get(3).is_some());
+    }
+
+    /// A zero-cap cache is a no-op: get always misses, put doesn't store.
+    #[test]
+    fn node_cache_zero_cap_no_op() {
+        let mut c = NodeCache::new(0);
+        c.put(1, vec![1, 2, 3]);
+        assert!(c.get(1).is_none());
+    }
+
+    /// Build a fixed-KV internal node with 8-byte child pointers and
+    /// confirm `child_entry_at` returns the right oid.
+    #[test]
+    fn child_entry_reads_8byte_oid() {
+        let block_size = 512usize;
+        let mut block = vec![0u8; block_size];
+        block[24..28].copy_from_slice(&OBJECT_TYPE_BTREE_NODE.to_le_bytes());
+        // ROOT, NOT leaf, FIXED_KV. Keys 16, "values" 8 (per spec internal
+        // node values are always 8-byte child pointers regardless of
+        // bt_val_size which describes the leaf payload).
+        let flags = BTNODE_ROOT | BTNODE_FIXED_KV_SIZE;
+        block[32..34].copy_from_slice(&flags.to_le_bytes());
+        block[34..36].copy_from_slice(&1u16.to_le_bytes()); // level
+        block[36..40].copy_from_slice(&2u32.to_le_bytes()); // nkeys = 2
+        block[40..42].copy_from_slice(&0u16.to_le_bytes()); // toc_off
+        block[42..44].copy_from_slice(&8u16.to_le_bytes()); // toc_len (2 kvoff)
+
+        // ToC: two kvoff_t entries (4B each)
+        let toc_base = 56;
+        block[toc_base..toc_base + 2].copy_from_slice(&0u16.to_le_bytes()); // k.off
+        block[toc_base + 2..toc_base + 4].copy_from_slice(&8u16.to_le_bytes()); // v.off
+        block[toc_base + 4..toc_base + 6].copy_from_slice(&16u16.to_le_bytes()); // k.off
+        block[toc_base + 6..toc_base + 8].copy_from_slice(&16u16.to_le_bytes()); // v.off
+        // Keys area starts at toc_base + 8 = 64.
+        // We don't care about key bytes for this test.
+        // Values: vals_end is at block_size - 40 (root). Two 8-byte child
+        // pointers: first at vals_end-8 (offset 8), second at vals_end-16
+        // (offset 16).
+        let vals_end = block_size - BTREE_INFO_SIZE;
+        block[vals_end - 8..vals_end].copy_from_slice(&0x100u64.to_le_bytes());
+        block[vals_end - 16..vals_end - 8].copy_from_slice(&0x200u64.to_le_bytes());
+        // Populate bt_key_size = 16, bt_val_size = 16 (the leaf would carry
+        // 16-byte values; internal nodes still store 8-byte child ptrs).
+        let info_off = block_size - BTREE_INFO_SIZE;
+        block[info_off + 8..info_off + 12].copy_from_slice(&16u32.to_le_bytes());
+        block[info_off + 12..info_off + 16].copy_from_slice(&16u32.to_le_bytes());
+
+        let node = BTreeNode::decode(&block).unwrap();
+        assert!(!node.is_leaf());
+        let (_k0, c0) = node.child_entry_at(0, 16).unwrap();
+        let (_k1, c1) = node.child_entry_at(1, 16).unwrap();
+        assert_eq!(c0, 0x100);
+        assert_eq!(c1, 0x200);
     }
 
     /// Hand-craft a fixed-KV root node (e.g. an omap node) with one entry.

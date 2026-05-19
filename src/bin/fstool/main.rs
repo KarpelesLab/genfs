@@ -1705,7 +1705,7 @@ fn require_force_for_device(
 fn ls(image: &str, path: &str) -> fstool::Result<()> {
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::with_target_device(&target, |dev| {
-        let fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut fs = fstool::inspect::AnyFs::open(dev)?;
         let entries = fs.list(dev, path)?;
         let mut out = std::io::stdout().lock();
         for e in &entries {
@@ -1718,7 +1718,7 @@ fn ls(image: &str, path: &str) -> fstool::Result<()> {
 fn cat(image: &str, path: &str) -> fstool::Result<()> {
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::with_target_device(&target, |dev| {
-        let fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut fs = fstool::inspect::AnyFs::open(dev)?;
         let mut out = std::io::stdout().lock();
         fs.copy_file_to(dev, path, &mut out)?;
         Ok(())
@@ -1738,13 +1738,13 @@ fn info(image: &str) -> fstool::Result<()> {
         }
         // No table — fall through to the bare-FS info below using the
         // already-opened disk.
-        let fs = fstool::inspect::AnyFs::open(disk.as_mut())?;
-        print_fs_info(disk.as_mut(), &fs);
+        let mut fs = fstool::inspect::AnyFs::open(disk.as_mut())?;
+        print_fs_info(disk.as_mut(), &mut fs);
         return Ok(());
     }
     fstool::inspect::with_target_device(&target, |dev| {
-        let fs = fstool::inspect::AnyFs::open(dev)?;
-        print_fs_info(dev, &fs);
+        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        print_fs_info(dev, &mut fs);
         Ok(())
     })
 }
@@ -1826,7 +1826,7 @@ fn human_size(b: u64) -> String {
     }
 }
 
-fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &fstool::inspect::AnyFs) {
+fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::inspect::AnyFs) {
     println!("fs kind:           {}", fs.kind_string());
     match fs {
         fstool::inspect::AnyFs::Ext(ext) => print_ext_info(ext),

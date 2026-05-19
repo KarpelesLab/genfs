@@ -1,34 +1,42 @@
-//! SquashFS — read-only compressed archive filesystem. Scaffold module.
+//! SquashFS — read-only compressed archive filesystem.
 //!
 //! ## Status
 //!
-//! Detection + superblock parse only. List / read returns `Unsupported`;
-//! the inode-table and directory-table walks land in a follow-up, and a
-//! decompressor abstraction (zstd / xz / lz4 / lzma / gzip) is wired
-//! in at the same time.
+//! Read-only support for **uncompressed** SquashFS v4 images:
+//!
+//! - Listing any directory by absolute path.
+//! - Streaming any regular file by absolute path.
+//! - Reading symlink targets.
+//!
+//! Compressed metablocks, data blocks, and fragment blocks return
+//! [`crate::Error::Unsupported`] with the algorithm name. The integrator
+//! gates real decompressors (gzip / xz / lz4 / zstd / lzo / lzma) behind
+//! optional Cargo features so this module stays dependency-free.
 //!
 //! ## Reference
 //!
-//! - SquashFS on-disk layout, kernel docs:
-//!   <https://docs.kernel.org/filesystems/squashfs.html>
-//! - On-disk header reference (Mountains): squashfs source ships the
-//!   complete struct definitions; we re-derive them from the docs.
+//! - <https://docs.kernel.org/filesystems/squashfs.html> — kernel docs.
+//! - <https://dr-emann.github.io/squashfs/squashfs.html> — community
+//!   binary-format reference (cross-checked field offsets only).
 //!
 //! ## Versioning
 //!
-//! Modern SquashFS images use major version 4 (minor 0); older 3.x
-//! images appear in long-tail kernels. v1 scaffold only accepts v4 —
-//! a v3 image opens with an `Unsupported` error naming the version.
-//!
-//! ## Compression
-//!
-//! SquashFS supports many algorithms; the superblock's `compression`
-//! field picks one and the optional "compression options" block right
-//! after the header carries algorithm-specific parameters. The scaffold
-//! records which algorithm is in use but does not decompress anything.
+//! Only major version 4 is accepted. Earlier images open with an
+//! [`crate::Error::Unsupported`] error naming the version.
+
+use std::io::Read;
 
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::fs::DirEntry;
+
+mod directory;
+mod file;
+mod fragment;
+mod inode;
+mod metablock;
+
+pub use file::FileReader;
 
 /// SquashFS magic, little-endian: `hsqs` reversed on disk = `0x73717368`.
 const SQUASHFS_MAGIC: u32 = 0x7371_7368;
@@ -59,8 +67,8 @@ impl Compression {
     }
 }
 
-/// Decoded prefix of the SquashFS superblock that we care about for
-/// detection and `info`.
+/// Decoded SquashFS superblock. The on-disk layout is 96 bytes total; we
+/// surface everything later layers need to walk the metadata tables.
 #[derive(Debug, Clone)]
 pub struct Superblock {
     pub magic: u32,
@@ -82,6 +90,12 @@ pub struct Superblock {
     /// Inode reference (block,offset) for the root directory inode.
     pub root_inode: u64,
     pub bytes_used: u64,
+    pub id_table_start: u64,
+    pub xattr_id_table_start: u64,
+    pub inode_table_start: u64,
+    pub directory_table_start: u64,
+    pub fragment_table_start: u64,
+    pub export_table_start: u64,
 }
 
 impl Superblock {
@@ -105,6 +119,12 @@ impl Superblock {
         let minor = u16::from_le_bytes(buf[30..32].try_into().ok()?);
         let root_inode = u64::from_le_bytes(buf[32..40].try_into().ok()?);
         let bytes_used = u64::from_le_bytes(buf[40..48].try_into().ok()?);
+        let id_table_start = u64::from_le_bytes(buf[48..56].try_into().ok()?);
+        let xattr_id_table_start = u64::from_le_bytes(buf[56..64].try_into().ok()?);
+        let inode_table_start = u64::from_le_bytes(buf[64..72].try_into().ok()?);
+        let directory_table_start = u64::from_le_bytes(buf[72..80].try_into().ok()?);
+        let fragment_table_start = u64::from_le_bytes(buf[80..88].try_into().ok()?);
+        let export_table_start = u64::from_le_bytes(buf[88..96].try_into().ok()?);
         Some(Self {
             magic,
             inode_count,
@@ -119,10 +139,17 @@ impl Superblock {
             minor,
             root_inode,
             bytes_used,
+            id_table_start,
+            xattr_id_table_start,
+            inode_table_start,
+            directory_table_start,
+            fragment_table_start,
+            export_table_start,
         })
     }
 }
 
+/// Quick detection — reads only the first four bytes.
 pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
     if dev.total_size() < 4 {
         return Ok(false);
@@ -132,12 +159,17 @@ pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
     Ok(u32::from_le_bytes(head) == SQUASHFS_MAGIC)
 }
 
+/// Open handle on a SquashFS image. All fields are derived from the
+/// superblock at open time; metadata tables are read lazily.
 #[derive(Debug)]
 pub struct Squashfs {
     sb: Superblock,
 }
 
 impl Squashfs {
+    /// Open an existing SquashFS image. Validates magic + version; the
+    /// metadata tables are not touched until a `list_path` /
+    /// `open_file_reader` / `read_symlink` call walks them.
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         if dev.total_size() < 96 {
             return Err(crate::Error::InvalidImage(
@@ -174,37 +206,147 @@ impl Squashfs {
         &self.sb
     }
 
-    pub fn list_path(
-        &mut self,
-        _dev: &mut dyn BlockDevice,
-        _path: &str,
-    ) -> Result<Vec<crate::fs::DirEntry>> {
-        Err(unsupported())
+    /// List a directory by absolute path. `/`, `""`, `.` all resolve to
+    /// the root. Non-directory paths return [`crate::Error::InvalidArgument`].
+    pub fn list_path(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<DirEntry>> {
+        let resolved = directory::resolve_path(
+            dev,
+            self.sb.inode_table_start,
+            self.sb.directory_table_start,
+            self.sb.compression,
+            self.sb.root_inode,
+            self.sb.block_size,
+            path,
+        )?;
+        let dir = match resolved {
+            inode::Inode::Dir(d) => d,
+            _ => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "squashfs: {path:?} is not a directory"
+                )));
+            }
+        };
+        let raw_entries = directory::read_directory_entries(
+            dev,
+            self.sb.directory_table_start,
+            self.sb.compression,
+            dir.block_index,
+            dir.block_offset,
+            dir.file_size,
+        )?;
+        Ok(raw_entries
+            .into_iter()
+            .map(|e| DirEntry {
+                name: e.name,
+                inode: e.inode_number,
+                kind: directory::entry_kind_from_type(e.inode_type),
+            })
+            .collect())
     }
-}
 
-fn unsupported() -> crate::Error {
-    crate::Error::Unsupported(
-        "squashfs: read support is not implemented yet (scaffold only)".into(),
-    )
+    /// Open a streaming reader for the regular file at `path`. Returns
+    /// [`crate::Error::InvalidArgument`] if `path` is a directory or
+    /// missing, and [`crate::Error::Unsupported`] if the file's data is
+    /// stored compressed.
+    pub fn open_file_reader<'a>(
+        &self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<Box<dyn Read + 'a>> {
+        let resolved = directory::resolve_path(
+            dev,
+            self.sb.inode_table_start,
+            self.sb.directory_table_start,
+            self.sb.compression,
+            self.sb.root_inode,
+            self.sb.block_size,
+            path,
+        )?;
+        let file_inode = match resolved {
+            inode::Inode::File(f) => f,
+            _ => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "squashfs: {path:?} is not a regular file"
+                )));
+            }
+        };
+        Ok(Box::new(FileReader::new(
+            dev,
+            &file_inode,
+            self.sb.compression,
+            self.sb.fragment_table_start,
+            self.sb.fragment_count,
+            self.sb.block_size,
+        )))
+    }
+
+    /// Read a symbolic link's target. The target lives inline in the
+    /// inode, so no data-block decompression is involved.
+    pub fn read_symlink(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<String> {
+        let resolved = directory::resolve_path(
+            dev,
+            self.sb.inode_table_start,
+            self.sb.directory_table_start,
+            self.sb.compression,
+            self.sb.root_inode,
+            self.sb.block_size,
+            path,
+        )?;
+        match resolved {
+            inode::Inode::Symlink(s) => Ok(s.target),
+            _ => Err(crate::Error::InvalidArgument(format!(
+                "squashfs: {path:?} is not a symlink"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::MemoryBackend;
+    use crate::fs::EntryKind;
+
+    /// Build a 96-byte uncompressed-v4 superblock with caller-controlled
+    /// table offsets. `comp` is the compressor id (1=gzip, etc.).
+    #[allow(clippy::too_many_arguments)]
+    fn fake_sb_v4(
+        comp: u16,
+        block_size: u32,
+        fragment_count: u32,
+        root_inode: u64,
+        bytes_used: u64,
+        inode_table_start: u64,
+        directory_table_start: u64,
+        fragment_table_start: u64,
+    ) -> Vec<u8> {
+        let mut v = vec![0u8; 96];
+        v[0..4].copy_from_slice(&SQUASHFS_MAGIC.to_le_bytes());
+        v[4..8].copy_from_slice(&8u32.to_le_bytes());
+        v[8..12].copy_from_slice(&0u32.to_le_bytes());
+        v[12..16].copy_from_slice(&block_size.to_le_bytes());
+        v[16..20].copy_from_slice(&fragment_count.to_le_bytes());
+        v[20..22].copy_from_slice(&comp.to_le_bytes());
+        let block_log = block_size.trailing_zeros() as u16;
+        v[22..24].copy_from_slice(&block_log.to_le_bytes());
+        v[24..26].copy_from_slice(&0u16.to_le_bytes());
+        v[26..28].copy_from_slice(&0u16.to_le_bytes());
+        v[28..30].copy_from_slice(&4u16.to_le_bytes());
+        v[30..32].copy_from_slice(&0u16.to_le_bytes());
+        v[32..40].copy_from_slice(&root_inode.to_le_bytes());
+        v[40..48].copy_from_slice(&bytes_used.to_le_bytes());
+        v[48..56].copy_from_slice(&u64::MAX.to_le_bytes()); // id_table_start
+        v[56..64].copy_from_slice(&u64::MAX.to_le_bytes()); // xattr_id_table_start
+        v[64..72].copy_from_slice(&inode_table_start.to_le_bytes());
+        v[72..80].copy_from_slice(&directory_table_start.to_le_bytes());
+        v[80..88].copy_from_slice(&fragment_table_start.to_le_bytes());
+        v[88..96].copy_from_slice(&u64::MAX.to_le_bytes()); // export_table_start
+        v
+    }
 
     fn fake_sb(major: u16, comp: u16) -> Vec<u8> {
-        let mut v = vec![0u8; 128];
-        v[0..4].copy_from_slice(&SQUASHFS_MAGIC.to_le_bytes());
-        v[4..8].copy_from_slice(&3u32.to_le_bytes()); // inodes
-        v[8..12].copy_from_slice(&0u32.to_le_bytes());
-        v[12..16].copy_from_slice(&131072u32.to_le_bytes()); // 128 KiB
-        v[16..20].copy_from_slice(&0u32.to_le_bytes());
-        v[20..22].copy_from_slice(&comp.to_le_bytes());
-        v[22..24].copy_from_slice(&17u16.to_le_bytes());
+        let mut v = fake_sb_v4(comp, 131072, 0, 0, 512, u64::MAX, u64::MAX, u64::MAX);
         v[28..30].copy_from_slice(&major.to_le_bytes());
-        v[30..32].copy_from_slice(&0u16.to_le_bytes());
-        v[40..48].copy_from_slice(&512u64.to_le_bytes()); // bytes_used
         v
     }
 
@@ -218,7 +360,6 @@ mod tests {
 
     #[test]
     fn open_rejects_v3() {
-        use crate::block::MemoryBackend;
         let mut dev = MemoryBackend::new(4096);
         dev.write_at(0, &fake_sb(3, 1)).unwrap();
         let err = Squashfs::open(&mut dev).unwrap_err();
@@ -230,7 +371,6 @@ mod tests {
 
     #[test]
     fn open_accepts_v4() {
-        use crate::block::MemoryBackend;
         let mut dev = MemoryBackend::new(4096);
         dev.write_at(0, &fake_sb(4, 6)).unwrap();
         let s = Squashfs::open(&mut dev).unwrap();
@@ -239,9 +379,237 @@ mod tests {
 
     #[test]
     fn probe_matches_magic() {
-        use crate::block::MemoryBackend;
         let mut dev = MemoryBackend::new(4096);
         dev.write_at(0, &SQUASHFS_MAGIC.to_le_bytes()).unwrap();
         assert!(probe(&mut dev).unwrap());
+    }
+
+    // ----- end-to-end fixture: hand-crafted uncompressed image -----------
+    //
+    // Layout we build for the integration test:
+    //
+    //   [0..96)        superblock
+    //   [96..]         data blocks for "hi.txt" (5 bytes "hello")
+    //   [..]           inode table (one metablock):
+    //                    [0]  root dir inode  (BasicDir)  16+16 bytes
+    //                    [32] regular file    (BasicFile) 16+16+0 bytes
+    //                    [64] symlink inode   (BasicSymlink) 16+8+4 bytes
+    //   [..]           directory table (one metablock):
+    //                    header + 2 entries (hi.txt, lnk)
+    //   [..]           — no fragment table —
+    //
+    // All metablocks are uncompressed (high bit set).
+
+    use super::metablock::encode_uncompressed;
+
+    struct Built {
+        image: Vec<u8>,
+        root_inode_ref: u64,
+        inode_table_start: u64,
+        directory_table_start: u64,
+        data_offset: u64,
+    }
+
+    fn build_fixture() -> Built {
+        // ----- Data block for "hi.txt" -----
+        let file_payload = b"hello";
+        let data_offset = 96u64;
+        let data_block_size = file_payload.len() as u32 | 0x0100_0000; // uncompressed
+
+        // ----- Inode table metablock contents (uncompressed payload) -----
+        let mut inodes: Vec<u8> = Vec::new();
+
+        // Root directory (BasicDir): offsets [0..32) within the metablock.
+        // header (16 bytes):
+        inodes.extend_from_slice(&1u16.to_le_bytes()); // type = BasicDir
+        inodes.extend_from_slice(&0o755u16.to_le_bytes()); // perms
+        inodes.extend_from_slice(&0u16.to_le_bytes()); // uid_idx
+        inodes.extend_from_slice(&0u16.to_le_bytes()); // gid_idx
+        inodes.extend_from_slice(&0u32.to_le_bytes()); // mtime
+        inodes.extend_from_slice(&1u32.to_le_bytes()); // inode_number
+        // basic_dir payload (16 bytes):
+        inodes.extend_from_slice(&0u32.to_le_bytes()); // block_index = 0
+        inodes.extend_from_slice(&3u32.to_le_bytes()); // link_count
+        // file_size: stored size+3. Real listing size to be filled in below
+        // — patch later once we know it; placeholder for now.
+        let dir_size_patch_offset = inodes.len();
+        inodes.extend_from_slice(&0u16.to_le_bytes()); // file_size placeholder
+        inodes.extend_from_slice(&0u16.to_le_bytes()); // block_offset = 0
+        inodes.extend_from_slice(&0u32.to_le_bytes()); // parent_inode
+
+        // BasicFile inode (16 + 16 + 0 bytes), starting at offset 32.
+        let file_inode_offset = inodes.len() as u16;
+        inodes.extend_from_slice(&2u16.to_le_bytes()); // type = BasicFile
+        inodes.extend_from_slice(&0o644u16.to_le_bytes());
+        inodes.extend_from_slice(&0u16.to_le_bytes());
+        inodes.extend_from_slice(&0u16.to_le_bytes());
+        inodes.extend_from_slice(&0u32.to_le_bytes()); // mtime
+        inodes.extend_from_slice(&2u32.to_le_bytes()); // inode_number
+        // BasicFile payload:
+        inodes.extend_from_slice(&(data_offset as u32).to_le_bytes()); // blocks_start
+        inodes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // frag_index = none
+        inodes.extend_from_slice(&0u32.to_le_bytes()); // frag_offset
+        inodes.extend_from_slice(&(file_payload.len() as u32).to_le_bytes()); // file_size
+        // 1 block size word:
+        inodes.extend_from_slice(&data_block_size.to_le_bytes());
+
+        // BasicSymlink inode at offset = current length.
+        let symlink_inode_offset = inodes.len() as u16;
+        inodes.extend_from_slice(&3u16.to_le_bytes()); // type = BasicSymlink
+        inodes.extend_from_slice(&0o777u16.to_le_bytes());
+        inodes.extend_from_slice(&0u16.to_le_bytes());
+        inodes.extend_from_slice(&0u16.to_le_bytes());
+        inodes.extend_from_slice(&0u32.to_le_bytes());
+        inodes.extend_from_slice(&3u32.to_le_bytes()); // inode_number
+        // symlink payload:
+        let target = b"hi.txt";
+        inodes.extend_from_slice(&1u32.to_le_bytes()); // link_count
+        inodes.extend_from_slice(&(target.len() as u32).to_le_bytes()); // target_size
+        inodes.extend_from_slice(target);
+
+        // ----- Directory listing payload -----
+        // One header + two entries (hi.txt @ file_inode_offset, lnk @ symlink_inode_offset).
+        let mut dirs: Vec<u8> = Vec::new();
+        // header (12 bytes):
+        dirs.extend_from_slice(&1u32.to_le_bytes()); // count = entries-1 = 1
+        dirs.extend_from_slice(&0u32.to_le_bytes()); // start_block (rel to inode table)
+        dirs.extend_from_slice(&2u32.to_le_bytes()); // inode_number base = 2 (file is 2)
+        // entry hi.txt:
+        dirs.extend_from_slice(&file_inode_offset.to_le_bytes());
+        dirs.extend_from_slice(&0i16.to_le_bytes()); // inode_offset = 0 -> inode_number 2
+        dirs.extend_from_slice(&2u16.to_le_bytes()); // type = BasicFile
+        dirs.extend_from_slice(&((b"hi.txt".len() - 1) as u16).to_le_bytes()); // name_size (off by one)
+        dirs.extend_from_slice(b"hi.txt");
+        // entry lnk:
+        dirs.extend_from_slice(&symlink_inode_offset.to_le_bytes());
+        dirs.extend_from_slice(&1i16.to_le_bytes()); // base+1 = 3
+        dirs.extend_from_slice(&3u16.to_le_bytes()); // BasicSymlink
+        dirs.extend_from_slice(&((b"lnk".len() - 1) as u16).to_le_bytes());
+        dirs.extend_from_slice(b"lnk");
+
+        // Patch the root dir's file_size now that we know the listing size.
+        let dir_size_real = dirs.len() as u16 + 3; // stored as size+3
+        let patch = dir_size_real.to_le_bytes();
+        inodes[dir_size_patch_offset..dir_size_patch_offset + 2].copy_from_slice(&patch);
+
+        // ----- Stitch it together -----
+        let mut image = vec![0u8; data_offset as usize + file_payload.len()];
+        image[data_offset as usize..data_offset as usize + file_payload.len()]
+            .copy_from_slice(file_payload);
+
+        let inode_table_start = image.len() as u64;
+        image.extend_from_slice(&encode_uncompressed(&inodes));
+        let directory_table_start = image.len() as u64;
+        image.extend_from_slice(&encode_uncompressed(&dirs));
+
+        // Root inode reference: block 0 (offset within inode table), offset 0.
+        let root_inode_ref: u64 = 0;
+
+        let bytes_used = image.len() as u64;
+        let mut sb = fake_sb_v4(
+            1, // gzip; doesn't matter — payload is uncompressed
+            4096,
+            0,
+            root_inode_ref,
+            bytes_used,
+            inode_table_start,
+            directory_table_start,
+            u64::MAX,
+        );
+        // Splice superblock into the head.
+        image[..96].copy_from_slice(&sb[..]);
+        // (also keep the un-spliced `sb` around for type, but discard).
+        let _ = &mut sb;
+        Built {
+            image,
+            root_inode_ref,
+            inode_table_start,
+            directory_table_start,
+            data_offset,
+        }
+    }
+
+    #[test]
+    fn end_to_end_list_read_symlink() {
+        let built = build_fixture();
+        assert_eq!(built.root_inode_ref, 0);
+        assert!(built.inode_table_start > 0);
+        assert!(built.directory_table_start > built.inode_table_start);
+        assert!(built.data_offset < built.inode_table_start);
+
+        let mut dev = MemoryBackend::new(built.image.len() as u64 + 64);
+        dev.write_at(0, &built.image).unwrap();
+        let s = Squashfs::open(&mut dev).unwrap();
+
+        // List root.
+        let entries = s.list_path(&mut dev, "/").unwrap();
+        assert_eq!(entries.len(), 2);
+        let by_name: std::collections::HashMap<_, _> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), (e.inode, e.kind)))
+            .collect();
+        assert_eq!(by_name["hi.txt"].1, EntryKind::Regular);
+        assert_eq!(by_name["lnk"].1, EntryKind::Symlink);
+        assert_eq!(by_name["hi.txt"].0, 2);
+        assert_eq!(by_name["lnk"].0, 3);
+
+        // Read the file by path.
+        let mut r = s.open_file_reader(&mut dev, "/hi.txt").unwrap();
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut out).unwrap();
+        drop(r);
+        assert_eq!(out, b"hello");
+
+        // Read the symlink target.
+        let tgt = s.read_symlink(&mut dev, "/lnk").unwrap();
+        assert_eq!(tgt, "hi.txt");
+    }
+
+    #[test]
+    fn list_path_on_missing_entry_errors() {
+        let built = build_fixture();
+        let mut dev = MemoryBackend::new(built.image.len() as u64 + 64);
+        dev.write_at(0, &built.image).unwrap();
+        let s = Squashfs::open(&mut dev).unwrap();
+        let err = s.list_path(&mut dev, "/nope").unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn compressed_data_block_surfaces_unsupported() {
+        // Build a fixture but mark the file's data block as compressed
+        // (clear bit 24). Reading the file should yield Unsupported with
+        // the algorithm name.
+        let mut built = build_fixture();
+        // Open + intercept: re-decode superblock, walk to file inode, patch
+        // its block_size word. Easier: locate the bytes "hello" data was
+        // at, and patch the metablock containing the file inode directly.
+        //
+        // The file's block size word sits inside the inode metablock at
+        // a known offset. Rebuild that block deterministically:
+        //   - dir inode at offset 0..32
+        //   - file inode at offset 32..64 (+ 4-byte block size at 64..68)
+        //   - block size word is at byte 64 of the payload, i.e.
+        //     metablock_header(2) + 64 = 66 inside the *metablock on disk*.
+        let sb_buf = &built.image[0..96];
+        let sb = Superblock::decode(sb_buf).unwrap();
+        let off = sb.inode_table_start as usize + 2 + 64; // header + 64
+        // Clear the uncompressed bit (bit 24).
+        let mut word_bytes = [0u8; 4];
+        word_bytes.copy_from_slice(&built.image[off..off + 4]);
+        let mut word = u32::from_le_bytes(word_bytes);
+        word &= !0x0100_0000; // clear uncompressed bit
+        built.image[off..off + 4].copy_from_slice(&word.to_le_bytes());
+
+        let mut dev = MemoryBackend::new(built.image.len() as u64 + 64);
+        dev.write_at(0, &built.image).unwrap();
+        let s = Squashfs::open(&mut dev).unwrap();
+        let mut r = s.open_file_reader(&mut dev, "/hi.txt").unwrap();
+        let mut sink = Vec::new();
+        let res = std::io::Read::read_to_end(&mut r, &mut sink);
+        let err = res.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("gzip"), "unexpected message: {msg}");
+        assert!(msg.contains("decompression"), "unexpected message: {msg}");
     }
 }

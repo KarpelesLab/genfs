@@ -1,12 +1,21 @@
 //! XFS directory parsing.
 //!
-//! XFS has three on-disk directory formats. The on-disk choice is recorded
-//! in the inode's `di_format` for `local` (shortform) vs `extents` /
-//! `btree` (block, leaf, node, btree). This module implements the
-//! **shortform** layout, which is what fits in the inode's literal area
-//! and covers tiny directories — including the root of small images.
+//! XFS has four on-disk directory formats. The on-disk choice is recorded
+//! in the inode's `di_format`:
 //!
-//! Shortform header (v5 / v3 inodes):
+//! - `local`  (shortform)   — entries packed in the inode literal area
+//! - `extents` (block / leaf / node) — entries stored in directory blocks on
+//!   disk, addressed through the inode's extent list
+//! - `btree`  — a B-tree-of-extents form for very large directories
+//!
+//! This module implements **shortform**, **block**, and **leaf** formats.
+//! Node format is best-effort: the leaf-index variant of node directories is
+//! parsed (we read every data block) but full node-btree traversal is not
+//! required for correctness because all data blocks have logical addresses
+//! < `XFS_DIR2_LEAF_OFFSET` and we can scan them in order. B-tree (`btree`
+//! di_format) directories return `Error::Unsupported`.
+//!
+//! ## Shortform header (v5 / v3 inodes)
 //!
 //! ```text
 //!   off  len  field
@@ -18,7 +27,7 @@
 //! `parent` is 4 bytes when `i8count == 0`, 8 bytes otherwise (the kernel
 //! upgrades the whole directory if any inode in it can't fit in 32 bits).
 //!
-//! Each entry that follows the header is:
+//! ## Shortform entry
 //!
 //! ```text
 //!   off  len  field
@@ -32,17 +41,31 @@
 //! On a v3 inode the per-entry `ftype` byte is present after the name. On a
 //! v2 inode (no CRC) it is absent. We detect by `inode_version` passed in.
 //!
-//! File types (`XFS_DIR3_FT_*`) follow the same numbering as the kernel's
-//! per-entry ftype byte (1=REG, 2=DIR, 3=CHR, 4=BLK, 5=FIFO, 6=SOCK, 7=LNK).
+//! ## Data-block layout (block / leaf / node directories)
 //!
-//! ## What this module does NOT implement
+//! Each "directory block" (size = `1 << sb_dirblklog` FS blocks) starts with
+//! a header, then a sequence of variable-length records. Each record is
+//! either a used `data_entry` or a free `data_unused` region.
 //!
-//! - **Block** directories (data fork holds one or more directory blocks
-//!   on disk, inode format = `extents`, total size ≤ one directory block).
-//! - **Leaf+ / Node / B-tree** directories (larger trees).
+//! Headers:
 //!
-//! Callers that encounter those formats should return
-//! `Error::Unsupported("xfs: block/leaf directories not implemented")`.
+//! - v4 data block: magic `"XD2D"`, then `bestfree[3]` (3 × 4 bytes). 16 B.
+//! - v4 block dir: magic `"XD2B"`, then `bestfree[3]`. 16 B header, plus
+//!   leaf array + `block_tail{count,stale}` at the tail.
+//! - v5 data block: magic `"XDD3"`, 48 B v5-header + `bestfree[3]` + 4 B
+//!   pad = 64 B.
+//! - v5 block dir: magic `"XDB3"`, same 64 B header, plus tail (as v4).
+//!
+//! Per-entry:
+//!
+//! ```text
+//!   data_entry:    __be64 inumber, u8 namelen, u8 name[namelen],
+//!                  [u8 ftype (v5)], <pad>, __be16 tag — total padded to 8 B.
+//!   data_unused:   __be16 freetag = 0xffff, __be16 length, <pad>, __be16 tag.
+//! ```
+//!
+//! File types (`XFS_DIR3_FT_*`) follow the kernel numbering (1=REG, 2=DIR,
+//! 3=CHR, 4=BLK, 5=FIFO, 6=SOCK, 7=LNK).
 
 use crate::Result;
 use crate::fs::{DirEntry, EntryKind};
@@ -56,6 +79,25 @@ pub const XFS_DIR3_FT_BLKDEV: u8 = 4;
 pub const XFS_DIR3_FT_FIFO: u8 = 5;
 pub const XFS_DIR3_FT_SOCK: u8 = 6;
 pub const XFS_DIR3_FT_SYMLINK: u8 = 7;
+
+/// Magic numbers for the various directory block flavours.
+pub const XFS_DIR2_BLOCK_MAGIC: u32 = 0x5844_3242; // "XD2B"
+pub const XFS_DIR2_DATA_MAGIC: u32 = 0x5844_3244; // "XD2D"
+pub const XFS_DIR3_BLOCK_MAGIC: u32 = 0x5844_4233; // "XDB3"
+pub const XFS_DIR3_DATA_MAGIC: u32 = 0x5844_4433; // "XDD3"
+
+// Note: leaf/node/free-index block magics (XD2F/XD2L/XDLF/XDD2/etc.) are
+// recognised implicitly by checking that a block's magic does NOT match
+// either of the data magics above. We do not parse those blocks here —
+// the data-block scan in `Xfs::read_extent_dir_entries` is sufficient to
+// enumerate every entry without going through the hashed leaf index.
+
+/// Freetag stored at the start of a `data_unused` region.
+pub const XFS_DIR2_DATA_FREE_TAG: u16 = 0xFFFF;
+
+/// Logical block index (in dir-block units) where the leaf block lives in a
+/// leaf-format directory. Defined as `32 GiB / dirblksize`.
+pub const XFS_DIR2_LEAF_FIRSTDB_BYTES: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB
 
 /// Map an XFS ftype byte to the generic `EntryKind`. `Unknown` is mapped to
 /// `EntryKind::Unknown` so the caller can still display the entry.
@@ -76,6 +118,14 @@ pub fn ftype_to_kind(ft: u8) -> EntryKind {
 /// number of the target.
 #[derive(Debug, Clone)]
 pub struct ShortformEntry {
+    pub name: String,
+    pub inumber: u64,
+    pub ftype: u8,
+}
+
+/// A decoded entry from a block / leaf / node directory data block.
+#[derive(Debug, Clone)]
+pub struct DataEntry {
     pub name: String,
     pub inumber: u64,
     pub ftype: u8,
@@ -177,6 +227,253 @@ pub fn shortform_to_generic(entries: &[ShortformEntry]) -> Vec<DirEntry> {
         .collect()
 }
 
+/// Convert block/leaf/node data entries to the generic `DirEntry` shape.
+pub fn data_entries_to_generic(entries: &[DataEntry]) -> Vec<DirEntry> {
+    entries
+        .iter()
+        .map(|e| DirEntry {
+            name: e.name.clone(),
+            inode: e.inumber as u32,
+            kind: ftype_to_kind(e.ftype),
+        })
+        .collect()
+}
+
+/// Parse a single directory **data** or **block** block. Walks the
+/// per-entry stream between `entries_start` and either the end of the buffer
+/// or the start of the trailing leaf array (for block-format directories).
+///
+/// `has_ftype` is true on v5 filesystems (per-entry filetype byte present).
+/// `entries_end` is the byte offset where parsing should stop — for plain
+/// data blocks this is the buffer length; for block-format directories it
+/// is the start of the leaf-entry array (== `header.bestfree.offsets` range
+/// after the block tail accounting).
+fn parse_data_records(
+    block: &[u8],
+    entries_start: usize,
+    entries_end: usize,
+    has_ftype: bool,
+) -> Result<Vec<DataEntry>> {
+    if entries_start > entries_end || entries_end > block.len() {
+        return Err(crate::Error::InvalidImage(format!(
+            "xfs: dir data record range out of bounds: [{entries_start}..{entries_end}] vs buf {}",
+            block.len()
+        )));
+    }
+    let mut out = Vec::new();
+    let mut pos = entries_start;
+    while pos + 4 <= entries_end {
+        // Detect freetag (data_unused): first 2 bytes == 0xFFFF.
+        let head = u16::from_be_bytes(block[pos..pos + 2].try_into().unwrap());
+        if head == XFS_DIR2_DATA_FREE_TAG {
+            // length field is bytes [pos+2..pos+4].
+            let length = u16::from_be_bytes(block[pos + 2..pos + 4].try_into().unwrap()) as usize;
+            if length == 0 {
+                return Err(crate::Error::InvalidImage(
+                    "xfs: dir data_unused with length 0".into(),
+                ));
+            }
+            if pos + length > entries_end {
+                return Err(crate::Error::InvalidImage(format!(
+                    "xfs: dir data_unused length {length} overshoots end at {entries_end}"
+                )));
+            }
+            pos += length;
+            continue;
+        }
+        // Otherwise it's a data_entry: inumber(8) namelen(1) name[] [ftype(1)] tag(2) pad-to-8.
+        if pos + 8 + 1 > entries_end {
+            return Err(crate::Error::InvalidImage(
+                "xfs: dir data_entry header truncated".into(),
+            ));
+        }
+        let inumber = u64::from_be_bytes(block[pos..pos + 8].try_into().unwrap());
+        let namelen = block[pos + 8] as usize;
+        if namelen == 0 {
+            return Err(crate::Error::InvalidImage(
+                "xfs: dir data_entry has namelen=0".into(),
+            ));
+        }
+        let name_start = pos + 9;
+        let name_end = name_start + namelen;
+        if name_end > entries_end {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: dir data_entry name truncated (need {name_end}, have {entries_end})"
+            )));
+        }
+        let name = std::str::from_utf8(&block[name_start..name_end])
+            .map_err(|_| {
+                crate::Error::InvalidImage("xfs: non-UTF-8 dir name in data block".into())
+            })?
+            .to_string();
+        let mut after_name = name_end;
+        let ftype = if has_ftype {
+            if after_name >= entries_end {
+                return Err(crate::Error::InvalidImage(
+                    "xfs: dir data_entry missing ftype byte".into(),
+                ));
+            }
+            let f = block[after_name];
+            after_name += 1;
+            f
+        } else {
+            XFS_DIR3_FT_UNKNOWN
+        };
+        // The tag (__be16) is at the last 2 bytes of the padded record. The
+        // padded record size is: 8 (inumber) + 1 (namelen) + namelen + (1 if
+        // has_ftype) + 2 (tag), rounded up to 8 bytes.
+        let raw_len = 8 + 1 + namelen + (if has_ftype { 1 } else { 0 }) + 2;
+        let padded_len = (raw_len + 7) & !7;
+        if pos + padded_len > entries_end {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: dir data_entry padded length {padded_len} overshoots end {entries_end}"
+            )));
+        }
+        // Sanity: skip past the entry. We don't validate the tag value.
+        let _ = after_name;
+        pos += padded_len;
+        out.push(DataEntry {
+            name,
+            inumber,
+            ftype,
+        });
+    }
+    Ok(out)
+}
+
+/// Decode the header of a directory data or block block. Returns
+/// `(entries_start, magic)`.
+///
+/// `is_v5` controls which header layout is expected. The magic must match
+/// one of the data/block magics for the requested version. Block-format
+/// directories share the same header but additionally have a leaf-entry
+/// array + tail at the END of the block (see [`block_dir_entries_end`]).
+fn decode_data_header(block: &[u8], is_v5: bool) -> Result<(usize, u32)> {
+    if block.len() < 4 {
+        return Err(crate::Error::InvalidImage(
+            "xfs: dir data block too small".into(),
+        ));
+    }
+    let magic = u32::from_be_bytes(block[0..4].try_into().unwrap());
+    if is_v5 {
+        match magic {
+            XFS_DIR3_BLOCK_MAGIC | XFS_DIR3_DATA_MAGIC => {}
+            _ => {
+                return Err(crate::Error::InvalidImage(format!(
+                    "xfs: bad v5 dir block magic {magic:#010x}"
+                )));
+            }
+        }
+        // v5 header is 48 B + bestfree[3](12) + pad(4) = 64 B.
+        if block.len() < 64 {
+            return Err(crate::Error::InvalidImage(
+                "xfs: v5 dir block shorter than header".into(),
+            ));
+        }
+        Ok((64, magic))
+    } else {
+        match magic {
+            XFS_DIR2_BLOCK_MAGIC | XFS_DIR2_DATA_MAGIC => {}
+            _ => {
+                return Err(crate::Error::InvalidImage(format!(
+                    "xfs: bad v4 dir block magic {magic:#010x}"
+                )));
+            }
+        }
+        // v4 header is magic(4) + bestfree[3](12) = 16 B.
+        if block.len() < 16 {
+            return Err(crate::Error::InvalidImage(
+                "xfs: v4 dir block shorter than header".into(),
+            ));
+        }
+        Ok((16, magic))
+    }
+}
+
+/// For a **block-format** directory, the byte offset where data records end
+/// and the trailing leaf-entry array begins. Layout (from end of block):
+///
+/// ```text
+///   ... data entries ...
+///   leaf[count] :: 8 bytes each (hashval, address)
+///   __be32 count
+///   __be32 stale
+/// ```
+///
+/// Returns `entries_end`, i.e. the start of the leaf array.
+fn block_dir_entries_end(block: &[u8]) -> Result<usize> {
+    let blen = block.len();
+    if blen < 8 {
+        return Err(crate::Error::InvalidImage(
+            "xfs: block dir too short for tail".into(),
+        ));
+    }
+    let count = u32::from_be_bytes(block[blen - 8..blen - 4].try_into().unwrap()) as usize;
+    // We don't actually need the leaf entries to walk records, but we DO
+    // need to know how much of the block is leaf-entry area so we stop
+    // parsing data records before it. Each leaf entry is 8 bytes.
+    let leaf_bytes = count
+        .checked_mul(8)
+        .ok_or_else(|| crate::Error::InvalidImage("xfs: block dir leaf count overflows".into()))?;
+    let tail = 8 + leaf_bytes;
+    if tail > blen {
+        return Err(crate::Error::InvalidImage(format!(
+            "xfs: block dir tail (8 + 8*{count}) > block size {blen}"
+        )));
+    }
+    Ok(blen - tail)
+}
+
+/// Decode a single **block-format** directory block. Used when the inode is
+/// `EXTENTS` and the directory data fits in one directory block.
+pub fn decode_block_dir(block: &[u8], is_v5: bool) -> Result<Vec<DataEntry>> {
+    let (entries_start, magic) = decode_data_header(block, is_v5)?;
+    let want_magic = if is_v5 {
+        XFS_DIR3_BLOCK_MAGIC
+    } else {
+        XFS_DIR2_BLOCK_MAGIC
+    };
+    if magic != want_magic {
+        return Err(crate::Error::InvalidImage(format!(
+            "xfs: block dir expected magic {want_magic:#010x}, got {magic:#010x}"
+        )));
+    }
+    let entries_end = block_dir_entries_end(block)?;
+    parse_data_records(block, entries_start, entries_end, is_v5)
+}
+
+/// Decode a **data-only** directory block (one of many in a leaf-format
+/// directory). Skips the header and walks all records to the end of the
+/// buffer.
+pub fn decode_data_block(block: &[u8], is_v5: bool) -> Result<Vec<DataEntry>> {
+    let (entries_start, magic) = decode_data_header(block, is_v5)?;
+    let want_magic = if is_v5 {
+        XFS_DIR3_DATA_MAGIC
+    } else {
+        XFS_DIR2_DATA_MAGIC
+    };
+    if magic != want_magic {
+        return Err(crate::Error::InvalidImage(format!(
+            "xfs: data dir expected magic {want_magic:#010x}, got {magic:#010x}"
+        )));
+    }
+    parse_data_records(block, entries_start, block.len(), is_v5)
+}
+
+/// Distinguish between block-format and leaf-format directories by peeking
+/// at the magic of the first directory block. Returns `true` for block
+/// format, `false` for data format (caller should then walk all data
+/// blocks).
+pub fn is_block_format(block: &[u8]) -> Result<bool> {
+    if block.len() < 4 {
+        return Err(crate::Error::InvalidImage(
+            "xfs: dir first block too small".into(),
+        ));
+    }
+    let magic = u32::from_be_bytes(block[0..4].try_into().unwrap());
+    Ok(matches!(magic, XFS_DIR2_BLOCK_MAGIC | XFS_DIR3_BLOCK_MAGIC))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +566,177 @@ mod tests {
         assert_eq!(g[0].name, "x");
         assert_eq!(g[0].inode, 7);
         assert_eq!(g[0].kind, EntryKind::Regular);
+    }
+
+    /// Build a v5 data/block "data entry" record: inumber(8), namelen(1),
+    /// name[], ftype(1), tag(2), padded to 8 bytes.
+    fn build_v5_entry(inumber: u64, name: &str, ftype: u8) -> Vec<u8> {
+        let raw_len = 8 + 1 + name.len() + 1 + 2;
+        let padded = (raw_len + 7) & !7;
+        let mut e = vec![0u8; padded];
+        e[0..8].copy_from_slice(&inumber.to_be_bytes());
+        e[8] = name.len() as u8;
+        e[9..9 + name.len()].copy_from_slice(name.as_bytes());
+        e[9 + name.len()] = ftype;
+        // tag at last two bytes — we leave it zero, decoder doesn't validate.
+        e
+    }
+
+    /// Build a v4 data entry record (no ftype byte): inumber(8), namelen(1),
+    /// name[], tag(2), padded to 8 bytes.
+    fn build_v4_entry(inumber: u64, name: &str) -> Vec<u8> {
+        let raw_len = 8 + 1 + name.len() + 2;
+        let padded = (raw_len + 7) & !7;
+        let mut e = vec![0u8; padded];
+        e[0..8].copy_from_slice(&inumber.to_be_bytes());
+        e[8] = name.len() as u8;
+        e[9..9 + name.len()].copy_from_slice(name.as_bytes());
+        e
+    }
+
+    /// Build a synthetic v5 block-format directory: 64B header + entries +
+    /// leaf array + tail. Inserts a `data_unused` freetag region between the
+    /// last entry and the leaf-array reservation, matching what XFS writes
+    /// on disk.
+    fn build_v5_block_dir(entries: &[(u64, &str, u8)], dirsize: usize) -> Vec<u8> {
+        let mut block = vec![0u8; dirsize];
+        block[0..4].copy_from_slice(&XFS_DIR3_BLOCK_MAGIC.to_be_bytes());
+        let mut pos = 64usize;
+        for (ino, name, ft) in entries {
+            let rec = build_v5_entry(*ino, name, *ft);
+            block[pos..pos + rec.len()].copy_from_slice(&rec);
+            pos += rec.len();
+        }
+        // Tail: count (4B BE) + stale (4B BE) at the end.
+        let count = entries.len() as u32;
+        block[dirsize - 8..dirsize - 4].copy_from_slice(&count.to_be_bytes());
+        // Leaf-array reservation: count × 8 bytes immediately before tail.
+        let entries_end = dirsize - 8 - (count as usize) * 8;
+        // Fill the slack [pos..entries_end] with a data_unused region.
+        if entries_end > pos {
+            let slack = entries_end - pos;
+            block[pos..pos + 2].copy_from_slice(&XFS_DIR2_DATA_FREE_TAG.to_be_bytes());
+            block[pos + 2..pos + 4].copy_from_slice(&(slack as u16).to_be_bytes());
+        }
+        block
+    }
+
+    #[test]
+    fn decode_v5_block_dir_smoke() {
+        let block = build_v5_block_dir(
+            &[
+                (200, "hello", XFS_DIR3_FT_REG_FILE),
+                (300, "subdir", XFS_DIR3_FT_DIR),
+            ],
+            4096,
+        );
+        let entries = decode_block_dir(&block, true).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "hello");
+        assert_eq!(entries[0].inumber, 200);
+        assert_eq!(entries[0].ftype, XFS_DIR3_FT_REG_FILE);
+        assert_eq!(entries[1].name, "subdir");
+        assert_eq!(entries[1].inumber, 300);
+        assert_eq!(entries[1].ftype, XFS_DIR3_FT_DIR);
+    }
+
+    #[test]
+    fn block_dir_handles_unused_region() {
+        // Build a block with a freetag region between two entries.
+        let dirsize = 4096usize;
+        let mut block = vec![0u8; dirsize];
+        block[0..4].copy_from_slice(&XFS_DIR3_BLOCK_MAGIC.to_be_bytes());
+        let mut pos = 64;
+        let rec1 = build_v5_entry(100, "a", XFS_DIR3_FT_REG_FILE);
+        block[pos..pos + rec1.len()].copy_from_slice(&rec1);
+        pos += rec1.len();
+        // Insert a 16-byte unused region.
+        block[pos..pos + 2].copy_from_slice(&XFS_DIR2_DATA_FREE_TAG.to_be_bytes());
+        block[pos + 2..pos + 4].copy_from_slice(&16u16.to_be_bytes());
+        pos += 16;
+        let rec2 = build_v5_entry(101, "bee", XFS_DIR3_FT_DIR);
+        block[pos..pos + rec2.len()].copy_from_slice(&rec2);
+        pos += rec2.len();
+        // Tail: count = 2.
+        let count = 2u32;
+        block[dirsize - 8..dirsize - 4].copy_from_slice(&count.to_be_bytes());
+        // Fill the rest with a freetag block up to entries_end.
+        let entries_end = dirsize - 8 - (count as usize) * 8;
+        if entries_end > pos {
+            let slack = entries_end - pos;
+            block[pos..pos + 2].copy_from_slice(&XFS_DIR2_DATA_FREE_TAG.to_be_bytes());
+            block[pos + 2..pos + 4].copy_from_slice(&(slack as u16).to_be_bytes());
+        }
+        let entries = decode_block_dir(&block, true).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "a");
+        assert_eq!(entries[1].name, "bee");
+    }
+
+    #[test]
+    fn decode_v5_data_block_smoke() {
+        let mut block = vec![0u8; 4096];
+        block[0..4].copy_from_slice(&XFS_DIR3_DATA_MAGIC.to_be_bytes());
+        let mut pos = 64;
+        for (ino, name, ft) in &[
+            (10u64, "f1", XFS_DIR3_FT_REG_FILE),
+            (11, "f2", XFS_DIR3_FT_REG_FILE),
+            (12, "f3", XFS_DIR3_FT_REG_FILE),
+        ] {
+            let rec = build_v5_entry(*ino, name, *ft);
+            block[pos..pos + rec.len()].copy_from_slice(&rec);
+            pos += rec.len();
+        }
+        // Trailing freetag-region to indicate "end of records, free space
+        // until end of block".
+        block[pos..pos + 2].copy_from_slice(&XFS_DIR2_DATA_FREE_TAG.to_be_bytes());
+        block[pos + 2..pos + 4].copy_from_slice(&((4096 - pos) as u16).to_be_bytes());
+        let entries = decode_data_block(&block, true).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, "f1");
+        assert_eq!(entries[2].name, "f3");
+    }
+
+    #[test]
+    fn decode_v4_block_dir_no_ftype() {
+        let dirsize = 4096usize;
+        let mut block = vec![0u8; dirsize];
+        block[0..4].copy_from_slice(&XFS_DIR2_BLOCK_MAGIC.to_be_bytes());
+        let mut pos = 16; // v4 header is 16 bytes
+        let rec = build_v4_entry(42, "abc");
+        block[pos..pos + rec.len()].copy_from_slice(&rec);
+        pos += rec.len();
+        let count = 1u32;
+        block[dirsize - 8..dirsize - 4].copy_from_slice(&count.to_be_bytes());
+        // Insert freetag for the slack [pos .. entries_end).
+        let entries_end = dirsize - 8 - (count as usize) * 8;
+        if entries_end > pos {
+            let slack = entries_end - pos;
+            block[pos..pos + 2].copy_from_slice(&XFS_DIR2_DATA_FREE_TAG.to_be_bytes());
+            block[pos + 2..pos + 4].copy_from_slice(&(slack as u16).to_be_bytes());
+        }
+        let entries = decode_block_dir(&block, false).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "abc");
+        assert_eq!(entries[0].inumber, 42);
+        assert_eq!(entries[0].ftype, XFS_DIR3_FT_UNKNOWN);
+    }
+
+    #[test]
+    fn rejects_bad_magic() {
+        let block = vec![0u8; 4096];
+        let r = decode_block_dir(&block, true);
+        assert!(matches!(r, Err(crate::Error::InvalidImage(_))));
+    }
+
+    #[test]
+    fn is_block_format_detects() {
+        let mut block = vec![0u8; 4096];
+        block[0..4].copy_from_slice(&XFS_DIR3_BLOCK_MAGIC.to_be_bytes());
+        assert!(is_block_format(&block).unwrap());
+        block[0..4].copy_from_slice(&XFS_DIR3_DATA_MAGIC.to_be_bytes());
+        assert!(!is_block_format(&block).unwrap());
+        block[0..4].copy_from_slice(&XFS_DIR2_BLOCK_MAGIC.to_be_bytes());
+        assert!(is_block_format(&block).unwrap());
     }
 }

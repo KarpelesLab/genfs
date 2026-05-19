@@ -30,7 +30,7 @@
 //! The omap is a fixed-KV B-tree (16/16). Lookup of `(oid, xid)` walks the
 //! tree as usual; we pick the entry with the largest `xid <= target_xid`.
 
-use super::btree::BTreeNode;
+use super::btree::{BTreeNode, NodeCache};
 use super::obj::{OBJECT_TYPE_OMAP, ObjPhys};
 
 /// Decoded `omap_phys_t`.
@@ -118,36 +118,62 @@ impl OmapVal {
     }
 }
 
-/// Search an omap B-tree (a leaf-only root node, or a multi-level tree
-/// rooted at `root_block`) for the entry matching `target_oid` with the
-/// largest `xid <= target_xid`. Returns the resolved `OmapVal` or `None`
-/// when the oid is absent.
+/// Compare two omap keys per the spec's ordering rule: ascending `oid`
+/// first, then ascending `xid`.
+fn cmp_omap_key(a: &OmapKey, b: &OmapKey) -> std::cmp::Ordering {
+    a.oid.cmp(&b.oid).then(a.xid.cmp(&b.xid))
+}
+
+/// Search an omap B-tree of arbitrary depth for the entry matching
+/// `target_oid` with the largest `xid <= target_xid`. Returns the
+/// resolved `OmapVal` or `None` when no such entry exists.
 ///
-/// `read_block` is supplied by the caller; it's given a physical block
-/// number and must fill the passed buffer (length = block size) with that
-/// block's contents. We use this trampoline so the function is fully
-/// reusable: it makes no assumption about the underlying device.
+/// `read_block` is supplied by the caller; given a physical block
+/// number it must fill the passed buffer (length = block size) with
+/// that block's contents. The function makes no assumption about the
+/// underlying device.
 ///
-/// **Limitation:** this routine only walks a *single-level* omap (root
-/// node is also a leaf). Multi-level omaps return
-/// `Err(Unsupported)` for now — a full container needs the multi-level
-/// walker, which we punt for v1.
+/// Internal nodes are descended by binary-searching for the smallest
+/// key that compares **strictly greater** than the target `(oid,
+/// target_xid)`, then stepping back one entry — the standard "largest
+/// key ≤ target" rule, except that here every internal-node separator
+/// is the *smallest* key in its child subtree (APFS uses this
+/// convention).
+///
+/// Multi-level walks consult `cache` to avoid re-fetching blocks.
+/// Callers that don't want caching can pass `NodeCache::new(0)`.
 pub fn lookup<F>(
     root_block: &[u8],
     target_oid: u64,
     target_xid: u64,
-    _read_block: &mut F,
+    read_block: &mut F,
 ) -> crate::Result<Option<OmapVal>>
 where
     F: FnMut(u64, &mut [u8]) -> crate::Result<()>,
 {
-    let node = BTreeNode::decode(root_block)?;
-    if !node.is_leaf() {
-        return Err(crate::Error::Unsupported(
-            "apfs: multi-level omap walking not yet implemented".into(),
-        ));
-    }
-    let (klen, vlen) = node
+    let mut cache = NodeCache::new(NodeCache::DEFAULT_CAP);
+    lookup_with_cache(root_block, target_oid, target_xid, read_block, &mut cache)
+}
+
+/// Same as [`lookup`] but with caller-supplied cache so repeated lookups
+/// in the same omap reuse loaded internal nodes.
+pub fn lookup_with_cache<F>(
+    root_block: &[u8],
+    target_oid: u64,
+    target_xid: u64,
+    read_block: &mut F,
+    cache: &mut NodeCache,
+) -> crate::Result<Option<OmapVal>>
+where
+    F: FnMut(u64, &mut [u8]) -> crate::Result<()>,
+{
+    let target = OmapKey {
+        oid: target_oid,
+        xid: target_xid,
+    };
+    let block_size = root_block.len();
+    let root = BTreeNode::decode(root_block)?;
+    let (klen, vlen) = root
         .fixed_kv_size()
         .ok_or_else(|| crate::Error::InvalidImage("apfs: omap root missing btree_info".into()))?;
     if klen != OmapKey::SIZE || vlen != OmapVal::SIZE {
@@ -156,6 +182,67 @@ where
         )));
     }
 
+    if root.is_leaf() {
+        return scan_leaf_for_best(&root, klen, target_oid, target_xid);
+    }
+
+    // Descend by re-binding to an owned child block each iteration.
+    let child_idx = find_child_for_key(&root, klen, &target)?;
+    let (_, mut child_paddr) = root.child_entry_at(child_idx, klen)?;
+    let mut cur = fetch_block(child_paddr, block_size, read_block, cache)?;
+    loop {
+        let node = BTreeNode::decode(&cur)?;
+        if node.is_leaf() {
+            return scan_leaf_for_best(&node, klen, target_oid, target_xid);
+        }
+        let idx = find_child_for_key(&node, klen, &target)?;
+        let (_, paddr) = node.child_entry_at(idx, klen)?;
+        child_paddr = paddr;
+        // Replace cur with the next child block (this drops the previous
+        // `node` borrow since `cur` is rebound).
+        cur = fetch_block(child_paddr, block_size, read_block, cache)?;
+    }
+}
+
+/// Locate the child of an internal omap node whose subtree may contain
+/// `target`. Per the spec, internal keys are the *first* key in their
+/// subtree, so we want the largest entry whose key ≤ target.
+fn find_child_for_key(node: &BTreeNode<'_>, klen: usize, target: &OmapKey) -> crate::Result<u32> {
+    if node.nkeys == 0 {
+        return Err(crate::Error::InvalidImage(
+            "apfs: empty omap internal node".into(),
+        ));
+    }
+    // Binary search for the largest index whose key ≤ target.
+    let mut lo: i64 = 0;
+    let mut hi: i64 = node.nkeys as i64 - 1;
+    let mut best: i64 = 0; // default: leftmost child
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let (kb, _) = node.child_entry_at(mid as u32, klen)?;
+        let k = OmapKey::decode(kb)?;
+        match cmp_omap_key(&k, target) {
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                best = mid;
+                lo = mid + 1;
+            }
+            std::cmp::Ordering::Greater => {
+                hi = mid - 1;
+            }
+        }
+    }
+    Ok(best as u32)
+}
+
+/// Scan a leaf node for the largest-xid entry matching `target_oid`
+/// with `xid <= target_xid`.
+fn scan_leaf_for_best(
+    node: &BTreeNode<'_>,
+    klen: usize,
+    target_oid: u64,
+    target_xid: u64,
+) -> crate::Result<Option<OmapVal>> {
+    let vlen = OmapVal::SIZE;
     let mut best: Option<OmapVal> = None;
     let mut best_xid: u64 = 0;
     for i in 0..node.nkeys {
@@ -168,17 +255,208 @@ where
             continue;
         }
         if best.is_none() || k.xid > best_xid {
-            let v = OmapVal::decode(vb)?;
             best_xid = k.xid;
-            best = Some(v);
+            best = Some(OmapVal::decode(vb)?);
         }
     }
     Ok(best)
 }
 
+fn fetch_block<F>(
+    paddr: u64,
+    block_size: usize,
+    read_block: &mut F,
+    cache: &mut NodeCache,
+) -> crate::Result<Vec<u8>>
+where
+    F: FnMut(u64, &mut [u8]) -> crate::Result<()>,
+{
+    if let Some(b) = cache.get(paddr) {
+        return Ok(b.to_vec());
+    }
+    let mut buf = vec![0u8; block_size];
+    read_block(paddr, &mut buf)?;
+    cache.put(paddr, buf.clone());
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::btree::{BTNODE_FIXED_KV_SIZE, BTNODE_LEAF, BTNODE_ROOT, BTREE_INFO_SIZE};
+    use super::super::obj::OBJECT_TYPE_BTREE_NODE;
     use super::*;
+
+    /// Build a leaf omap node with a list of `(oid, xid, paddr)` entries
+    /// in the order given. Caller is responsible for keeping the list
+    /// sorted by `(oid, xid)`.
+    fn build_leaf_omap_node(
+        block_size: usize,
+        entries: &[(u64, u64, u64)],
+        is_root: bool,
+    ) -> Vec<u8> {
+        let mut block = vec![0u8; block_size];
+        block[24..28].copy_from_slice(&OBJECT_TYPE_BTREE_NODE.to_le_bytes());
+        let mut flags = BTNODE_LEAF | BTNODE_FIXED_KV_SIZE;
+        if is_root {
+            flags |= BTNODE_ROOT;
+        }
+        block[32..34].copy_from_slice(&flags.to_le_bytes());
+        block[34..36].copy_from_slice(&0u16.to_le_bytes()); // level
+        block[36..40].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        let toc_len = entries.len() * 4;
+        block[40..42].copy_from_slice(&0u16.to_le_bytes()); // toc_off
+        block[42..44].copy_from_slice(&(toc_len as u16).to_le_bytes());
+
+        let toc_base = 56;
+        let keys_start = toc_base + toc_len;
+        let vals_end = if is_root {
+            block_size - BTREE_INFO_SIZE
+        } else {
+            block_size
+        };
+
+        for (i, &(oid, xid, paddr)) in entries.iter().enumerate() {
+            // ToC: kvoff with k.off = i*16, v.off = (i+1)*16
+            let k_off = (i * 16) as u16;
+            let v_off = ((i + 1) * 16) as u16;
+            block[toc_base + i * 4..toc_base + i * 4 + 2].copy_from_slice(&k_off.to_le_bytes());
+            block[toc_base + i * 4 + 2..toc_base + i * 4 + 4].copy_from_slice(&v_off.to_le_bytes());
+
+            // Key bytes at keys_start + k_off
+            let ks = keys_start + k_off as usize;
+            block[ks..ks + 8].copy_from_slice(&oid.to_le_bytes());
+            block[ks + 8..ks + 16].copy_from_slice(&xid.to_le_bytes());
+
+            // Value bytes at vals_end - v_off (16 B) — flags=0, size=0, paddr
+            let vs = vals_end - v_off as usize;
+            block[vs..vs + 4].copy_from_slice(&0u32.to_le_bytes());
+            block[vs + 4..vs + 8].copy_from_slice(&0u32.to_le_bytes());
+            block[vs + 8..vs + 16].copy_from_slice(&paddr.to_le_bytes());
+        }
+
+        if is_root {
+            let info_off = block_size - BTREE_INFO_SIZE;
+            block[info_off + 8..info_off + 12].copy_from_slice(&16u32.to_le_bytes());
+            block[info_off + 12..info_off + 16].copy_from_slice(&16u32.to_le_bytes());
+        }
+        block
+    }
+
+    /// Build an internal omap node: keys are `(oid, xid)` separators
+    /// and the values are 8-byte child paddrs (despite bt_val_size = 16
+    /// for the leaves — internal nodes always store 8-byte child ptrs).
+    fn build_internal_omap_node(
+        block_size: usize,
+        entries: &[(u64, u64, u64)],
+        is_root: bool,
+    ) -> Vec<u8> {
+        let mut block = vec![0u8; block_size];
+        block[24..28].copy_from_slice(&OBJECT_TYPE_BTREE_NODE.to_le_bytes());
+        let mut flags = BTNODE_FIXED_KV_SIZE;
+        if is_root {
+            flags |= BTNODE_ROOT;
+        }
+        block[32..34].copy_from_slice(&flags.to_le_bytes());
+        block[34..36].copy_from_slice(&1u16.to_le_bytes()); // level = 1
+        block[36..40].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        let toc_len = entries.len() * 4;
+        block[40..42].copy_from_slice(&0u16.to_le_bytes());
+        block[42..44].copy_from_slice(&(toc_len as u16).to_le_bytes());
+
+        let toc_base = 56;
+        let keys_start = toc_base + toc_len;
+        let vals_end = if is_root {
+            block_size - BTREE_INFO_SIZE
+        } else {
+            block_size
+        };
+
+        for (i, &(oid, xid, child_paddr)) in entries.iter().enumerate() {
+            let k_off = (i * 16) as u16;
+            // Internal node values are 8 bytes — offsets must reflect
+            // that. Use 8B per slot.
+            let v_off = ((i + 1) * 8) as u16;
+            block[toc_base + i * 4..toc_base + i * 4 + 2].copy_from_slice(&k_off.to_le_bytes());
+            block[toc_base + i * 4 + 2..toc_base + i * 4 + 4].copy_from_slice(&v_off.to_le_bytes());
+
+            let ks = keys_start + k_off as usize;
+            block[ks..ks + 8].copy_from_slice(&oid.to_le_bytes());
+            block[ks + 8..ks + 16].copy_from_slice(&xid.to_le_bytes());
+
+            let vs = vals_end - v_off as usize;
+            block[vs..vs + 8].copy_from_slice(&child_paddr.to_le_bytes());
+        }
+
+        if is_root {
+            // bt_key_size = 16, bt_val_size = 16 (leaf payload size).
+            let info_off = block_size - BTREE_INFO_SIZE;
+            block[info_off + 8..info_off + 12].copy_from_slice(&16u32.to_le_bytes());
+            block[info_off + 12..info_off + 16].copy_from_slice(&16u32.to_le_bytes());
+        }
+        block
+    }
+
+    /// Single-leaf omap: lookup picks the largest xid ≤ target.
+    #[test]
+    fn lookup_single_leaf_picks_latest_xid_below_target() {
+        let block_size = 512usize;
+        // Entries sorted (oid, xid): (5,1)→0x100, (5,3)→0x200, (5,7)→0x300
+        let root = build_leaf_omap_node(
+            block_size,
+            &[(5, 1, 0x100), (5, 3, 0x200), (5, 7, 0x300)],
+            true,
+        );
+        let mut no_read =
+            |_p: u64, _b: &mut [u8]| panic!("single-leaf lookup must not read from device");
+        let mut cache = NodeCache::new(NodeCache::DEFAULT_CAP);
+        let v = lookup_with_cache(&root, 5, 5, &mut no_read, &mut cache).unwrap();
+        assert_eq!(v.unwrap().paddr, 0x200);
+        let v = lookup_with_cache(&root, 5, 10, &mut no_read, &mut cache).unwrap();
+        assert_eq!(v.unwrap().paddr, 0x300);
+        let v = lookup_with_cache(&root, 5, 0, &mut no_read, &mut cache).unwrap();
+        assert!(v.is_none());
+        let v = lookup_with_cache(&root, 99, 5, &mut no_read, &mut cache).unwrap();
+        assert!(v.is_none());
+    }
+
+    /// Two-level omap: descend through an internal root to a leaf
+    /// child. We register the leaf at paddr 10 in a fake device.
+    #[test]
+    fn lookup_two_level_descends_to_correct_leaf() {
+        let block_size = 512usize;
+        // Build two leaves:
+        //  leaf_a (paddr 10) holds oid=5 entries
+        //  leaf_b (paddr 11) holds oid=9 entries
+        let leaf_a = build_leaf_omap_node(block_size, &[(5, 1, 0x100), (5, 3, 0x200)], false);
+        let leaf_b = build_leaf_omap_node(block_size, &[(9, 2, 0x900)], false);
+
+        // Build an internal root: first entry (5, 0) → child paddr 10,
+        // second entry (9, 0) → child paddr 11.
+        let root = build_internal_omap_node(block_size, &[(5, 0, 10), (9, 0, 11)], true);
+
+        let mut device: std::collections::HashMap<u64, Vec<u8>> = Default::default();
+        device.insert(10, leaf_a);
+        device.insert(11, leaf_b);
+
+        let mut read = |paddr: u64, buf: &mut [u8]| -> crate::Result<()> {
+            let b = device
+                .get(&paddr)
+                .ok_or_else(|| crate::Error::InvalidImage(format!("no block at {paddr}")))?;
+            buf.copy_from_slice(b);
+            Ok(())
+        };
+        let mut cache = NodeCache::new(NodeCache::DEFAULT_CAP);
+
+        let v = lookup_with_cache(&root, 5, 3, &mut read, &mut cache).unwrap();
+        assert_eq!(v.unwrap().paddr, 0x200);
+
+        let v = lookup_with_cache(&root, 9, 10, &mut read, &mut cache).unwrap();
+        assert_eq!(v.unwrap().paddr, 0x900);
+
+        // Missing oid: descends to the appropriate leaf, finds nothing.
+        let v = lookup_with_cache(&root, 7, 10, &mut read, &mut cache).unwrap();
+        assert!(v.is_none());
+    }
 
     #[test]
     fn decode_omap_phys() {

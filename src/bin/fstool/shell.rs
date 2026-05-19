@@ -150,7 +150,12 @@ quit | exit         leave\n";
         Ok(())
     }
 
-    fn cmd_ls(&self, dev: &mut dyn BlockDevice, arg: &str, output: &mut impl Write) -> Result<()> {
+    fn cmd_ls(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        arg: &str,
+        output: &mut impl Write,
+    ) -> Result<()> {
         let target = if arg.is_empty() {
             self.cwd.clone()
         } else {
@@ -181,7 +186,12 @@ quit | exit         leave\n";
         Ok(())
     }
 
-    fn cmd_cat(&self, dev: &mut dyn BlockDevice, arg: &str, output: &mut impl Write) -> Result<()> {
+    fn cmd_cat(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        arg: &str,
+        output: &mut impl Write,
+    ) -> Result<()> {
         if arg.is_empty() {
             return Err(fstool::Error::InvalidArgument(
                 "cat: PATH is required".into(),

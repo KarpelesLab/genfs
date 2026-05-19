@@ -191,6 +191,40 @@ impl ForkReader {
         })
     }
 
+    /// Build a fork reader from an inline `ForkData` plus an
+    /// already-collected list of overflow extents pulled from the
+    /// extents-overflow B-tree. The combined extent list must cover
+    /// the fork's `total_blocks`, otherwise `Err(InvalidImage)` is
+    /// returned.
+    pub fn from_inline_plus_overflow(
+        fork: &ForkData,
+        overflow: &[ExtentDescriptor],
+        block_size: u32,
+        what: &str,
+    ) -> Result<Self> {
+        let mut extents: Vec<ExtentDescriptor> = fork
+            .extents
+            .iter()
+            .copied()
+            .filter(|e| e.block_count != 0)
+            .collect();
+        extents.extend(overflow.iter().copied().filter(|e| e.block_count != 0));
+        let covered: u64 = extents.iter().map(|e| u64::from(e.block_count)).sum();
+        if covered < u64::from(fork.total_blocks) {
+            return Err(crate::Error::InvalidImage(format!(
+                "hfs+: {what} fork still missing extents after overflow walk \
+                 (covered {covered} blocks, expected {})",
+                fork.total_blocks
+            )));
+        }
+        Ok(Self {
+            base_offset: 0,
+            block_size,
+            extents,
+            logical_size: fork.logical_size,
+        })
+    }
+
     /// Translate a fork-relative byte offset to the absolute device
     /// offset by walking the extent list. Returns `None` if `offset`
     /// is past the last extent.

@@ -187,8 +187,10 @@ impl AnyFs {
         }
     }
 
-    /// List the entries of a directory by absolute path.
-    pub fn list(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<DirEntry>> {
+    /// List the entries of a directory by absolute path. Takes `&mut self`
+    /// because some read-only backends (NTFS, F2FS) maintain cached state
+    /// (run-list bootstrap, checkpoint selection) behind their list path.
+    pub fn list(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<DirEntry>> {
         match self {
             Self::Ext(ext) => {
                 let ino = ext.path_to_inode(dev, path)?;
@@ -200,16 +202,17 @@ impl AnyFs {
             Self::Exfat(exfat) => exfat.list_path(dev, path),
             Self::HfsPlus(hfs) => hfs.list_path(dev, path),
             Self::Apfs(apfs) => apfs.list_path(dev, path),
-            Self::Ntfs(_) => Err(scaffold_only("ntfs")),
-            Self::F2fs(_) => Err(scaffold_only("f2fs")),
-            Self::Squashfs(_) => Err(scaffold_only("squashfs")),
+            Self::Ntfs(ntfs) => ntfs.list_path(dev, path),
+            Self::F2fs(f2) => f2.list_path(dev, path),
+            Self::Squashfs(sq) => sq.list_path(dev, path),
         }
     }
 
     /// Stream a regular file's bytes into `out`. The file is read in
     /// 64 KiB chunks; nothing larger than that buffer is ever resident.
+    /// Takes `&mut self` for the same reason as [`AnyFs::list`].
     pub fn copy_file_to(
-        &self,
+        &mut self,
         dev: &mut dyn BlockDevice,
         path: &str,
         out: &mut dyn std::io::Write,
@@ -245,9 +248,18 @@ impl AnyFs {
                 let mut r = apfs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
-            Self::Ntfs(_) => Err(scaffold_only("ntfs")),
-            Self::F2fs(_) => Err(scaffold_only("f2fs")),
-            Self::Squashfs(_) => Err(scaffold_only("squashfs")),
+            Self::Ntfs(ntfs) => {
+                let mut r = ntfs.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
+            Self::F2fs(f2) => {
+                let mut r = f2.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
+            Self::Squashfs(sq) => {
+                let mut r = sq.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
         }
     }
 
@@ -450,15 +462,6 @@ fn host_mode_from_meta(meta: &std::fs::Metadata, is_dir: bool) -> u16 {
 fn read_only_fs(name: &str) -> crate::Error {
     crate::Error::Unsupported(format!(
         "{name} is mounted read-only by fstool; build a fresh output with `fstool repack`"
-    ))
-}
-
-/// Error for scaffold-only filesystems where the on-disk layout is recognised
-/// but full read/list support hasn't been implemented yet.
-fn scaffold_only(name: &str) -> crate::Error {
-    crate::Error::Unsupported(format!(
-        "{name}: only detection / `info` is implemented in this scaffold; \
-         list / read / repack support is not built yet"
     ))
 }
 
@@ -716,7 +719,7 @@ mod tests {
         dev.sync().unwrap();
         drop(dev);
 
-        let (mut dev, fs) = open_image_file(tmp.path()).unwrap();
+        let (mut dev, mut fs) = open_image_file(tmp.path()).unwrap();
         assert_eq!(fs.kind(), FsKind::Ext);
         let entries = fs.list(dev.as_mut(), "/").unwrap();
         // Default ext format includes lost+found.

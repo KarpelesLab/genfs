@@ -10,27 +10,26 @@
 //!    decoded. The checkpoint descriptor area is then scanned for the
 //!    most-recent valid NXSB copy (the live checkpoint).
 //! 2. The container's **object map** (`omap_phys_t`) is loaded and its
-//!    root B-tree node is read. We require this root to be a single leaf
-//!    node — multi-level container omaps return `Unsupported`.
+//!    root B-tree node is read. The omap walker descends multi-level
+//!    trees by binary-searching internal nodes; a small LRU node cache
+//!    keeps memory bounded while honouring the streaming invariant.
 //! 3. The first volume slot (`nx_fs_oid[0]`) is resolved through the
 //!    container omap to a physical block, and the **APFS volume
 //!    superblock** (`apfs_superblock_t`) is decoded.
 //! 4. The volume's own omap is loaded; the volume root tree (`fsroot`,
 //!    `OBJECT_TYPE_FSTREE`) is located.
-//! 5. The fsroot is walked to list directory children and to follow
-//!    file-extent records.
+//! 5. The fsroot is walked top-down using a virtual-oid-aware
+//!    multi-level B-tree walker. Directory listings and file extents
+//!    are gathered via prefix range scans over the fs-tree.
 //!
 //! ## Honest limitations
 //!
-//! - **Single-leaf omaps only.** Both the container and volume object
-//!   maps must fit in a single root/leaf node. Larger volumes need a
-//!   multi-level walker; we return `Unsupported("apfs: ...")` cleanly.
-//! - **Single-leaf fsroot only.** The fs-tree must also fit in one node.
-//!   Trees that span multiple nodes return `Unsupported`. This is fine
-//!   for tiny test images but obviously not for real systems.
-//! - **Hashed drec keys only.** We require `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE`
-//!   layout (hashed dir-record keys) — case-sensitive volumes with plain
-//!   drec keys are accepted on a best-effort basis but flagged.
+//! - **Drec layout detection.** The walker chooses between hashed and
+//!   plain drec keys based on `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE`,
+//!   and falls back to the other layout on decode error. APFS's normalized
+//!   hash function isn't implemented here; range scans iterate by
+//!   `(parent_oid, DIR_REC)` prefix and filter by name in the caller, so
+//!   correctness doesn't depend on the hash.
 //! - **No snapshots.** Anything that involves snapshot lookups
 //!   (`om_snapshot_tree`, sealed volumes, snapshot rollback) returns
 //!   `Unsupported`.
@@ -55,6 +54,7 @@
 
 pub mod btree;
 pub mod checksum;
+pub mod fstree;
 pub mod jrec;
 pub mod obj;
 pub mod omap;
@@ -63,10 +63,10 @@ pub mod superblock;
 use crate::Result;
 use crate::block::BlockDevice;
 
-use btree::BTreeNode;
+use fstree::{DrecKeyLayout, FsKeyTarget, FsTreeCtx, RangeScan};
 use jrec::{
     APFS_TYPE_DIR_REC, APFS_TYPE_FILE_EXTENT, APFS_TYPE_INODE, DT_DIR, DT_LNK, DT_REG, DrecKey,
-    DrecVal, FileExtentKey, FileExtentVal, InodeVal, split_obj_id,
+    DrecVal, FileExtentVal, InodeVal,
 };
 use obj::{OBJECT_TYPE_MASK, ObjPhys};
 use omap::{OmapPhys, lookup as omap_lookup};
@@ -76,7 +76,12 @@ use superblock::{ApfsSuperblock, NX_MAGIC, NxSuperblock};
 const ROOT_DIR_INO: u64 = 2;
 
 /// In-memory state for an opened APFS container/volume.
-#[derive(Debug)]
+///
+/// The fs-tree caches are kept behind a `RefCell` so the public API
+/// can remain `&self`-callable even though multi-level walks
+/// internally mutate cache state. Callers that need read-from-multiple
+/// threads should wrap the whole `Apfs` in a `Mutex` — there is no
+/// internal locking.
 pub struct Apfs {
     /// Effective block size (`nx_block_size`).
     block_size: u32,
@@ -84,10 +89,34 @@ pub struct Apfs {
     total_bytes: u64,
     /// Volume name (UTF-8, trimmed of trailing NUL).
     volume_name: String,
-    /// Fs-tree root block. We cache the whole block so the walker can
-    /// run without further device I/O for the (single-node) case.
+    /// Fs-tree root block — kept around because every fs-tree walk
+    /// starts here. Internal-node children are virtual oids resolved
+    /// through the volume omap in `fs_ctx`.
     fsroot_block: Vec<u8>,
+    /// Volume omap context (omap root block + caches + target xid).
+    /// Wrapped in `RefCell` so `&self` methods can still mutate the
+    /// LRU caches.
+    fs_ctx: std::cell::RefCell<FsTreeCtx>,
+    /// Drec layout (hashed vs plain) chosen at open time based on
+    /// `apfs_incompatible_features` flags.
+    drec_layout: DrecKeyLayout,
 }
+
+impl std::fmt::Debug for Apfs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Apfs")
+            .field("block_size", &self.block_size)
+            .field("total_bytes", &self.total_bytes)
+            .field("volume_name", &self.volume_name)
+            .field("drec_layout", &self.drec_layout)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE` — when set, drec keys use
+/// the hashed layout (`j_drec_hashed_key_t`); otherwise the plain
+/// layout (`j_drec_key_t`) is in use.
+const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x0000_0008;
 
 impl Apfs {
     /// Decode the container, find the active checkpoint, locate the
@@ -174,7 +203,7 @@ impl Apfs {
         let mut vol_omap_root = vec![0u8; block_size as usize];
         dev_reader.read(vol_omap_phys.tree_oid, &mut vol_omap_root)?;
 
-        // ---- Resolve fsroot through the volume omap ----
+        // ---- Resolve fsroot through the volume omap (multi-level safe) ----
         let fsroot_loc = omap_lookup(
             &vol_omap_root,
             apsb.root_tree_oid,
@@ -190,8 +219,7 @@ impl Apfs {
 
         let mut fsroot_block = vec![0u8; block_size as usize];
         dev_reader.read(fsroot_loc.paddr, &mut fsroot_block)?;
-        // Sanity-check the root is a btree and (for our limited walker) a
-        // single leaf node.
+        // Sanity-check the root is a btree (internal or leaf — both work).
         let fsroot_obj = ObjPhys::decode(&fsroot_block)?;
         let ot = fsroot_obj.type_and_flags & OBJECT_TYPE_MASK;
         if ot != obj::OBJECT_TYPE_BTREE && ot != obj::OBJECT_TYPE_BTREE_NODE {
@@ -200,24 +228,37 @@ impl Apfs {
             )));
         }
 
+        let drec_layout =
+            if apsb.incompatible_features & APFS_INCOMPAT_NORMALIZATION_INSENSITIVE != 0 {
+                DrecKeyLayout::Hashed
+            } else {
+                DrecKeyLayout::Plain
+            };
+
+        let fs_ctx = FsTreeCtx::new(vol_omap_root, apsb.obj.xid, block_size as usize);
+
         Ok(Self {
             block_size,
             total_bytes,
             volume_name: apsb.volname,
             fsroot_block,
+            fs_ctx: std::cell::RefCell::new(fs_ctx),
+            drec_layout,
         })
     }
 
     /// List the children of `path`. Only absolute paths starting at "/"
     /// are accepted; "" and "/" both resolve to the root directory.
+    ///
+    /// Walks the fs-tree top-down using a multi-level B-tree walker; the
+    /// tree may be of any depth.
     pub fn list_path(
         &self,
         dev: &mut dyn BlockDevice,
         path: &str,
     ) -> Result<Vec<crate::fs::DirEntry>> {
-        let _ = dev; // single-leaf walker reads only the cached fsroot
-        let target_oid = self.resolve_path_to_oid(path)?;
-        self.list_dir(target_oid)
+        let target_oid = self.resolve_path_to_oid(dev, path)?;
+        self.list_dir(dev, target_oid)
     }
 
     /// Open a regular file for streaming reads. The returned reader
@@ -227,10 +268,9 @@ impl Apfs {
         dev: &'a mut dyn BlockDevice,
         path: &str,
     ) -> Result<ApfsFileReader<'a>> {
-        let target_oid = self.resolve_path_to_oid(path)?;
-        // Look up the inode for `target_oid` to get its size + private_id.
-        let (size, dstream_oid) = self.lookup_inode_size(target_oid)?;
-        let extents = self.collect_extents(dstream_oid.unwrap_or(target_oid))?;
+        let target_oid = self.resolve_path_to_oid(dev, path)?;
+        let (size, dstream_oid) = self.lookup_inode_size(dev, target_oid)?;
+        let extents = self.collect_extents(dev, dstream_oid.unwrap_or(target_oid))?;
         Ok(ApfsFileReader {
             dev,
             block_size: self.block_size,
@@ -259,10 +299,10 @@ impl Apfs {
 
     /// Walk path components, resolving each name through its parent's
     /// directory records. Returns the target's object id.
-    fn resolve_path_to_oid(&self, path: &str) -> Result<u64> {
+    fn resolve_path_to_oid(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
         let mut cur = ROOT_DIR_INO;
         for part in split_path(path) {
-            cur = self.find_drec_child(cur, part)?.ok_or_else(|| {
+            cur = self.find_drec_child(dev, cur, part)?.ok_or_else(|| {
                 crate::Error::InvalidArgument(format!(
                     "apfs: no such entry {part:?} under {path:?}"
                 ))
@@ -271,62 +311,86 @@ impl Apfs {
         Ok(cur)
     }
 
-    /// Find the child named `name` under directory inode `parent_oid`,
-    /// returning the child's object id (file_id from the drec value).
-    fn find_drec_child(&self, parent_oid: u64, name: &str) -> Result<Option<u64>> {
-        let node = BTreeNode::decode(&self.fsroot_block)?;
-        if !node.is_leaf() {
-            return Err(crate::Error::Unsupported(
-                "apfs: multi-level fs-tree walking is not yet implemented".into(),
-            ));
-        }
-        for i in 0..node.nkeys {
-            let (kb, vb) = node.entry_at(i, 0, 0)?;
-            if kb.len() < 8 {
-                continue;
-            }
-            let raw = u64::from_le_bytes(kb[0..8].try_into().unwrap());
-            let (kind, oid) = split_obj_id(raw);
-            if kind != APFS_TYPE_DIR_REC || oid != parent_oid {
-                continue;
-            }
-            // Try the hashed layout first; fall back to plain.
-            let key = DrecKey::decode_hashed(kb).or_else(|_| DrecKey::decode_plain(kb))?;
+    /// Find the child named `name` under directory inode `parent_oid`
+    /// using a range scan over the drec records under that parent.
+    fn find_drec_child(
+        &self,
+        dev: &mut dyn BlockDevice,
+        parent_oid: u64,
+        name: &str,
+    ) -> Result<Option<u64>> {
+        let layout = self.drec_layout;
+        let target = FsKeyTarget {
+            oid: parent_oid,
+            kind: APFS_TYPE_DIR_REC,
+            tail: &[],
+            drec_layout: layout,
+        };
+        let block_size = self.block_size;
+        let mut ctx = self.fs_ctx.borrow_mut();
+        let mut scan =
+            RangeScan::start(&self.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+                read_at_paddr(dev, paddr, block_size, buf)
+            })?;
+        while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })? {
+            let key = match layout {
+                DrecKeyLayout::Hashed => {
+                    DrecKey::decode_hashed(&kb).or_else(|_| DrecKey::decode_plain(&kb))?
+                }
+                DrecKeyLayout::Plain => {
+                    DrecKey::decode_plain(&kb).or_else(|_| DrecKey::decode_hashed(&kb))?
+                }
+            };
             if key.name == name {
-                let val = DrecVal::decode(vb)?;
+                let val = DrecVal::decode(&vb)?;
                 return Ok(Some(val.file_id));
             }
         }
         Ok(None)
     }
 
-    /// List the entries inside `dir_oid`. Iterates every record in the
-    /// single-leaf fsroot looking for `APFS_TYPE_DIR_REC` records whose
-    /// object id matches.
-    fn list_dir(&self, dir_oid: u64) -> Result<Vec<crate::fs::DirEntry>> {
+    /// List the entries inside `dir_oid` by range-scanning all drec
+    /// records whose key shares the `(dir_oid, DIR_REC)` prefix.
+    fn list_dir(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_oid: u64,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
         use crate::fs::{DirEntry as FsDirEntry, EntryKind};
-        let node = BTreeNode::decode(&self.fsroot_block)?;
-        if !node.is_leaf() {
-            return Err(crate::Error::Unsupported(
-                "apfs: multi-level fs-tree walking is not yet implemented".into(),
-            ));
-        }
+        let layout = self.drec_layout;
+        let target = FsKeyTarget {
+            oid: dir_oid,
+            kind: APFS_TYPE_DIR_REC,
+            tail: &[],
+            drec_layout: layout,
+        };
+        let block_size = self.block_size;
+        let mut ctx = self.fs_ctx.borrow_mut();
         let mut out = Vec::new();
-        for i in 0..node.nkeys {
-            let (kb, vb) = node.entry_at(i, 0, 0)?;
-            if kb.len() < 8 {
-                continue;
-            }
-            let raw = u64::from_le_bytes(kb[0..8].try_into().unwrap());
-            let (kind, oid) = split_obj_id(raw);
-            if kind != APFS_TYPE_DIR_REC || oid != dir_oid {
-                continue;
-            }
-            let key = match DrecKey::decode_hashed(kb).or_else(|_| DrecKey::decode_plain(kb)) {
-                Ok(k) => k,
-                Err(_) => continue,
+        let mut scan =
+            RangeScan::start(&self.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+                read_at_paddr(dev, paddr, block_size, buf)
+            })?;
+        while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })? {
+            let key = match layout {
+                DrecKeyLayout::Hashed => {
+                    match DrecKey::decode_hashed(&kb).or_else(|_| DrecKey::decode_plain(&kb)) {
+                        Ok(k) => k,
+                        Err(_) => continue,
+                    }
+                }
+                DrecKeyLayout::Plain => {
+                    match DrecKey::decode_plain(&kb).or_else(|_| DrecKey::decode_hashed(&kb)) {
+                        Ok(k) => k,
+                        Err(_) => continue,
+                    }
+                }
             };
-            let val = match DrecVal::decode(vb) {
+            let val = match DrecVal::decode(&vb) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -340,9 +404,6 @@ impl Apfs {
                 jrec::DT_SOCK => EntryKind::Socket,
                 _ => EntryKind::Unknown,
             };
-            // We expose the APFS file id as the "inode" number; it
-            // doesn't fit in 32 bits in general — wrap-truncate, callers
-            // who care should query the inode directly.
             out.push(FsDirEntry {
                 name: key.name,
                 inode: val.file_id as u32,
@@ -353,28 +414,26 @@ impl Apfs {
     }
 
     /// Find the inode record for `oid` and return `(size, dstream_oid)`.
-    /// `dstream_oid` is the inode's `private_id` when it differs from
-    /// the inode's own oid; otherwise extents are keyed on the inode oid
-    /// directly.
-    fn lookup_inode_size(&self, oid: u64) -> Result<(u64, Option<u64>)> {
-        let node = BTreeNode::decode(&self.fsroot_block)?;
-        if !node.is_leaf() {
-            return Err(crate::Error::Unsupported(
-                "apfs: multi-level fs-tree walking is not yet implemented".into(),
-            ));
-        }
-        for i in 0..node.nkeys {
-            let (kb, vb) = node.entry_at(i, 0, 0)?;
-            if kb.len() < 8 {
-                continue;
-            }
-            let raw = u64::from_le_bytes(kb[0..8].try_into().unwrap());
-            let (kind, koid) = split_obj_id(raw);
-            if kind != APFS_TYPE_INODE || koid != oid {
-                continue;
-            }
-            let ino = InodeVal::decode(vb)?;
-            // S_IFMT mask is 0o170000 in classic POSIX; S_IFREG is 0o100000.
+    /// Inode records have an empty type-specific tail; a single
+    /// `(oid, APFS_TYPE_INODE)` range scan yields exactly the one we
+    /// want (at most one record per oid in a fs-tree).
+    fn lookup_inode_size(&self, dev: &mut dyn BlockDevice, oid: u64) -> Result<(u64, Option<u64>)> {
+        let target = FsKeyTarget {
+            oid,
+            kind: APFS_TYPE_INODE,
+            tail: &[],
+            drec_layout: self.drec_layout,
+        };
+        let block_size = self.block_size;
+        let mut ctx = self.fs_ctx.borrow_mut();
+        let mut scan =
+            RangeScan::start(&self.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+                read_at_paddr(dev, paddr, block_size, buf)
+            })?;
+        if let Some((_kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })? {
+            let ino = InodeVal::decode(&vb)?;
             const S_IFMT: u16 = 0o170_000;
             const S_IFREG: u16 = 0o100_000;
             if ino.mode & S_IFMT != S_IFREG {
@@ -396,33 +455,56 @@ impl Apfs {
         )))
     }
 
-    /// Collect every `j_file_extent` record whose object id equals
-    /// `dstream_oid`, in ascending `logical_addr` order.
-    fn collect_extents(&self, dstream_oid: u64) -> Result<Vec<(u64, FileExtentVal)>> {
-        let node = BTreeNode::decode(&self.fsroot_block)?;
-        if !node.is_leaf() {
-            return Err(crate::Error::Unsupported(
-                "apfs: multi-level fs-tree walking is not yet implemented".into(),
-            ));
-        }
+    /// Range-scan all `j_file_extent` records keyed under `dstream_oid`,
+    /// returning them in ascending `logical_addr` order. The B-tree
+    /// itself yields entries in sorted order; we sort defensively to
+    /// tolerate badly written images.
+    fn collect_extents(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dstream_oid: u64,
+    ) -> Result<Vec<(u64, FileExtentVal)>> {
+        let target = FsKeyTarget {
+            oid: dstream_oid,
+            kind: APFS_TYPE_FILE_EXTENT,
+            tail: &[],
+            drec_layout: self.drec_layout,
+        };
+        let block_size = self.block_size;
+        let mut ctx = self.fs_ctx.borrow_mut();
         let mut out = Vec::new();
-        for i in 0..node.nkeys {
-            let (kb, vb) = node.entry_at(i, 0, 0)?;
-            if kb.len() < 16 {
+        let mut scan =
+            RangeScan::start(&self.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+                read_at_paddr(dev, paddr, block_size, buf)
+            })?;
+        while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })? {
+            let logical_addr = if kb.len() >= 16 {
+                u64::from_le_bytes(kb[8..16].try_into().unwrap())
+            } else {
                 continue;
-            }
-            let raw = u64::from_le_bytes(kb[0..8].try_into().unwrap());
-            let (kind, koid) = split_obj_id(raw);
-            if kind != APFS_TYPE_FILE_EXTENT || koid != dstream_oid {
-                continue;
-            }
-            let key = FileExtentKey::decode(kb)?;
-            let val = FileExtentVal::decode(vb)?;
-            out.push((key.logical_addr, val));
+            };
+            let val = match FileExtentVal::decode(&vb) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            out.push((logical_addr, val));
         }
         out.sort_by_key(|(la, _)| *la);
         Ok(out)
     }
+}
+
+/// Read a physical block (by block number) from `dev` into `buf`.
+fn read_at_paddr(
+    dev: &mut dyn BlockDevice,
+    paddr: u64,
+    block_size: u32,
+    buf: &mut [u8],
+) -> Result<()> {
+    let off = paddr.saturating_mul(block_size as u64);
+    dev.read_at(off, buf)
 }
 
 /// Streaming reader over an APFS regular file. Walks the cached extent

@@ -68,9 +68,36 @@ impl Fat {
         Self { entries }
     }
 
+    /// Build a fresh FAT with `capacity` 32-bit entries. Entry 0 is set to
+    /// the media descriptor (0xFFFFFFF8) and entry 1 to EOC, per the spec.
+    /// All other entries are FREE.
+    pub fn new_blank(capacity: usize) -> Self {
+        assert!(capacity >= 2, "FAT must hold at least two reserved entries");
+        let mut entries = vec![FREE; capacity];
+        entries[0] = 0xFFFF_FFF8;
+        entries[1] = EOC;
+        Self { entries }
+    }
+
+    /// Serialise the FAT to a byte vector exactly `entries.len() * 4` bytes long.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.entries.len() * 4);
+        for e in &self.entries {
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+        out
+    }
+
     /// Raw 32-bit entry for `cluster`.
     pub fn raw(&self, cluster: u32) -> Option<u32> {
         self.entries.get(cluster as usize).copied()
+    }
+
+    /// Set the raw 32-bit value of `cluster`.
+    pub fn set_raw(&mut self, cluster: u32, value: u32) {
+        if let Some(slot) = self.entries.get_mut(cluster as usize) {
+            *slot = value;
+        }
     }
 
     /// Classified entry for `cluster`.

@@ -1,12 +1,13 @@
 //! XFS — read-only support.
 //!
-//! Implements enough of XFS v4/v5 to inspect the volume and stream small
-//! files out of it: the superblock, inodes with the v3 (CRC) and v2 cores,
-//! shortform directories, and the linear extent list for `EXTENTS`-format
-//! files. Block-format directories, leaf/node/B-tree directories, B-tree
-//! files, realtime files, encryption, reverse-mapping btrees, and the
-//! journal are deliberately out of scope — encountering any of them
-//! returns `Error::Unsupported` with a message naming the feature.
+//! Implements enough of XFS v4/v5 to inspect the volume and stream files
+//! out of it: the superblock, inodes with the v3 (CRC) and v2 cores,
+//! shortform / block / leaf / node directories, the linear extent list
+//! and B-tree extent maps (`BTREE` di_format) for regular files, and both
+//! inline and remote symlinks. B-tree-format directories, realtime files,
+//! encryption, reverse-mapping btrees, and the journal are out of scope
+//! — encountering any of them returns `Error::Unsupported` with a message
+//! naming the feature.
 //!
 //! ## Inode-number arithmetic
 //!
@@ -37,12 +38,13 @@ pub mod bmbt;
 pub mod dir;
 pub mod inode;
 pub mod superblock;
+pub mod symlink;
 
 use crate::Result;
 use crate::block::BlockDevice;
 
-use self::bmbt::Extent;
-use self::dir::ShortformEntry;
+use self::bmbt::{BmbtLayout, Extent};
+use self::dir::DataEntry;
 use self::inode::{DiFormat, DinodeCore};
 use self::superblock::Superblock;
 
@@ -165,7 +167,7 @@ impl Xfs {
         let mut cur_buf = buf;
         let mut cur_core = core;
         for part in split_path(path) {
-            let dir_entries = self.read_dir_entries(&cur_buf, &cur_core)?;
+            let dir_entries = self.read_dir_entries(dev, &cur_buf, &cur_core)?;
             let found = dir_entries.iter().find(|e| e.name == part).ok_or_else(|| {
                 crate::Error::InvalidArgument(format!("xfs: no such entry {part:?} under {path:?}"))
             })?;
@@ -177,8 +179,155 @@ impl Xfs {
         Ok((cur_ino, cur_buf, cur_core))
     }
 
-    /// Read a directory's entries given the inode's bytes + core.
-    fn read_dir_entries(&self, ino_buf: &[u8], core: &DinodeCore) -> Result<Vec<ShortformEntry>> {
+    /// Layout descriptor for B-tree / FSB walking.
+    fn bmbt_layout(&self) -> BmbtLayout {
+        BmbtLayout {
+            blocksize: self.sb.blocksize,
+            agblocks: self.sb.agblocks,
+            agblklog: self.sb.agblklog,
+            is_v5: self.sb.is_v5(),
+        }
+    }
+
+    /// Convert an FSB (filesystem block number) to a device byte offset.
+    fn fsb_to_byte(&self, fsb: u64) -> u64 {
+        let ag = fsb >> self.sb.agblklog as u32;
+        let agblk = fsb & ((1u64 << self.sb.agblklog as u32) - 1);
+        ag * (self.sb.agblocks as u64) * (self.sb.blocksize as u64)
+            + agblk * (self.sb.blocksize as u64)
+    }
+
+    /// Read the extent list for a file/dir inode. Returns the decoded
+    /// extents regardless of whether the inode is `EXTENTS` (inline list)
+    /// or `BTREE` (walked tree). Other formats are an error.
+    fn read_extent_list(
+        &self,
+        dev: &mut dyn BlockDevice,
+        ino_buf: &[u8],
+        core: &DinodeCore,
+    ) -> Result<Vec<Extent>> {
+        let lit = core.literal_area(ino_buf, self.sb.inodesize as usize);
+        match core.format {
+            DiFormat::Extents => bmbt::decode_extents(lit, core.nextents),
+            DiFormat::Btree => {
+                let layout = self.bmbt_layout();
+                bmbt::walk_btree(dev, &layout, lit)
+            }
+            other => Err(crate::Error::InvalidArgument(format!(
+                "xfs: extent list requested for non-extent inode (format={other:?})"
+            ))),
+        }
+    }
+
+    /// Read every directory data/block referenced by a directory inode's
+    /// extent list (block + leaf format directories), parse each one, and
+    /// return the concatenated list of entries. Skips the leaf index block
+    /// at logical offset >= `XFS_DIR2_LEAF_OFFSET / dirblksize`.
+    fn read_extent_dir_entries(
+        &self,
+        dev: &mut dyn BlockDevice,
+        ino_buf: &[u8],
+        core: &DinodeCore,
+    ) -> Result<Vec<DataEntry>> {
+        let extents = self.read_extent_list(dev, ino_buf, core)?;
+        // First, read logical block 0 to decide between block- and leaf-
+        // format. Block format: a single dir block, contains both data
+        // records and a trailing leaf-entry array.
+        if extents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dir_block_size = self.sb.dir_block_size() as u64;
+        let fs_blocks_per_dir_block = (dir_block_size / self.sb.blocksize as u64).max(1);
+        // Logical address of the leaf block in a leaf-format directory.
+        // The kernel uses 32 GiB / dir_block_size; convert to FS-block units
+        // since extents are stored in FS-block units.
+        let leaf_dir_block_addr_fsblk = dir::XFS_DIR2_LEAF_FIRSTDB_BYTES / self.sb.blocksize as u64;
+
+        // Read the very first block to peek at the magic.
+        let first = self.read_dir_block_at_logical(dev, &extents, 0, dir_block_size as usize)?;
+        let is_v5 = self.sb.is_v5();
+        if dir::is_block_format(&first)? {
+            // Block format: a single directory block.
+            return dir::decode_block_dir(&first, is_v5);
+        }
+        // Leaf or node format: walk every distinct directory-block-aligned
+        // logical address that some extent covers (capped at the leaf-
+        // offset boundary, which separates the data-block address range
+        // from the leaf-index / free-index ranges).
+        let mut out = Vec::new();
+        // Cap is the LESSER of (last covered logical block + 1) and the
+        // leaf-block boundary.
+        let max_covered = extents
+            .iter()
+            .map(|e| e.offset + e.blockcount as u64)
+            .max()
+            .unwrap_or(0);
+        let upper = max_covered.min(leaf_dir_block_addr_fsblk);
+        let mut lblk = 0u64;
+        while lblk < upper {
+            // Is `lblk` covered by any extent?
+            let covered = extents
+                .iter()
+                .any(|e| lblk >= e.offset && lblk < e.offset + e.blockcount as u64);
+            if covered {
+                let block =
+                    self.read_dir_block_at_logical(dev, &extents, lblk, dir_block_size as usize)?;
+                if block.len() >= 4 {
+                    let magic = u32::from_be_bytes(block[0..4].try_into().unwrap());
+                    if magic == dir::XFS_DIR3_DATA_MAGIC || magic == dir::XFS_DIR2_DATA_MAGIC {
+                        let mut entries = dir::decode_data_block(&block, is_v5)?;
+                        out.append(&mut entries);
+                    }
+                    // Other magics (block / leaf / node / free) are either
+                    // skipped (leaf/node/free are pure index) or impossible
+                    // here (block-format was handled above).
+                }
+            }
+            lblk += fs_blocks_per_dir_block;
+        }
+        Ok(out)
+    }
+
+    /// Read `dir_block_size` bytes from the directory at logical FS-block
+    /// `lblk`, by mapping through the extent list. Returns the assembled
+    /// buffer.
+    fn read_dir_block_at_logical(
+        &self,
+        dev: &mut dyn BlockDevice,
+        extents: &[Extent],
+        lblk: u64,
+        dir_block_size: usize,
+    ) -> Result<Vec<u8>> {
+        let bs = self.sb.blocksize as u64;
+        let fs_blocks_per_dir_block = (dir_block_size as u64 / bs).max(1);
+        let mut out = vec![0u8; dir_block_size];
+        for i in 0..fs_blocks_per_dir_block {
+            let target = lblk + i;
+            let ext = extents
+                .iter()
+                .find(|e| target >= e.offset && target < e.offset + e.blockcount as u64)
+                .ok_or_else(|| {
+                    crate::Error::InvalidImage(format!(
+                        "xfs: dir logical block {target} not covered by extent list"
+                    ))
+                })?;
+            let phys_fsb = ext.startblock + (target - ext.offset);
+            let phys_byte = self.fsb_to_byte(phys_fsb);
+            let off = (i * bs) as usize;
+            dev.read_at(phys_byte, &mut out[off..off + bs as usize])?;
+        }
+        Ok(out)
+    }
+
+    /// Read a directory's entries given the inode's bytes + core. Handles
+    /// shortform (local), block, leaf, and node format directories.
+    /// Returns `Error::Unsupported` for the `BTREE` di_format.
+    fn read_dir_entries(
+        &self,
+        dev: &mut dyn BlockDevice,
+        ino_buf: &[u8],
+        core: &DinodeCore,
+    ) -> Result<Vec<DataEntry>> {
         if !core.is_dir() {
             return Err(crate::Error::InvalidArgument(
                 "xfs: target is not a directory".into(),
@@ -189,13 +338,19 @@ impl Xfs {
                 let lit = core.literal_area(ino_buf, self.sb.inodesize as usize);
                 let has_ftype = core.version >= 3;
                 let (_parent, entries) = dir::decode_shortform(lit, has_ftype)?;
-                Ok(entries)
+                // Promote ShortformEntry → DataEntry (identical fields).
+                Ok(entries
+                    .into_iter()
+                    .map(|e| DataEntry {
+                        name: e.name,
+                        inumber: e.inumber,
+                        ftype: e.ftype,
+                    })
+                    .collect())
             }
-            DiFormat::Extents => Err(crate::Error::Unsupported(
-                "xfs: block / leaf+ directories not implemented (only shortform)".into(),
-            )),
+            DiFormat::Extents => self.read_extent_dir_entries(dev, ino_buf, core),
             DiFormat::Btree => Err(crate::Error::Unsupported(
-                "xfs: B-tree directories not implemented".into(),
+                "xfs: B-tree (di_format=BTREE) directories not implemented".into(),
             )),
             DiFormat::Dev => Err(crate::Error::InvalidImage(
                 "xfs: directory inode has di_format=dev".into(),
@@ -214,8 +369,39 @@ impl Xfs {
         path: &str,
     ) -> Result<Vec<crate::fs::DirEntry>> {
         let (_ino, buf, core) = self.resolve_path(dev, path)?;
-        let entries = self.read_dir_entries(&buf, &core)?;
-        Ok(dir::shortform_to_generic(&entries))
+        let entries = self.read_dir_entries(dev, &buf, &core)?;
+        Ok(dir::data_entries_to_generic(&entries))
+    }
+
+    /// Read the target of a symlink at an absolute path. Supports both
+    /// inline (local) and remote (extent-list) symlink targets.
+    pub fn read_symlink(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<String> {
+        let (_ino, buf, core) = self.resolve_path(dev, path)?;
+        if !core.is_symlink() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: {path:?} is not a symlink"
+            )));
+        }
+        match core.format {
+            DiFormat::Local => {
+                let lit = core.literal_area(&buf, self.sb.inodesize as usize);
+                symlink::decode_local(lit, core.size)
+            }
+            DiFormat::Extents => {
+                let extents = self.read_extent_list(dev, &buf, &core)?;
+                let layout = self.bmbt_layout();
+                symlink::decode_remote(dev, &layout, &extents, core.size)
+            }
+            DiFormat::Btree => Err(crate::Error::Unsupported(
+                "xfs: B-tree (di_format=BTREE) symlinks not implemented".into(),
+            )),
+            DiFormat::Dev => Err(crate::Error::InvalidArgument(
+                "xfs: symlink inode with di_format=dev".into(),
+            )),
+            DiFormat::Unknown(b) => Err(crate::Error::Unsupported(format!(
+                "xfs: symlink inode with unknown di_format {b}"
+            ))),
+        }
     }
 
     /// Open a regular file by absolute path for streaming reads.
@@ -231,9 +417,8 @@ impl Xfs {
             )));
         }
         match core.format {
-            DiFormat::Extents => {
-                let lit = core.literal_area(&buf, self.sb.inodesize as usize);
-                let extents = bmbt::decode_extents(lit, core.nextents)?;
+            DiFormat::Extents | DiFormat::Btree => {
+                let extents = self.read_extent_list(dev, &buf, &core)?;
                 for e in &extents {
                     if e.unwritten {
                         return Err(crate::Error::Unsupported(
@@ -241,13 +426,17 @@ impl Xfs {
                         ));
                     }
                 }
+                let layout = self.bmbt_layout();
                 Ok(XfsFileReader {
                     dev,
                     extents,
                     blocksize: self.sb.blocksize as u64,
+                    agblocks: self.sb.agblocks as u64,
+                    agblklog: self.sb.agblklog,
                     size: core.size,
                     pos: 0,
                     inline: None,
+                    _layout: layout,
                 })
             }
             DiFormat::Local => {
@@ -266,14 +455,14 @@ impl Xfs {
                     dev,
                     extents: Vec::new(),
                     blocksize: self.sb.blocksize as u64,
+                    agblocks: self.sb.agblocks as u64,
+                    agblklog: self.sb.agblklog,
                     size: core.size,
                     pos: 0,
                     inline: Some(data),
+                    _layout: self.bmbt_layout(),
                 })
             }
-            DiFormat::Btree => Err(crate::Error::Unsupported(
-                "xfs: B-tree extent files not implemented".into(),
-            )),
             DiFormat::Dev => Err(crate::Error::InvalidArgument(
                 "xfs: device-special inode has no file data".into(),
             )),
@@ -290,6 +479,11 @@ pub struct XfsFileReader<'a> {
     dev: &'a mut dyn BlockDevice,
     extents: Vec<Extent>,
     blocksize: u64,
+    /// AG width in blocks (for FSB → byte translation).
+    agblocks: u64,
+    /// log2 of the *power-of-two AG stride* used to pack FSBs. Comes from
+    /// `sb_agblklog`; the address is `(ag << agblklog) | agblk`.
+    agblklog: u8,
     size: u64,
     /// Logical byte position of the next byte to return.
     pos: u64,
@@ -297,6 +491,18 @@ pub struct XfsFileReader<'a> {
     /// literal area (`DiFormat::Local`). When present, `extents` is empty
     /// and reads come from this buffer.
     inline: Option<Vec<u8>>,
+    /// Layout (kept for symmetry with other readers; not used by the hot
+    /// path).
+    _layout: BmbtLayout,
+}
+
+impl<'a> XfsFileReader<'a> {
+    /// FSB → device byte address. Identical math to [`Xfs::fsb_to_byte`].
+    fn fsb_to_byte(&self, fsb: u64) -> u64 {
+        let ag = fsb >> self.agblklog as u32;
+        let agblk = fsb & ((1u64 << self.agblklog as u32) - 1);
+        ag * self.agblocks * self.blocksize + agblk * self.blocksize
+    }
 }
 
 impl<'a> std::io::Read for XfsFileReader<'a> {
@@ -330,7 +536,8 @@ impl<'a> std::io::Read for XfsFileReader<'a> {
                 let extent_blocks_left = e.offset + e.blockcount as u64 - pos_blk;
                 let extent_bytes_left = extent_blocks_left * self.blocksize - pos_off;
                 let to_read = (n as u64).min(extent_bytes_left) as usize;
-                let phys_byte = (e.startblock + (pos_blk - e.offset)) * self.blocksize + pos_off;
+                let phys_fsb = e.startblock + (pos_blk - e.offset);
+                let phys_byte = self.fsb_to_byte(phys_fsb) + pos_off;
                 self.dev
                     .read_at(phys_byte, &mut buf[..to_read])
                     .map_err(std::io::Error::other)?;
@@ -535,5 +742,60 @@ mod tests {
         assert_eq!(entries[0].name, "hi");
         assert_eq!(entries[0].inode, 200);
         assert_eq!(entries[0].kind, crate::fs::EntryKind::Regular);
+    }
+
+    /// Build the same minimal image as `list_root_shortform`, but route the
+    /// shortform entry "lnk" → ino 200, then carve inode 200 as an inline
+    /// symlink with target "/etc/hostname". Verify `read_symlink` returns
+    /// that target.
+    #[test]
+    fn read_inline_symlink_end_to_end() {
+        let mut dev = minimal_image();
+        let xfs = Xfs::open(&mut dev).unwrap();
+        let rootino = xfs.sb.rootino;
+
+        // Carve the root dir inode as before but with one entry pointing at
+        // ino 200 (ftype = SYMLINK).
+        let root_off = xfs.ino_byte_offset(rootino).unwrap();
+        let mut root_buf = vec![0u8; 256];
+        root_buf[0..2].copy_from_slice(&inode::XFS_DINODE_MAGIC.to_be_bytes());
+        root_buf[2..4].copy_from_slice(&(inode::S_IFDIR | 0o755).to_be_bytes());
+        root_buf[4] = 3; // v3
+        root_buf[5] = 1; // local
+        root_buf[16..20].copy_from_slice(&2u32.to_be_bytes()); // nlink
+        root_buf[152..160].copy_from_slice(&rootino.to_be_bytes()); // di_ino
+        let lit_off = 176;
+        root_buf[lit_off] = 1; // count
+        root_buf[lit_off + 1] = 0; // i8count
+        root_buf[lit_off + 2..lit_off + 6].copy_from_slice(&(rootino as u32).to_be_bytes());
+        let e = lit_off + 6;
+        root_buf[e] = 3; // namelen "lnk"
+        root_buf[e + 1] = 0;
+        root_buf[e + 2] = 0;
+        root_buf[e + 3..e + 6].copy_from_slice(b"lnk");
+        root_buf[e + 6] = dir::XFS_DIR3_FT_SYMLINK;
+        root_buf[e + 7..e + 11].copy_from_slice(&200u32.to_be_bytes());
+        dev.write_at(root_off, &root_buf).unwrap();
+
+        // Carve inode 200 as an inline symlink. Inode 200 in our scheme:
+        //   inopblog=4, agblklog=3 ⇒ ag=200>>7=1, blk=(200>>4)&7=4, slot=200&15=8.
+        //   byte = 1*8*4096 + 4*4096 + 8*256 = 32768 + 16384 + 2048 = 51200.
+        let off200 = xfs.ino_byte_offset(200).unwrap();
+        let mut buf = vec![0u8; 256];
+        buf[0..2].copy_from_slice(&inode::XFS_DINODE_MAGIC.to_be_bytes());
+        buf[2..4].copy_from_slice(&(inode::S_IFLNK | 0o777).to_be_bytes());
+        buf[4] = 3; // v3
+        buf[5] = 1; // local
+        buf[16..20].copy_from_slice(&1u32.to_be_bytes()); // nlink
+        let target = "/etc/hostname";
+        buf[56..64].copy_from_slice(&(target.len() as u64).to_be_bytes());
+        buf[152..160].copy_from_slice(&200u64.to_be_bytes()); // di_ino
+        let lit = 176;
+        buf[lit..lit + target.len()].copy_from_slice(target.as_bytes());
+        dev.write_at(off200, &buf).unwrap();
+
+        let xfs = Xfs::open(&mut dev).unwrap();
+        let got = xfs.read_symlink(&mut dev, "/lnk").unwrap();
+        assert_eq!(got, target);
     }
 }

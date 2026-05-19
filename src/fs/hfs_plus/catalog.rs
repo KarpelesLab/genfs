@@ -273,19 +273,44 @@ pub struct CatalogFolder {
 /// 8       4     fileID
 /// 12-31         dates (5x 4 bytes)
 /// 32      16    HFSPlusBSDInfo
-/// 48      16    FileInfo
+/// 48      16    FileInfo            (Finder; first 4 bytes = file type, next 4 = creator)
 /// 64      16    ExtendedFileInfo
 /// 80      4     textEncoding
 /// 84      4     reserved2
 /// 88      80    HFSPlusForkData dataFork
 /// 168     80    HFSPlusForkData resourceFork
 /// ```
+///
+/// `file_type` / `creator` are the leading 4-byte OSType tags inside
+/// the 16-byte `FileInfo` Finder block. Apple uses them to mark
+/// "indirect node" hard-link source files (`('hlnk', 'hfs+')`) and
+/// symbolic links (`('slnk', 'rhap')`) — both are stored as ordinary
+/// HFS+ files but get special-cased by the resolver.
 #[derive(Debug, Clone)]
 pub struct CatalogFile {
     pub file_id: u32,
     pub bsd: BsdInfo,
+    pub file_type: [u8; 4],
+    pub creator: [u8; 4],
     pub data_fork: ForkData,
     pub resource_fork: ForkData,
+}
+
+impl CatalogFile {
+    /// True if this is a hard-link "indirect node" pointer
+    /// (`fileType == 'hlnk'`, `creator == 'hfs+'`). The actual data
+    /// lives at `iNode<special>` in the HFS+ private data directory,
+    /// where `special` is `bsd.special` (link inode number).
+    pub fn is_hard_link(&self) -> bool {
+        &self.file_type == b"hlnk" && &self.creator == b"hfs+"
+    }
+
+    /// True if this file is a symbolic link
+    /// (`fileType == 'slnk'`, `creator == 'rhap'`). The data fork
+    /// holds the link target as UTF-8 bytes (no NUL terminator).
+    pub fn is_symlink(&self) -> bool {
+        &self.file_type == b"slnk" && &self.creator == b"rhap"
+    }
 }
 
 /// Either thread record (folder or file) maps a CNID back to its
@@ -351,6 +376,12 @@ impl CatalogRecord {
         }
         let file_id = u32::from_be_bytes(body[8..12].try_into().unwrap());
         let bsd = BsdInfo::decode(&body[32..48]);
+        // FileInfo lives at 48..64. The first two OSType tags are the
+        // Finder fileType (48..52) and creator (52..56).
+        let mut file_type = [0u8; 4];
+        let mut creator = [0u8; 4];
+        file_type.copy_from_slice(&body[48..52]);
+        creator.copy_from_slice(&body[52..56]);
         let mut fbuf = [0u8; 80];
         fbuf.copy_from_slice(&body[88..168]);
         let data_fork = ForkData::decode(&fbuf);
@@ -359,6 +390,8 @@ impl CatalogRecord {
         Ok(Self::File(CatalogFile {
             file_id,
             bsd,
+            file_type,
+            creator,
             data_fork,
             resource_fork,
         }))

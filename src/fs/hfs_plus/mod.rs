@@ -2,29 +2,29 @@
 //!
 //! ## Status
 //!
-//! Read-only v1: open, list directories, stream regular file contents.
+//! Read-only v1.1: open, list directories, stream regular file
+//! contents, read symbolic-link targets, and resolve hard links to
+//! their underlying indirect-node iNodes. Files whose data fork spills
+//! beyond eight inline extents are read through the extents-overflow
+//! B-tree.
+//!
 //! Implementation is based on Apple Technical Note TN1150, the
 //! canonical public reference for HFS+ on-disk structures.
 //!
 //! ## Scope and deferred features
 //!
-//! * Only the **inline extents** (≤ 8 per fork, embedded in the
-//!   catalog record) are supported. A file whose `totalBlocks` exceeds
-//!   the sum of its inline extents would need the extents-overflow
-//!   B-tree; this v1 returns `Error::Unsupported` for that case.
+//! * Write support is out of scope entirely.
 //! * No journal replay — the on-disk catalog is read as-is.
-//! * No attempt is made to chase indirect-link (`kHardLinkFileType`)
-//!   records; encountering one returns `Unsupported`.
 //! * HFSX case-sensitive comparison is honoured at the catalog-key
 //!   level; non-ASCII case folding follows a simplified table.
-//! * Write support is out of scope entirely.
+//! * Extended-attribute B-tree (`attributesFile`) is not parsed.
 //!
 //! ## Module layout
 //!
 //! * [`volume_header`] — the 512-byte `HFSPlusVolumeHeader` at offset 1024.
 //! * [`btree`] — node descriptors, header records, record-offset tables.
 //! * [`catalog`] — catalog keys, leaf records, lookup.
-//! * [`extents`] — extents-overflow key/record decoding (unused by v1).
+//! * [`extents`] — extents-overflow B-tree walker for spilled extents.
 
 pub mod btree;
 pub mod catalog;
@@ -38,12 +38,28 @@ use crate::block::BlockDevice;
 
 use btree::ForkReader;
 use catalog::{Catalog, CatalogFile, CatalogKey, CatalogRecord, ROOT_FOLDER_ID, UniStr, mode};
-use volume_header::{VolumeHeader, read_volume_header};
+use extents::ExtentsOverflow;
+use volume_header::{ForkData, VolumeHeader, read_volume_header};
+
+/// Maximum bytes we'll ever read from a symlink's data fork; symlinks
+/// are tiny path strings and a sane filesystem stays well under this.
+const SYMLINK_MAX_BYTES: u64 = 4096;
 
 /// An opened HFS+ volume.
 pub struct HfsPlus {
     volume_header: VolumeHeader,
     catalog: Catalog,
+    /// Extents-overflow B-tree, opened lazily-but-once at mount time.
+    /// Absent only if the volume header has no extents-overflow file,
+    /// which is unusual but technically permitted.
+    overflow: Option<ExtentsOverflow>,
+    /// CNID of the HFS+ private data directory (where `iNode<N>`
+    /// indirect-node files live), if it exists on this volume.
+    /// Resolved lazily on first hard-link encounter.
+    private_dir_cnid: std::cell::Cell<Option<u32>>,
+    /// `true` once we've attempted to resolve `private_dir_cnid`. We
+    /// cache the absent result too so we don't re-scan every time.
+    private_dir_resolved: std::cell::Cell<bool>,
     /// Cached volume name, taken from the root folder's thread record.
     volume_name: String,
 }
@@ -57,6 +73,16 @@ impl HfsPlus {
         let cat_fork = ForkReader::from_inline(&vh.catalog_file, vh.block_size, "catalog")?;
         let catalog = Catalog::open(dev, cat_fork, case_sensitive)?;
 
+        // Open the extents-overflow file if its fork has any blocks.
+        // It can be empty on a fresh volume.
+        let overflow = if vh.extents_file.total_blocks > 0 {
+            let ext_fork =
+                ForkReader::from_inline(&vh.extents_file, vh.block_size, "extents-overflow")?;
+            Some(ExtentsOverflow::open(dev, ext_fork)?)
+        } else {
+            None
+        };
+
         // The root folder's thread record is keyed by (ROOT_FOLDER_ID, "");
         // its name field is the volume name.
         let volume_name = lookup_thread_name(dev, &catalog, ROOT_FOLDER_ID)?
@@ -65,6 +91,9 @@ impl HfsPlus {
         Ok(Self {
             volume_header: vh,
             catalog,
+            overflow,
+            private_dir_cnid: std::cell::Cell::new(None),
+            private_dir_resolved: std::cell::Cell::new(false),
             volume_name,
         })
     }
@@ -87,7 +116,9 @@ impl HfsPlus {
     /// List the entries of a directory by absolute path. Returns one
     /// [`crate::fs::DirEntry`] per child, with `inode` set to the
     /// HFS+ CNID (catalog node id) — which is the closest analogue
-    /// to a Unix inode number on this filesystem.
+    /// to a Unix inode number on this filesystem. Hard-link source
+    /// entries are reported with the underlying iNode's `kind`
+    /// (typically `Regular`) so callers see a uniform view.
     pub fn list_path(
         &self,
         dev: &mut dyn BlockDevice,
@@ -98,6 +129,11 @@ impl HfsPlus {
     }
 
     /// Open a regular file by absolute path for streaming reads.
+    /// Transparently follows hard links (`hlnk`/`hfs+` indirect node
+    /// entries) to the actual iNode in the HFS+ private-data directory.
+    /// Returns `Unsupported` for symlinks — use
+    /// [`read_symlink_target_path`](Self::read_symlink_target_path)
+    /// for those.
     pub fn open_file_reader<'a>(
         &self,
         dev: &'a mut dyn BlockDevice,
@@ -117,11 +153,11 @@ impl HfsPlus {
                 )));
             }
         };
-        reject_indirect_link(&file)?;
+        let file = self.resolve_hard_link(dev, file)?;
         let mode_bits = file.bsd.file_mode & mode::S_IFMT;
-        if mode_bits == mode::S_IFLNK {
-            return Err(crate::Error::Unsupported(format!(
-                "hfs+: {path:?} is a symlink; symlink reads are not supported in v1"
+        if file.is_symlink() || mode_bits == mode::S_IFLNK {
+            return Err(crate::Error::InvalidArgument(format!(
+                "hfs+: {path:?} is a symlink; use read_symlink_target_path"
             )));
         }
         if mode_bits != 0 && mode_bits != mode::S_IFREG {
@@ -130,14 +166,61 @@ impl HfsPlus {
                 file.bsd.file_mode
             )));
         }
-        let fork =
-            ForkReader::from_inline(&file.data_fork, self.volume_header.block_size, "data fork")?;
+        let fork = self.open_data_fork(dev, &file)?;
         Ok(HfsPlusFileReader {
             dev,
             fork,
             remaining: file.data_fork.logical_size,
             position: 0,
         })
+    }
+
+    /// Read a symlink's target by absolute path. Returns the raw
+    /// UTF-8 bytes stored in the file's data fork as a `String`
+    /// (HFS+ symlinks are conventionally stored as UTF-8 path text
+    /// without a NUL terminator).
+    pub fn read_symlink_target_path(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<String> {
+        let rec = self.lookup_path(dev, path)?;
+        let file = match rec {
+            CatalogRecord::File(f) => f,
+            _ => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "hfs+: {path:?} is not a file (cannot be a symlink)"
+                )));
+            }
+        };
+        let file = self.resolve_hard_link(dev, file)?;
+        self.read_symlink_target_inner(dev, &file, path)
+    }
+
+    /// Read a symlink's target by CNID. Useful when the caller has
+    /// already discovered the target file ID via [`Self::list_path`] but
+    /// doesn't have a stable path (e.g. multiple parents). Returns
+    /// the link target as a UTF-8 string.
+    pub fn read_symlink_target(&self, dev: &mut dyn BlockDevice, cnid: u32) -> Result<String> {
+        let file = self.lookup_file_by_cnid(dev, cnid)?;
+        let file = self.resolve_hard_link(dev, file)?;
+        self.read_symlink_target_inner(dev, &file, &format!("CNID {cnid}"))
+    }
+
+    /// Total byte length of a regular file (after hard-link resolution),
+    /// for callers that want to size a buffer before streaming.
+    pub fn file_size(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
+        let rec = self.lookup_path(dev, path)?;
+        let file = match rec {
+            CatalogRecord::File(f) => f,
+            _ => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "hfs+: {path:?} is not a file"
+                )));
+            }
+        };
+        let file = self.resolve_hard_link(dev, file)?;
+        Ok(file.data_fork.logical_size)
     }
 
     // -- internal helpers ----------------------------------------------
@@ -211,6 +294,199 @@ impl HfsPlus {
         })
     }
 
+    /// Look up a catalog *file* by its CNID. Two-step: first read the
+    /// file's thread record (key = (cnid, "")) to recover its
+    /// `(parent_id, name)`, then look up the actual record.
+    fn lookup_file_by_cnid(&self, dev: &mut dyn BlockDevice, cnid: u32) -> Result<CatalogFile> {
+        let thread_key = CatalogKey {
+            parent_id: cnid,
+            name: UniStr::default(),
+            encoded_len: 0,
+        };
+        let (parent_id, name) = match self.catalog.lookup(dev, &thread_key)? {
+            Some(CatalogRecord::Thread(t)) => (t.parent_id, t.name),
+            Some(_) => {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: CNID {cnid} thread key did not return a thread record"
+                )));
+            }
+            None => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "hfs+: no thread record for CNID {cnid}"
+                )));
+            }
+        };
+        let child_key = CatalogKey {
+            parent_id,
+            name,
+            encoded_len: 0,
+        };
+        match self.catalog.lookup(dev, &child_key)? {
+            Some(CatalogRecord::File(f)) => Ok(f),
+            Some(CatalogRecord::Folder(_)) => Err(crate::Error::InvalidArgument(format!(
+                "hfs+: CNID {cnid} names a folder, not a file"
+            ))),
+            Some(CatalogRecord::Thread(_)) => Err(crate::Error::InvalidImage(format!(
+                "hfs+: CNID {cnid} reverse-lookup returned a thread record"
+            ))),
+            None => Err(crate::Error::InvalidArgument(format!(
+                "hfs+: no catalog file for CNID {cnid}"
+            ))),
+        }
+    }
+
+    /// If `file` is a hard-link indirect-node entry (`hlnk`/`hfs+`),
+    /// resolve it to the underlying iNode file in the HFS+ private
+    /// data directory. Otherwise return the file unchanged.
+    fn resolve_hard_link(
+        &self,
+        dev: &mut dyn BlockDevice,
+        file: CatalogFile,
+    ) -> Result<CatalogFile> {
+        if !file.is_hard_link() {
+            return Ok(file);
+        }
+        let private_dir = match self.private_data_dir(dev)? {
+            Some(cnid) => cnid,
+            None => {
+                return Err(crate::Error::InvalidImage(
+                    "hfs+: hard-link record but no '\\0\\0\\0\\0HFS+ Private Data' \
+                     directory found"
+                        .into(),
+                ));
+            }
+        };
+        // The iNode number lives in BsdInfo.special on a hlnk record.
+        let inode_id = file.bsd.special;
+        let name = format!("iNode{inode_id}");
+        let rec = self.lookup_component(dev, private_dir, &name)?;
+        match rec {
+            CatalogRecord::File(f) => {
+                // Defence in depth: forbid recursive hard links.
+                if f.is_hard_link() {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "hfs+: iNode{inode_id} is itself a hard-link indirection"
+                    )));
+                }
+                Ok(f)
+            }
+            _ => Err(crate::Error::InvalidImage(format!(
+                "hfs+: iNode{inode_id} is not a regular file record"
+            ))),
+        }
+    }
+
+    /// Resolve, cache, and return the CNID of the HFS+ private data
+    /// directory (Apple's well-known name with four leading NUL
+    /// code units followed by "HFS+ Private Data"). Returns `None`
+    /// on a volume that has no hard links — the directory only exists
+    /// when at least one hard link has ever been created.
+    fn private_data_dir(&self, dev: &mut dyn BlockDevice) -> Result<Option<u32>> {
+        if self.private_dir_resolved.get() {
+            return Ok(self.private_dir_cnid.get());
+        }
+        // UniStr cannot easily be built from a Rust string containing
+        // null code units, so build it directly.
+        let mut code_units: Vec<u16> = vec![0, 0, 0, 0];
+        code_units.extend("HFS+ Private Data".encode_utf16());
+        let key = CatalogKey {
+            parent_id: ROOT_FOLDER_ID,
+            name: UniStr { code_units },
+            encoded_len: 0,
+        };
+        let cnid = match self.catalog.lookup(dev, &key)? {
+            Some(CatalogRecord::Folder(f)) => Some(f.folder_id),
+            _ => None,
+        };
+        self.private_dir_cnid.set(cnid);
+        self.private_dir_resolved.set(true);
+        Ok(cnid)
+    }
+
+    /// Build a `ForkReader` for `file`'s data fork, pulling extra
+    /// extents from the extents-overflow B-tree if the inline eight
+    /// are insufficient.
+    fn open_data_fork(&self, dev: &mut dyn BlockDevice, file: &CatalogFile) -> Result<ForkReader> {
+        self.open_fork(
+            dev,
+            &file.data_fork,
+            file.file_id,
+            extents::FORK_DATA,
+            "data",
+        )
+    }
+
+    fn open_fork(
+        &self,
+        dev: &mut dyn BlockDevice,
+        fork: &ForkData,
+        file_id: u32,
+        fork_type: u8,
+        what: &str,
+    ) -> Result<ForkReader> {
+        if u64::from(fork.total_blocks) <= fork.inline_blocks() {
+            return ForkReader::from_inline(fork, self.volume_header.block_size, what);
+        }
+        let overflow = self.overflow.as_ref().ok_or_else(|| {
+            crate::Error::InvalidImage(
+                "hfs+: fork needs overflow extents but volume has no \
+                 extents-overflow file"
+                    .into(),
+            )
+        })?;
+        let first_overflow_block = u32::try_from(fork.inline_blocks()).map_err(|_| {
+            crate::Error::InvalidImage("hfs+: inline fork block count overflows u32".into())
+        })?;
+        let extra = overflow.find_extents(dev, file_id, fork_type, first_overflow_block)?;
+        ForkReader::from_inline_plus_overflow(fork, &extra, self.volume_header.block_size, what)
+    }
+
+    /// Read up to `SYMLINK_MAX_BYTES` from a symlink's data fork and
+    /// return the result as a Rust string. `descriptor` is a human-
+    /// readable identifier (path or CNID) used only in error text.
+    fn read_symlink_target_inner(
+        &self,
+        dev: &mut dyn BlockDevice,
+        file: &CatalogFile,
+        descriptor: &str,
+    ) -> Result<String> {
+        let mode_bits = file.bsd.file_mode & mode::S_IFMT;
+        let by_mode = mode_bits == mode::S_IFLNK;
+        let by_finder = file.is_symlink();
+        if !by_mode && !by_finder {
+            return Err(crate::Error::InvalidArgument(format!(
+                "hfs+: {descriptor} is not a symlink (mode {:#06o}, \
+                 FileInfo type {:?}, creator {:?})",
+                file.bsd.file_mode,
+                bytes_to_osstr(&file.file_type),
+                bytes_to_osstr(&file.creator),
+            )));
+        }
+        let len = file.data_fork.logical_size;
+        if len == 0 {
+            return Ok(String::new());
+        }
+        if len > SYMLINK_MAX_BYTES {
+            return Err(crate::Error::InvalidImage(format!(
+                "hfs+: {descriptor} symlink target too large ({len} bytes, \
+                 max {SYMLINK_MAX_BYTES})"
+            )));
+        }
+        let fork = self.open_data_fork(dev, file)?;
+        let mut buf = vec![0u8; len as usize];
+        fork.read(dev, 0, &mut buf)?;
+        // HFS+ symlinks are UTF-8 path strings. Accept a trailing NUL
+        // (some writers add one).
+        if buf.last() == Some(&0) {
+            buf.pop();
+        }
+        String::from_utf8(buf).map_err(|e| {
+            crate::Error::InvalidImage(format!(
+                "hfs+: {descriptor} symlink target is not valid UTF-8: {e}"
+            ))
+        })
+    }
+
     /// Enumerate the direct children of folder `cnid` by scanning
     /// every leaf node of the catalog from the first leaf onwards
     /// and collecting entries whose key.parentID matches.
@@ -255,7 +531,24 @@ impl HfsPlus {
                 // Skip threads — they're metadata, not real children.
                 let (kind, child_id) = match &record {
                     CatalogRecord::Folder(f) => (EntryKind::Dir, f.folder_id),
-                    CatalogRecord::File(f) => (file_kind(f), f.file_id),
+                    CatalogRecord::File(f) => {
+                        // Hard-link entries: resolve the kind by
+                        // peeking at the iNode so callers see a
+                        // unified view. The link itself is the
+                        // `child_id` we expose, matching what the
+                        // catalog records.
+                        if f.is_hard_link() {
+                            let resolved_kind = self
+                                .resolve_hard_link(dev, f.clone())
+                                .map(|r| file_kind(&r))
+                                .unwrap_or(EntryKind::Unknown);
+                            (resolved_kind, f.file_id)
+                        } else if f.is_symlink() {
+                            (EntryKind::Symlink, f.file_id)
+                        } else {
+                            (file_kind(f), f.file_id)
+                        }
+                    }
                     CatalogRecord::Thread(_) => continue,
                 };
                 out.push(FsDirEntry {
@@ -313,23 +606,6 @@ pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
 
 // -- helpers --------------------------------------------------------------
 
-/// Reject HFS+ "indirect node" file types — these are the files that
-/// stand in for hard links (`hlnk` / `hfs+`) and we don't chase them
-/// in v1.
-fn reject_indirect_link(file: &CatalogFile) -> Result<()> {
-    // FileInfo + ExtendedFileInfo live at body[48..80]; their first
-    // 8 bytes are fileType + creator. Apple's hard-link convention:
-    //   fileType = 'hlnk' (0x686C6E6B), creator = 'hfs+' (0x68667321 ... '!')
-    //
-    // We don't decode FileInfo into the struct, so this check would
-    // require a wider catalog record. Conservatively assume regular
-    // files are not indirect; the failure mode for a hard-link
-    // indirect is a stale fork pointer, which we'd report as a read
-    // error rather than silent data corruption.
-    let _ = file;
-    Ok(())
-}
-
 /// Classify a `CatalogFile` into a [`crate::fs::EntryKind`] using
 /// its BSD `file_mode` bits when set, falling back to "regular".
 fn file_kind(f: &CatalogFile) -> crate::fs::EntryKind {
@@ -362,6 +638,16 @@ fn lookup_thread_name(
     match catalog.lookup(dev, &key)? {
         Some(CatalogRecord::Thread(t)) => Ok(Some(t.name.to_string_lossy())),
         _ => Ok(None),
+    }
+}
+
+/// Render an OSType 4-byte tag for diagnostics, preferring ASCII
+/// when the tag is human-readable and falling back to hex otherwise.
+fn bytes_to_osstr(b: &[u8; 4]) -> String {
+    if b.iter().all(|&c| (0x20..=0x7E).contains(&c)) {
+        format!("'{}'", String::from_utf8_lossy(b))
+    } else {
+        format!("0x{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3])
     }
 }
 

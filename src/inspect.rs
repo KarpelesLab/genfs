@@ -8,13 +8,14 @@
 //! validation happens.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::Result;
-use crate::block::BlockDevice;
+use crate::block::{BlockDevice, FileBackend};
 use crate::fs::ext::Ext;
 use crate::fs::fat::Fat32;
 use crate::fs::{DirEntry, Filesystem};
+use crate::part::{Gpt, Mbr, Partition, PartitionTable, slice_partition};
 
 /// Which filesystem an image carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,10 +278,150 @@ fn add_host_tree_into_fat32(
 
 /// One-shot helper: open `path` as a file-backed device, identify the FS,
 /// and return the handle. Useful for CLI subcommands.
-pub fn open_image_file(path: &Path) -> Result<(crate::block::FileBackend, AnyFs)> {
-    let mut dev = crate::block::FileBackend::open(path)?;
+pub fn open_image_file(path: &Path) -> Result<(FileBackend, AnyFs)> {
+    let mut dev = FileBackend::open(path)?;
     let fs = AnyFs::open(&mut dev)?;
     Ok((dev, fs))
+}
+
+// -- partition-aware target plumbing ------------------------------------
+
+/// A parsed CLI image target. The user can write `disk.img` for the
+/// whole image or `disk.img:N` to target the N-th partition (1-indexed,
+/// matching `sgdisk -p` and `loopXpN`). Internally we store the index
+/// zero-based for convenience.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub path: PathBuf,
+    /// `None` → whole disk; `Some(i)` → partition with zero-based index `i`.
+    pub partition: Option<usize>,
+}
+
+impl Target {
+    /// Parse a target spec. `disk.img:N` is the partition form; any other
+    /// `:` in the path (e.g. on Windows) is preserved by only splitting on
+    /// the *last* `:` and only when the trailing segment parses as a
+    /// 1-based partition number.
+    pub fn parse(s: &str) -> Self {
+        if let Some((head, tail)) = s.rsplit_once(':')
+            && let Ok(n) = tail.parse::<usize>()
+            && n >= 1
+        {
+            return Self {
+                path: PathBuf::from(head),
+                partition: Some(n - 1),
+            };
+        }
+        Self {
+            path: PathBuf::from(s),
+            partition: None,
+        }
+    }
+}
+
+/// A disk's partition table. Box-wrapped behind [`PartitionTable`] so
+/// callers can consume MBR and GPT through the same dispatch.
+pub enum DetectedTable {
+    Gpt(Box<Gpt>),
+    Mbr(Box<Mbr>),
+}
+
+impl DetectedTable {
+    /// Returns the inner trait object for slicing / iteration.
+    pub fn as_table(&self) -> &dyn PartitionTable {
+        match self {
+            Self::Gpt(g) => g.as_ref(),
+            Self::Mbr(m) => m.as_ref(),
+        }
+    }
+
+    /// Short label for UI ("gpt" / "mbr").
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Gpt(_) => "gpt",
+            Self::Mbr(_) => "mbr",
+        }
+    }
+
+    /// All non-empty partitions, in disk order.
+    pub fn partitions(&self) -> &[Partition] {
+        self.as_table().partitions()
+    }
+}
+
+/// Probe `dev` for a partition table. Returns `Ok(Some(table))` when a
+/// GPT or MBR is found, `Ok(None)` when sector 0 looks like an ext or
+/// FAT32 image (no partition table), and `Err(_)` only on I/O failures.
+///
+/// GPT takes precedence: a GPT disk's sector 0 contains a *protective*
+/// MBR whose only entry has type 0xEE, so we'd otherwise treat it as a
+/// legacy MBR and slice incorrectly.
+pub fn detect_partition_table(dev: &mut dyn BlockDevice) -> Result<Option<DetectedTable>> {
+    if dev.total_size() < 512 {
+        return Ok(None);
+    }
+    // Look at the FS signatures first — if the sector 0 carries a FAT32
+    // boot record or the LBA-2 region (offset 1024) carries an ext
+    // superblock, it's a bare FS, not a partition table.
+    let mut s0 = [0u8; 512];
+    dev.read_at(0, &mut s0)?;
+    let is_fat32 = s0[510] == 0x55 && s0[511] == 0xAA && &s0[82..87] == b"FAT32";
+    if is_fat32 {
+        return Ok(None);
+    }
+    let has_55aa = s0[510] == 0x55 && s0[511] == 0xAA;
+    // GPT signature at LBA 1 (offset 512) is "EFI PART".
+    if dev.total_size() >= 1024 {
+        let mut s1_head = [0u8; 8];
+        dev.read_at(512, &mut s1_head)?;
+        if &s1_head == b"EFI PART" {
+            let gpt = Gpt::read(dev)?;
+            return Ok(Some(DetectedTable::Gpt(Box::new(gpt))));
+        }
+    }
+    // Legacy MBR: 0x55AA signature plus at least one partition entry whose
+    // type byte is non-zero. (A zero-FS image with a stray 0x55AA in the
+    // first 512 bytes is unlikely but possible — the entry-type check
+    // prevents misidentification.)
+    if has_55aa {
+        for i in 0..4 {
+            let entry_off = 446 + i * 16;
+            if s0[entry_off + 4] != 0 {
+                let mbr = Mbr::read(dev)?;
+                return Ok(Some(DetectedTable::Mbr(Box::new(mbr))));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Run `op` with a [`BlockDevice`] that points at whatever `target`
+/// resolves to: the whole disk for `disk.img`, or a partition slice for
+/// `disk.img:N`. The closure opens its own [`AnyFs`] (or doesn't, e.g.
+/// `info` may want to list the partition table instead).
+///
+/// Errors with [`crate::Error::InvalidArgument`] when `target` names a
+/// partition but the image carries no partition table (or the index is
+/// out of range).
+pub fn with_target_device<F, R>(target: &Target, op: F) -> Result<R>
+where
+    F: FnOnce(&mut dyn BlockDevice) -> Result<R>,
+{
+    let mut disk = FileBackend::open(&target.path)?;
+    match target.partition {
+        None => op(&mut disk),
+        Some(idx) => {
+            let table = detect_partition_table(&mut disk)?.ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "{}: no partition table found, can't target partition {}",
+                    target.path.display(),
+                    idx + 1
+                ))
+            })?;
+            let mut slice = slice_partition(table.as_table(), &mut disk, idx)?;
+            op(&mut slice)
+        }
+    }
 }
 
 #[cfg(test)]

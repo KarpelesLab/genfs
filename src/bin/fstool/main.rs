@@ -88,11 +88,12 @@ enum Command {
     },
 
     /// List a directory inside an image. One entry per line:
-    /// `<inode>\t<kind>\t<name>`.
+    /// `<inode>\t<kind>\t<name>`. To target a partition, append `:N`
+    /// (1-indexed) to the image path: `disk.img:2`.
     Ls {
-        /// Path to the image file.
-        #[arg(value_name = "IMAGE")]
-        image: PathBuf,
+        /// Image path, optionally with `:N` to select partition N.
+        #[arg(value_name = "IMAGE[:N]")]
+        image: String,
         /// Path inside the image to list. Defaults to `/`.
         #[arg(value_name = "PATH", default_value = "/")]
         path: String,
@@ -100,20 +101,21 @@ enum Command {
 
     /// Print the contents of a regular file from inside an image to stdout.
     Cat {
-        /// Path to the image file.
-        #[arg(value_name = "IMAGE")]
-        image: PathBuf,
+        /// Image path, optionally with `:N` to select partition N.
+        #[arg(value_name = "IMAGE[:N]")]
+        image: String,
         /// Path inside the image to read.
         #[arg(value_name = "PATH")]
         path: String,
     },
 
-    /// One-screen summary of an existing image: detected FS kind, block
-    /// size, total blocks, used/free counts, and a top-level listing.
+    /// One-screen summary of an existing image. On a partitioned image
+    /// (no `:N`), prints the partition table; with `:N`, prints the
+    /// filesystem summary for that partition.
     Info {
-        /// Path to the image file.
-        #[arg(value_name = "IMAGE")]
-        image: PathBuf,
+        /// Image path, optionally with `:N` to select partition N.
+        #[arg(value_name = "IMAGE[:N]")]
+        image: String,
     },
 
     /// Build an image from a TOML spec file. Bare-filesystem specs are
@@ -130,9 +132,9 @@ enum Command {
     /// Copy a host file or directory into an existing image. The
     /// destination's parent directory must already exist in the image.
     Add {
-        /// Path to the image file (modified in place).
-        #[arg(value_name = "IMAGE")]
-        image: PathBuf,
+        /// Image path, optionally with `:N` to select partition N.
+        #[arg(value_name = "IMAGE[:N]")]
+        image: String,
         /// Host file or directory to copy in.
         #[arg(value_name = "HOST_SRC")]
         host_src: PathBuf,
@@ -144,9 +146,9 @@ enum Command {
     /// Remove a file, symlink, device node, or empty directory from an
     /// existing image.
     Rm {
-        /// Path to the image file (modified in place).
-        #[arg(value_name = "IMAGE")]
-        image: PathBuf,
+        /// Image path, optionally with `:N` to select partition N.
+        #[arg(value_name = "IMAGE[:N]")]
+        image: String,
         /// Absolute path inside the image to remove.
         #[arg(value_name = "FS_PATH")]
         fs_path: String,
@@ -156,9 +158,9 @@ enum Command {
     /// and reads commands from stdin; type `help` once inside for the
     /// command list, or `quit` (or EOF) to leave.
     Shell {
-        /// Path to the image file (modified in place when you `put` or `rm`).
-        #[arg(value_name = "IMAGE")]
-        image: PathBuf,
+        /// Image path, optionally with `:N` to select partition N.
+        #[arg(value_name = "IMAGE[:N]")]
+        image: String,
     },
 }
 
@@ -222,46 +224,51 @@ fn run(cli: Cli) -> fstool::Result<()> {
     }
 }
 
-fn shell_cmd(image: &std::path::Path) -> fstool::Result<()> {
-    let mut dev = FileBackend::open(image)?;
-    let fs = fstool::inspect::AnyFs::open(&mut dev)?;
-    let mut sh = shell::Shell::new(fs);
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    sh.run(&mut dev, stdin.lock(), stdout.lock())?;
-    dev.sync()?;
-    Ok(())
+fn shell_cmd(image: &str) -> fstool::Result<()> {
+    let target = fstool::inspect::Target::parse(image);
+    fstool::inspect::with_target_device(&target, |dev| {
+        let fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut sh = shell::Shell::new(fs);
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        sh.run(dev, stdin.lock(), stdout.lock())?;
+        dev.sync()?;
+        Ok(())
+    })
 }
 
-fn rm(image: &std::path::Path, fs_path: &str) -> fstool::Result<()> {
-    let mut dev = FileBackend::open(image)?;
-    let mut fs = fstool::inspect::AnyFs::open(&mut dev)?;
-    fs.remove(&mut dev, fs_path)?;
-    fs.flush(&mut dev)?;
-    dev.sync()?;
-    eprintln!("removed {fs_path}");
-    Ok(())
+fn rm(image: &str, fs_path: &str) -> fstool::Result<()> {
+    let target = fstool::inspect::Target::parse(image);
+    fstool::inspect::with_target_device(&target, |dev| {
+        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        fs.remove(dev, fs_path)?;
+        fs.flush(dev)?;
+        dev.sync()?;
+        eprintln!("removed {fs_path}");
+        Ok(())
+    })
 }
 
-fn add(image: &std::path::Path, host_src: &std::path::Path, fs_dest: &str) -> fstool::Result<()> {
+fn add(image: &str, host_src: &std::path::Path, fs_dest: &str) -> fstool::Result<()> {
     let meta = std::fs::symlink_metadata(host_src)?;
-    let mut dev = FileBackend::open(image)?;
-    let mut fs = fstool::inspect::AnyFs::open(&mut dev)?;
-
-    if meta.is_dir() {
-        fs.add_dir_tree(&mut dev, fs_dest, host_src)?;
-    } else if meta.is_file() {
-        fs.add_file(&mut dev, fs_dest, host_src)?;
-    } else {
-        return Err(fstool::Error::InvalidArgument(format!(
-            "add: {} is neither a regular file nor a directory",
-            host_src.display()
-        )));
-    }
-    fs.flush(&mut dev)?;
-    dev.sync()?;
-    eprintln!("added {} → {fs_dest}", host_src.display());
-    Ok(())
+    let target = fstool::inspect::Target::parse(image);
+    fstool::inspect::with_target_device(&target, |dev| {
+        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        if meta.is_dir() {
+            fs.add_dir_tree(dev, fs_dest, host_src)?;
+        } else if meta.is_file() {
+            fs.add_file(dev, fs_dest, host_src)?;
+        } else {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "add: {} is neither a regular file nor a directory",
+                host_src.display()
+            )));
+        }
+        fs.flush(dev)?;
+        dev.sync()?;
+        eprintln!("added {} → {fs_dest}", host_src.display());
+        Ok(())
+    })
 }
 
 fn build(spec_path: &std::path::Path, output: &std::path::Path) -> fstool::Result<()> {
@@ -400,37 +407,115 @@ fn require_force_for_device(
     Ok(())
 }
 
-fn ls(image: &std::path::Path, path: &str) -> fstool::Result<()> {
-    let (mut dev, fs) = fstool::inspect::open_image_file(image)?;
-    let entries = fs.list(&mut dev, path)?;
-    let mut out = std::io::stdout().lock();
-    for e in &entries {
-        let _ = writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name);
+fn ls(image: &str, path: &str) -> fstool::Result<()> {
+    let target = fstool::inspect::Target::parse(image);
+    fstool::inspect::with_target_device(&target, |dev| {
+        let fs = fstool::inspect::AnyFs::open(dev)?;
+        let entries = fs.list(dev, path)?;
+        let mut out = std::io::stdout().lock();
+        for e in &entries {
+            let _ = writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name);
+        }
+        Ok(())
+    })
+}
+
+fn cat(image: &str, path: &str) -> fstool::Result<()> {
+    let target = fstool::inspect::Target::parse(image);
+    fstool::inspect::with_target_device(&target, |dev| {
+        let fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut out = std::io::stdout().lock();
+        fs.copy_file_to(dev, path, &mut out)?;
+        Ok(())
+    })
+}
+
+fn info(image: &str) -> fstool::Result<()> {
+    let target = fstool::inspect::Target::parse(image);
+    // If the user gave a bare `disk.img` and it carries a partition
+    // table, print the table instead of trying to open it as a single
+    // filesystem (which would fail).
+    if target.partition.is_none() {
+        let mut disk = FileBackend::open(&target.path)?;
+        if let Some(table) = fstool::inspect::detect_partition_table(&mut disk)? {
+            print_partition_table(&target.path, disk.total_size(), &table);
+            return Ok(());
+        }
+        // No table — fall through to the bare-FS info below using the
+        // already-opened disk.
+        let fs = fstool::inspect::AnyFs::open(&mut disk)?;
+        print_fs_info(&mut disk, &fs);
+        return Ok(());
     }
-    Ok(())
+    fstool::inspect::with_target_device(&target, |dev| {
+        let fs = fstool::inspect::AnyFs::open(dev)?;
+        print_fs_info(dev, &fs);
+        Ok(())
+    })
 }
 
-fn cat(image: &std::path::Path, path: &str) -> fstool::Result<()> {
-    let (mut dev, fs) = fstool::inspect::open_image_file(image)?;
-    let mut out = std::io::stdout().lock();
-    fs.copy_file_to(&mut dev, path, &mut out)?;
-    Ok(())
+fn print_partition_table(
+    path: &std::path::Path,
+    total_bytes: u64,
+    table: &fstool::inspect::DetectedTable,
+) {
+    println!("image:             {}", path.display());
+    println!("size:              {total_bytes} bytes");
+    println!("partition table:   {}", table.label());
+    let parts = table.partitions();
+    println!("partitions:        {}", parts.len());
+    if parts.is_empty() {
+        return;
+    }
+    println!();
+    println!("  N  start (LBA)     end (LBA)         size       kind                    name");
+    for (i, p) in parts.iter().enumerate() {
+        let end = p.start_lba + p.size_lba - 1;
+        let bytes = p.size_lba * 512;
+        let name = p.name.as_deref().unwrap_or("");
+        println!(
+            "  {:>2}  {:>11}  {:>13}  {:>10}  {:<22}  {}",
+            i + 1,
+            p.start_lba,
+            end,
+            human_size(bytes),
+            format!("{:?}", p.kind),
+            name
+        );
+    }
 }
 
-fn info(image: &std::path::Path) -> fstool::Result<()> {
-    let (mut dev, fs) = fstool::inspect::open_image_file(image)?;
+fn human_size(b: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if b >= GIB {
+        format!("{:.2} GiB", b as f64 / GIB as f64)
+    } else if b >= MIB {
+        format!("{:.2} MiB", b as f64 / MIB as f64)
+    } else if b >= KIB {
+        format!("{:.2} KiB", b as f64 / KIB as f64)
+    } else {
+        format!("{b} B")
+    }
+}
+
+fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &fstool::inspect::AnyFs) {
     println!("fs kind:           {}", fs.kind_string());
-    match &fs {
+    match fs {
         fstool::inspect::AnyFs::Ext(ext) => print_ext_info(ext),
         fstool::inspect::AnyFs::Fat32(fat) => print_fat_info(fat),
     }
     println!();
     println!("/ listing:");
-    let entries = fs.list(&mut dev, "/")?;
-    for e in &entries {
-        println!("  {:>10}  {:?}  {}", e.inode, e.kind, e.name);
+    match fs.list(dev, "/") {
+        Ok(entries) => {
+            for e in &entries {
+                println!("  {:>10}  {:?}  {}", e.inode, e.kind, e.name);
+            }
+        }
+        Err(e) => println!("  (couldn't list /: {e})"),
     }
-    Ok(())
 }
 
 fn print_ext_info(ext: &Ext) {

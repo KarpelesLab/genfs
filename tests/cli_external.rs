@@ -236,6 +236,201 @@ fn cli_info_reports_ext4() {
     );
 }
 
+/// `fstool info disk.img` on a partitioned image prints the table;
+/// `fstool info disk.img:N` and `ls`/`cat` walk into a partition's FS.
+#[test]
+fn cli_partition_target_syntax() {
+    if !which("e2fsck") {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    }
+
+    // Build a GPT disk with an EFI/FAT32 + a root/ext4.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hello"), b"in a partition\n").unwrap();
+    std::fs::create_dir(srcdir.path().join("etc")).unwrap();
+    std::fs::write(srcdir.path().join("etc/app.conf"), b"mode=on\n").unwrap();
+
+    let spec = NamedTempFile::new().unwrap();
+    std::fs::write(
+        spec.path(),
+        format!(
+            r#"
+            [image]
+            size = "128MiB"
+            partition_table = "gpt"
+
+            [[partitions]]
+            name = "EFI"
+            type = "esp"
+            size = "48MiB"
+
+            [partitions.filesystem]
+            type = "fat32"
+            volume_label = "EFI"
+
+            [[partitions]]
+            name = "root"
+            type = "linux"
+            size = "remaining"
+
+            [partitions.filesystem]
+            type = "ext4"
+            source = "{}"
+            block_size = 1024
+            "#,
+            srcdir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .arg("build")
+        .arg(spec.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `info disk.img` (no :N) prints the partition table.
+    let out = Command::new(FSTOOL)
+        .arg("info")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("partition table:"), "missing table header:\n{s}");
+    assert!(s.contains("gpt"), "expected gpt label:\n{s}");
+    assert!(s.contains("EFI"), "expected EFI name:\n{s}");
+    assert!(s.contains("root"), "expected root name:\n{s}");
+
+    // `info :1` opens the EFI FAT32 partition.
+    let out = Command::new(FSTOOL)
+        .arg("info")
+        .arg(format!("{}:1", img.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "info :1 failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("fat32"), "expected fat32 fs:\n{s}");
+
+    // `info :2` opens the root ext4 partition.
+    let out = Command::new(FSTOOL)
+        .arg("info")
+        .arg(format!("{}:2", img.path().display()))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("ext4"), "expected ext4 fs:\n{s}");
+
+    // `ls :2 /` shows the source tree.
+    let out = Command::new(FSTOOL)
+        .arg("ls")
+        .arg(format!("{}:2", img.path().display()))
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("hello"));
+    assert!(s.contains("etc"));
+
+    // `cat :2 /etc/app.conf` returns the file body.
+    let out = Command::new(FSTOOL)
+        .arg("cat")
+        .arg(format!("{}:2", img.path().display()))
+        .arg("/etc/app.conf")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"mode=on\n");
+
+    // Out-of-range partition index → clean error.
+    let out = Command::new(FSTOOL)
+        .arg("ls")
+        .arg(format!("{}:9", img.path().display()))
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let s = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        s.contains("out of range"),
+        "expected out-of-range error:\n{s}"
+    );
+
+    // `add :2 host /new.txt` writes into a partition; e2fsck still clean.
+    let extra = NamedTempFile::new().unwrap();
+    std::fs::write(extra.path(), b"added to root partition\n").unwrap();
+    let out = Command::new(FSTOOL)
+        .arg("add")
+        .arg(format!("{}:2", img.path().display()))
+        .arg(extra.path())
+        .arg("/new.txt")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "add :2 failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // dd out the root partition so e2fsck can check it.
+    // sgdisk -p tells us the LBAs.
+    if which("sgdisk") {
+        let p = Command::new("sgdisk")
+            .arg("-p")
+            .arg(img.path())
+            .output()
+            .unwrap();
+        let pout = String::from_utf8_lossy(&p.stdout);
+        let root_line = pout
+            .lines()
+            .find(|l| l.trim_start().starts_with("2 "))
+            .expect("partition 2 line");
+        let nums: Vec<u64> = root_line
+            .split_whitespace()
+            .skip(1)
+            .take(2)
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let (start, end) = (nums[0], nums[1]);
+        let part = NamedTempFile::new().unwrap();
+        let dd = Command::new("dd")
+            .arg(format!("if={}", img.path().display()))
+            .arg(format!("of={}", part.path().display()))
+            .arg("bs=512")
+            .arg(format!("skip={start}"))
+            .arg(format!("count={}", end - start + 1))
+            .arg("status=none")
+            .output()
+            .unwrap();
+        assert!(dd.status.success());
+        let fsck = Command::new("e2fsck")
+            .arg("-fn")
+            .arg(part.path())
+            .output()
+            .unwrap();
+        assert!(
+            fsck.status.success(),
+            "e2fsck on root partition failed after :2 add:\n{}",
+            String::from_utf8_lossy(&fsck.stdout)
+        );
+    }
+}
+
 /// `fstool shell` runs an SFTP-style REPL. Drive it with a scripted
 /// stdin and assert the captured stdout contains the right output for
 /// each command.

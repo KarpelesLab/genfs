@@ -1009,13 +1009,15 @@ impl Writer {
                 ind.on_disk_block,
             ));
         }
-        // Reserved nids (0, 1=node_ino, 2=meta_ino) intentionally have NO
-        // NAT entry. They are virtual inodes that never resolve via NAT,
-        // and fsck.f2fs's `build_nat_area_bitmap` rejects any entry whose
-        // block_addr is below `main_blkaddr` — so writing block_addr =
-        // cp_blkaddr here is what was tripping it earlier. Leaving the
-        // slots as zero in the page is the correct "absent" representation
-        // (NULL_ADDR for both ino and block_addr).
+        // Special inodes nid=1 (node_ino) and nid=2 (meta_ino) must have
+        // valid block_addr entries in the NAT — fsck.f2fs (Android fork)
+        // rejects any slot whose `ne.ino != 0` but `block_addr == 0`,
+        // and also rejects slots whose `ne.ino == 0` but `block_addr !=
+        // 0`. mkfs.f2fs writes `block_addr = 1` for both (a placeholder
+        // in the SB region — not in the main area). Match that exactly.
+        // Tuple is (nid, ino, block_addr); version is hard-coded below.
+        all_nodes.push((1, 1, 1)); // node_ino → ino=1, blk_addr=1
+        all_nodes.push((2, 2, 1)); // meta_ino → ino=2, blk_addr=1
 
         for (nid, owner, blk) in all_nodes {
             let page_idx = (nid as usize) / super::constants::NAT_ENTRY_PER_BLOCK;
@@ -1028,7 +1030,8 @@ impl Writer {
             while pages[page_idx].len() <= slot {
                 pages[page_idx].push((0, 0, 0));
             }
-            pages[page_idx][slot] = (1, owner, blk);
+            // mkfs.f2fs uses version=0 across the board on a fresh image.
+            pages[page_idx][slot] = (0, owner, blk);
         }
         for (pidx, slots) in pages.iter().enumerate() {
             let page = super::format::encode_nat_page(slots);

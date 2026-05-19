@@ -289,20 +289,25 @@ pub(crate) fn wipe_metadata_region(dev: &mut dyn BlockDevice, geom: &Geometry) -
 }
 
 /// Encode a single 4 KiB NAT page that holds `entries` starting at the
-/// page's slot 0. The page's trailing CRC32 covers the first 4092 bytes.
+/// page's slot 0.
+///
+/// NAT pages have NO trailing CRC: `struct f2fs_nat_block` is exactly
+/// `entries[NAT_ENTRY_PER_BLOCK]` packed, and mkfs.f2fs leaves the
+/// trailing bytes (after the last full 9-byte slot) as zero. Writing a
+/// 4-byte CRC at offset 4092 would alias into slot 454's block_addr
+/// field (slot 454 spans bytes 4086..4095), making fsck see garbage
+/// addresses for an entry we never wrote.
 pub(crate) fn encode_nat_page(entries: &[(u8, u32, u32)]) -> Vec<u8> {
     let mut page = vec![0u8; F2FS_BLKSIZE];
     for (i, (version, ino, block_addr)) in entries.iter().enumerate() {
         let o = i * NAT_ENTRY_SIZE;
-        if o + NAT_ENTRY_SIZE > F2FS_BLK_CSUM_OFFSET {
+        if o + NAT_ENTRY_SIZE > F2FS_BLKSIZE {
             break;
         }
         page[o] = *version;
         page[o + 1..o + 5].copy_from_slice(&ino.to_le_bytes());
         page[o + 5..o + 9].copy_from_slice(&block_addr.to_le_bytes());
     }
-    let crc = super::constants::f2fs_crc32(&page[..F2FS_BLK_CSUM_OFFSET]);
-    page[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     page
 }
 
@@ -313,24 +318,20 @@ pub(crate) fn encode_nat_page(entries: &[(u8, u32, u32)]) -> Vec<u8> {
 /// Layout per SIT entry (64 bytes here for simplicity, F2FS spec uses
 /// 74 packed): `vblocks u16 | valid_map[blocks_per_seg / 8] | mtime u64`.
 /// Our reader doesn't decode the SIT, so the exact stride is only
-/// observed by `fsck.f2fs`. We use a conservative all-zero region — the
-/// CRC footer still validates the page.
+/// observed by `fsck.f2fs`. SIT pages have no trailing CRC (same as
+/// NAT pages — see `encode_nat_page`).
 pub(crate) fn encode_sit_page() -> Vec<u8> {
-    let mut page = vec![0u8; F2FS_BLKSIZE];
-    let crc = super::constants::f2fs_crc32(&page[..F2FS_BLK_CSUM_OFFSET]);
-    page[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
-    page
+    vec![0u8; F2FS_BLKSIZE]
 }
 
 /// Encode a 4 KiB SSA page. Each entry is a `f2fs_summary` (7 bytes) that
 /// records `(nid, version, ofs_in_node)` for the block at that offset in
-/// the parent segment. A blank page (zeros + CRC) is enough for the
-/// reader and is the safest default for a fresh-image build.
+/// the parent segment. SSA blocks are `struct f2fs_summary_block` —
+/// `entries[ENTRIES_IN_SUM] + journal + summary_footer`. A fresh image
+/// emits an all-zero block; fsck does not verify the summary footer's
+/// CRC for read-only walks.
 pub(crate) fn encode_ssa_page() -> Vec<u8> {
-    let mut page = vec![0u8; F2FS_BLKSIZE];
-    let crc = super::constants::f2fs_crc32(&page[..F2FS_BLK_CSUM_OFFSET]);
-    page[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
-    page
+    vec![0u8; F2FS_BLKSIZE]
 }
 
 /// Build a minimally-valid root inode block for the freshly formatted FS.

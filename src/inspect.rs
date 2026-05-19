@@ -656,7 +656,9 @@ pub fn with_target_device<F, R>(target: &Target, op: F) -> Result<R>
 where
     F: FnOnce(&mut dyn BlockDevice) -> Result<R>,
 {
-    let mut disk = crate::block::open_image(&target.path)?;
+    // _tmp keeps the decompressed temp file alive for the duration of
+    // the borrow — when it drops, the file is unlinked.
+    let (mut disk, _tmp) = crate::block::open_image_maybe_compressed(&target.path)?;
     match target.partition {
         None => op(disk.as_mut()),
         Some(idx) => {

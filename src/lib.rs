@@ -12,6 +12,7 @@
 //! crate root once P5 lands.
 
 pub mod block;
+pub mod compression;
 pub mod error;
 pub mod fs;
 pub mod inspect;

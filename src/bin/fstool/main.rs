@@ -403,6 +403,10 @@ fn repack_cmd(
         //
         // Default destination FS: explicit --fs-type, else infer from
         // the dst extension (.tar → tar), else preserve the source kind.
+        // Tar output, optionally with a codec extension chain
+        // (`.tar.gz` / `.tar.zst` / `.tgz` etc.). The chain is parsed
+        // here so the writer below can pick a streaming compressor.
+        let dst_tar_codec = tar_output_codec(dst);
         let target_fs_str = fs_type_override
             .map(|s| s.to_string())
             .or_else(|| {
@@ -411,6 +415,7 @@ fn repack_cmd(
                     .filter(|e| e.eq_ignore_ascii_case("tar"))
                     .map(|_| "tar".to_string())
             })
+            .or_else(|| dst_tar_codec.map(|_| "tar".to_string()))
             .unwrap_or_else(|| {
                 // Default destination FS when nothing else specifies one:
                 // preserve the source FS, unless the source is tar (in
@@ -454,9 +459,18 @@ fn repack_cmd(
             },
         };
 
-        // Format the destination.
+        // Format the destination. When the output is a compressed tar
+        // (`.tar.gz`, `.tar.zst`, …) write the plain tar bytes to a
+        // tempfile first and stream-compress to `dst` at the end of the
+        // tar branch.
+        let (real_dst, _dst_tmp) = if dst_tar_codec.is_some() && lower == "tar" {
+            let tmp = tempfile::NamedTempFile::new()?;
+            (tmp.path().to_path_buf(), Some(tmp))
+        } else {
+            (dst.to_path_buf(), None)
+        };
         let mut dst_dev = fstool::block::create_image(
-            dst,
+            &real_dst,
             dst_size,
             &fstool::block::CreateOpts {
                 cluster_size: qcow2_cluster_size,
@@ -499,33 +513,31 @@ fn repack_cmd(
             "tar" => {
                 let written = repack_into_tar(src_dev, &src_fs, dst_dev.as_mut())?;
                 dst_dev.sync()?;
-                // For a raw output, trim the file down to the actual
-                // archive length (we over-allocated). qcow2 outputs
-                // already leave the tail as unallocated clusters.
+                // Trim the tar file down to the actual archive length;
+                // we over-allocated above. qcow2 wrappers and the
+                // compressed-output codepath both skip this.
                 drop(dst_dev);
-                if dst
+                let real_ext = real_dst
                     .extension()
                     .and_then(|s| s.to_str())
-                    .map(|s| s.to_ascii_lowercase())
-                    != Some("qcow2".into())
-                    && dst
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_ascii_lowercase())
-                        != Some("qcow".into())
-                    && dst
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_ascii_lowercase())
-                        != Some("q2".into())
-                    && let Ok(f) = std::fs::OpenOptions::new().write(true).open(dst)
-                {
+                    .map(|s| s.to_ascii_lowercase());
+                let is_qcow = matches!(real_ext.as_deref(), Some("qcow2" | "qcow" | "q2"));
+                if !is_qcow && let Ok(f) = std::fs::OpenOptions::new().write(true).open(&real_dst) {
                     let _ = f.set_len(written);
                 }
-                eprintln!(
-                    "repacked {src} → {} (fs: {source_kind} → tar, {written} bytes)",
-                    dst.display()
-                );
+                if let Some(algo) = dst_tar_codec {
+                    fstool::compression::compress_file_to_file(&real_dst, dst, algo)?;
+                    eprintln!(
+                        "repacked {src} → {} (fs: {source_kind} → tar.{}, {written} bytes plain)",
+                        dst.display(),
+                        algo.name()
+                    );
+                } else {
+                    eprintln!(
+                        "repacked {src} → {} (fs: {source_kind} → tar, {written} bytes)",
+                        dst.display()
+                    );
+                }
                 return Ok(());
             }
             other => {
@@ -587,6 +599,25 @@ fn copy_into_fat32(
 /// Repack-source error for the four read-only FSes (xfs/exfat/hfs+/apfs)
 /// — they're inspectable via ls/cat/info but not yet wired into the
 /// FS-to-FS copy walkers.
+/// If `path` looks like a compressed tar (`.tar.gz`, `.tar.zst`,
+/// `.tar.xz`, `.tgz`, `.txz`, `.tar.lz4`, `.tar.lzma`, `.tar.lzo`),
+/// return the codec to use; otherwise `None`. Used by repack to pick a
+/// streaming compressor for the output file.
+fn tar_output_codec(path: &std::path::Path) -> Option<fstool::compression::Algo> {
+    let s = path.to_string_lossy().to_ascii_lowercase();
+    if s.ends_with(".tgz") {
+        return Some(fstool::compression::Algo::Gzip);
+    }
+    if s.ends_with(".txz") {
+        return Some(fstool::compression::Algo::Xz);
+    }
+    if !s.contains(".tar.") {
+        // Bare `.gz` / `.zst` etc. without a `.tar.` prefix isn't tar.
+        return None;
+    }
+    fstool::compression::Algo::from_extension(path)
+}
+
 fn unsupported_repack_src(src_fs: &fstool::inspect::AnyFs) -> fstool::Error {
     fstool::Error::Unsupported(format!(
         "repack: {} source is not yet wired into the FS-to-FS copy path (it's inspectable via `ls`/`cat`/`info` but can't yet be a repack source)",

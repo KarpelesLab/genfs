@@ -35,7 +35,7 @@ fstool repack out.img out.tar                    # convert ext4 → tar (and bac
 | APFS       | ✅              | —     | multi-level omap + fs-tree; no snapshots / crypto  |
 | NTFS       | ✅              | —     | MFT, attributes, $DATA + ADS, indexes; xattr map   |
 | F2FS       | ✅              | —     | CP / NAT / dnodes / inline data + dentries         |
-| SquashFS   | ✅ (uncompressed) | —     | gzip/xz/lz4/zstd refused until compression lands   |
+| SquashFS   | ✅              | —     | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features |
 | qcow2      | ✅              | ✅     | v2 + v3, allocate-on-write writer                  |
 
 The reader for each FS streams: file contents are never fully resident in
@@ -170,12 +170,37 @@ For the read-only filesystems (XFS, HFS+, APFS, NTFS, F2FS, SquashFS),
 repack works **from** them. Repacking **to** them isn't supported until
 their writers land.
 
+## Compression
+
+`fstool` ships with six compression codecs enabled by default. Each has
+its own Cargo feature flag so you can trim the binary down:
+
+| Codec | Feature | Used for |
+|-------|---------|----------|
+| gzip  | `gzip`  | SquashFS, `.tar.gz` / `.tgz` |
+| xz    | `xz`    | SquashFS, `.tar.xz` / `.txz` |
+| lzma  | `lzma`  | SquashFS, `.tar.lzma` |
+| lz4   | `lz4`   | SquashFS, `.tar.lz4` |
+| zstd  | `zstd`  | SquashFS, `.tar.zst` |
+| lzo   | `lzo`   | SquashFS, `.tar.lzo` |
+
+Compressed tar input / output is detected by filename extension (or by
+magic for inputs without a recognisable extension): `fstool ls
+disk.tar.zst /` and `fstool repack ext.img out.tar.gz` Just Work.
+Internally the codec is streamed through a temp file so the whole
+archive is never resident in RAM.
+
+To disable a codec at build time, e.g. to avoid the bundled C `zstd`
+build on a constrained system:
+
+```sh
+cargo install fstool --no-default-features --features gzip,lz4,xz,lzma
+```
+
 ## Limitations
 
 Things explicitly out of scope today, in rough order of likely-to-change:
 
-- SquashFS compression decode (needs flate2 / zstd / xz / lz4 dependencies).
-  Compressed blocks return a clean `Unsupported` naming the algorithm.
 - NTFS / F2FS / XFS / APFS / HFS+ writers.
 - NTFS compressed and encrypted `$DATA`, `$ATTRIBUTE_LIST` spill, `$Secure`
   security-descriptor indirection — all return `Unsupported`.

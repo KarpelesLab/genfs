@@ -18,6 +18,18 @@ path = "src/lib.rs"
 name = "fstool"
 path = "src/bin/fstool/main.rs"
 
+[features]
+# Compression codecs for SquashFS reads and `.tar.<algo>` streaming I/O.
+# Enabled by default; disable with `default-features = false` and pick
+# a subset if you want to slim the binary or avoid a C-bundled build.
+default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo"]
+gzip = ["dep:flate2"]
+xz = ["dep:lzma-rs"]
+lzma = ["dep:lzma-rs"]
+lz4 = ["dep:lz4_flex"]
+zstd = ["dep:zstd"]
+lzo = ["dep:minilzo-rs"]
+
 [dependencies]
 thiserror = "2"
 log = "0.4"
@@ -27,6 +39,19 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
 crc32c = "0.6.8"
+# Used to spool compressed tar streams to a temp file when reading or
+# writing `.tar.gz` / `.tar.zst` / etc., so we don't have to hold the
+# whole archive in RAM. Cheap dep; already in dev-dependencies.
+tempfile = "3"
+
+# Compression codecs — all optional and feature-gated. Pure-rust where
+# possible (flate2 via miniz_oxide, lz4_flex, lzma-rs); zstd and lzo
+# pull in bundled C source.
+flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
+lzma-rs = { version = "0.3", optional = true }
+lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["std", "safe-encode", "safe-decode", "frame"] }
+zstd = { version = "0.13", optional = true }
+"minilzo-rs" = { version = "0.6", optional = true }
 
 # Needed on Unix for the BLKGETSIZE64 / DKIOCGETBLOCKCOUNT ioctls used to
 # query the size of a block device, plus the O_EXCL open flag that refuses

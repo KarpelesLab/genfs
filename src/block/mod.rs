@@ -43,11 +43,35 @@ use std::path::Path;
 /// qcow2 files (detected by magic `"QFI\xfb"`) get a [`Qcow2Backend`];
 /// everything else — regular files, block devices — gets a
 /// [`FileBackend`]. The detection reads just the first four bytes.
+///
+/// This does **not** handle compressed inputs like `.tar.gz`. Use
+/// [`open_image_maybe_compressed`] when the path might carry a codec.
 pub fn open_image(path: &Path) -> crate::Result<Box<dyn BlockDevice>> {
     if Qcow2Backend::probe(path)? {
         Ok(Box::new(Qcow2Backend::open(path)?))
     } else {
         Ok(Box::new(FileBackend::open(path)?))
+    }
+}
+
+/// Like [`open_image`], but transparently decompresses `.tar.gz` /
+/// `.tar.zst` / `.xz` / etc. into a [`tempfile::NamedTempFile`] before
+/// opening it as a `FileBackend`. The temp file is returned alongside
+/// the device so the caller can hold it alive for the duration of the
+/// borrow — when the tempfile drops, the underlying file is unlinked.
+///
+/// For uncompressed paths the returned tempfile slot is `None` and the
+/// behaviour matches [`open_image`] exactly.
+pub fn open_image_maybe_compressed(
+    path: &Path,
+) -> crate::Result<(Box<dyn BlockDevice>, Option<tempfile::NamedTempFile>)> {
+    match crate::compression::detect_path(path)? {
+        Some(algo) => {
+            let tmp = crate::compression::decompress_to_tempfile(path, algo)?;
+            let dev = FileBackend::open(tmp.path())?;
+            Ok((Box::new(dev), Some(tmp)))
+        }
+        None => Ok((open_image(path)?, None)),
     }
 }
 

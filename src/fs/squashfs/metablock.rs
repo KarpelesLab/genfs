@@ -48,15 +48,33 @@ pub fn read_metablock(
     }
     let mut payload = vec![0u8; on_disk_len];
     dev.read_at(disk_offset + 2, &mut payload)?;
-    if !uncompressed {
-        return Err(crate::Error::Unsupported(format!(
-            "squashfs: {} decompression requires a feature flag, not built",
-            compression_label(compression)
-        )));
-    }
+    let data = if uncompressed {
+        payload
+    } else {
+        let algo = compression_to_algo(compression).ok_or_else(|| {
+            crate::Error::InvalidImage(format!(
+                "squashfs: unknown compressor id {}",
+                compression_label(compression)
+            ))
+        })?;
+        crate::compression::decompress(algo, &payload, METABLOCK_SIZE)?
+    };
     Ok(Metablock {
-        data: payload,
+        data,
         on_disk_size: (on_disk_len + 2) as u32,
+    })
+}
+
+pub(crate) fn compression_to_algo(c: Compression) -> Option<crate::compression::Algo> {
+    use crate::compression::Algo;
+    Some(match c {
+        Compression::Gzip => Algo::Gzip,
+        Compression::Lzma => Algo::Lzma,
+        Compression::Lzo => Algo::Lzo,
+        Compression::Xz => Algo::Xz,
+        Compression::Lz4 => Algo::Lz4,
+        Compression::Zstd => Algo::Zstd,
+        Compression::Unknown(_) => return None,
     })
 }
 

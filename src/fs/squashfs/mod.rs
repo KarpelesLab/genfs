@@ -578,8 +578,13 @@ mod tests {
     #[test]
     fn compressed_data_block_surfaces_unsupported() {
         // Build a fixture but mark the file's data block as compressed
-        // (clear bit 24). Reading the file should yield Unsupported with
-        // the algorithm name.
+        // (clear bit 24). Behaviour depends on build features:
+        // - With `gzip` enabled (default), the decompressor attempts to
+        //   inflate the raw "hello" bytes and fails with a gzip-decode
+        //   error (the bytes aren't valid gzip).
+        // - With `gzip` disabled, we get an `Unsupported` error from the
+        //   compression module saying the feature is off.
+        // Either way the message mentions "gzip".
         let mut built = build_fixture();
         // Open + intercept: re-decode superblock, walk to file inode, patch
         // its block_size word. Easier: locate the bytes "hello" data was
@@ -610,6 +615,5 @@ mod tests {
         let err = res.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("gzip"), "unexpected message: {msg}");
-        assert!(msg.contains("decompression"), "unexpected message: {msg}");
     }
 }

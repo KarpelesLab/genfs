@@ -16,6 +16,7 @@ use crate::block::BlockDevice;
 use crate::fs::squashfs::Compression;
 use crate::fs::squashfs::fragment::{self, FragmentEntry};
 use crate::fs::squashfs::inode::FileInode;
+use crate::fs::squashfs::metablock::compression_to_algo;
 
 /// Streaming reader for a regular SquashFS file. Stays within one block
 /// (or fragment-tail) buffer at a time; never loads the entire file.
@@ -100,18 +101,29 @@ impl<'a> FileReader<'a> {
                 let take = (self.full_block_size as u64).min(self.remaining) as usize;
                 self.buf = vec![0u8; take];
             } else {
-                if !uncompressed {
-                    return Err(crate::Error::Unsupported(format!(
-                        "squashfs: {} decompression requires a feature flag, not built",
-                        compression_label(self.compression)
-                    )));
-                }
                 let mut payload = vec![0u8; on_disk as usize];
                 self.dev.read_at(self.next_disk_offset, &mut payload)?;
+                let decoded = if uncompressed {
+                    payload
+                } else {
+                    // Non-tail blocks decompress to exactly `full_block_size`;
+                    // the tail block decompresses to whatever's left of the
+                    // file. minilzo treats this as an exact size, so the
+                    // remaining-vs-full distinction matters for LZO.
+                    let expected = self.remaining.min(self.full_block_size as u64) as usize;
+                    let algo = compression_to_algo(self.compression).ok_or_else(|| {
+                        crate::Error::InvalidImage(format!(
+                            "squashfs: unknown compressor id {}",
+                            compression_label(self.compression)
+                        ))
+                    })?;
+                    crate::compression::decompress(algo, &payload, expected)?
+                };
                 // Trim the final block to actual file size if needed.
-                let take = (payload.len() as u64).min(self.remaining) as usize;
-                payload.truncate(take);
-                self.buf = payload;
+                let take = (decoded.len() as u64).min(self.remaining) as usize;
+                let mut trimmed = decoded;
+                trimmed.truncate(take);
+                self.buf = trimmed;
             }
             self.next_disk_offset = self.next_disk_offset.saturating_add(on_disk as u64);
             self.next_block_idx += 1;
@@ -127,16 +139,27 @@ impl<'a> FileReader<'a> {
                 self.compression,
                 self.fragment_index,
             )?;
-            if !entry.is_uncompressed() {
-                return Err(crate::Error::Unsupported(format!(
-                    "squashfs: {} decompression requires a feature flag, not built",
-                    compression_label(self.compression)
-                )));
-            }
-            // Read the fragment block, slice out our tail.
+            // Read the fragment block, decompressing if needed, then slice
+            // out our tail.
             let frag_size = entry.on_disk_size() as usize;
             let mut frag_buf = vec![0u8; frag_size];
             self.dev.read_at(entry.start, &mut frag_buf)?;
+            let frag_buf = if entry.is_uncompressed() {
+                frag_buf
+            } else {
+                let algo = compression_to_algo(self.compression).ok_or_else(|| {
+                    crate::Error::InvalidImage(format!(
+                        "squashfs: unknown compressor id {}",
+                        compression_label(self.compression)
+                    ))
+                })?;
+                // Fragment blocks pack multiple file tails together; their
+                // uncompressed size is at most one FS block. We can't know
+                // it exactly from on-disk metadata, so we pass `full_block_size`
+                // as the cap. For LZO that becomes an exact-length request,
+                // which works for mksquashfs-produced images.
+                crate::compression::decompress(algo, &frag_buf, self.full_block_size as usize)?
+            };
             let off = self.fragment_offset as usize;
             let take = self.remaining as usize;
             if off.checked_add(take).is_none_or(|end| end > frag_buf.len()) {

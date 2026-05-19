@@ -128,10 +128,7 @@ impl ForkData {
     /// Sum of `block_count` across the inline extents — used to
     /// determine whether overflow extents would be required.
     pub fn inline_blocks(&self) -> u64 {
-        self.extents
-            .iter()
-            .map(|e| u64::from(e.block_count))
-            .sum()
+        self.extents.iter().map(|e| u64::from(e.block_count)).sum()
     }
 }
 

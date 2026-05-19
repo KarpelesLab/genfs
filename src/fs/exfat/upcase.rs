@@ -119,7 +119,9 @@ impl Upcase {
         if a.len() != b.len() {
             return false;
         }
-        a.iter().zip(b.iter()).all(|(&x, &y)| self.up(x) == self.up(y))
+        a.iter()
+            .zip(b.iter())
+            .all(|(&x, &y)| self.up(x) == self.up(y))
     }
 
     /// Number of slots actually populated; beyond this, characters map to

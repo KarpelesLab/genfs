@@ -80,7 +80,8 @@ impl Extent {
         let hi = (unwritten << 63)
             | ((self.offset & ((1 << 54) - 1)) << 9)
             | ((self.startblock >> 43) & ((1 << 9) - 1));
-        let lo = ((self.startblock & ((1 << 43) - 1)) << 21) | (self.blockcount as u64 & ((1 << 21) - 1));
+        let lo = ((self.startblock & ((1 << 43) - 1)) << 21)
+            | (self.blockcount as u64 & ((1 << 21) - 1));
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&hi.to_be_bytes());
         out[8..16].copy_from_slice(&lo.to_be_bytes());
@@ -91,9 +92,9 @@ impl Extent {
 /// Decode `n` consecutive extent records from `buf`. `buf` must hold at
 /// least `n * BMBT_REC_SIZE` bytes.
 pub fn decode_extents(buf: &[u8], n: u32) -> Result<Vec<Extent>> {
-    let need = (n as usize).checked_mul(BMBT_REC_SIZE).ok_or_else(|| {
-        crate::Error::InvalidImage("xfs: extent count overflows".into())
-    })?;
+    let need = (n as usize)
+        .checked_mul(BMBT_REC_SIZE)
+        .ok_or_else(|| crate::Error::InvalidImage("xfs: extent count overflows".into()))?;
     if buf.len() < need {
         return Err(crate::Error::InvalidImage(format!(
             "xfs: extent array truncated: need {need} bytes, have {}",

@@ -10,11 +10,14 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  test:
+  # Linux runs the full battery: fmt, clippy, build, test, doc. The
+  # external cross-validation tests (e2fsck, mke2fs, sgdisk, qemu-img,
+  # …) only fire here because they need apt-supplied tools.
+  test-linux:
     name: test (ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install system tools
         run: |
@@ -61,3 +64,46 @@ jobs:
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  # macOS proves the lib + CLI compile and unit-test cleanly on a
+  # non-Linux Unix. `qemu-img` is available via Homebrew so the qcow2
+  # round-trip suite runs here too; sgdisk / e2fsck / mke2fs / mtools
+  # aren't packaged in stock Homebrew, so those tests skip themselves.
+  test-macos:
+    name: test (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install qemu (for qcow2 tests)
+        run: brew install qemu
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --all-targets --verbose
+
+      - name: cargo test
+        run: cargo test --all-targets --verbose
+
+  # Windows proves the Unix-only paths in populate_from_host_dir /
+  # build_plan / file.rs are properly cfg-gated. Almost all external
+  # cross-validation tests skip here (their tools aren't on the runner),
+  # which is the contract: the in-process tests must still pass.
+  test-windows:
+    name: test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --all-targets --verbose
+
+      - name: cargo test
+        run: cargo test --all-targets --verbose

@@ -7,14 +7,20 @@
 //! check; opening the image with the chosen backend is still where actual
 //! validation happens.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::fs::apfs::Apfs;
+use crate::fs::exfat::Exfat;
 use crate::fs::ext::Ext;
+use crate::fs::f2fs::F2fs;
 use crate::fs::fat::Fat32;
+use crate::fs::hfs_plus::HfsPlus;
+use crate::fs::ntfs::Ntfs;
+use crate::fs::squashfs::Squashfs;
 use crate::fs::tar::Tar;
+use crate::fs::xfs::Xfs;
 use crate::fs::{DirEntry, Filesystem};
 use crate::part::{Gpt, Mbr, Partition, PartitionTable, slice_partition};
 
@@ -27,6 +33,20 @@ pub enum FsKind {
     Fat32,
     /// A tar archive treated as a read-only filesystem.
     Tar,
+    /// XFS — read-only (shortform dirs + extent files).
+    Xfs,
+    /// exFAT — read-only.
+    Exfat,
+    /// HFS+ — read-only.
+    HfsPlus,
+    /// APFS — read-only, single-leaf-tree case only.
+    Apfs,
+    /// NTFS — scaffold; detection only, all ops return `Unsupported`.
+    Ntfs,
+    /// F2FS — scaffold; detection only.
+    F2fs,
+    /// SquashFS — scaffold; detection only.
+    Squashfs,
 }
 
 /// Probe `dev` to decide which filesystem it carries. Reads only sector 0
@@ -42,10 +62,33 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     if bs[510] == 0x55 && bs[511] == 0xAA && &bs[82..87] == b"FAT32" {
         return Ok(FsKind::Fat32);
     }
+    // exFAT: "EXFAT   " at offset 3 of LBA 0 (also has 0x55AA at +510).
+    if &bs[3..11] == b"EXFAT   " {
+        return Ok(FsKind::Exfat);
+    }
+    // NTFS: "NTFS    " at offset 3 of LBA 0.
+    if &bs[3..11] == b"NTFS    " {
+        return Ok(FsKind::Ntfs);
+    }
+
+    // XFS: "XFSB" at offset 0 of LBA 0.
+    if &bs[0..4] == b"XFSB" {
+        return Ok(FsKind::Xfs);
+    }
+
+    // SquashFS: little-endian "hsqs" at offset 0.
+    if &bs[0..4] == b"hsqs" {
+        return Ok(FsKind::Squashfs);
+    }
 
     // Tar: "ustar\0" or "ustar " magic at offset 257 of the first block.
     if &bs[257..262] == b"ustar" {
         return Ok(FsKind::Tar);
+    }
+
+    // APFS: container superblock magic "NXSB" at offset 32 of block 0.
+    if &bs[32..36] == b"NXSB" {
+        return Ok(FsKind::Apfs);
     }
 
     // ext superblock starts at byte 1024; s_magic (0xEF53) is at offset 56.
@@ -55,25 +98,60 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
         return Ok(FsKind::Ext);
     }
 
+    // HFS+ / HFSX volume header sig at byte 1024.
+    let mut hfs_sig = [0u8; 2];
+    if dev.total_size() >= 1024 + 2 {
+        dev.read_at(1024, &mut hfs_sig)?;
+        if &hfs_sig == b"H+" || &hfs_sig == b"HX" {
+            return Ok(FsKind::HfsPlus);
+        }
+    }
+
+    // F2FS: 32-bit LE magic 0xF2F52010 at offset 1024 (primary) or
+    // 1024 + 0x1000 (backup). Check both copies before giving up.
+    let mut f2_magic = [0u8; 4];
+    if dev.total_size() >= 1024 + 0x1000 + 4 {
+        dev.read_at(1024, &mut f2_magic)?;
+        if u32::from_le_bytes(f2_magic) == 0xF2F5_2010 {
+            return Ok(FsKind::F2fs);
+        }
+        dev.read_at(1024 + 0x1000, &mut f2_magic)?;
+        if u32::from_le_bytes(f2_magic) == 0xF2F5_2010 {
+            return Ok(FsKind::F2fs);
+        }
+    }
+
     Err(crate::Error::InvalidImage(
-        "inspect: no recognised filesystem (ext2/3/4, FAT32, or tar) on this image".into(),
+        "inspect: no recognised filesystem (ext2/3/4, FAT32, exFAT, XFS, HFS+, APFS, tar, NTFS, F2FS, SquashFS) on this image".into(),
     ))
 }
 
 /// A unified read-side handle. Hides whether the underlying filesystem
-/// is ext, FAT32, or a tar archive — the CLI calls `list` / `read_file`
-/// / `summary` and the right backend dispatches.
+/// is ext, FAT32, tar, XFS, exFAT, HFS+, or APFS — the CLI calls
+/// `list` / `read_file` / `summary` and the right backend dispatches.
 ///
-/// The ext backend's state is much larger than FAT32's (group descriptors,
-/// bitmaps, inode table cache), so it's boxed to keep the enum compact.
+/// Of these, ext, FAT32, and tar support full read/write; the other
+/// four are read-only. Write-side operations on a read-only variant
+/// return [`crate::Error::Unsupported`].
 pub enum AnyFs {
     Ext(Box<Ext>),
     Fat32(Box<Fat32>),
-    /// Tar archive — read-only via this handle. Write-side operations
-    /// (add_file, add_dir_tree, mkdir, remove) error with
-    /// `Unsupported`; build a fresh tar via `fstool repack` or
-    /// `fstool tar-build`.
+    /// Tar archive — read-only via this handle.
     Tar(Box<Tar>),
+    /// XFS — read-only (shortform dirs + extent-format files).
+    Xfs(Box<Xfs>),
+    /// exFAT — read-only.
+    Exfat(Box<Exfat>),
+    /// HFS+ — read-only.
+    HfsPlus(Box<HfsPlus>),
+    /// APFS — read-only; single-leaf trees only.
+    Apfs(Box<Apfs>),
+    /// NTFS — scaffold; only `info` returns useful data, list/read error.
+    Ntfs(Box<Ntfs>),
+    /// F2FS — scaffold; only `info` returns useful data, list/read error.
+    F2fs(Box<F2fs>),
+    /// SquashFS — scaffold; only `info` returns useful data, list/read error.
+    Squashfs(Box<Squashfs>),
 }
 
 impl AnyFs {
@@ -83,6 +161,13 @@ impl AnyFs {
             FsKind::Ext => Ok(Self::Ext(Box::new(Ext::open(dev)?))),
             FsKind::Fat32 => Ok(Self::Fat32(Box::new(Fat32::open(dev)?))),
             FsKind::Tar => Ok(Self::Tar(Box::new(Tar::open(dev)?))),
+            FsKind::Xfs => Ok(Self::Xfs(Box::new(Xfs::open(dev)?))),
+            FsKind::Exfat => Ok(Self::Exfat(Box::new(Exfat::open(dev)?))),
+            FsKind::HfsPlus => Ok(Self::HfsPlus(Box::new(HfsPlus::open(dev)?))),
+            FsKind::Apfs => Ok(Self::Apfs(Box::new(Apfs::open(dev)?))),
+            FsKind::Ntfs => Ok(Self::Ntfs(Box::new(Ntfs::open(dev)?))),
+            FsKind::F2fs => Ok(Self::F2fs(Box::new(F2fs::open(dev)?))),
+            FsKind::Squashfs => Ok(Self::Squashfs(Box::new(Squashfs::open(dev)?))),
         }
     }
 
@@ -92,6 +177,13 @@ impl AnyFs {
             Self::Ext(_) => FsKind::Ext,
             Self::Fat32(_) => FsKind::Fat32,
             Self::Tar(_) => FsKind::Tar,
+            Self::Xfs(_) => FsKind::Xfs,
+            Self::Exfat(_) => FsKind::Exfat,
+            Self::HfsPlus(_) => FsKind::HfsPlus,
+            Self::Apfs(_) => FsKind::Apfs,
+            Self::Ntfs(_) => FsKind::Ntfs,
+            Self::F2fs(_) => FsKind::F2fs,
+            Self::Squashfs(_) => FsKind::Squashfs,
         }
     }
 
@@ -104,6 +196,13 @@ impl AnyFs {
             }
             Self::Fat32(fat) => fat.list_path(dev, path),
             Self::Tar(tar) => tar.list_path(dev, path),
+            Self::Xfs(xfs) => xfs.list_path(dev, path),
+            Self::Exfat(exfat) => exfat.list_path(dev, path),
+            Self::HfsPlus(hfs) => hfs.list_path(dev, path),
+            Self::Apfs(apfs) => apfs.list_path(dev, path),
+            Self::Ntfs(_) => Err(scaffold_only("ntfs")),
+            Self::F2fs(_) => Err(scaffold_only("f2fs")),
+            Self::Squashfs(_) => Err(scaffold_only("squashfs")),
         }
     }
 
@@ -116,44 +215,40 @@ impl AnyFs {
         out: &mut dyn std::io::Write,
     ) -> Result<u64> {
         let mut buf = [0u8; 64 * 1024];
-        let mut total = 0u64;
         match self {
             Self::Ext(ext) => {
                 let ino = ext.path_to_inode(dev, path)?;
-                let mut reader = ext.open_file_reader(dev, ino)?;
-                loop {
-                    let n = reader.read(&mut buf).map_err(crate::Error::from)?;
-                    if n == 0 {
-                        break;
-                    }
-                    out.write_all(&buf[..n]).map_err(crate::Error::from)?;
-                    total += n as u64;
-                }
+                let mut r = ext.open_file_reader(dev, ino)?;
+                pump(&mut r, out, &mut buf)
             }
             Self::Fat32(fat) => {
-                let mut reader = fat.open_file_reader(dev, path)?;
-                loop {
-                    let n = reader.read(&mut buf).map_err(crate::Error::from)?;
-                    if n == 0 {
-                        break;
-                    }
-                    out.write_all(&buf[..n]).map_err(crate::Error::from)?;
-                    total += n as u64;
-                }
+                let mut r = fat.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
             }
             Self::Tar(tar) => {
-                let mut reader = tar.open_file_reader(dev, path)?;
-                loop {
-                    let n = reader.read(&mut buf).map_err(crate::Error::from)?;
-                    if n == 0 {
-                        break;
-                    }
-                    out.write_all(&buf[..n]).map_err(crate::Error::from)?;
-                    total += n as u64;
-                }
+                let mut r = tar.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
             }
+            Self::Xfs(xfs) => {
+                let mut r = xfs.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
+            Self::Exfat(exfat) => {
+                let mut r = exfat.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
+            Self::HfsPlus(hfs) => {
+                let mut r = hfs.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
+            Self::Apfs(apfs) => {
+                let mut r = apfs.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
+            Self::Ntfs(_) => Err(scaffold_only("ntfs")),
+            Self::F2fs(_) => Err(scaffold_only("f2fs")),
+            Self::Squashfs(_) => Err(scaffold_only("squashfs")),
         }
-        Ok(total)
     }
 
     /// Add a regular file at `dest_path`, populated from a host file.
@@ -168,10 +263,9 @@ impl AnyFs {
     ) -> Result<()> {
         match self {
             Self::Ext(ext) => {
-                use std::os::unix::fs::PermissionsExt;
                 let meta = std::fs::symlink_metadata(host_src)?;
                 let fmeta = crate::fs::FileMeta {
-                    mode: (meta.permissions().mode() & 0o7777) as u16,
+                    mode: host_mode_from_meta(&meta, false),
                     ..crate::fs::FileMeta::default()
                 };
                 let dest = std::path::Path::new(dest_path);
@@ -184,7 +278,14 @@ impl AnyFs {
                 )
             }
             Self::Fat32(fat) => fat.add_file(dev, dest_path, host_src),
-            Self::Tar(_) => Err(tar_readonly()),
+            Self::Tar(_) => Err(read_only_fs("tar")),
+            Self::Xfs(_) => Err(read_only_fs("xfs")),
+            Self::Exfat(_) => Err(read_only_fs("exfat")),
+            Self::HfsPlus(_) => Err(read_only_fs("hfs+")),
+            Self::Apfs(_) => Err(read_only_fs("apfs")),
+            Self::Ntfs(_) => Err(read_only_fs("ntfs")),
+            Self::F2fs(_) => Err(read_only_fs("f2fs")),
+            Self::Squashfs(_) => Err(read_only_fs("squashfs")),
         }
     }
 
@@ -199,10 +300,9 @@ impl AnyFs {
     ) -> Result<()> {
         match self {
             Self::Ext(ext) => {
-                use std::os::unix::fs::PermissionsExt;
                 let meta = std::fs::symlink_metadata(host_src)?;
                 let fmeta = crate::fs::FileMeta {
-                    mode: (meta.permissions().mode() & 0o7777) as u16,
+                    mode: host_mode_from_meta(&meta, true),
                     ..crate::fs::FileMeta::default()
                 };
                 let dest = std::path::Path::new(dest_path);
@@ -215,7 +315,14 @@ impl AnyFs {
                 fat.add_dir(dev, dest_path)?;
                 add_host_tree_into_fat32(fat, dev, dest_path, host_src)
             }
-            Self::Tar(_) => Err(tar_readonly()),
+            Self::Tar(_) => Err(read_only_fs("tar")),
+            Self::Xfs(_) => Err(read_only_fs("xfs")),
+            Self::Exfat(_) => Err(read_only_fs("exfat")),
+            Self::HfsPlus(_) => Err(read_only_fs("hfs+")),
+            Self::Apfs(_) => Err(read_only_fs("apfs")),
+            Self::Ntfs(_) => Err(read_only_fs("ntfs")),
+            Self::F2fs(_) => Err(read_only_fs("f2fs")),
+            Self::Squashfs(_) => Err(read_only_fs("squashfs")),
         }
     }
 
@@ -232,7 +339,14 @@ impl AnyFs {
                 ext.create_dir(dev, std::path::Path::new(path), meta)
             }
             Self::Fat32(fat) => fat.add_dir(dev, path),
-            Self::Tar(_) => Err(tar_readonly()),
+            Self::Tar(_) => Err(read_only_fs("tar")),
+            Self::Xfs(_) => Err(read_only_fs("xfs")),
+            Self::Exfat(_) => Err(read_only_fs("exfat")),
+            Self::HfsPlus(_) => Err(read_only_fs("hfs+")),
+            Self::Apfs(_) => Err(read_only_fs("apfs")),
+            Self::Ntfs(_) => Err(read_only_fs("ntfs")),
+            Self::F2fs(_) => Err(read_only_fs("f2fs")),
+            Self::Squashfs(_) => Err(read_only_fs("squashfs")),
         }
     }
 
@@ -242,7 +356,14 @@ impl AnyFs {
         match self {
             Self::Ext(ext) => ext.remove_path(dev, path),
             Self::Fat32(fat) => fat.remove(dev, path),
-            Self::Tar(_) => Err(tar_readonly()),
+            Self::Tar(_) => Err(read_only_fs("tar")),
+            Self::Xfs(_) => Err(read_only_fs("xfs")),
+            Self::Exfat(_) => Err(read_only_fs("exfat")),
+            Self::HfsPlus(_) => Err(read_only_fs("hfs+")),
+            Self::Apfs(_) => Err(read_only_fs("apfs")),
+            Self::Ntfs(_) => Err(read_only_fs("ntfs")),
+            Self::F2fs(_) => Err(read_only_fs("f2fs")),
+            Self::Squashfs(_) => Err(read_only_fs("squashfs")),
         }
     }
 
@@ -251,13 +372,43 @@ impl AnyFs {
         match self {
             Self::Ext(ext) => ext.flush(dev),
             Self::Fat32(fat) => fat.flush(dev),
-            // Tar is read-only via AnyFs; nothing to flush.
-            Self::Tar(_) => Ok(()),
+            // Read-only handles have nothing to flush.
+            Self::Tar(_)
+            | Self::Xfs(_)
+            | Self::Exfat(_)
+            | Self::HfsPlus(_)
+            | Self::Apfs(_)
+            | Self::Ntfs(_)
+            | Self::F2fs(_)
+            | Self::Squashfs(_) => Ok(()),
         }
     }
 
     /// One-line FS summary, used by `fstool info`'s heading.
     pub fn kind_string(&self) -> &'static str {
+        // Stitch in the read-only variants up front so the existing
+        // arms below for ext/fat32/tar don't need restructuring.
+        if let Self::Xfs(_) = self {
+            return "xfs";
+        }
+        if let Self::Exfat(_) = self {
+            return "exfat";
+        }
+        if let Self::HfsPlus(_) = self {
+            return "hfs+";
+        }
+        if let Self::Apfs(_) = self {
+            return "apfs";
+        }
+        if let Self::Ntfs(_) = self {
+            return "ntfs";
+        }
+        if let Self::F2fs(_) = self {
+            return "f2fs";
+        }
+        if let Self::Squashfs(_) = self {
+            return "squashfs";
+        }
         match self {
             Self::Ext(ext) => match ext.kind {
                 crate::fs::ext::FsKind::Ext2 => "ext2",
@@ -266,14 +417,69 @@ impl AnyFs {
             },
             Self::Fat32(_) => "fat32",
             Self::Tar(_) => "tar",
+            // Read-only variants are dispatched above.
+            Self::Xfs(_)
+            | Self::Exfat(_)
+            | Self::HfsPlus(_)
+            | Self::Apfs(_)
+            | Self::Ntfs(_)
+            | Self::F2fs(_)
+            | Self::Squashfs(_) => unreachable!(),
         }
     }
 }
 
-fn tar_readonly() -> crate::Error {
-    crate::Error::Unsupported(
-        "tar archives are read-only via fstool; build a fresh archive with `fstool repack` or `fstool tar-build`".into(),
-    )
+/// Best-effort mode for a host file pulled in via `add_file` / `add_dir_tree`.
+/// On Unix: the actual permission bits. On Windows: a fixed 0o755 for
+/// directories and 0o644 for everything else (we don't have POSIX bits
+/// to read).
+fn host_mode_from_meta(meta: &std::fs::Metadata, is_dir: bool) -> u16 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = is_dir;
+        (meta.permissions().mode() & 0o7777) as u16
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        if is_dir { 0o755 } else { 0o644 }
+    }
+}
+
+fn read_only_fs(name: &str) -> crate::Error {
+    crate::Error::Unsupported(format!(
+        "{name} is mounted read-only by fstool; build a fresh output with `fstool repack`"
+    ))
+}
+
+/// Error for scaffold-only filesystems where the on-disk layout is recognised
+/// but full read/list support hasn't been implemented yet.
+fn scaffold_only(name: &str) -> crate::Error {
+    crate::Error::Unsupported(format!(
+        "{name}: only detection / `info` is implemented in this scaffold; \
+         list / read / repack support is not built yet"
+    ))
+}
+
+/// Pump `reader` into `out` through `buf` until EOF, returning total
+/// bytes copied. Used by `copy_file_to` for every backend. `W` is
+/// `?Sized` so `&mut dyn Write` callers work directly.
+fn pump<R: std::io::Read + ?Sized, W: std::io::Write + ?Sized>(
+    reader: &mut R,
+    out: &mut W,
+    buf: &mut [u8],
+) -> Result<u64> {
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(buf).map_err(crate::Error::from)?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n]).map_err(crate::Error::from)?;
+        total += n as u64;
+    }
+    Ok(total)
 }
 
 /// Recursively copy a host directory tree into a pre-existing FAT32

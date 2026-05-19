@@ -35,7 +35,7 @@
 //!  184   nx_fs_oid[NX_MAX_FILE_SYSTEMS=100] u64  → ends at 184+800 = 984
 //! ```
 
-use super::obj::{ObjPhys, OBJECT_TYPE_NX_SUPERBLOCK};
+use super::obj::{OBJECT_TYPE_NX_SUPERBLOCK, ObjPhys};
 
 /// Magic value of `nx_magic` ("NXSB" read little-endian).
 pub const NX_MAGIC: u32 = 0x4253_584e;

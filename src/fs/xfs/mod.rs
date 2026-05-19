@@ -166,14 +166,9 @@ impl Xfs {
         let mut cur_core = core;
         for part in split_path(path) {
             let dir_entries = self.read_dir_entries(&cur_buf, &cur_core)?;
-            let found = dir_entries
-                .iter()
-                .find(|e| e.name == part)
-                .ok_or_else(|| {
-                    crate::Error::InvalidArgument(format!(
-                        "xfs: no such entry {part:?} under {path:?}"
-                    ))
-                })?;
+            let found = dir_entries.iter().find(|e| e.name == part).ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("xfs: no such entry {part:?} under {path:?}"))
+            })?;
             cur_ino = found.inumber;
             let (b, c) = self.read_inode(dev, cur_ino)?;
             cur_buf = b;
@@ -183,11 +178,7 @@ impl Xfs {
     }
 
     /// Read a directory's entries given the inode's bytes + core.
-    fn read_dir_entries(
-        &self,
-        ino_buf: &[u8],
-        core: &DinodeCore,
-    ) -> Result<Vec<ShortformEntry>> {
+    fn read_dir_entries(&self, ino_buf: &[u8], core: &DinodeCore) -> Result<Vec<ShortformEntry>> {
         if !core.is_dir() {
             return Err(crate::Error::InvalidArgument(
                 "xfs: target is not a directory".into(),
@@ -337,8 +328,7 @@ impl<'a> std::io::Read for XfsFileReader<'a> {
                 // Read across this extent until the next extent boundary
                 // or the user's buffer is full.
                 let extent_blocks_left = e.offset + e.blockcount as u64 - pos_blk;
-                let extent_bytes_left =
-                    extent_blocks_left * self.blocksize - pos_off;
+                let extent_bytes_left = extent_blocks_left * self.blocksize - pos_off;
                 let to_read = (n as u64).min(extent_bytes_left) as usize;
                 let phys_byte = (e.startblock + (pos_blk - e.offset)) * self.blocksize + pos_off;
                 self.dev
@@ -385,7 +375,9 @@ pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
 /// Split a `/`-rooted path into non-empty components. Treats `/`, `""`,
 /// and `.` as "the root" (empty vec). Multiple slashes are collapsed.
 fn split_path(path: &str) -> Vec<&str> {
-    path.split('/').filter(|p| !p.is_empty() && *p != ".").collect()
+    path.split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect()
 }
 
 #[cfg(test)]

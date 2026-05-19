@@ -123,9 +123,7 @@ pub fn decode_shortform(lit: &[u8], has_ftype: bool) -> Result<(u64, Vec<Shortfo
             )));
         }
         let name = std::str::from_utf8(&lit[name_start..name_end])
-            .map_err(|_| {
-                crate::Error::InvalidImage("xfs: non-UTF-8 shortform dir name".into())
-            })?
+            .map_err(|_| crate::Error::InvalidImage("xfs: non-UTF-8 shortform dir name".into()))?
             .to_string();
         let mut cur = name_end;
         let ftype = if has_ftype {
@@ -207,7 +205,10 @@ mod tests {
     fn decode_two_entries_with_ftype() {
         let buf = synth(
             128,
-            &[("a", 200, XFS_DIR3_FT_REG_FILE), ("dir", 201, XFS_DIR3_FT_DIR)],
+            &[
+                ("a", 200, XFS_DIR3_FT_REG_FILE),
+                ("dir", 201, XFS_DIR3_FT_DIR),
+            ],
             true,
         );
         let (parent, entries) = decode_shortform(&buf, true).unwrap();
@@ -258,13 +259,11 @@ mod tests {
 
     #[test]
     fn to_generic_preserves_data() {
-        let entries = vec![
-            ShortformEntry {
-                name: "x".into(),
-                inumber: 7,
-                ftype: XFS_DIR3_FT_REG_FILE,
-            },
-        ];
+        let entries = vec![ShortformEntry {
+            name: "x".into(),
+            inumber: 7,
+            ftype: XFS_DIR3_FT_REG_FILE,
+        }];
         let g = shortform_to_generic(&entries);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].name, "x");

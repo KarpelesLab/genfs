@@ -7,8 +7,9 @@
 Build disk images and filesystem images from a directory tree and a TOML
 spec — in the spirit of `genext2fs`, but going further:
 
-- **Multiple filesystems** — ext2, ext3, ext4, FAT32, and tar (as a
-  read/write filesystem-like archive format).
+- **Multiple filesystems** — read+write for ext2/3/4, FAT32, and tar; read-only
+  for XFS, exFAT, HFS+, and APFS; detection scaffolds in place for NTFS,
+  F2FS, and SquashFS.
 - **Whole disk images** — MBR and GPT partition tables, not just bare FS images.
 - **Streaming** — file contents are never preloaded in memory regardless of
   size. Generation is a two-pass scan-then-stream.

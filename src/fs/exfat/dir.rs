@@ -288,9 +288,8 @@ pub fn parse_file_set(set: &[u8]) -> crate::Result<FileEntrySet> {
         }
     }
     name_utf16.truncate(name_length as usize);
-    let name = String::from_utf16(&name_utf16).map_err(|_| {
-        crate::Error::InvalidImage("exfat: file name is not valid UTF-16".into())
-    })?;
+    let name = String::from_utf16(&name_utf16)
+        .map_err(|_| crate::Error::InvalidImage("exfat: file name is not valid UTF-16".into()))?;
 
     // We don't strictly validate name_hash — it's a hint, and verifying
     // requires the up-case table the caller may not yet have. Keep the
@@ -370,7 +369,13 @@ mod tests {
         // A trivial 3-entry set, all zero except types.
         let primary = make_primary(2, 0);
         let stream = make_stream(SECFLAG_NO_FAT_CHAIN, 5, 5, 4, 5);
-        let name = make_name(&[b'H' as u16, b'E' as u16, b'L' as u16, b'L' as u16, b'O' as u16]);
+        let name = make_name(&[
+            b'H' as u16,
+            b'E' as u16,
+            b'L' as u16,
+            b'L' as u16,
+            b'O' as u16,
+        ]);
         let mut set = Vec::new();
         set.extend_from_slice(&primary);
         set.extend_from_slice(&stream);
@@ -445,13 +450,7 @@ mod tests {
         let secondary_count = (1 + n_name_entries) as u8;
 
         let mut primary = make_primary(secondary_count, 0);
-        let stream = make_stream(
-            SECFLAG_NO_FAT_CHAIN,
-            name_units.len() as u8,
-            100,
-            10,
-            100,
-        );
+        let stream = make_stream(SECFLAG_NO_FAT_CHAIN, name_units.len() as u8, 100, 10, 100);
 
         let mut set = Vec::new();
         set.extend_from_slice(&primary);

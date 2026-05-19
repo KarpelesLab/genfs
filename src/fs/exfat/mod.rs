@@ -155,11 +155,8 @@ impl Exfat {
             )));
         }
         let cluster_bytes = self.boot.bytes_per_cluster() as u64;
-        let chain = self.build_data_chain(
-            entry.first_cluster,
-            entry.no_fat_chain(),
-            entry.data_length,
-        )?;
+        let chain =
+            self.build_data_chain(entry.first_cluster, entry.no_fat_chain(), entry.data_length)?;
         // ValidDataLength is what the file system reports as the logical
         // file size; bytes beyond it but within DataLength are nominally
         // zero. Cap reads to ValidDataLength.
@@ -203,11 +200,7 @@ impl Exfat {
 
     /// Resolve `path` to its file entry set plus the cluster of the
     /// containing directory. Errors if `path` is the root.
-    fn resolve_entry(
-        &self,
-        dev: &mut dyn BlockDevice,
-        path: &str,
-    ) -> Result<(FileEntrySet, u32)> {
+    fn resolve_entry(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<(FileEntrySet, u32)> {
         let parts = split_path(path);
         if parts.is_empty() {
             return Err(crate::Error::InvalidArgument(
@@ -341,8 +334,7 @@ impl Exfat {
 
         let mut i = 0;
         while i + ENTRY_SIZE <= root_bytes.len() {
-            let slot: &[u8; ENTRY_SIZE] =
-                (&root_bytes[i..i + ENTRY_SIZE]).try_into().unwrap();
+            let slot: &[u8; ENTRY_SIZE] = (&root_bytes[i..i + ENTRY_SIZE]).try_into().unwrap();
             match dir::classify_slot(slot) {
                 RawSlot::EndOfDirectory => break,
                 RawSlot::Unused => {
@@ -453,12 +445,9 @@ impl<'a> std::io::Read for ExfatFileReader<'a> {
             return Ok(0);
         }
         let avail_in_cluster = self.cluster_bytes - self.cluster_off;
-        let want = (buf.len() as u64)
-            .min(avail_in_cluster)
-            .min(self.remaining) as usize;
+        let want = (buf.len() as u64).min(avail_in_cluster).min(self.remaining) as usize;
         let cluster = self.chain[self.cluster_idx];
-        let cluster_start =
-            self.cluster_heap_offset + (cluster as u64 - 2) * self.cluster_bytes;
+        let cluster_start = self.cluster_heap_offset + (cluster as u64 - 2) * self.cluster_bytes;
         let off = cluster_start + self.cluster_off;
         self.dev
             .read_at(off, &mut buf[..want])
@@ -574,8 +563,7 @@ mod tests {
 
         // Helper: byte offset of cluster N.
         let cluster_off = |c: u32| -> u64 {
-            CLUSTER_HEAP_OFFSET_SECTORS as u64 * BPS as u64
-                + (c as u64 - 2) * BPC as u64
+            CLUSTER_HEAP_OFFSET_SECTORS as u64 * BPS as u64 + (c as u64 - 2) * BPC as u64
         };
 
         // Up-case table (ASCII identity 0..0x80, with a..z → A..Z).
@@ -593,7 +581,8 @@ mod tests {
         let upcase_checksum = super::upcase::table_checksum(&upcase);
         let mut upcase_cluster = vec![0u8; BPC as usize];
         upcase_cluster[..upcase.len()].copy_from_slice(&upcase);
-        dev.write_at(cluster_off(CL_UPCASE), &upcase_cluster).unwrap();
+        dev.write_at(cluster_off(CL_UPCASE), &upcase_cluster)
+            .unwrap();
 
         // File: "hello.txt" contents.
         let hello_text = b"Hello, exFAT!\n";
@@ -608,12 +597,7 @@ mod tests {
         dev.write_at(cluster_off(CL_XBIN), &xbin_cluster).unwrap();
 
         // Sub directory: holds entry-set for "x.bin".
-        let sub_entries = build_dir_entries(&[(
-            "x.bin",
-            false,
-            CL_XBIN,
-            xbin_data.len() as u64,
-        )]);
+        let sub_entries = build_dir_entries(&[("x.bin", false, CL_XBIN, xbin_data.len() as u64)]);
         let mut sub_cluster = vec![0u8; BPC as usize];
         sub_cluster[..sub_entries.len()].copy_from_slice(&sub_entries);
         dev.write_at(cluster_off(CL_SUB), &sub_cluster).unwrap();
@@ -657,21 +641,11 @@ mod tests {
         }
 
         // File "hello.txt" (regular file, 14 bytes).
-        root.extend_from_slice(&build_dir_entries(&[(
-            "hello.txt",
-            false,
-            CL_HELLO,
-            14,
-        )]));
+        root.extend_from_slice(&build_dir_entries(&[("hello.txt", false, CL_HELLO, 14)]));
 
         // Directory "sub" (size = one cluster — the spec records data_length
         // as the directory's total byte length).
-        root.extend_from_slice(&build_dir_entries(&[(
-            "sub",
-            true,
-            CL_SUB,
-            BPC as u64,
-        )]));
+        root.extend_from_slice(&build_dir_entries(&[("sub", true, CL_SUB, BPC as u64)]));
 
         let mut root_cluster = vec![0u8; BPC as usize];
         root_cluster[..root.len()].copy_from_slice(&root);

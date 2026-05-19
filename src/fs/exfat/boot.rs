@@ -92,8 +92,7 @@ impl BootSector {
 
     /// Byte offset of cluster `n` (n >= 2).
     pub fn cluster_byte_offset(&self, cluster: u32) -> u64 {
-        self.cluster_heap_byte_offset()
-            + (cluster as u64 - 2) * self.bytes_per_cluster() as u64
+        self.cluster_heap_byte_offset() + (cluster as u64 - 2) * self.bytes_per_cluster() as u64
     }
 
     /// Decode from the first 512 bytes of LBA 0.

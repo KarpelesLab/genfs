@@ -24,8 +24,8 @@ use crate::Result;
 use crate::block::BlockDevice;
 
 use super::btree::{
-    BTreeHeader, ForkReader, KIND_INDEX, KIND_LEAF, NodeDescriptor, NODE_DESCRIPTOR_SIZE,
-    HEADER_REC_SIZE, read_node, record_bytes, record_offsets,
+    BTreeHeader, ForkReader, HEADER_REC_SIZE, KIND_INDEX, KIND_LEAF, NODE_DESCRIPTOR_SIZE,
+    NodeDescriptor, read_node, record_bytes, record_offsets,
 };
 use super::volume_header::ForkData;
 
@@ -169,9 +169,7 @@ impl CatalogKey {
     /// (records and their keys are 2-byte aligned per TN1150).
     pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < 6 {
-            return Err(crate::Error::InvalidImage(
-                "hfs+: short catalog key".into(),
-            ));
+            return Err(crate::Error::InvalidImage("hfs+: short catalog key".into()));
         }
         let key_length = u16::from_be_bytes([buf[0], buf[1]]) as usize;
         let parent_id = u32::from_be_bytes(buf[2..6].try_into().unwrap());
@@ -388,11 +386,7 @@ pub struct Catalog {
 
 impl Catalog {
     /// Open the catalog by reading its B-tree header node (node 0).
-    pub fn open(
-        dev: &mut dyn BlockDevice,
-        fork: ForkReader,
-        case_sensitive: bool,
-    ) -> Result<Self> {
+    pub fn open(dev: &mut dyn BlockDevice, fork: ForkReader, case_sensitive: bool) -> Result<Self> {
         // Read just enough of node 0 to discover the real node size.
         // The header record always begins at byte 14 of node 0, immediately
         // after the BTNodeDescriptor.
@@ -468,7 +462,8 @@ impl Catalog {
                             "hfs+: index record missing child pointer".into(),
                         ));
                     }
-                    let next = u32::from_be_bytes(rec[pointer_off..pointer_off + 4].try_into().unwrap());
+                    let next =
+                        u32::from_be_bytes(rec[pointer_off..pointer_off + 4].try_into().unwrap());
                     match key.compare(wanted, self.case_sensitive) {
                         Ordering::Less | Ordering::Equal => child = Some(next),
                         Ordering::Greater => break,

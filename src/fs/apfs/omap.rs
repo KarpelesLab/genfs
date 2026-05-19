@@ -31,7 +31,7 @@
 //! tree as usual; we pick the entry with the largest `xid <= target_xid`.
 
 use super::btree::BTreeNode;
-use super::obj::{ObjPhys, OBJECT_TYPE_OMAP};
+use super::obj::{OBJECT_TYPE_OMAP, ObjPhys};
 
 /// Decoded `omap_phys_t`.
 #[derive(Debug, Clone)]
@@ -83,7 +83,9 @@ impl OmapKey {
     pub const SIZE: usize = 16;
     pub fn decode(buf: &[u8]) -> crate::Result<Self> {
         if buf.len() < Self::SIZE {
-            return Err(crate::Error::InvalidImage("apfs: omap_key too short".into()));
+            return Err(crate::Error::InvalidImage(
+                "apfs: omap_key too short".into(),
+            ));
         }
         Ok(Self {
             oid: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
@@ -104,7 +106,9 @@ impl OmapVal {
     pub const SIZE: usize = 16;
     pub fn decode(buf: &[u8]) -> crate::Result<Self> {
         if buf.len() < Self::SIZE {
-            return Err(crate::Error::InvalidImage("apfs: omap_val too short".into()));
+            return Err(crate::Error::InvalidImage(
+                "apfs: omap_val too short".into(),
+            ));
         }
         Ok(Self {
             flags: u32::from_le_bytes(buf[0..4].try_into().unwrap()),

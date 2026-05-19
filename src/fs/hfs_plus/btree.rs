@@ -116,9 +116,7 @@ impl BTreeHeader {
     /// Decode the BTHeaderRec record (first record of node 0).
     pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < HEADER_REC_SIZE {
-            return Err(crate::Error::InvalidImage(
-                "hfs+: short BTHeaderRec".into(),
-            ));
+            return Err(crate::Error::InvalidImage("hfs+: short BTHeaderRec".into()));
         }
         let h = Self {
             tree_depth: u16::from_be_bytes(buf[0..2].try_into().unwrap()),
@@ -170,11 +168,7 @@ impl ForkReader {
     /// file (i.e. its `total_blocks` exceeds the sum of inline extent
     /// block counts) — for v1 we report this cleanly rather than walking
     /// the overflow tree.
-    pub fn from_inline(
-        fork: &ForkData,
-        block_size: u32,
-        what: &str,
-    ) -> Result<Self> {
+    pub fn from_inline(fork: &ForkData, block_size: u32, what: &str) -> Result<Self> {
         if u64::from(fork.total_blocks) > fork.inline_blocks() {
             return Err(crate::Error::Unsupported(format!(
                 "hfs+: {what} fork has {} allocation blocks but only \

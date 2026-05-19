@@ -55,7 +55,7 @@ jobs:
             asset_suffix: windows-aarch64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install cross compiler (Linux aarch64)
         if: matrix.apt_packages
@@ -116,7 +116,7 @@ jobs:
     name: build macos universal
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

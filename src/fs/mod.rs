@@ -22,9 +22,12 @@ use std::path::{Path, PathBuf};
 pub mod apfs;
 pub mod exfat;
 pub mod ext;
+pub mod f2fs;
 pub mod fat;
 pub mod hfs_plus;
+pub mod ntfs;
 pub mod rootdevs;
+pub mod squashfs;
 pub mod tar;
 pub mod xfs;
 

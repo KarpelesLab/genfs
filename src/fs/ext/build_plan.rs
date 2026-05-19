@@ -7,7 +7,6 @@
 //! contents are not loaded.
 
 use std::fs;
-use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
 use super::FsKind;
@@ -111,11 +110,15 @@ impl BuildPlan {
                 let target = fs::read_link(entry.path())?;
                 let tl = target.to_string_lossy().len();
                 self.add_symlink(tl);
-            } else if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket()
-            {
-                self.add_device();
             } else {
-                // Skip unknown types.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    if ft.is_block_device() || ft.is_char_device() || ft.is_fifo() || ft.is_socket()
+                    {
+                        self.add_device();
+                    }
+                }
             }
         }
         Ok(())

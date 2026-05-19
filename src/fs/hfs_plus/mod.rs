@@ -37,9 +37,7 @@ use crate::Result;
 use crate::block::BlockDevice;
 
 use btree::ForkReader;
-use catalog::{
-    Catalog, CatalogFile, CatalogKey, CatalogRecord, ROOT_FOLDER_ID, UniStr, mode,
-};
+use catalog::{Catalog, CatalogFile, CatalogKey, CatalogRecord, ROOT_FOLDER_ID, UniStr, mode};
 use volume_header::{VolumeHeader, read_volume_header};
 
 /// An opened HFS+ volume.
@@ -132,11 +130,8 @@ impl HfsPlus {
                 file.bsd.file_mode
             )));
         }
-        let fork = ForkReader::from_inline(
-            &file.data_fork,
-            self.volume_header.block_size,
-            "data fork",
-        )?;
+        let fork =
+            ForkReader::from_inline(&file.data_fork, self.volume_header.block_size, "data fork")?;
         Ok(HfsPlusFileReader {
             dev,
             fork,
@@ -209,23 +204,17 @@ impl HfsPlus {
             name: UniStr::from_str_lossy(name),
             encoded_len: 0,
         };
-        self.catalog
-            .lookup(dev, &key)?
-            .ok_or_else(|| {
-                crate::Error::InvalidArgument(format!(
-                    "hfs+: no such entry {name:?} under CNID {parent_id}"
-                ))
-            })
+        self.catalog.lookup(dev, &key)?.ok_or_else(|| {
+            crate::Error::InvalidArgument(format!(
+                "hfs+: no such entry {name:?} under CNID {parent_id}"
+            ))
+        })
     }
 
     /// Enumerate the direct children of folder `cnid` by scanning
     /// every leaf node of the catalog from the first leaf onwards
     /// and collecting entries whose key.parentID matches.
-    fn list_cnid(
-        &self,
-        dev: &mut dyn BlockDevice,
-        cnid: u32,
-    ) -> Result<Vec<crate::fs::DirEntry>> {
+    fn list_cnid(&self, dev: &mut dyn BlockDevice, cnid: u32) -> Result<Vec<crate::fs::DirEntry>> {
         use crate::fs::{DirEntry as FsDirEntry, EntryKind};
 
         let mut out = Vec::new();

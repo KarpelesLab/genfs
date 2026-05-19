@@ -145,14 +145,7 @@ mod tests {
     #[test]
     fn chain_walks_to_eoc() {
         // [0]=media, [1]=EOC, [2]→3, [3]→5, [4]=FREE, [5]=EOC.
-        let fat = build(&[
-            0xFFFF_FFF8,
-            0xFFFF_FFFF,
-            3,
-            5,
-            FREE,
-            EOC,
-        ]);
+        let fat = build(&[0xFFFF_FFF8, 0xFFFF_FFFF, 3, 5, FREE, EOC]);
         assert_eq!(fat.chain(2).unwrap(), vec![2, 3, 5]);
     }
 

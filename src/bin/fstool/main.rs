@@ -561,6 +561,7 @@ fn copy_into_ext(
             copy_fat_dir_into_ext(src_dev, src_fat, "/", dst_dev, dst, 2, &FileMeta::default())
         }
         AnyFs::Tar(src_tar) => copy_tar_into_ext(src_dev, src_tar, dst_dev, dst),
+        _ => Err(unsupported_repack_src(src_fs)),
     }
 }
 
@@ -579,7 +580,18 @@ fn copy_into_fat32(
         AnyFs::Ext(src_ext) => copy_ext_dir_into_fat(src_dev, src_ext, 2, "/", dst_dev, dst),
         AnyFs::Fat32(src_fat) => copy_fat_dir_into_fat(src_dev, src_fat, "/", dst_dev, dst),
         AnyFs::Tar(src_tar) => copy_tar_into_fat(src_dev, src_tar, dst_dev, dst),
+        _ => Err(unsupported_repack_src(src_fs)),
     }
+}
+
+/// Repack-source error for the four read-only FSes (xfs/exfat/hfs+/apfs)
+/// — they're inspectable via ls/cat/info but not yet wired into the
+/// FS-to-FS copy walkers.
+fn unsupported_repack_src(src_fs: &fstool::inspect::AnyFs) -> fstool::Error {
+    fstool::Error::Unsupported(format!(
+        "repack: {} source is not yet wired into the FS-to-FS copy path (it's inspectable via `ls`/`cat`/`info` but can't yet be a repack source)",
+        src_fs.kind_string()
+    ))
 }
 
 // ─── ext → ext (full metadata preservation) ─────────────────────────────
@@ -1051,6 +1063,7 @@ fn build_ext_plan(
         AnyFs::Ext(src_ext) => walk_ext_for_plan(src_dev, src_ext, 2, &mut plan)?,
         AnyFs::Fat32(src_fat) => walk_fat_for_plan(src_dev, src_fat, "/", &mut plan)?,
         AnyFs::Tar(src_tar) => walk_tar_for_plan(src_tar, &mut plan),
+        _ => return Err(unsupported_repack_src(src_fs)),
     }
     Ok(plan)
 }
@@ -1130,6 +1143,7 @@ fn sum_source_file_bytes(
             .filter(|e| matches!(e.kind, fstool::fs::tar::EntryKind::Regular))
             .map(|e| e.size)
             .sum()),
+        _ => Err(unsupported_repack_src(src_fs)),
     }
 }
 
@@ -1169,6 +1183,7 @@ fn tar_size_upper_bound(
                 total += per_entry_overhead(xb) + content;
             }
         }
+        _ => return Err(unsupported_repack_src(src_fs)),
     }
     // Two zero blocks for EOF + 1 KiB pad.
     Ok(total + 1024 + 1024)
@@ -1245,6 +1260,7 @@ fn repack_into_tar(
         AnyFs::Ext(src_ext) => tar_walk_ext(src_dev, src_ext, 2, "", &mut writer)?,
         AnyFs::Fat32(src_fat) => tar_walk_fat(src_dev, src_fat, "/", &mut writer)?,
         AnyFs::Tar(src_tar) => tar_replay_tar(src_dev, src_tar, &mut writer)?,
+        _ => return Err(unsupported_repack_src(src_fs)),
     }
     writer.finish()?;
     Ok(writer.cursor())
@@ -1816,6 +1832,13 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &fstool::inspect:
         fstool::inspect::AnyFs::Ext(ext) => print_ext_info(ext),
         fstool::inspect::AnyFs::Fat32(fat) => print_fat_info(fat),
         fstool::inspect::AnyFs::Tar(tar) => print_tar_info(tar),
+        fstool::inspect::AnyFs::Xfs(xfs) => print_xfs_info(xfs),
+        fstool::inspect::AnyFs::Exfat(exfat) => print_exfat_info(exfat),
+        fstool::inspect::AnyFs::HfsPlus(hfs) => print_hfs_plus_info(hfs),
+        fstool::inspect::AnyFs::Apfs(apfs) => print_apfs_info(apfs),
+        fstool::inspect::AnyFs::Ntfs(ntfs) => print_ntfs_info(ntfs),
+        fstool::inspect::AnyFs::F2fs(f2) => print_f2fs_info(f2),
+        fstool::inspect::AnyFs::Squashfs(sq) => print_squashfs_info(sq),
     }
     println!();
     println!("/ listing:");
@@ -1865,6 +1888,63 @@ fn print_fat_info(fat: &fstool::fs::fat::Fat32) {
     println!("root cluster:      {}", b.root_cluster);
     println!("volume ID:         {:#010x}", b.volume_id);
     println!("volume label:      {label:?}");
+}
+
+fn print_xfs_info(xfs: &fstool::fs::xfs::Xfs) {
+    println!("total bytes:       {}", xfs.total_bytes());
+    println!("block size:        {}", xfs.block_size());
+    println!("inode size:        {}", xfs.inode_size());
+    println!("AG count:          {}", xfs.ag_count());
+}
+
+fn print_exfat_info(exfat: &fstool::fs::exfat::Exfat) {
+    println!("total bytes:       {}", exfat.total_bytes());
+    println!("cluster size:      {}", exfat.cluster_size());
+    println!("sectors / cluster: {}", exfat.sectors_per_cluster());
+    println!("root cluster:      {}", exfat.root_directory_cluster());
+    println!("volume label:      {:?}", exfat.volume_label());
+}
+
+fn print_hfs_plus_info(hfs: &fstool::fs::hfs_plus::HfsPlus) {
+    println!("total bytes:       {}", hfs.total_bytes());
+    println!("block size:        {}", hfs.block_size());
+    println!("volume name:       {:?}", hfs.volume_name());
+}
+
+fn print_apfs_info(apfs: &fstool::fs::apfs::Apfs) {
+    println!("total bytes:       {}", apfs.total_bytes());
+    println!("block size:        {}", apfs.block_size());
+    println!("volume name:       {:?}", apfs.volume_name());
+}
+
+fn print_ntfs_info(ntfs: &fstool::fs::ntfs::Ntfs) {
+    println!("total bytes:       {}", ntfs.total_bytes());
+    println!("cluster size:      {}", ntfs.cluster_size());
+    println!("bytes / sector:    {}", ntfs.bytes_per_sector());
+    println!("sectors / cluster: {}", ntfs.sectors_per_cluster());
+    println!("MFT record size:   {}", ntfs.mft_record_size());
+    println!("volume serial:     {:#018x}", ntfs.volume_serial());
+    println!("note:              read support is scaffold-only");
+}
+
+fn print_f2fs_info(f2: &fstool::fs::f2fs::F2fs) {
+    let sb = f2.superblock();
+    println!("total bytes:       {}", f2.total_bytes());
+    println!("block size:        {}", f2.block_size());
+    println!("version:           {}.{}", sb.major_ver, sb.minor_ver);
+    println!("block count:       {}", sb.block_count);
+    println!("volume name:       {:?}", f2.volume_name());
+    println!("note:              read support is scaffold-only");
+}
+
+fn print_squashfs_info(sq: &fstool::fs::squashfs::Squashfs) {
+    let sb = sq.superblock();
+    println!("total bytes:       {}", sq.total_bytes());
+    println!("block size:        {}", sq.block_size());
+    println!("compression:       {:?}", sq.compression());
+    println!("version:           {}.{}", sb.major, sb.minor);
+    println!("inode count:       {}", sb.inode_count);
+    println!("note:              read support is scaffold-only");
 }
 
 fn format_uuid(bytes: &[u8; 16]) -> String {

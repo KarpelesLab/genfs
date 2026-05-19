@@ -29,7 +29,7 @@
 //!
 //! A leaf value of 0xFFFF (in a `BTREE_ALLOW_GHOSTS` tree) means "no value".
 
-use super::obj::{ObjPhys, OBJECT_TYPE_BTREE_NODE};
+use super::obj::{OBJECT_TYPE_BTREE_NODE, ObjPhys};
 
 /// `BTNODE_ROOT` — set on the root node of a tree. Root nodes have a
 /// trailing `btree_info_t` in the last 40 bytes of the block.
@@ -48,7 +48,7 @@ pub const BTREE_INFO_SIZE: usize = 40;
 pub const BTOFF_INVALID: u16 = 0xFFFF;
 
 /// A decoded `btree_node_phys_t` (only the header + ToC; key/value bytes
-/// are looked up on demand via [`BTreeNode::get_kv`]).
+/// are looked up on demand via [`BTreeNode::entry_at`]).
 #[derive(Debug)]
 pub struct BTreeNode<'a> {
     /// Backing block bytes (length = container block size).
@@ -99,7 +99,7 @@ impl<'a> BTreeNode<'a> {
         let toc_off = u16::from_le_bytes(block[40..42].try_into().unwrap());
         let toc_len = u16::from_le_bytes(block[42..44].try_into().unwrap());
 
-        let data_start = 56;
+        let data_start: usize = 56;
         let is_root = flags & BTNODE_ROOT != 0;
         let fixed_kv = flags & BTNODE_FIXED_KV_SIZE != 0;
         let keys_start = data_start
@@ -226,9 +226,9 @@ impl<'a> BTreeNode<'a> {
             .keys_start
             .checked_add(e.key_off as usize)
             .ok_or_else(|| crate::Error::InvalidImage("apfs: btree key offset overflow".into()))?;
-        let kend = kstart.checked_add(klen).ok_or_else(|| {
-            crate::Error::InvalidImage("apfs: btree key length overflow".into())
-        })?;
+        let kend = kstart
+            .checked_add(klen)
+            .ok_or_else(|| crate::Error::InvalidImage("apfs: btree key length overflow".into()))?;
         if kend > self.vals_end {
             return Err(crate::Error::InvalidImage(
                 "apfs: btree key extends past value area".into(),
@@ -240,15 +240,22 @@ impl<'a> BTreeNode<'a> {
             &[]
         } else {
             let vlen = e.val_len.map(usize::from).unwrap_or(fixed_vlen);
-            let vend = self.vals_end.checked_sub(e.val_off as usize).ok_or_else(|| {
-                crate::Error::InvalidImage("apfs: btree value offset underflow".into())
+            // Per spec: `v.off` is the value's offset *measured backward
+            // from `vals_end`*, and the value extends forward from there
+            // for `v.len` bytes. So vstart = vals_end - v.off and
+            // vend = vstart + v.len.
+            let vstart = self
+                .vals_end
+                .checked_sub(e.val_off as usize)
+                .ok_or_else(|| {
+                    crate::Error::InvalidImage("apfs: btree value offset underflow".into())
+                })?;
+            let vend = vstart.checked_add(vlen).ok_or_else(|| {
+                crate::Error::InvalidImage("apfs: btree value length overflow".into())
             })?;
-            let vstart = vend.checked_sub(vlen).ok_or_else(|| {
-                crate::Error::InvalidImage("apfs: btree value length underflow".into())
-            })?;
-            if vstart < self.keys_start {
+            if vstart < self.keys_start || vend > self.vals_end {
                 return Err(crate::Error::InvalidImage(
-                    "apfs: btree value extends into key area".into(),
+                    "apfs: btree value extends outside data area".into(),
                 ));
             }
             &self.block[vstart..vend]

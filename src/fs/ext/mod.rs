@@ -1210,14 +1210,19 @@ impl Ext {
         parent_ino: u32,
         src: &std::path::Path,
     ) -> Result<()> {
-        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
             let meta = entry.metadata()?;
             let ft = meta.file_type();
             let name = entry.file_name();
             let name_bytes = name.as_encoded_bytes();
-            let mode = (meta.permissions().mode() & 0o7777) as u16;
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                (meta.permissions().mode() & 0o7777) as u16
+            };
+            #[cfg(not(unix))]
+            let mode: u16 = if ft.is_dir() { 0o755 } else { 0o644 };
             let fmeta = FileMeta {
                 mode,
                 uid: 0,
@@ -1242,31 +1247,51 @@ impl Ext {
                 let target = std::fs::read_link(entry.path())?;
                 let target_str = target.to_string_lossy();
                 self.add_symlink_to(dev, parent_ino, name_bytes, target_str.as_bytes(), fmeta)?;
-            } else if ft.is_block_device() || ft.is_char_device() {
-                use std::os::unix::fs::MetadataExt;
-                let rdev = meta.rdev();
-                // Linux dev_t: major in bits 8..19 and 32..47, minor in 0..7 and 20..31.
-                // For typical small device numbers the canonical formulas:
-                let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
-                let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
-                let kind = if ft.is_char_device() {
-                    DeviceKind::Char
-                } else {
-                    DeviceKind::Block
-                };
-                self.add_device_to(
-                    dev,
-                    parent_ino,
-                    name_bytes,
-                    kind,
-                    major as u32,
-                    minor as u32,
-                    fmeta,
-                )?;
-            } else if ft.is_fifo() {
-                self.add_device_to(dev, parent_ino, name_bytes, DeviceKind::Fifo, 0, 0, fmeta)?;
-            } else if ft.is_socket() {
-                self.add_device_to(dev, parent_ino, name_bytes, DeviceKind::Socket, 0, 0, fmeta)?;
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                    if ft.is_block_device() || ft.is_char_device() {
+                        let rdev = meta.rdev();
+                        // Linux dev_t: major in bits 8..19 and 32..47, minor in 0..7 and 20..31.
+                        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+                        let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+                        let kind = if ft.is_char_device() {
+                            DeviceKind::Char
+                        } else {
+                            DeviceKind::Block
+                        };
+                        self.add_device_to(
+                            dev,
+                            parent_ino,
+                            name_bytes,
+                            kind,
+                            major as u32,
+                            minor as u32,
+                            fmeta,
+                        )?;
+                    } else if ft.is_fifo() {
+                        self.add_device_to(
+                            dev,
+                            parent_ino,
+                            name_bytes,
+                            DeviceKind::Fifo,
+                            0,
+                            0,
+                            fmeta,
+                        )?;
+                    } else if ft.is_socket() {
+                        self.add_device_to(
+                            dev,
+                            parent_ino,
+                            name_bytes,
+                            DeviceKind::Socket,
+                            0,
+                            0,
+                            fmeta,
+                        )?;
+                    }
+                }
             }
         }
         Ok(())

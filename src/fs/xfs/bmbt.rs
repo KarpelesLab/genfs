@@ -100,8 +100,9 @@ impl Extent {
         })
     }
 
-    /// Encode for the round-trip unit test.
-    #[cfg(test)]
+    /// Encode this record as the on-disk packed 128-bit form. Used by
+    /// the writer to lay extent lists into the inode literal area and
+    /// into bmbt leaf blocks; also used by the round-trip unit test.
     pub fn encode(&self) -> [u8; BMBT_REC_SIZE] {
         let unwritten = if self.unwritten { 1u64 } else { 0 };
         let hi = (unwritten << 63)

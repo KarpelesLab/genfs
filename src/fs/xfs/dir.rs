@@ -460,6 +460,164 @@ pub fn decode_data_block(block: &[u8], is_v5: bool) -> Result<Vec<DataEntry>> {
     parse_data_records(block, entries_start, block.len(), is_v5)
 }
 
+/// CRC offset inside a v5 directory-block header (XDB3 / XDD3 / XDL3 /
+/// XDF3 / XDN3). The v5 block header is
+/// `magic(4) crc(4) blkno(8) lsn(8) uuid(16) owner(8) = 48 B`, followed
+/// by per-magic specialised fields.
+pub const V5_DIR_CRC_OFFSET: usize = 4;
+
+/// Bytes of v5 directory data-block header (XDD3 / XDB3) up to the start
+/// of variable-length records.
+pub const V5_DATA_HDR_SIZE: usize = 64;
+
+/// Stamp the v5 directory-block CRC32C in place. The CRC is taken over
+/// the entire block with the 4-byte `crc` field at offset 4 zeroed,
+/// then stored as little-endian.
+pub fn stamp_v5_dir_block_crc(block: &mut [u8]) {
+    block[V5_DIR_CRC_OFFSET..V5_DIR_CRC_OFFSET + 4].copy_from_slice(&[0u8; 4]);
+    let crc = crc32c::crc32c(block);
+    block[V5_DIR_CRC_OFFSET..V5_DIR_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Encode a v5 block-format (XDB3) directory holding `entries` plus the
+/// synthetic `.` and `..` records. `owner` is the directory inode
+/// number; `parent` is the parent directory's inode (== `owner` for the
+/// root); `uuid` is the volume meta UUID stamped into the v5 header.
+///
+/// Block layout (bytes):
+/// ```text
+///   0     XDB3 v5 data header (64 B):
+///         magic crc blkno lsn uuid owner | bestfree[3] | pad
+///  64     packed data_entry records (incl. "." and ".."), in order
+///         ...
+///         data_unused freetag region filling slack
+/// blen-8 - 8*count   start of leaf entries
+/// blen-8 .. blen-4   __be32 count
+/// blen-4 .. blen     __be32 stale
+/// ```
+pub fn encode_v5_block_dir(
+    dir_block_size: usize,
+    owner: u64,
+    parent: u64,
+    entries: &[(String, u64, u8)],
+    uuid: &[u8; 16],
+    block_basic_blkno: u64,
+) -> Result<Vec<u8>> {
+    if dir_block_size < V5_DATA_HDR_SIZE + 32 {
+        return Err(crate::Error::InvalidArgument(format!(
+            "xfs: dir block size {dir_block_size} too small for v5 header"
+        )));
+    }
+    let mut block = vec![0u8; dir_block_size];
+    block[0..4].copy_from_slice(&XFS_DIR3_BLOCK_MAGIC.to_be_bytes());
+    // crc at [4..8] is stamped at the end.
+    block[8..16].copy_from_slice(&block_basic_blkno.to_be_bytes());
+    // lsn at [16..24] zero
+    block[24..40].copy_from_slice(uuid);
+    block[40..48].copy_from_slice(&owner.to_be_bytes());
+    // bestfree[3] (48..60) filled below; pad (60..64) zero
+
+    let mut all: Vec<(String, u64, u8)> = Vec::with_capacity(entries.len() + 2);
+    all.push((".".to_string(), owner, XFS_DIR3_FT_DIR));
+    all.push(("..".to_string(), parent, XFS_DIR3_FT_DIR));
+    all.extend(entries.iter().cloned());
+    if all.len() > u32::MAX as usize {
+        return Err(crate::Error::InvalidArgument(
+            "xfs: block dir has too many entries".into(),
+        ));
+    }
+    let leaf_count = all.len() as u32;
+    let leaf_bytes = (leaf_count as usize) * 8;
+    let tail_off = dir_block_size - 8 - leaf_bytes;
+
+    let mut pos = V5_DATA_HDR_SIZE;
+    let mut leaf_pairs: Vec<(u32, u32)> = Vec::with_capacity(all.len());
+    for (name, inum, ft) in &all {
+        let namelen = name.len();
+        let raw_len = 8 + 1 + namelen + 1 + 2;
+        let padded = (raw_len + 7) & !7;
+        if pos + padded > tail_off {
+            return Err(crate::Error::InvalidArgument(
+                "xfs: block dir overflowed available space".into(),
+            ));
+        }
+        block[pos..pos + 8].copy_from_slice(&inum.to_be_bytes());
+        block[pos + 8] = namelen as u8;
+        block[pos + 9..pos + 9 + namelen].copy_from_slice(name.as_bytes());
+        block[pos + 9 + namelen] = *ft;
+        let tag = (pos as u16).to_be_bytes();
+        block[pos + padded - 2..pos + padded].copy_from_slice(&tag);
+
+        let hashval = dahashname(name.as_bytes());
+        let address = (pos / 8) as u32;
+        leaf_pairs.push((hashval, address));
+        pos += padded;
+    }
+
+    if tail_off > pos {
+        let slack = tail_off - pos;
+        if slack < 8 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: block dir slack {slack} < 8 bytes"
+            )));
+        }
+        block[pos..pos + 2].copy_from_slice(&XFS_DIR2_DATA_FREE_TAG.to_be_bytes());
+        block[pos + 2..pos + 4].copy_from_slice(&(slack as u16).to_be_bytes());
+        let tag_off = pos + slack - 2;
+        block[tag_off..tag_off + 2].copy_from_slice(&(pos as u16).to_be_bytes());
+
+        // bestfree[0] = this slack region.
+        block[48..50].copy_from_slice(&(pos as u16).to_be_bytes());
+        block[50..52].copy_from_slice(&(slack as u16).to_be_bytes());
+    }
+
+    leaf_pairs.sort_by_key(|p| p.0);
+    for (i, (h, a)) in leaf_pairs.iter().enumerate() {
+        let off = tail_off + i * 8;
+        block[off..off + 4].copy_from_slice(&h.to_be_bytes());
+        block[off + 4..off + 8].copy_from_slice(&a.to_be_bytes());
+    }
+    block[dir_block_size - 8..dir_block_size - 4].copy_from_slice(&leaf_count.to_be_bytes());
+    block[dir_block_size - 4..dir_block_size].copy_from_slice(&0u32.to_be_bytes());
+
+    stamp_v5_dir_block_crc(&mut block);
+    Ok(block)
+}
+
+/// XFS directory-name hash (`xfs_da_hashname`). Used as the leaf-key in
+/// every dabtree-indexed directory / attribute block.
+pub fn dahashname(name: &[u8]) -> u32 {
+    let mut hash: u32 = 0;
+    let mut i = 0;
+    while i + 4 <= name.len() {
+        let n0 = name[i] as u32;
+        let n1 = name[i + 1] as u32;
+        let n2 = name[i + 2] as u32;
+        let n3 = name[i + 3] as u32;
+        hash = (n0 << 21) ^ (n1 << 14) ^ (n2 << 7) ^ n3 ^ hash.rotate_left(28);
+        i += 4;
+    }
+    let remaining = name.len() - i;
+    match remaining {
+        3 => {
+            let n0 = name[i] as u32;
+            let n1 = name[i + 1] as u32;
+            let n2 = name[i + 2] as u32;
+            (n0 << 14) ^ (n1 << 7) ^ n2 ^ hash.rotate_left(21)
+        }
+        2 => {
+            let n0 = name[i] as u32;
+            let n1 = name[i + 1] as u32;
+            (n0 << 7) ^ n1 ^ hash.rotate_left(14)
+        }
+        1 => {
+            let n0 = name[i] as u32;
+            n0 ^ hash.rotate_left(7)
+        }
+        _ => hash,
+    }
+}
+
 /// Distinguish between block-format and leaf-format directories by peeking
 /// at the magic of the first directory block. Returns `true` for block
 /// format, `false` for data format (caller should then walk all data

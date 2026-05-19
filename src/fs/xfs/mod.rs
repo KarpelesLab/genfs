@@ -36,9 +36,14 @@
 
 pub mod bmbt;
 pub mod dir;
+pub mod format;
 pub mod inode;
 pub mod superblock;
 pub mod symlink;
+pub mod write;
+
+pub use format::{FormatOpts, format};
+pub use write::{DeviceKind, EntryMeta, WriteState};
 
 use crate::Result;
 use crate::block::BlockDevice;
@@ -49,9 +54,13 @@ use self::inode::{DiFormat, DinodeCore};
 use self::superblock::Superblock;
 
 /// In-memory state of an opened XFS volume. Owns the parsed superblock; all
-/// other reads go through the passed-in `BlockDevice`.
+/// other reads go through the passed-in `BlockDevice`. When the volume
+/// was just formatted via [`format()`] (or [`begin_writes`](Xfs::begin_writes)
+/// was called after open), the `write_state` field tracks the
+/// bump-pointer allocator + INOBT chunks for incremental adds.
 pub struct Xfs {
-    sb: Superblock,
+    pub(crate) sb: Superblock,
+    pub(crate) write_state: Option<WriteState>,
 }
 
 impl Xfs {
@@ -74,7 +83,10 @@ impl Xfs {
                 "xfs: realtime subvolume not supported".into(),
             ));
         }
-        Ok(Self { sb })
+        Ok(Self {
+            sb,
+            write_state: None,
+        })
     }
 
     /// Total bytes the volume claims: `sb_dblocks * sb_blocksize`.
@@ -349,9 +361,14 @@ impl Xfs {
                     .collect())
             }
             DiFormat::Extents => self.read_extent_dir_entries(dev, ino_buf, core),
-            DiFormat::Btree => Err(crate::Error::Unsupported(
-                "xfs: B-tree (di_format=BTREE) directories not implemented".into(),
-            )),
+            // BTREE-format directories — the inode-fork holds a bmbt root
+            // (same shape as for files); leaves still contain XDD3/XDB3
+            // data blocks plus a LEAFN / NODE index above the
+            // XFS_DIR2_LEAF_OFFSET boundary. `read_extent_dir_entries`
+            // walks the extent list and scans every data-block-aligned
+            // logical address it covers, so it works unmodified once
+            // `read_extent_list` returns the bmbt-walked extents.
+            DiFormat::Btree => self.read_extent_dir_entries(dev, ino_buf, core),
             DiFormat::Dev => Err(crate::Error::InvalidImage(
                 "xfs: directory inode has di_format=dev".into(),
             )),

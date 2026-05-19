@@ -235,6 +235,93 @@ impl DinodeCore {
     }
 }
 
+/// Byte offset of `di_crc` inside a v3 dinode core. CRC32C is computed
+/// over the entire on-disk inode (every byte the inode occupies) with
+/// this 4-byte field zeroed, then stored as little-endian (`__le32`).
+pub const V3_CRC_OFFSET: usize = 100;
+
+/// On-disk byte size of the v3 dinode core (including the v3 extension
+/// up to but not including the literal area).
+pub const V3_CORE_SIZE: usize = 176;
+
+/// Build a v3 (CRC) dinode. Lays out an `inodesize`-byte buffer with
+/// every field except `di_crc`. Use [`stamp_v3_inode_crc`] **after**
+/// writing the literal-area (fork) bytes so the checksum covers them.
+#[derive(Debug, Clone)]
+pub struct V3DinodeBuilder {
+    pub inodesize: usize,
+    pub mode: u16,
+    pub format: u8,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u32,
+    pub atime: XfsTimestamp,
+    pub mtime: XfsTimestamp,
+    pub ctime: XfsTimestamp,
+    pub crtime: XfsTimestamp,
+    pub size: u64,
+    pub nblocks: u64,
+    pub extsize: u32,
+    pub nextents: u32,
+    pub forkoff: u8,
+    pub aformat: u8,
+    pub flags: u16,
+    pub generation: u32,
+    pub di_ino: u64,
+    pub uuid: [u8; 16],
+}
+
+impl V3DinodeBuilder {
+    /// Allocate the on-disk inode buffer and stamp every field except
+    /// `di_crc`. The literal area starts at byte 176 and is the caller's
+    /// to populate.
+    pub fn build(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; self.inodesize];
+        buf[0..2].copy_from_slice(&XFS_DINODE_MAGIC.to_be_bytes());
+        buf[2..4].copy_from_slice(&self.mode.to_be_bytes());
+        buf[4] = 3;
+        buf[5] = self.format;
+        // di_onlink (legacy) — v3 zero
+        buf[8..12].copy_from_slice(&self.uid.to_be_bytes());
+        buf[12..16].copy_from_slice(&self.gid.to_be_bytes());
+        buf[16..20].copy_from_slice(&self.nlink.to_be_bytes());
+        buf[32..40].copy_from_slice(&encode_ts(self.atime));
+        buf[40..48].copy_from_slice(&encode_ts(self.mtime));
+        buf[48..56].copy_from_slice(&encode_ts(self.ctime));
+        buf[56..64].copy_from_slice(&self.size.to_be_bytes());
+        buf[64..72].copy_from_slice(&self.nblocks.to_be_bytes());
+        buf[72..76].copy_from_slice(&self.extsize.to_be_bytes());
+        buf[76..80].copy_from_slice(&self.nextents.to_be_bytes());
+        buf[82] = self.forkoff;
+        buf[83] = self.aformat;
+        buf[90..92].copy_from_slice(&self.flags.to_be_bytes());
+        buf[92..96].copy_from_slice(&self.generation.to_be_bytes());
+        // di_next_unlinked at 96..100 = NULL (-1)
+        buf[96..100].copy_from_slice(&u32::MAX.to_be_bytes());
+        // di_crc at 100..104 — caller's responsibility via stamp_v3_inode_crc
+        buf[144..152].copy_from_slice(&encode_ts(self.crtime));
+        buf[152..160].copy_from_slice(&self.di_ino.to_be_bytes());
+        buf[160..176].copy_from_slice(&self.uuid);
+        buf
+    }
+}
+
+fn encode_ts(ts: XfsTimestamp) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[0..4].copy_from_slice(&ts.sec.to_be_bytes());
+    out[4..8].copy_from_slice(&ts.nsec.to_be_bytes());
+    out
+}
+
+/// Compute and store the v3 dinode CRC. CRC32C is taken over the full
+/// inode buffer with the 4-byte `di_crc` field at offset 100 zeroed,
+/// then written back as little-endian.
+pub fn stamp_v3_inode_crc(buf: &mut [u8]) {
+    buf[V3_CRC_OFFSET..V3_CRC_OFFSET + 4].copy_from_slice(&[0u8; 4]);
+    let crc = crc32c::crc32c(buf);
+    buf[V3_CRC_OFFSET..V3_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

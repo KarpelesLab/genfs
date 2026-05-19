@@ -144,14 +144,7 @@ fn writer_image_passes_fsck_f2fs() {
 /// then re-open it through our library and walk the root. Confirms the
 /// reader survives a fully-canonical mkfs.f2fs layout (compression
 /// disabled by default, no encryption).
-///
-/// TODO: ignored because our checkpoint validator rejects mkfs.f2fs's
-/// CP layout with `f2fs: neither checkpoint pack validates`. The
-/// superblock now decodes correctly (we fixed the field offsets in
-/// commit 51553eb) but the CRC32 / `cp_pack_start_sum` walk in
-/// `checkpoint::load` doesn't yet match what mkfs.f2fs emits.
 #[test]
-#[ignore]
 fn mkfs_f2fs_image_opens_through_fstool() {
     if !tool_available("mkfs.f2fs") {
         eprintln!("skipping: mkfs.f2fs not installed");

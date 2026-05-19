@@ -105,14 +105,19 @@ impl Checkpoint {
         dev.read_at(head_blkaddr as u64 * bs, &mut head)?;
         let cp = decode_cp_head(&head, head_blkaddr)?;
 
-        // Validate the head-block CRC32. The CRC covers everything up to
-        // the 4-byte footer.
-        let want = u32::from_le_bytes(
-            head[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4]
-                .try_into()
-                .unwrap(),
-        );
-        let got = crc32fast::hash(&head[..F2FS_BLK_CSUM_OFFSET]);
+        // The CRC lives at the byte offset given by the on-disk
+        // `checksum_offset` field (at +0xA4). It covers bytes 0..crc_off.
+        // mkfs.f2fs defaults this to 4092 (F2FS_BLK_CSUM_OFFSET); fsck
+        // accepts other positions if `checksum_offset` agrees. We
+        // tolerate any value in `[0xA8, F2FS_BLKSIZE-4]`.
+        let crc_off = u32::from_le_bytes(head[0xA4..0xA8].try_into().unwrap()) as usize;
+        let crc_off = if (0xA8..=F2FS_BLK_CSUM_OFFSET).contains(&crc_off) {
+            crc_off
+        } else {
+            F2FS_BLK_CSUM_OFFSET
+        };
+        let want = u32::from_le_bytes(head[crc_off..crc_off + 4].try_into().unwrap());
+        let got = super::constants::f2fs_crc32(&head[..crc_off]);
         if got != want {
             return Err(crate::Error::InvalidImage(format!(
                 "f2fs: cp@{head_blkaddr}: crc mismatch (want {want:08x}, got {got:08x})"
@@ -141,8 +146,30 @@ impl Checkpoint {
     }
 }
 
-/// Decode the leading region of a CP head block. The block is 4 KiB and
-/// the trailing 4 bytes are the CRC32 footer.
+/// Decode the leading region of a CP head block. The block is 4 KiB.
+///
+/// Field offsets follow `struct f2fs_checkpoint` in `include/linux/f2fs_fs.h`:
+/// ```text
+/// 0x00  __le64 checkpoint_ver
+/// 0x08  __le64 user_block_count
+/// 0x10  __le64 valid_block_count
+/// 0x18  __le32 rsvd_segment_count
+/// 0x1C  __le32 overprov_segment_count
+/// 0x20  __le32 free_segment_count
+/// 0x24..0x44  __le32 cur_node_segno[8]
+/// 0x44..0x54  __le16 cur_node_blkoff[8]
+/// 0x54..0x74  __le32 cur_data_segno[8]
+/// 0x74..0x84  __le16 cur_data_blkoff[8]
+/// 0x84  __le32 ckpt_flags
+/// 0x88  __le32 cp_pack_total_block_count
+/// 0x8C  __le32 cp_pack_start_sum
+/// 0x90  __le32 valid_node_count
+/// 0x94  __le32 valid_inode_count
+/// 0x98  __le32 next_free_nid
+/// 0x9C  __le32 sit_ver_bitmap_bytesize
+/// 0xA0  __le32 nat_ver_bitmap_bytesize
+/// 0xA4  __le32 checksum_offset
+/// ```
 fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
     if buf.len() < F2FS_BLKSIZE {
         return Err(crate::Error::InvalidImage(
@@ -152,21 +179,15 @@ fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
     let r32 = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
     let r64 = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
 
-    // Field offsets follow the publicly documented f2fs_checkpoint layout.
     let version = r64(0x00);
     let user_block_count = r64(0x08);
     let valid_block_count = r64(0x10);
-    // 0x18 rsvd_segment_count, 0x1C overprov_segment_count
-    let _free_segment_count = r32(0x20);
-    // 0x24..0x44 — eight cur_node_segno + cur_node_blkoff + cur_data_segno +
-    // cur_data_blkoff slots; we don't need them for read.
-    // 0x64 valid_node_count, 0x68 valid_inode_count, 0x6C next_free_nid
-    let nat_ver_bitmap_bytesize = r32(0x70);
-    let sit_ver_bitmap_bytesize = r32(0x74);
-    let cp_pack_total_block_count = r32(0x78);
-    let ckpt_flags = r32(0x7C);
-    let cp_pack_start_sum = r32(0x80);
-    let cp_payload = r32(0x84);
+    let ckpt_flags = r32(0x84);
+    let cp_pack_total_block_count = r32(0x88);
+    let cp_pack_start_sum = r32(0x8C);
+    let sit_ver_bitmap_bytesize = r32(0x9C);
+    let nat_ver_bitmap_bytesize = r32(0xA0);
+    // 0xA4 checksum_offset — used to locate the CRC at `try_load`.
 
     Ok(Checkpoint {
         version,
@@ -175,7 +196,9 @@ fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
         flags: ckpt_flags,
         cp_pack_start_sum,
         cp_pack_total_block_count,
-        cp_payload,
+        // `cp_payload` is a superblock field, not a CP field. The reader
+        // gets it from `Superblock::cp_payload` instead.
+        cp_payload: 0,
         head_blkaddr,
         nat_ver_bitmap_bytesize,
         sit_ver_bitmap_bytesize,
@@ -228,20 +251,26 @@ fn decode_nat_journal(buf: &[u8]) -> Vec<NatJournalEntry> {
     out
 }
 
-/// Encode a CP head block — single source of truth for the offsets
-/// [`decode_cp_head`] consumes. Used by the live flush path.
+/// Encode a CP head block per `f2fs_fs.h`. Single source of truth for
+/// the offsets [`decode_cp_head`] consumes. Used by the live flush path.
 pub(crate) fn encode_cp_head_writer(cp: &Checkpoint) -> Vec<u8> {
     let mut buf = vec![0u8; F2FS_BLKSIZE];
     buf[0x00..0x08].copy_from_slice(&cp.version.to_le_bytes());
     buf[0x08..0x10].copy_from_slice(&cp.user_block_count.to_le_bytes());
     buf[0x10..0x18].copy_from_slice(&cp.valid_block_count.to_le_bytes());
-    buf[0x70..0x74].copy_from_slice(&cp.nat_ver_bitmap_bytesize.to_le_bytes());
-    buf[0x74..0x78].copy_from_slice(&cp.sit_ver_bitmap_bytesize.to_le_bytes());
-    buf[0x78..0x7C].copy_from_slice(&cp.cp_pack_total_block_count.to_le_bytes());
-    buf[0x7C..0x80].copy_from_slice(&cp.flags.to_le_bytes());
-    buf[0x80..0x84].copy_from_slice(&cp.cp_pack_start_sum.to_le_bytes());
-    buf[0x84..0x88].copy_from_slice(&cp.cp_payload.to_le_bytes());
-    let crc = crc32fast::hash(&buf[..F2FS_BLK_CSUM_OFFSET]);
+    // 0x18..0x84 — rsvd / overprov / free_segment_count + cur_*_segno[8]
+    // + cur_*_blkoff[8]. We leave them all zero for a fresh image; fsck
+    // tolerates zeros for segments that aren't yet active.
+    buf[0x84..0x88].copy_from_slice(&cp.flags.to_le_bytes());
+    buf[0x88..0x8C].copy_from_slice(&cp.cp_pack_total_block_count.to_le_bytes());
+    buf[0x8C..0x90].copy_from_slice(&cp.cp_pack_start_sum.to_le_bytes());
+    buf[0x9C..0xA0].copy_from_slice(&cp.sit_ver_bitmap_bytesize.to_le_bytes());
+    buf[0xA0..0xA4].copy_from_slice(&cp.nat_ver_bitmap_bytesize.to_le_bytes());
+    // `checksum_offset` = where the CRC32 will go. mkfs.f2fs uses 4092
+    // (= F2FS_BLK_CSUM_OFFSET, last 4 bytes of the block).
+    let crc_off = F2FS_BLK_CSUM_OFFSET as u32;
+    buf[0xA4..0xA8].copy_from_slice(&crc_off.to_le_bytes());
+    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
     buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     buf
 }

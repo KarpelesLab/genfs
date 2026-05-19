@@ -295,7 +295,7 @@ pub(crate) fn encode_nat_page(entries: &[(u8, u32, u32)]) -> Vec<u8> {
         page[o + 1..o + 5].copy_from_slice(&ino.to_le_bytes());
         page[o + 5..o + 9].copy_from_slice(&block_addr.to_le_bytes());
     }
-    let crc = crc32fast::hash(&page[..F2FS_BLK_CSUM_OFFSET]);
+    let crc = super::constants::f2fs_crc32(&page[..F2FS_BLK_CSUM_OFFSET]);
     page[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     page
 }
@@ -311,7 +311,7 @@ pub(crate) fn encode_nat_page(entries: &[(u8, u32, u32)]) -> Vec<u8> {
 /// CRC footer still validates the page.
 pub(crate) fn encode_sit_page() -> Vec<u8> {
     let mut page = vec![0u8; F2FS_BLKSIZE];
-    let crc = crc32fast::hash(&page[..F2FS_BLK_CSUM_OFFSET]);
+    let crc = super::constants::f2fs_crc32(&page[..F2FS_BLK_CSUM_OFFSET]);
     page[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     page
 }
@@ -322,7 +322,7 @@ pub(crate) fn encode_sit_page() -> Vec<u8> {
 /// reader and is the safest default for a fresh-image build.
 pub(crate) fn encode_ssa_page() -> Vec<u8> {
     let mut page = vec![0u8; F2FS_BLKSIZE];
-    let crc = crc32fast::hash(&page[..F2FS_BLK_CSUM_OFFSET]);
+    let crc = super::constants::f2fs_crc32(&page[..F2FS_BLK_CSUM_OFFSET]);
     page[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     page
 }
@@ -351,7 +351,7 @@ pub(crate) fn encode_root_inode_block(opts: &FormatOpts) -> Vec<u8> {
     // i_addr + i_nid arrays are zero (no children, no node tree).
     let _ = (ADDRS_PER_INODE, NIDS_PER_INODE, I_ADDR_OFFSET);
 
-    let crc = crc32fast::hash(&buf[..F2FS_BLK_CSUM_OFFSET]);
+    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
     buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     buf
 }

@@ -207,7 +207,7 @@ pub(crate) fn encode_inode_block(ino: &F2fsInode) -> Vec<u8> {
         buf[o..o + 4].copy_from_slice(&a.to_le_bytes());
     }
     // CRC32 footer.
-    let crc = crc32fast::hash(&buf[..F2FS_BLK_CSUM_OFFSET]);
+    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
     buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     buf
 }

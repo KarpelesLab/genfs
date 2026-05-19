@@ -645,7 +645,9 @@ mod tests {
             let n = payload.len().min(blk.len() - off - 8); // leave footer alone
             blk[off..off + n].copy_from_slice(&payload[..n]);
             // Re-stamp the CRC32 footer.
-            let crc = crc32fast::hash(&blk[..super::constants::F2FS_BLK_CSUM_OFFSET]);
+            let crc = crate::fs::f2fs::constants::f2fs_crc32(
+                &blk[..super::constants::F2FS_BLK_CSUM_OFFSET],
+            );
             blk[super::constants::F2FS_BLK_CSUM_OFFSET..super::constants::F2FS_BLK_CSUM_OFFSET + 4]
                 .copy_from_slice(&crc.to_le_bytes());
             dev.write_at(root_phys_inode as u64 * bs, &blk).unwrap();
@@ -1096,7 +1098,8 @@ mod tests {
         let off = super::inode::I_ADDR_OFFSET;
         let n = payload_buf.len().min(blk.len() - off - 8);
         blk[off..off + n].copy_from_slice(&payload_buf[..n]);
-        let crc = crc32fast::hash(&blk[..super::constants::F2FS_BLK_CSUM_OFFSET]);
+        let crc =
+            crate::fs::f2fs::constants::f2fs_crc32(&blk[..super::constants::F2FS_BLK_CSUM_OFFSET]);
         blk[super::constants::F2FS_BLK_CSUM_OFFSET..super::constants::F2FS_BLK_CSUM_OFFSET + 4]
             .copy_from_slice(&crc.to_le_bytes());
         dev.write_at(root_inode_blk as u64 * bs, &blk).unwrap();

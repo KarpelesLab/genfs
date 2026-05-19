@@ -1195,7 +1195,7 @@ fn encode_block_dentry(entries: &[Dentry]) -> Vec<u8> {
         slot += need;
     }
     // Footer CRC — covers everything but the trailing 4 bytes.
-    let crc = crc32fast::hash(&buf[..F2FS_BLK_CSUM_OFFSET]);
+    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
     buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     buf
 }
@@ -1274,7 +1274,7 @@ fn encode_inode_block(ino: &InodeRec, inline_children: Option<&[Dentry]>) -> Vec
         }
     }
 
-    let crc = crc32fast::hash(&buf[..F2FS_BLK_CSUM_OFFSET]);
+    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
     buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     buf
 }
@@ -1289,7 +1289,7 @@ fn encode_direct_node_with_crc(ptrs: &[u32; ADDRS_PER_BLOCK]) -> Vec<u8> {
         }
         buf[o..o + 4].copy_from_slice(&p.to_le_bytes());
     }
-    let crc = crc32fast::hash(&buf[..F2FS_BLK_CSUM_OFFSET]);
+    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
     buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     buf
 }
@@ -1304,7 +1304,7 @@ fn encode_indirect_node_with_crc(nids: &[u32; NIDS_PER_BLOCK]) -> Vec<u8> {
         }
         buf[o..o + 4].copy_from_slice(&n.to_le_bytes());
     }
-    let crc = crc32fast::hash(&buf[..F2FS_BLK_CSUM_OFFSET]);
+    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
     buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     buf
 }

@@ -7,8 +7,44 @@
 pub const F2FS_BLKSIZE: usize = 4096;
 
 /// Offset (within a 4 KiB CP / NAT / SIT / dnode block) of the trailing
-/// CRC32 footer that protects the block.
+/// CRC32 footer that protects the block. For CP blocks this is what
+/// mkfs.f2fs writes into the `checksum_offset` field.
 pub const F2FS_BLK_CSUM_OFFSET: usize = F2FS_BLKSIZE - 4;
+
+/// F2FS magic; doubles as the initial CRC seed.
+pub const F2FS_SUPER_MAGIC: u32 = 0xF2F5_2010;
+
+/// Compute the F2FS CRC32 over `buf`. F2FS uses Linux's raw `crc32_le`
+/// — IEEE 802.3 polynomial 0xEDB88320 but with NO initial XOR and NO
+/// final XOR, seeded with `F2FS_SUPER_MAGIC` instead of the usual
+/// 0xFFFFFFFF. The `crc32fast` crate's standard `hash()` is the
+/// final-XOR variant (Ethernet); using it here would produce values
+/// that fsck.f2fs / mkfs.f2fs reject, so we hand-roll the right one.
+pub fn f2fs_crc32(buf: &[u8]) -> u32 {
+    let mut crc = F2FS_SUPER_MAGIC;
+    for &b in buf {
+        crc = (crc >> 8) ^ F2FS_CRC32_TABLE[((crc ^ u32::from(b)) & 0xFF) as usize];
+    }
+    crc
+}
+
+/// Reflected IEEE 802.3 CRC32 table (polynomial 0xEDB88320). Built at
+/// compile time so the codec stays zero-cost.
+const F2FS_CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0u32;
+    while i < 256 {
+        let mut c = i;
+        let mut j = 0;
+        while j < 8 {
+            c = (c >> 1) ^ ((c & 1).wrapping_neg() & 0xEDB8_8320);
+            j += 1;
+        }
+        table[i as usize] = c;
+        i += 1;
+    }
+    table
+};
 
 /// Inode block — number of direct data-block pointers.
 ///

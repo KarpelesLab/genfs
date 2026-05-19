@@ -88,6 +88,20 @@ enum Command {
         #[arg(short = 'o', long = "output", value_name = "IMAGE")]
         output: PathBuf,
     },
+
+    /// Copy a host file or directory into an existing image. The
+    /// destination's parent directory must already exist in the image.
+    Add {
+        /// Path to the image file (modified in place).
+        #[arg(value_name = "IMAGE")]
+        image: PathBuf,
+        /// Host file or directory to copy in.
+        #[arg(value_name = "HOST_SRC")]
+        host_src: PathBuf,
+        /// Absolute destination path inside the image.
+        #[arg(value_name = "FS_DEST")]
+        fs_dest: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -130,7 +144,53 @@ fn run(cli: Cli) -> fstool::Result<()> {
         Command::Cat { image, path } => cat(&image, &path),
         Command::Info { image } => info(&image),
         Command::Build { spec, output } => build(&spec, &output),
+        Command::Add {
+            image,
+            host_src,
+            fs_dest,
+        } => add(&image, &host_src, &fs_dest),
     }
+}
+
+fn add(image: &std::path::Path, host_src: &std::path::Path, fs_dest: &str) -> fstool::Result<()> {
+    use fstool::fs::{FileMeta, FileSource, Filesystem};
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = std::fs::symlink_metadata(host_src)?;
+    let mut dev = FileBackend::open(image)?;
+    let mut ext = Ext::open(&mut dev)?;
+    let dest = std::path::Path::new(fs_dest);
+
+    if meta.is_dir() {
+        let fmeta = FileMeta {
+            mode: (meta.permissions().mode() & 0o7777) as u16,
+            ..FileMeta::default()
+        };
+        ext.create_dir(&mut dev, dest, fmeta)?;
+        // Resolve the new directory's inode and recurse the host tree into it.
+        let dir_ino = ext.path_to_inode(&mut dev, fs_dest)?;
+        ext.populate_from_host_dir(&mut dev, dir_ino, host_src)?;
+    } else if meta.is_file() {
+        let fmeta = FileMeta {
+            mode: (meta.permissions().mode() & 0o7777) as u16,
+            ..FileMeta::default()
+        };
+        ext.create_file(
+            &mut dev,
+            dest,
+            FileSource::HostPath(host_src.to_path_buf()),
+            fmeta,
+        )?;
+    } else {
+        return Err(fstool::Error::InvalidArgument(format!(
+            "add: {} is neither a regular file nor a directory",
+            host_src.display()
+        )));
+    }
+    ext.flush(&mut dev)?;
+    dev.sync()?;
+    eprintln!("added {} → {fs_dest}", host_src.display());
+    Ok(())
 }
 
 fn build(spec_path: &std::path::Path, output: &std::path::Path) -> fstool::Result<()> {

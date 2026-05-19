@@ -1,0 +1,151 @@
+//! Exercises the `fstool` binary end to end via its CLI.
+
+use std::process::Command;
+
+use tempfile::NamedTempFile;
+
+/// Path to the freshly-built `fstool` binary (provided by Cargo for
+/// integration tests).
+const FSTOOL: &str = env!("CARGO_BIN_EXE_fstool");
+
+fn which(tool: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {tool}"))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// build (bare ext4 spec) → ls → cat → add → cat the added file.
+#[test]
+fn cli_build_ls_cat_add_roundtrip() {
+    if !which("e2fsck") {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    }
+
+    // Source tree + a spare-capacity spec (extra inodes via a bigger tree
+    // is awkward; instead we test `add` against the headroom a fresh image
+    // happens to have).
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("one.txt"), b"first\n").unwrap();
+
+    let spec = NamedTempFile::new().unwrap();
+    std::fs::write(
+        spec.path(),
+        format!(
+            "[filesystem]\ntype = \"ext4\"\nsource = \"{}\"\nblock_size = 1024\n",
+            srcdir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+
+    // build
+    let out = Command::new(FSTOOL)
+        .arg("build")
+        .arg(spec.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // ls /
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        listing.contains("one.txt"),
+        "ls missing one.txt:\n{listing}"
+    );
+
+    // cat /one.txt
+    let out = Command::new(FSTOOL)
+        .args(["cat"])
+        .arg(img.path())
+        .arg("/one.txt")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"first\n");
+
+    // add a host file
+    let extra = NamedTempFile::new().unwrap();
+    std::fs::write(extra.path(), b"added via cli\n").unwrap();
+    let out = Command::new(FSTOOL)
+        .arg("add")
+        .arg(img.path())
+        .arg(extra.path())
+        .arg("/two.txt")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // e2fsck must still be clean after the modification.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after add:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+
+    // cat the added file
+    let out = Command::new(FSTOOL)
+        .args(["cat"])
+        .arg(img.path())
+        .arg("/two.txt")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"added via cli\n");
+}
+
+/// `fstool info` reports the expected filesystem summary.
+#[test]
+fn cli_info_reports_ext4() {
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("x"), b"y\n").unwrap();
+    let img = NamedTempFile::new().unwrap();
+
+    let out = Command::new(FSTOOL)
+        .args(["ext-build", "--kind", "ext4"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let out = Command::new(FSTOOL)
+        .arg("info")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let info = String::from_utf8_lossy(&out.stdout);
+    assert!(info.contains("Ext4"), "info missing kind:\n{info}");
+    assert!(
+        info.contains("block size"),
+        "info missing block size:\n{info}"
+    );
+}

@@ -740,9 +740,10 @@ impl Ext {
     fn encode_inode(&self, ino: u32, inode: &Inode) -> [u8; inode::INODE_BASE_SIZE] {
         let mut buf = inode.encode();
         if self.has_metadata_csum() {
-            // The checksum field is already zero in `buf` (Inode::encode
-            // writes osd2 from an all-zero array), so the checksum covers
-            // the inode with the field implicitly zeroed.
+            // Zero the checksum field before summing — an inode read back
+            // from disk (modify-after-open) carries its previous checksum
+            // in osd2, which must not feed into the recomputed value.
+            buf[124..126].fill(0);
             let c = csum::inode(self.csum_seed(), ino, inode.generation, &buf);
             buf[124..126].copy_from_slice(&((c & 0xffff) as u16).to_le_bytes());
         }

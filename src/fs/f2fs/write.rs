@@ -1128,10 +1128,7 @@ impl Writer {
             dev.write_at((self.geom.cp_blkaddr as u64 + off) * bs, &zero)?;
         }
         // Footer at block cp_blkaddr + total - 1 (must duplicate head).
-        dev.write_at(
-            (self.geom.cp_blkaddr as u64 + total - 1) * bs,
-            &cp_bytes,
-        )?;
+        dev.write_at((self.geom.cp_blkaddr as u64 + total - 1) * bs, &cp_bytes)?;
         // Mark CP1 invalid by zeroing every block it would occupy.
         // Zero magic and zero checksum_offset both fail
         // validate_checkpoint, so any of the 8 blocks landing on

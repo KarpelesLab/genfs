@@ -32,7 +32,9 @@ pub mod header;
 pub mod pax;
 pub mod stream;
 
-pub use stream::{StreamEntry, TarStreamReader, TarStreamWriter};
+pub use stream::{
+    BoundedReader, IndexedEntry, StreamEntry, TarStreamIndex, TarStreamReader, TarStreamWriter,
+};
 
 use std::collections::HashMap;
 use std::io::Read;

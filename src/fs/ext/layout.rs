@@ -33,6 +33,14 @@ pub struct Layout {
     pub inode_table_blocks: u32,
     /// Number of GDT blocks (ceil(num_groups * desc_size / block_size)).
     pub gdt_blocks: u32,
+    /// Base-2 logarithm of the number of groups per "flex unit" when the
+    /// `INCOMPAT_FLEX_BG` feature is active. 0 means flex_bg is disabled.
+    /// When non-zero, the first group of each flex unit packs the block
+    /// bitmaps, inode bitmaps, and inode tables of all
+    /// `2^log_groups_per_flex` groups in that unit contiguously; the
+    /// remaining groups in the unit hold only data (and optional SB+GDT
+    /// backups per `sparse_super`).
+    pub log_groups_per_flex: u8,
     /// One entry per group, in order.
     pub groups: Vec<GroupLayout>,
 }
@@ -41,6 +49,15 @@ impl Layout {
     /// Total number of groups.
     pub fn num_groups(&self) -> u32 {
         self.groups.len() as u32
+    }
+
+    /// Number of groups per flex unit, or 1 when flex_bg is disabled.
+    pub fn flex_size(&self) -> u32 {
+        if self.log_groups_per_flex == 0 {
+            1
+        } else {
+            1u32 << self.log_groups_per_flex
+        }
     }
 }
 
@@ -104,6 +121,24 @@ pub fn plan_with(
     inodes_count: u32,
     sparse_super: bool,
 ) -> crate::Result<Layout> {
+    plan_full(block_size, blocks_count, inodes_count, sparse_super, 0)
+}
+
+/// Full layout planner with optional `INCOMPAT_FLEX_BG` packing.
+///
+/// `log_groups_per_flex == 0` disables flex_bg (classic per-group metadata
+/// placement). Otherwise `2^log_groups_per_flex` groups form a flex unit;
+/// the first group of each unit packs the bitmaps and inode tables of
+/// every group in the unit contiguously, while the rest of the unit holds
+/// only data (and, optionally, SB+GDT backups per `sparse_super`). The
+/// on-disk format caps `log_groups_per_flex` at 5 (32 groups per unit).
+pub fn plan_full(
+    block_size: u32,
+    blocks_count: u32,
+    inodes_count: u32,
+    sparse_super: bool,
+    log_groups_per_flex: u8,
+) -> crate::Result<Layout> {
     if !block_size.is_power_of_two() || block_size < 1024 {
         return Err(crate::Error::InvalidArgument(format!(
             "ext: block_size must be a power of two ≥ 1024, got {block_size}"
@@ -117,6 +152,11 @@ pub fn plan_with(
     if inodes_count < 11 {
         return Err(crate::Error::InvalidArgument(format!(
             "ext: inodes_count must include the reserved range (≥ 11), got {inodes_count}"
+        )));
+    }
+    if log_groups_per_flex > 5 {
+        return Err(crate::Error::InvalidArgument(format!(
+            "ext: log_groups_per_flex {log_groups_per_flex} > 5 (max flex unit = 32 groups)"
         )));
     }
 
@@ -175,7 +215,13 @@ pub fn plan_with(
     let gdt_bytes = num_groups as u64 * GROUP_DESC_SIZE as u64;
     let gdt_blocks = gdt_bytes.div_ceil(block_size as u64) as u32;
 
-    let mut groups = Vec::with_capacity(num_groups as usize);
+    let flex_size: u32 = if log_groups_per_flex == 0 {
+        1
+    } else {
+        1u32 << log_groups_per_flex
+    };
+
+    let mut groups: Vec<GroupLayout> = Vec::with_capacity(num_groups as usize);
     for g in 0..num_groups {
         let start = first_data_block + g * blocks_per_group;
         let nominal_end = start + blocks_per_group - 1;
@@ -188,23 +234,53 @@ pub fn plan_with(
         } else {
             true
         };
+        let sb_gdt_blocks: u32 = if has_sb { 1 + gdt_blocks } else { 0 };
+        let local_meta_start = start + sb_gdt_blocks;
 
-        // Block layout within the group:
-        //   [SB? + GDT?] -> block bitmap -> inode bitmap -> inode table -> data
-        // The superblock copy occupies one block. For group 0 with 1 KiB
-        // blocks the superblock is at block 1 (first_data_block).
-        // For groups other than 0, the SB copy starts at the group's first
-        // block.
-        let mut next = start;
-        if has_sb {
-            // SB block + GDT blocks
-            next += 1 + gdt_blocks;
+        let (block_bitmap, inode_bitmap, inode_table, data_start, meta_blocks);
+
+        if log_groups_per_flex == 0 {
+            // Classic per-group layout: SB?+GDT? -> bbm -> ibm -> itable -> data.
+            block_bitmap = local_meta_start;
+            inode_bitmap = local_meta_start + 1;
+            inode_table = local_meta_start + 2;
+            data_start = inode_table + inode_table_blocks;
+            meta_blocks = data_start - start;
+        } else {
+            // flex_bg: per-group bitmap + inode-table live in flex_first.
+            let flex_first = (g / flex_size) * flex_size;
+            let pos_in_flex = g - flex_first;
+            // Resolve the packed-region base for this flex unit. When g is
+            // itself flex_first the first-of-flex layout isn't in `groups`
+            // yet, so derive it from local state; otherwise look it up.
+            let (first_start, first_has_sb) = if pos_in_flex == 0 {
+                (start, has_sb)
+            } else {
+                let prev = &groups[flex_first as usize];
+                (prev.start_block, prev.has_superblock)
+            };
+            let packed_base = first_start + if first_has_sb { 1 + gdt_blocks } else { 0 };
+            // Layout inside `flex_first`:
+            //   [SB?+GDT?] bbm[0..flex_size] ibm[0..flex_size] itable[0..flex_size] data
+            let bbm_base = packed_base;
+            let ibm_base = bbm_base + flex_size;
+            let table_base = ibm_base + flex_size;
+            block_bitmap = bbm_base + pos_in_flex;
+            inode_bitmap = ibm_base + pos_in_flex;
+            inode_table = table_base + pos_in_flex * inode_table_blocks;
+
+            if pos_in_flex == 0 {
+                // First-of-flex group owns the packed area.
+                let packed_end = table_base + flex_size * inode_table_blocks;
+                data_start = packed_end;
+                meta_blocks = data_start - start;
+            } else {
+                // Non-first member: only its own SB+GDT backup (if any)
+                // sits at the start; everything else is data.
+                data_start = local_meta_start;
+                meta_blocks = sb_gdt_blocks;
+            }
         }
-        let block_bitmap = next;
-        let inode_bitmap = next + 1;
-        let inode_table = next + 2;
-        let data_start = inode_table + inode_table_blocks;
-        let meta_blocks = data_start - start;
 
         groups.push(GroupLayout {
             start_block: start,
@@ -218,6 +294,25 @@ pub fn plan_with(
         });
     }
 
+    // Sanity check: with flex_bg the packed metadata of each flex unit
+    // must fit within the first group's address range. Otherwise e2fsck
+    // would reject the image (and the writer would overflow the bitmap).
+    if log_groups_per_flex != 0 {
+        for first in (0..num_groups).step_by(flex_size as usize) {
+            let g0 = &groups[first as usize];
+            if g0.data_start > g0.end_block + 1 {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "ext: flex_bg metadata for unit starting at group {} \
+                     ({} blocks) exceeds its capacity ({} blocks); try a \
+                     smaller log_groups_per_flex.",
+                    first,
+                    g0.data_start - g0.start_block,
+                    g0.end_block + 1 - g0.start_block,
+                )));
+            }
+        }
+    }
+
     Ok(Layout {
         block_size,
         blocks_count,
@@ -229,6 +324,7 @@ pub fn plan_with(
         desc_size: GROUP_DESC_SIZE,
         inode_table_blocks,
         gdt_blocks,
+        log_groups_per_flex,
         groups,
     })
 }
@@ -253,26 +349,69 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
 
     let sparse_super =
         sb.feature_ro_compat & super::constants::feature::RO_COMPAT_SPARSE_SUPER != 0;
-    let mut groups = Vec::with_capacity(num_groups as usize);
+    let flex_bg_on = sb.feature_incompat & super::constants::feature::INCOMPAT_FLEX_BG != 0;
+    let log_groups_per_flex = if flex_bg_on {
+        sb.log_groups_per_flex
+    } else {
+        0
+    };
+    let flex_size: u32 = if log_groups_per_flex == 0 {
+        1
+    } else {
+        1u32 << log_groups_per_flex
+    };
+
+    let mut groups: Vec<GroupLayout> = Vec::with_capacity(num_groups as usize);
     for g in 0..num_groups {
         let start = sb.first_data_block + g * sb.blocks_per_group;
         let nominal_end = start + sb.blocks_per_group - 1;
         let end = nominal_end.min(sb.blocks_count - 1);
         // With sparse_super, only groups 0, 1, and powers of 3/5/7 hold
-        // backups; without it, every group does. The descriptor's
-        // bitmap/table pointers (read from disk separately) remain the
-        // source of truth for actual block positions.
+        // backups; without it, every group does. These are the *expected*
+        // positions — `Ext::open` overwrites bitmap/inode-table pointers
+        // with the on-disk descriptor values, which remain the source of
+        // truth for actual block locations.
         let has_sb = if sparse_super {
             group_has_sparse_super(g)
         } else {
             true
         };
-        let meta_first = start + if has_sb { 1 + gdt_blocks } else { 0 };
-        let block_bitmap = meta_first;
-        let inode_bitmap = meta_first + 1;
-        let inode_table = meta_first + 2;
-        let data_start = inode_table + inode_table_blocks;
-        let meta_blocks = data_start - start;
+        let sb_gdt_blocks: u32 = if has_sb { 1 + gdt_blocks } else { 0 };
+        let local_meta_start = start + sb_gdt_blocks;
+
+        let (block_bitmap, inode_bitmap, inode_table, data_start, meta_blocks);
+        if log_groups_per_flex == 0 {
+            block_bitmap = local_meta_start;
+            inode_bitmap = local_meta_start + 1;
+            inode_table = local_meta_start + 2;
+            data_start = inode_table + inode_table_blocks;
+            meta_blocks = data_start - start;
+        } else {
+            let flex_first = (g / flex_size) * flex_size;
+            let pos_in_flex = g - flex_first;
+            let (first_start, first_has_sb) = if pos_in_flex == 0 {
+                (start, has_sb)
+            } else {
+                let prev = &groups[flex_first as usize];
+                (prev.start_block, prev.has_superblock)
+            };
+            let packed_base = first_start + if first_has_sb { 1 + gdt_blocks } else { 0 };
+            let bbm_base = packed_base;
+            let ibm_base = bbm_base + flex_size;
+            let table_base = ibm_base + flex_size;
+            block_bitmap = bbm_base + pos_in_flex;
+            inode_bitmap = ibm_base + pos_in_flex;
+            inode_table = table_base + pos_in_flex * inode_table_blocks;
+            if pos_in_flex == 0 {
+                let packed_end = table_base + flex_size * inode_table_blocks;
+                data_start = packed_end;
+                meta_blocks = data_start - start;
+            } else {
+                data_start = local_meta_start;
+                meta_blocks = sb_gdt_blocks;
+            }
+        }
+
         groups.push(GroupLayout {
             start_block: start,
             end_block: end,
@@ -296,6 +435,7 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
         desc_size,
         inode_table_blocks,
         gdt_blocks,
+        log_groups_per_flex,
         groups,
     })
 }
@@ -371,5 +511,86 @@ mod tests {
         let layout = plan(1024, 1024, 11).unwrap();
         assert_eq!(layout.inodes_per_group % 8, 0);
         assert!(layout.inodes_per_group >= 11);
+    }
+
+    #[test]
+    fn flex_bg_packs_metadata_into_first_group() {
+        // bs=4096, 4 groups of 32768 blocks; log_groups_per_flex = 2 →
+        // one flex unit covers all 4 groups.
+        let blocks_per_group = 32768u32;
+        let total_blocks = 4 * blocks_per_group; // first_data_block = 0 for bs=4096
+        let layout = plan_full(4096, total_blocks, 1024, false, 2).unwrap();
+        assert_eq!(layout.num_groups(), 4);
+        assert_eq!(layout.log_groups_per_flex, 2);
+        assert_eq!(layout.flex_size(), 4);
+
+        let g0 = &layout.groups[0];
+        let g1 = &layout.groups[1];
+        let g2 = &layout.groups[2];
+        let g3 = &layout.groups[3];
+
+        // Group 0 owns the packed bitmaps + inode tables for all 4 groups.
+        let gdt = layout.gdt_blocks;
+        let packed_base = 1 + gdt; // SB + GDT for bs=4096
+        assert_eq!(g0.block_bitmap, packed_base);
+        assert_eq!(g1.block_bitmap, packed_base + 1);
+        assert_eq!(g2.block_bitmap, packed_base + 2);
+        assert_eq!(g3.block_bitmap, packed_base + 3);
+        assert_eq!(g0.inode_bitmap, packed_base + 4);
+        assert_eq!(g1.inode_bitmap, packed_base + 5);
+        assert_eq!(g2.inode_bitmap, packed_base + 6);
+        assert_eq!(g3.inode_bitmap, packed_base + 7);
+        let table_base = packed_base + 8;
+        assert_eq!(g0.inode_table, table_base);
+        assert_eq!(g1.inode_table, table_base + layout.inode_table_blocks);
+        assert_eq!(g2.inode_table, table_base + 2 * layout.inode_table_blocks);
+        assert_eq!(g3.inode_table, table_base + 3 * layout.inode_table_blocks);
+
+        // sparse_super off ⇒ every group has SB+GDT in its own range; the
+        // non-first flex member then has data_start = start + 1 + gdt.
+        assert_eq!(g1.meta_blocks, 1 + gdt);
+        assert_eq!(g1.data_start, g1.start_block + 1 + gdt);
+        assert_eq!(g2.meta_blocks, 1 + gdt);
+        assert_eq!(g3.meta_blocks, 1 + gdt);
+    }
+
+    #[test]
+    fn flex_bg_with_sparse_super_skips_backups() {
+        // With sparse_super, group 2 of flex unit 0 has no SB+GDT — only
+        // its bitmap+table live elsewhere (in group 0); its data_start
+        // equals its start_block. Group 3 IS a power of 3, so it carries
+        // a backup.
+        let blocks_per_group = 32768u32;
+        let total_blocks = 4 * blocks_per_group;
+        let layout = plan_full(4096, total_blocks, 1024, true, 2).unwrap();
+        let g2 = &layout.groups[2];
+        let g3 = &layout.groups[3];
+        assert!(!g2.has_superblock);
+        assert!(g3.has_superblock);
+        assert_eq!(g2.meta_blocks, 0);
+        assert_eq!(g2.data_start, g2.start_block);
+        assert_eq!(g3.meta_blocks, 1 + layout.gdt_blocks);
+    }
+
+    #[test]
+    fn flex_bg_rejects_too_large_log() {
+        // 2^6 = 64, exceeds the spec cap of 32.
+        let err = plan_full(4096, 32 * 1024, 256, false, 6).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn flex_bg_off_matches_classic_plan() {
+        // log_groups_per_flex = 0 → identical to plan_with(.., false).
+        let a = plan_full(1024, 32 * 1024, 256, false, 0).unwrap();
+        let b = plan_with(1024, 32 * 1024, 256, false).unwrap();
+        assert_eq!(a.num_groups(), b.num_groups());
+        for i in 0..a.groups.len() {
+            assert_eq!(a.groups[i].block_bitmap, b.groups[i].block_bitmap);
+            assert_eq!(a.groups[i].inode_bitmap, b.groups[i].inode_bitmap);
+            assert_eq!(a.groups[i].inode_table, b.groups[i].inode_table);
+            assert_eq!(a.groups[i].data_start, b.groups[i].data_start);
+            assert_eq!(a.groups[i].meta_blocks, b.groups[i].meta_blocks);
+        }
     }
 }

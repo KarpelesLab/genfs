@@ -95,6 +95,20 @@ pub struct FormatOpts {
     /// raw-ext2 output stays binary-exact with genext2fs (which doesn't
     /// emit sparse_super); on by default for ext3/ext4 (which match mke2fs).
     pub sparse_super: bool,
+    /// Base-2 logarithm of the flex-unit size when `INCOMPAT_FLEX_BG` is
+    /// enabled (0 disables the feature).
+    ///
+    /// With flex_bg the block bitmap, inode bitmap, and inode table of
+    /// every group in a flex unit are packed contiguously into the first
+    /// group of that unit; the remaining groups in the unit hold only
+    /// data (and optional SB+GDT backups). Improves large-FS performance
+    /// at the cost of clustered metadata.
+    ///
+    /// Valid range: 0..=5 (1 to 32 groups per unit). Defaults to 0
+    /// (disabled) so that ext2/3/4 output stays bit-for-bit compatible
+    /// with the pre-flex_bg writer; opt in by setting this to 4 (mke2fs's
+    /// default for small/medium FSes, 16 groups per unit).
+    pub log_groups_per_flex: u8,
 }
 
 impl Default for FormatOpts {
@@ -112,7 +126,31 @@ impl Default for FormatOpts {
             journal_blocks: 0,
             sparse: false,
             sparse_super: false,
+            log_groups_per_flex: 0,
         }
+    }
+}
+
+impl FormatOpts {
+    /// Recommended `log_groups_per_flex` for a filesystem with the given
+    /// number of block groups. Mirrors mke2fs's heuristic: leave flex_bg
+    /// off for very small FSes (it buys nothing) and use a 16-group flex
+    /// unit (log 4) otherwise. The integrator is free to override.
+    pub const fn default_log_groups_per_flex(num_groups: u32) -> u8 {
+        if num_groups < 16 { 0 } else { 4 }
+    }
+
+    /// Validate this opts' flex_bg setting before format. Returns Ok if
+    /// flex_bg is disabled or in-range; an error if `log_groups_per_flex`
+    /// exceeds the 5 (32-groups) cap defined by the on-disk format.
+    fn check_flex_bg(&self) -> crate::Result<()> {
+        if self.log_groups_per_flex > 5 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: log_groups_per_flex {} > 5 (max 32 groups per flex unit)",
+                self.log_groups_per_flex
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -160,11 +198,13 @@ impl Ext {
     /// image is a valid ext2 containing just the root directory (and
     /// `/lost+found` if requested in `opts`).
     pub fn format_with(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Self> {
-        let layout = layout::plan_with(
+        opts.check_flex_bg()?;
+        let layout = layout::plan_full(
             opts.block_size,
             opts.blocks_count,
             opts.inodes_count,
             opts.sparse_super,
+            opts.log_groups_per_flex,
         )?;
         let total_bytes = layout.blocks_count as u64 * layout.block_size as u64;
         if dev.total_size() < total_bytes {
@@ -270,6 +310,15 @@ impl Ext {
         }
         if opts.kind.has_journal() {
             ext.sb.feature_compat |= constants::feature::COMPAT_HAS_JOURNAL;
+        }
+        // flex_bg: when log_groups_per_flex != 0 the layout planner has
+        // already packed metadata into the first group of each flex unit;
+        // we just record the feature flag + the log value in the
+        // superblock so the kernel and e2fsck know to expect the packed
+        // layout.
+        if opts.log_groups_per_flex > 0 {
+            ext.sb.feature_incompat |= constants::feature::INCOMPAT_FLEX_BG;
+            ext.sb.log_groups_per_flex = opts.log_groups_per_flex;
         }
 
         // Reserve inodes 1..first_ino-1 (1..=10 for dynamic rev).
@@ -2103,5 +2152,142 @@ mod tests {
         assert_eq!(ext.sb.blocks_count, 1024);
         assert_eq!(ext.sb.inodes_count, 16);
         assert_eq!(ext.sb.block_size(), 1024);
+    }
+
+    #[test]
+    fn flex_bg_off_by_default() {
+        // The default FormatOpts must not enable flex_bg, preserving the
+        // pre-flex_bg byte-exact ext2 layout.
+        let mut dev = MemoryBackend::new(1024 * 1024);
+        let opts = FormatOpts::default();
+        let ext = Ext::format_with(&mut dev, &opts).expect("format");
+        assert_eq!(ext.sb.log_groups_per_flex, 0);
+        assert_eq!(
+            ext.sb.feature_incompat & constants::feature::INCOMPAT_FLEX_BG,
+            0
+        );
+        assert_eq!(ext.layout.log_groups_per_flex, 0);
+    }
+
+    #[test]
+    fn flex_bg_sets_feature_and_log() {
+        // bs=4096, 64 MiB FS → 2 groups of 32768 blocks. log_groups_per_flex = 1.
+        let total_bytes = 64u64 * 1024 * 1024;
+        let mut dev = MemoryBackend::new(total_bytes);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            log_groups_per_flex: 1,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let ext = Ext::format_with(&mut dev, &opts).expect("format flex_bg");
+        assert_eq!(ext.sb.log_groups_per_flex, 1);
+        assert!(
+            ext.sb.feature_incompat & constants::feature::INCOMPAT_FLEX_BG != 0,
+            "INCOMPAT_FLEX_BG must be set when log_groups_per_flex > 0"
+        );
+        // Reopen: the parsed superblock must round-trip the flex value.
+        let reopened = Ext::open(&mut dev).expect("reopen flex_bg image");
+        assert_eq!(reopened.sb.log_groups_per_flex, 1);
+        assert_eq!(reopened.layout.log_groups_per_flex, 1);
+    }
+
+    #[test]
+    fn flex_bg_rejects_invalid_log() {
+        let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            log_groups_per_flex: 6,
+            ..FormatOpts::default()
+        };
+        let err = Ext::format_with(&mut dev, &opts).expect_err("must reject log > 5");
+        assert!(matches!(err, crate::Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn flex_bg_default_helper_picks_reasonable_log() {
+        // Small (single-group) → 0 (off). Large → 4.
+        assert_eq!(FormatOpts::default_log_groups_per_flex(1), 0);
+        assert_eq!(FormatOpts::default_log_groups_per_flex(15), 0);
+        assert_eq!(FormatOpts::default_log_groups_per_flex(16), 4);
+        assert_eq!(FormatOpts::default_log_groups_per_flex(1024), 4);
+    }
+
+    #[test]
+    fn flex_bg_metadata_packed_in_first_group() {
+        // 128 MiB / 4 KiB = 32768 blocks total = 1 group of 32768 blocks
+        // → still single-group. Use 65536 blocks → 2 groups of 32768.
+        let mut dev = MemoryBackend::new(256u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 64 * 1024, // 2 groups of 32768 each
+            inodes_count: 2048,
+            log_groups_per_flex: 1,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let ext = Ext::format_with(&mut dev, &opts).expect("format flex_bg");
+        assert_eq!(ext.layout.num_groups(), 2, "test setup must yield 2 groups");
+        let g0 = ext.layout.groups[0];
+        let g1 = ext.layout.groups[1];
+        assert!(g1.block_bitmap < g1.start_block);
+        assert!(g1.block_bitmap > g0.start_block);
+        assert!(g1.inode_bitmap < g1.start_block);
+        assert!(g1.inode_table < g1.start_block);
+    }
+
+    #[test]
+    fn flex_bg_add_and_readback_file() {
+        // Format a flex_bg image, add a file, reopen, read it back.
+        let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            log_groups_per_flex: 1,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format flex_bg");
+        let payload = b"hello flex_bg".to_vec();
+        ext.add_file_to_streaming(
+            &mut dev,
+            constants::INO_ROOT_DIR,
+            b"greet.txt",
+            &mut payload.as_slice(),
+            payload.len() as u64,
+            FileMeta {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                atime: 0,
+                ctime: 0,
+            },
+        )
+        .expect("add file");
+        ext.flush(&mut dev).expect("flush");
+
+        // Reopen and read back.
+        let reopened = Ext::open(&mut dev).expect("reopen");
+        let ino = reopened
+            .path_to_inode(&mut dev, "/greet.txt")
+            .expect("path lookup");
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        reopened
+            .open_file_reader(&mut dev, ino)
+            .expect("open reader")
+            .read_to_end(&mut buf)
+            .expect("read");
+        assert_eq!(&buf, &payload);
     }
 }

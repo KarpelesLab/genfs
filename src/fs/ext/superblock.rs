@@ -59,6 +59,10 @@ pub struct Superblock {
     /// On-disk size of each group descriptor. 0 means the classic 32-byte
     /// form; when `INCOMPAT_64BIT` is set this is 64 (or larger).
     pub desc_size: u16,
+    /// `s_log_groups_per_flex` at offset 0x174. Base-2 log of the number
+    /// of groups packed into one flex unit when `INCOMPAT_FLEX_BG` is
+    /// active. 0 means the classic one-group-at-a-time metadata layout.
+    pub log_groups_per_flex: u8,
 }
 
 impl Superblock {
@@ -118,6 +122,7 @@ impl Superblock {
             algorithm_usage_bitmap: 0,
             journal_inum: 0,
             desc_size: 0,
+            log_groups_per_flex: 0,
         }
     }
 
@@ -178,7 +183,13 @@ impl Superblock {
         // 228..252: s_journal_dev, s_last_orphan, s_hash_seed — left zero
         // 252: s_def_hash_version (u8), 253: s_jnl_backup_type (u8) — zero
         write_u16(p, 254, self.desc_size);
-        // 256..: s_default_mount_opts, ... — left zero
+        // 256..0x174: s_default_mount_opts, s_first_meta_bg, s_mkfs_time,
+        // s_jnl_blocks — left zero.
+        // 0x174: s_log_groups_per_flex (u8).
+        p[0x174] = self.log_groups_per_flex;
+        // 0x175..: s_checksum_type, padding, ... — left zero. (The
+        // metadata-checksum path in mod.rs sets 0x175 directly when
+        // needed.)
         buf
     }
 
@@ -241,6 +252,7 @@ impl Superblock {
             algorithm_usage_bitmap: read_u32(buf, 200),
             journal_inum: read_u32(buf, 224),
             desc_size: read_u16(buf, 254),
+            log_groups_per_flex: buf[0x174],
         })
     }
 }

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/fstool/compare/v0.0.3...v0.0.4) - 2026-05-19
+
+### Added
+
+- *(ext)* xattr support — read inline + block, write block, preserve on repack
+- *(cli)* convert + repack — byte-copy and FS-aware resize
+- *(block, cli)* qcow2 write + create — Phase B
+- *(block)* qcow2 read path — Phase A
+- *(cli)* partition-aware target syntax — disk.img:N
+- *(block, cli)* real block-device support on Unix
+- *(cli)* fstool shell — interactive REPL over any image
+- *(ext4)* sparse_super on the write path
+- *(fat32, cli)* modify-in-place — add files, add dirs, remove entries
+- *(fat32, cli)* read-side parity — FAT32 reader + unified CLI dispatch
+
+### Fixed
+
+- *(cli)* repack as a direct FS-to-FS copy, no host tempdir
+
+### Other
+
+- release-binaries workflow — five archives per release
+
 ## [0.0.3](https://github.com/KarpelesLab/fstool/compare/v0.0.2...v0.0.3) - 2026-05-19
 
 ### Added

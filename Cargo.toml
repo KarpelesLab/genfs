@@ -1,6 +1,6 @@
 [package]
 name = "fstool"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 rust-version = "1.85"
 description = "Build disk images and filesystems (ext2/3/4, MBR, GPT) from a directory tree and TOML spec, in the spirit of genext2fs."

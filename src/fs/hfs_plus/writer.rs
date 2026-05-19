@@ -807,39 +807,25 @@ fn build_btree(
     let leaf_count_initial = records.len();
 
     if records.is_empty() {
-        // TN1150 §"Initialization": "When a B-tree file is initialized,
-        // the header node AND one empty leaf node are written." fsck.hfs
-        // rejects a tree with treeDepth=0 / rootNode=0 — it expects at
-        // least one leaf to anchor future inserts. The leaf has
-        // numRecords=0 and no records, just the descriptor.
-        let ns = node_size as usize;
-        let mut leaf = vec![0u8; ns];
-        // fLink=0, bLink=0 (only leaf), kind=KIND_LEAF, height=1, numRecords=0.
-        leaf[8] = KIND_LEAF as u8;
-        leaf[9] = 1;
-        // record-offset table: a single offset to the free-space start
-        // (= NODE_DESCRIPTOR_SIZE since there are no records).
-        let free_off = NODE_DESCRIPTOR_SIZE as u16;
-        let last = ns - 2;
-        leaf[last..last + 2].copy_from_slice(&free_off.to_be_bytes());
+        // mkfs.hfsplus writes an empty B-tree as a single header node
+        // with rootNode = 0 / treeDepth = 0 / firstLeafNode = 0. The
+        // structural fix that satisfies fsck is the map-record size
+        // (see `header_node`), not synthesising an empty leaf.
         return Ok(BuiltTree {
-            nodes: vec![
-                header_node(
-                    node_size,
-                    1, // treeDepth
-                    1, // rootNode (= the empty leaf)
-                    0, // leafRecords
-                    1, // firstLeafNode
-                    1, // lastLeafNode
-                    nodes_capacity,
-                    nodes_capacity.saturating_sub(2), // header + leaf used
-                )?,
-                leaf,
-            ],
-            tree_depth: 1,
-            root_node: 1,
-            first_leaf: 1,
-            last_leaf: 1,
+            nodes: vec![header_node(
+                node_size,
+                0,
+                0,
+                0,
+                0,
+                0,
+                nodes_capacity,
+                nodes_capacity.saturating_sub(1),
+            )?],
+            tree_depth: 0,
+            root_node: 0,
+            first_leaf: 0,
+            last_leaf: 0,
             leaf_records: 0,
         });
     }
@@ -1024,15 +1010,29 @@ fn header_node(
     node[h + 38..h + 42].copy_from_slice(&6u32.to_be_bytes());
     // reserved3 (16 u32 words) -- zero.
 
-    // Record offsets table: header rec (14), user rec (14+106=120),
-    // map rec (120+128=248) -- mkfs.hfsplus pads userData/map.
-    // For us: user rec = 128 zero bytes; map rec = the remaining map bits.
+    // Record offsets table: 4 entries at the tail (8 bytes total).
+    // mkfs.hfsplus stretches the map record across ALL remaining space
+    // — TN1150 §"B-Tree Header Record" says "The size of the first map
+    // record is the size of the rest of the header node" — so the map
+    // ends at `node_size - 8` (where the offsets table starts). fsck
+    // rejects a header whose map record is short of that boundary.
     let used_blocks = total_nodes - free_nodes;
-    let map_rec_size = (total_nodes as usize).div_ceil(8); // bytes of map bits
-    let user_off = NODE_DESCRIPTOR_SIZE + HEADER_REC_SIZE;
-    let map_off = user_off + 128;
-    let free_off = map_off + map_rec_size;
-    // 4 offset entries.
+    let user_off = NODE_DESCRIPTOR_SIZE + HEADER_REC_SIZE; // 120
+    let map_off = user_off + 128; // 248
+    let offsets_table = 2 * 4; // 4 entries × u16
+    let free_off = ns - offsets_table;
+    if free_off <= map_off {
+        return Err(crate::Error::Unsupported(format!(
+            "hfs+ writer: node_size {ns} too small for header layout"
+        )));
+    }
+    let map_rec_size = free_off - map_off;
+    // The map needs at least one byte to hold the header's own bit.
+    if (total_nodes as usize).div_ceil(8) > map_rec_size {
+        return Err(crate::Error::Unsupported(format!(
+            "hfs+ writer: {total_nodes}-node tree exceeds map record capacity ({map_rec_size} bytes)"
+        )));
+    }
     let offs = [
         NODE_DESCRIPTOR_SIZE as u16,
         user_off as u16,
@@ -1041,14 +1041,11 @@ fn header_node(
     ];
     for (i, &o) in offs.iter().enumerate() {
         let pos = ns - 2 * (i + 1);
-        if pos < free_off {
-            return Err(crate::Error::Unsupported(format!(
-                "hfs+ writer: node_size {ns} cannot hold {total_nodes}-bit map"
-            )));
-        }
         node[pos..pos + 2].copy_from_slice(&o.to_be_bytes());
     }
-    // Populate the map bits for blocks 0..used_blocks (these nodes are in use).
+    // Populate the map bits for nodes 0..used_blocks (these nodes are
+    // in use). MSB-first within each byte, matching f2fs_test_bit and
+    // every other HFS+ bitmap convention.
     for b in 0..used_blocks {
         let bi = b as usize;
         node[map_off + bi / 8] |= 1u8 << (7 - (bi & 7));

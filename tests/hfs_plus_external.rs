@@ -245,6 +245,7 @@ fn newfs_hfsplus_image_opens_via_fstool() {
 /// Debug helper: dumps mkfs.hfsplus's extents-overflow header bytes
 /// alongside ours. Always fails to surface the diff in CI logs.
 #[test]
+#[ignore = "diagnostic — run explicitly via `cargo test -- --ignored`"]
 fn dump_mkfs_vs_fstool_extents_header() {
     // Linux ships the formatter as `mkfs.hfsplus`; macOS as `newfs_hfs`.
     let Some(newfs) = which("mkfs.hfsplus")

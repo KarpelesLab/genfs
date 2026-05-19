@@ -228,11 +228,9 @@ fn decode_nat_journal(buf: &[u8]) -> Vec<NatJournalEntry> {
     out
 }
 
-/// Encode a CP head block — used by tests to build synthetic images, and
-/// useful as a single source-of-truth for the offsets that
-/// [`decode_cp_head`] consumes.
-#[cfg(test)]
-pub(crate) fn encode_cp_head(cp: &Checkpoint) -> Vec<u8> {
+/// Encode a CP head block — single source of truth for the offsets
+/// [`decode_cp_head`] consumes. Used by the live flush path.
+pub(crate) fn encode_cp_head_writer(cp: &Checkpoint) -> Vec<u8> {
     let mut buf = vec![0u8; F2FS_BLKSIZE];
     buf[0x00..0x08].copy_from_slice(&cp.version.to_le_bytes());
     buf[0x08..0x10].copy_from_slice(&cp.user_block_count.to_le_bytes());
@@ -243,26 +241,46 @@ pub(crate) fn encode_cp_head(cp: &Checkpoint) -> Vec<u8> {
     buf[0x7C..0x80].copy_from_slice(&cp.flags.to_le_bytes());
     buf[0x80..0x84].copy_from_slice(&cp.cp_pack_start_sum.to_le_bytes());
     buf[0x84..0x88].copy_from_slice(&cp.cp_payload.to_le_bytes());
-    // CRC32 footer.
     let crc = crc32fast::hash(&buf[..F2FS_BLK_CSUM_OFFSET]);
     buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     buf
 }
 
-/// Encode a NAT-journal block — counterpart of [`decode_nat_journal`].
-#[cfg(test)]
-pub(crate) fn encode_nat_journal_block(entries: &[NatJournalEntry]) -> Vec<u8> {
+/// Encode an empty NAT-journal summary block — used by the writer when
+/// every nid is persisted to the on-disk NAT pages instead of the
+/// journal.
+pub(crate) fn encode_empty_journal_block() -> Vec<u8> {
+    encode_nat_journal_block_writer(&[])
+}
+
+/// Encode a NAT-journal block. Layout mirrors [`decode_nat_journal`].
+pub(crate) fn encode_nat_journal_block_writer(entries: &[NatJournalEntry]) -> Vec<u8> {
     let mut buf = vec![0u8; F2FS_BLKSIZE];
     buf[0..2].copy_from_slice(&(entries.len() as u16).to_le_bytes());
     let stride = 16usize;
     for (i, e) in entries.iter().enumerate() {
         let o = 4 + i * stride;
+        if o + stride > buf.len() {
+            break;
+        }
         buf[o..o + 4].copy_from_slice(&e.nid.to_le_bytes());
         buf[o + 4..o + 8].copy_from_slice(&e.ino.to_le_bytes());
         buf[o + 8..o + 12].copy_from_slice(&e.block_addr.to_le_bytes());
         buf[o + 12] = e.version;
     }
     buf
+}
+
+/// Test alias for [`encode_cp_head_writer`].
+#[cfg(test)]
+pub(crate) fn encode_cp_head(cp: &Checkpoint) -> Vec<u8> {
+    encode_cp_head_writer(cp)
+}
+
+/// Test alias for [`encode_nat_journal_block_writer`].
+#[cfg(test)]
+pub(crate) fn encode_nat_journal_block(entries: &[NatJournalEntry]) -> Vec<u8> {
+    encode_nat_journal_block_writer(entries)
 }
 
 // Silence unused-import warnings when CP_COMPACT_SUM_FLAG isn't read in

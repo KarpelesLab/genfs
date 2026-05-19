@@ -44,9 +44,11 @@ pub mod checkpoint;
 pub mod constants;
 pub mod dir;
 pub mod file;
+pub mod format;
 pub mod inode;
 pub mod nat;
 pub mod superblock;
+pub mod write;
 
 use std::io::Read;
 
@@ -54,7 +56,9 @@ use crate::Result;
 use crate::block::BlockDevice;
 
 pub use file::FileReader;
+pub use format::{FormatOpts, Geometry, plan_geometry};
 pub use superblock::{F2FS_MAGIC, SB_OFFSET_BACKUP, SB_OFFSET_PRIMARY, Superblock};
+pub use write::Writer;
 
 use checkpoint::Checkpoint;
 use constants::{F2FS_BLKSIZE, S_IFDIR, S_IFMT, S_IFREG};
@@ -75,23 +79,140 @@ pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
     Ok(u32::from_le_bytes(head) == F2FS_MAGIC)
 }
 
-/// Mounted F2FS volume — read-only.
+/// Mounted F2FS volume.
 ///
 /// The struct caches the superblock and checkpoint pack at open time so
 /// every `list_path` / `open_file_reader` call is a flat sequence of
 /// 4 KiB reads against the block device with no further metadata-pack
-/// re-scanning.
+/// re-scanning. Opening through [`F2fs::format`] additionally arms a
+/// [`Writer`] for in-place create / remove / flush operations.
 pub struct F2fs {
     sb: Superblock,
     cp: Checkpoint,
+    writer: Option<Writer>,
 }
 
 impl F2fs {
-    /// Open the volume and lock in the live checkpoint pack.
+    /// Open the volume read-only and lock in the live checkpoint pack.
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         let sb = superblock::load(dev)?;
         let cp = Checkpoint::load(dev, &sb)?;
-        Ok(Self { sb, cp })
+        Ok(Self {
+            sb,
+            cp,
+            writer: None,
+        })
+    }
+
+    /// Format `dev` as a fresh F2FS volume and return a handle ready for
+    /// `create_*` / `remove` / `flush` calls. Any prior content of `dev`
+    /// is overwritten.
+    pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Self> {
+        let bs = F2FS_BLKSIZE as u64;
+        let total_blocks = dev.total_size() / bs;
+        let geom = format::plan_geometry(total_blocks, opts)?;
+        dev.zero_range(0, geom.main_blkaddr as u64 * bs)?;
+        format::write_superblocks(dev, &geom, opts)?;
+        format::wipe_metadata_region(dev, &geom)?;
+
+        let sb = superblock::load(dev)?;
+        let writer = Writer::new(geom, sb.clone());
+        let mut me = Self {
+            sb,
+            cp: Checkpoint {
+                version: 0,
+                user_block_count: total_blocks,
+                valid_block_count: 0,
+                flags: 0,
+                cp_pack_start_sum: 1,
+                cp_pack_total_block_count: 2,
+                cp_payload: 0,
+                head_blkaddr: geom.cp_blkaddr,
+                nat_ver_bitmap_bytesize: 64,
+                sit_ver_bitmap_bytesize: 64,
+                cur_nat_pack: 0,
+                cur_sit_pack: 0,
+                nat_journal: Vec::new(),
+            },
+            writer: Some(writer),
+        };
+        me.flush(dev)?;
+        me.cp = Checkpoint::load(dev, &me.sb)?;
+        Ok(me)
+    }
+
+    /// Create a regular file at `path` populated from `src`. The parent
+    /// directory must exist; the leaf must not. Returns the new nid.
+    pub fn create_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
+    ) -> Result<u32> {
+        self.writer_mut()?.add_file(dev, path, src, meta)
+    }
+
+    /// Create a directory at `path`.
+    pub fn create_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<u32> {
+        self.writer_mut()?.add_dir(dev, path, meta)
+    }
+
+    /// Create a symbolic link.
+    pub fn create_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        target: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<u32> {
+        self.writer_mut()?.add_symlink(dev, path, target, meta)
+    }
+
+    /// Create a device / FIFO / socket node.
+    pub fn create_device(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: crate::fs::FileMeta,
+    ) -> Result<u32> {
+        self.writer_mut()?
+            .add_device(dev, path, kind, major, minor, meta)
+    }
+
+    /// Remove a file / empty directory / symlink. Non-empty directories
+    /// are rejected with [`crate::Error::InvalidArgument`].
+    pub fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+        self.writer_mut()?.remove(dev, path)
+    }
+
+    /// Persist in-memory writer state to `dev`. Idempotent. No-op on
+    /// read-only handles.
+    pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let Some(w) = self.writer.as_mut() else {
+            return Ok(());
+        };
+        w.flush(dev)?;
+        if let Ok(cp) = Checkpoint::load(dev, &self.sb) {
+            self.cp = cp;
+        }
+        Ok(())
+    }
+
+    fn writer_mut(&mut self) -> Result<&mut Writer> {
+        self.writer.as_mut().ok_or_else(|| {
+            crate::Error::Unsupported(
+                "f2fs: handle opened read-only; use F2fs::format for write access".into(),
+            )
+        })
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -218,6 +339,90 @@ impl F2fs {
         let _ = inode;
         let reader = FileReader::new(dev, self.sb.clone(), self.cp.clone(), inode_block)?;
         Ok(Box::new(reader))
+    }
+}
+
+impl crate::fs::Filesystem for F2fs {
+    type FormatOpts = FormatOpts;
+
+    fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
+        Self::format(dev, opts)
+    }
+
+    fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        Self::open(dev)
+    }
+
+    fn create_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        self.create_file(dev, path, src, meta).map(|_| ())
+    }
+
+    fn create_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        self.create_dir(dev, path, meta).map(|_| ())
+    }
+
+    fn create_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        target: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        self.create_symlink(dev, path, target, meta).map(|_| ())
+    }
+
+    fn create_device(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        self.create_device(dev, path, kind, major, minor, meta)
+            .map(|_| ())
+    }
+
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+        self.remove(dev, path)
+    }
+
+    fn list(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("f2fs: non-UTF-8 path".into()))?;
+        self.list_path(dev, s)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("f2fs: non-UTF-8 path".into()))?;
+        self.open_file_reader(dev, s)
+    }
+
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        Self::flush(self, dev)
     }
 }
 
@@ -948,5 +1153,289 @@ mod tests {
         let got = super::inode::decode_indirect_node(&blk).unwrap();
         assert_eq!(got[..4], nids[..]);
         assert_eq!(got.len(), super::constants::NIDS_PER_BLOCK);
+    }
+
+    // -------- Writer round-trip tests --------
+
+    /// Build a small device, format it, and re-open. The empty root must
+    /// list cleanly.
+    #[test]
+    fn format_creates_readable_empty_root() {
+        // 1 MiB device (256 × 4 KiB blocks). Plenty of room for a tiny
+        // log2(blocks_per_seg)=2 layout (4 blocks/segment).
+        let mut dev = MemoryBackend::new(1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            volume_label: "fstool".into(),
+            ..super::FormatOpts::default()
+        };
+        let _fs = F2fs::format(&mut dev, &opts).unwrap();
+        let mut fs = F2fs::open(&mut dev).unwrap();
+        let list = fs.list_path(&mut dev, "/").unwrap();
+        assert!(list.is_empty());
+        assert_eq!(fs.volume_name(), "fstool");
+    }
+
+    /// Create a tiny file (inline path) and read it back through the
+    /// read driver.
+    #[test]
+    fn format_then_create_file_inline() {
+        let mut dev = MemoryBackend::new(1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        let payload = b"hello fresh f2fs writer";
+        let src = crate::fs::FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(payload.to_vec())),
+            len: payload.len() as u64,
+        };
+        fs.create_file(
+            &mut dev,
+            std::path::Path::new("/hello.txt"),
+            src,
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        // Reopen and confirm.
+        let mut fs2 = F2fs::open(&mut dev).unwrap();
+        let list = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "hello.txt");
+        let mut r = fs2.open_file_reader(&mut dev, "/hello.txt").unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    /// Create a file big enough to spill out of the inline area.
+    #[test]
+    fn format_then_create_file_block() {
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        // Payload size: 3 blocks worth of data (> MAX_INLINE_DATA).
+        let payload: Vec<u8> = (0..(F2FS_BLKSIZE * 3))
+            .map(|i| (i as u8).wrapping_mul(13))
+            .collect();
+        let src = crate::fs::FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(payload.clone())),
+            len: payload.len() as u64,
+        };
+        fs.create_file(
+            &mut dev,
+            std::path::Path::new("/big.bin"),
+            src,
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let mut fs2 = F2fs::open(&mut dev).unwrap();
+        let mut r = fs2.open_file_reader(&mut dev, "/big.bin").unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out.len(), payload.len());
+        assert_eq!(out, payload);
+    }
+
+    /// Directory creation: mkdir, then file inside, then list both.
+    #[test]
+    fn format_then_create_dir_and_child() {
+        let mut dev = MemoryBackend::new(1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        fs.create_dir(
+            &mut dev,
+            std::path::Path::new("/etc"),
+            crate::fs::FileMeta::with_mode(0o755),
+        )
+        .unwrap();
+        let src = crate::fs::FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"x=1".to_vec())),
+            len: 3,
+        };
+        fs.create_file(
+            &mut dev,
+            std::path::Path::new("/etc/config"),
+            src,
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut fs2 = F2fs::open(&mut dev).unwrap();
+        let root_list = fs2.list_path(&mut dev, "/").unwrap();
+        assert!(root_list.iter().any(|e| e.name == "etc"));
+        let etc = root_list.iter().find(|e| e.name == "etc").unwrap();
+        assert_eq!(etc.kind, EntryKind::Dir);
+        let etc_list = fs2.list_path(&mut dev, "/etc").unwrap();
+        assert_eq!(etc_list.len(), 1);
+        assert_eq!(etc_list[0].name, "config");
+        let mut r = fs2.open_file_reader(&mut dev, "/etc/config").unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"x=1");
+    }
+
+    /// Symlink creation + read-back via the dentry's file-type byte.
+    #[test]
+    fn format_then_create_symlink() {
+        let mut dev = MemoryBackend::new(1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        fs.create_symlink(
+            &mut dev,
+            std::path::Path::new("/link"),
+            std::path::Path::new("./target"),
+            crate::fs::FileMeta::with_mode(0o777),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut fs2 = F2fs::open(&mut dev).unwrap();
+        let list = fs2.list_path(&mut dev, "/").unwrap();
+        let link = list.iter().find(|e| e.name == "link").unwrap();
+        assert_eq!(link.kind, EntryKind::Symlink);
+    }
+
+    /// Remove a file and check it's gone after re-open.
+    #[test]
+    fn format_then_remove_file() {
+        let mut dev = MemoryBackend::new(1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        let src = crate::fs::FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"tmp".to_vec())),
+            len: 3,
+        };
+        fs.create_file(
+            &mut dev,
+            std::path::Path::new("/scratch"),
+            src,
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap();
+        fs.remove(&mut dev, std::path::Path::new("/scratch"))
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut fs2 = F2fs::open(&mut dev).unwrap();
+        let list = fs2.list_path(&mut dev, "/").unwrap();
+        assert!(list.is_empty());
+    }
+
+    /// Read-only handle rejects writes with a helpful message.
+    #[test]
+    fn read_only_open_rejects_create() {
+        let mut dev = MemoryBackend::new(1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let _ = F2fs::format(&mut dev, &opts).unwrap();
+        let mut fs_ro = F2fs::open(&mut dev).unwrap();
+        let src = crate::fs::FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"!".to_vec())),
+            len: 1,
+        };
+        let err = fs_ro
+            .create_file(
+                &mut dev,
+                std::path::Path::new("/x"),
+                src,
+                crate::fs::FileMeta::default(),
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(err, crate::Error::Unsupported(_)));
+    }
+
+    /// Many small files force the directory to spill from inline to a
+    /// 4 KiB dentry block. Both formats must read back consistently.
+    #[test]
+    fn dir_spill_to_block_layout() {
+        let mut dev = MemoryBackend::new(4 * 1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        // 100 files with 9-byte names → 2 slots per dentry, 200 slots
+        // total. That overflows the inline-dentry 182-slot budget and
+        // forces a spill to a 4 KiB block-format dentry (214 slots, so
+        // 100 × 2 = 200 slots still fits).
+        let n_files = 100;
+        for i in 0..n_files {
+            let name = format!("ab{i:07}"); // 9 bytes (ab + 7 digits)
+            let src = crate::fs::FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(vec![b'.'; 1])),
+                len: 1,
+            };
+            fs.create_file(
+                &mut dev,
+                std::path::Path::new(&format!("/{name}")),
+                src,
+                crate::fs::FileMeta::default(),
+            )
+            .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+        let mut fs2 = F2fs::open(&mut dev).unwrap();
+        let list = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(list.len(), n_files);
+        for entry in &list {
+            assert_eq!(entry.kind, EntryKind::Regular);
+        }
+    }
+
+    /// A file that overflows the in-inode 923 direct pointers must
+    /// allocate at least one direct-node block.
+    #[test]
+    fn writer_overflows_into_direct_node() {
+        use super::constants::ADDRS_PER_INODE;
+        let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        // ADDRS_PER_INODE + 5 blocks of pseudo-random data.
+        let n_blocks = ADDRS_PER_INODE + 5;
+        let payload: Vec<u8> = (0..(n_blocks * F2FS_BLKSIZE))
+            .map(|i| (i as u8).wrapping_mul(17))
+            .collect();
+        let src = crate::fs::FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(payload.clone())),
+            len: payload.len() as u64,
+        };
+        fs.create_file(
+            &mut dev,
+            std::path::Path::new("/huge.bin"),
+            src,
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut fs2 = F2fs::open(&mut dev).unwrap();
+        let mut r = fs2.open_file_reader(&mut dev, "/huge.bin").unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out.len(), payload.len());
+        assert_eq!(out, payload);
     }
 }

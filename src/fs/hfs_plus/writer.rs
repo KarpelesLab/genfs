@@ -807,21 +807,39 @@ fn build_btree(
     let leaf_count_initial = records.len();
 
     if records.is_empty() {
+        // TN1150 §"Initialization": "When a B-tree file is initialized,
+        // the header node AND one empty leaf node are written." fsck.hfs
+        // rejects a tree with treeDepth=0 / rootNode=0 — it expects at
+        // least one leaf to anchor future inserts. The leaf has
+        // numRecords=0 and no records, just the descriptor.
+        let ns = node_size as usize;
+        let mut leaf = vec![0u8; ns];
+        // fLink=0, bLink=0 (only leaf), kind=KIND_LEAF, height=1, numRecords=0.
+        leaf[8] = KIND_LEAF as u8;
+        leaf[9] = 1;
+        // record-offset table: a single offset to the free-space start
+        // (= NODE_DESCRIPTOR_SIZE since there are no records).
+        let free_off = NODE_DESCRIPTOR_SIZE as u16;
+        let last = ns - 2;
+        leaf[last..last + 2].copy_from_slice(&free_off.to_be_bytes());
         return Ok(BuiltTree {
-            nodes: vec![header_node(
-                node_size,
-                0,
-                0,
-                0,
-                0,
-                0,
-                nodes_capacity,
-                nodes_capacity.saturating_sub(1),
-            )?],
-            tree_depth: 0,
-            root_node: 0,
-            first_leaf: 0,
-            last_leaf: 0,
+            nodes: vec![
+                header_node(
+                    node_size,
+                    1, // treeDepth
+                    1, // rootNode (= the empty leaf)
+                    0, // leafRecords
+                    1, // firstLeafNode
+                    1, // lastLeafNode
+                    nodes_capacity,
+                    nodes_capacity.saturating_sub(2), // header + leaf used
+                )?,
+                leaf,
+            ],
+            tree_depth: 1,
+            root_node: 1,
+            first_leaf: 1,
+            last_leaf: 1,
             leaf_records: 0,
         });
     }
@@ -1990,15 +2008,18 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     }
     let ext_built = build_btree(ext_records, writer.node_size, ext_total_nodes)?;
     let mut ext_nodes_owned: Vec<Vec<u8>> = ext_built.nodes;
-    // Patch the extents-overflow header to reflect its actual key
-    // geometry: maxKeyLength = 10 bytes, keyCompareType = 0 (binary).
-    // The catalog tree's geometry (516 / 0xCF) lives in `header_node()`,
-    // which we share with the catalog path.
+    // Patch the extents-overflow header for the geometry the shared
+    // `header_node()` helper got wrong:
+    //   - maxKeyLength: 10 (extents key) vs. 516 (catalog key)
+    //   - keyCompareType: 0 binary  vs. 0xCF catalog case-fold
+    //   - attributes: kBTBigKeysMask only (extents keys are fixed
+    //     size, so kBTVariableIndexKeysMask = 4 must NOT be set)
     if let Some(header) = ext_nodes_owned.first_mut() {
         let h = NODE_DESCRIPTOR_SIZE;
         if header.len() >= h + HEADER_REC_SIZE {
             header[h + 20..h + 22].copy_from_slice(&(EXTENT_KEY_PAYLOAD_LEN as u16).to_be_bytes());
             header[h + 37] = 0; // binary compare
+            header[h + 38..h + 42].copy_from_slice(&2u32.to_be_bytes()); // kBTBigKeysMask
         }
     }
     write_btree_to_fork(

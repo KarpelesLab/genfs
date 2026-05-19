@@ -1085,15 +1085,19 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     let alloc_blocks_needed = u32::try_from(alloc_blocks_needed).map_err(|_| {
         crate::Error::InvalidArgument("hfs+ format: bitmap too large for u32".into())
     })?;
-    let allocation_file = layout_special(&mut cursor, alloc_blocks_needed, bs)?;
+    // Allocation bitmap: clumpSize matches the allocation unit (block).
+    let allocation_file = layout_special(&mut cursor, alloc_blocks_needed, bs, bs)?;
 
-    // Extents-overflow B-tree: opts.extents_nodes nodes worth of blocks.
+    // Extents-overflow and catalog B-trees: per TN1150 + mkfs.hfsplus
+    // convention, `clumpSize` on a B-tree fork equals the B-tree's
+    // node size (the BTHeaderRec.clumpSize and ForkData.clumpSize agree).
+    // fsck.hfsplus rejects an extents-overflow fork whose clumpSize is
+    // smaller than its declared nodeSize ("Invalid B-tree node size").
     let ext_blocks = blocks_for_nodes(opts.extents_nodes, opts.node_size, bs)?;
-    let extents_file = layout_special(&mut cursor, ext_blocks, bs)?;
+    let extents_file = layout_special(&mut cursor, ext_blocks, bs, opts.node_size)?;
 
-    // Catalog B-tree: opts.catalog_nodes nodes worth of blocks.
     let cat_blocks = blocks_for_nodes(opts.catalog_nodes, opts.node_size, bs)?;
-    let catalog_file = layout_special(&mut cursor, cat_blocks, bs)?;
+    let catalog_file = layout_special(&mut cursor, cat_blocks, bs, opts.node_size)?;
 
     // Attributes B-tree and startup file: empty (zero fork data).
     let attributes_file = ForkData::default();
@@ -1239,7 +1243,12 @@ fn blocks_for_nodes(nodes: u32, node_size: u32, block_size: u32) -> Result<u32> 
     })
 }
 
-fn layout_special(cursor: &mut u32, blocks: u32, block_size: u32) -> Result<ForkData> {
+fn layout_special(
+    cursor: &mut u32,
+    blocks: u32,
+    block_size: u32,
+    clump_size: u32,
+) -> Result<ForkData> {
     let start = *cursor;
     *cursor = cursor
         .checked_add(blocks)
@@ -1251,7 +1260,7 @@ fn layout_special(cursor: &mut u32, blocks: u32, block_size: u32) -> Result<Fork
     };
     Ok(ForkData {
         logical_size: u64::from(blocks) * u64::from(block_size),
-        clump_size: block_size,
+        clump_size,
         total_blocks: blocks,
         extents,
     })
@@ -1952,7 +1961,13 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     };
 
     let built = build_btree(records, writer.node_size, cat_total_nodes)?;
-    write_btree_to_fork(dev, &built.nodes, &writer.catalog_file, writer.node_size)?;
+    write_btree_to_fork(
+        dev,
+        &built.nodes,
+        &writer.catalog_file,
+        writer.node_size,
+        writer.block_size,
+    )?;
     // 2. Extents-overflow tree. Empty when no fork has spilled past 8
     //    inline extents; otherwise the records we queued in
     //    `writer.overflow_extents` get serialised here.
@@ -1991,6 +2006,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         &ext_nodes_owned,
         &writer.extents_file,
         writer.node_size,
+        writer.block_size,
     )?;
 
     // 3. Allocation bitmap.
@@ -2153,26 +2169,19 @@ fn write_btree_to_fork(
     nodes: &[Vec<u8>],
     fork: &ForkData,
     node_size: u32,
+    block_size: u32,
 ) -> Result<()> {
     if nodes.is_empty() {
         return Ok(());
     }
-    // Fork is laid out in one contiguous extent (we set it up that way
-    // in `format`). Walk extents in order anyway for robustness.
     let mut node_idx = 0usize;
     for ext in &fork.extents {
         if ext.block_count == 0 {
             continue;
         }
-        let nodes_in_extent =
-            (u64::from(ext.block_count) * u64::from(fork.clump_size.max(1))) / u64::from(node_size);
-        // fork.clump_size isn't reliable; recompute via actual block_size implicit.
-        // Use the writer's block_size via fork.clump_size, set at layout time.
-        let _ = nodes_in_extent;
-        // Use the extent's bytes divided by node_size:
-        let ext_bytes = u64::from(ext.block_count) * u64::from(fork.clump_size);
+        let ext_bytes = u64::from(ext.block_count) * u64::from(block_size);
         let nodes_here = (ext_bytes / u64::from(node_size)) as usize;
-        let mut off = u64::from(ext.start_block) * u64::from(fork.clump_size);
+        let mut off = u64::from(ext.start_block) * u64::from(block_size);
         for _ in 0..nodes_here {
             if node_idx >= nodes.len() {
                 return Ok(());

@@ -171,6 +171,63 @@ enum Command {
         #[arg(value_name = "IMAGE[:N]")]
         image: String,
     },
+
+    /// Convert an image between container formats (raw ↔ qcow2). Streams
+    /// every byte from SRC to DST; no filesystem awareness, so this
+    /// works on partitioned disks just as well as bare filesystems. Use
+    /// `repack` instead if you want to shrink the image — `convert` can
+    /// only grow it.
+    Convert {
+        /// Source image (raw, qcow2, or block device).
+        #[arg(value_name = "SRC")]
+        src: PathBuf,
+        /// Destination image. Format is picked from the extension
+        /// (`.qcow2` / `.qcow` / `.q2` → qcow2; otherwise raw).
+        #[arg(value_name = "DST")]
+        dst: PathBuf,
+        /// Destination size. Defaults to the source's virtual size. May
+        /// be larger (grows the image with all-zero tail) but not smaller.
+        #[arg(long, value_name = "SIZE")]
+        size: Option<String>,
+        /// qcow2 cluster size for the destination, when DST is a qcow2.
+        #[arg(long, value_name = "SIZE", default_value = "64KiB")]
+        cluster_size: String,
+    },
+
+    /// Repack an image into a fresh filesystem at a (possibly different)
+    /// size. Walks SRC's filesystem, stages each file into a host
+    /// tempdir, then formats DST from scratch. Use this when you need to
+    /// shrink an image — `convert` can only do byte copies, while
+    /// `repack` actually rewrites the filesystem.
+    Repack {
+        /// Source image, optionally with `:N` to select a partition.
+        #[arg(value_name = "SRC[:N]")]
+        src: String,
+        /// Destination image (raw or qcow2 per extension).
+        #[arg(value_name = "DST")]
+        dst: PathBuf,
+        /// Destination size. Default: same as source's filesystem size.
+        /// Mutually exclusive with `--shrink`.
+        #[arg(long, value_name = "SIZE", conflicts_with = "shrink")]
+        size: Option<String>,
+        /// Auto-size the destination to the minimum that fits the
+        /// staged content (uses BuildPlan for ext; the FAT32 minimum
+        /// of ~33 MiB still applies).
+        #[arg(long)]
+        shrink: bool,
+        /// Destination filesystem type. Defaults to the source's type
+        /// (ext2/3/4 → matching ext flavour; FAT32 → FAT32). Pass an
+        /// explicit value to convert filesystem types (loses
+        /// per-inode metadata on ext → FAT32).
+        #[arg(long, value_name = "TYPE")]
+        fs_type: Option<String>,
+        /// ext block size (1024/2048/4096); ignored for FAT32 output.
+        #[arg(long, default_value_t = 1024)]
+        block_size: u32,
+        /// qcow2 cluster size for the destination, when DST is a qcow2.
+        #[arg(long, value_name = "SIZE", default_value = "64KiB")]
+        cluster_size: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -248,7 +305,333 @@ fn run(cli: Cli) -> fstool::Result<()> {
         } => add(&image, &host_src, &fs_dest),
         Command::Rm { image, fs_path } => rm(&image, &fs_path),
         Command::Shell { image } => shell_cmd(&image),
+        Command::Convert {
+            src,
+            dst,
+            size,
+            cluster_size,
+        } => convert_cmd(&src, &dst, size.as_deref(), &cluster_size),
+        Command::Repack {
+            src,
+            dst,
+            size,
+            shrink,
+            fs_type,
+            block_size,
+            cluster_size,
+        } => repack_cmd(
+            &src,
+            &dst,
+            size.as_deref(),
+            shrink,
+            fs_type.as_deref(),
+            block_size,
+            &cluster_size,
+        ),
     }
+}
+
+/// A self-cleaning host-side staging directory. Used by `repack` to
+/// materialise the source filesystem's content before re-formatting
+/// into the destination. Drop removes the whole tree.
+struct StagingDir(std::path::PathBuf);
+
+impl StagingDir {
+    fn new() -> fstool::Result<Self> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut path = std::env::temp_dir();
+        path.push(format!("fstool-repack-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn convert_cmd(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    size_arg: Option<&str>,
+    cluster_size: &str,
+) -> fstool::Result<()> {
+    let cluster_size = parse_cluster_size(cluster_size)?;
+    let mut src_dev = fstool::block::open_image(src)?;
+    let src_size = src_dev.total_size();
+    let dst_size = match size_arg {
+        None => src_size,
+        Some(s) => {
+            let want = fstool::spec::parse_size(s)?;
+            if want < src_size {
+                return Err(fstool::Error::InvalidArgument(format!(
+                    "convert: --size {want} is smaller than source's {src_size}; use `repack --shrink` instead"
+                )));
+            }
+            want
+        }
+    };
+    let mut dst_dev =
+        fstool::block::create_image(dst, dst_size, &fstool::block::CreateOpts { cluster_size })?;
+    // 1 MiB copy buffer. Reads from sparse regions return zeros; on the
+    // qcow2 side those become unallocated clusters (no on-disk cost).
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    while copied < src_size {
+        let n = (src_size - copied).min(buf.len() as u64) as usize;
+        src_dev.read_at(copied, &mut buf[..n])?;
+        // Skip all-zero chunks on the write side so sparse output stays sparse.
+        if !buf[..n].iter().all(|&b| b == 0) {
+            dst_dev.write_at(copied, &buf[..n])?;
+        }
+        copied += n as u64;
+    }
+    dst_dev.sync()?;
+    eprintln!(
+        "converted {} → {} ({} → {} bytes)",
+        src.display(),
+        dst.display(),
+        src_size,
+        dst_size
+    );
+    Ok(())
+}
+
+fn repack_cmd(
+    src: &str,
+    dst: &std::path::Path,
+    size_arg: Option<&str>,
+    shrink: bool,
+    fs_type_override: Option<&str>,
+    block_size: u32,
+    cluster_size: &str,
+) -> fstool::Result<()> {
+    let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
+    let target = fstool::inspect::Target::parse(src);
+
+    // Stage source FS content into a host tempdir. The tempdir's lifetime
+    // covers the destination build below; Drop cleans it up.
+    let staging = StagingDir::new()?;
+    let (source_kind, src_total_size) = fstool::inspect::with_target_device(&target, |dev| {
+        let fs = fstool::inspect::AnyFs::open(dev)?;
+        let kind = fs.kind_string().to_string();
+        let total = dev.total_size();
+        stage_fs_to_dir(dev, &fs, staging.path())?;
+        Ok::<_, fstool::Error>((kind, total))
+    })?;
+
+    // Pick destination FS type.
+    let target_fs = fs_type_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| source_kind.clone());
+
+    // Pick destination size.
+    let target_size = match (size_arg, shrink) {
+        (Some(s), _) => fstool::spec::parse_size(s)?,
+        (None, true) => 0, // sentinel: auto-shrink, computed below
+        (None, false) => src_total_size,
+    };
+
+    // Dispatch to ext-build or fat-build paths, sourcing from the
+    // staged tree.
+    match target_fs.to_ascii_lowercase().as_str() {
+        "ext2" | "ext3" | "ext4" => repack_into_ext(
+            staging.path(),
+            dst,
+            &target_fs,
+            block_size,
+            target_size,
+            shrink,
+            qcow2_cluster_size,
+        )?,
+        "fat32" | "vfat" => {
+            repack_into_fat32(staging.path(), dst, target_size, shrink, qcow2_cluster_size)?
+        }
+        other => {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "repack: unknown --fs-type {other:?}"
+            )));
+        }
+    }
+
+    eprintln!(
+        "repacked {} → {} (fs: {} → {})",
+        src,
+        dst.display(),
+        source_kind,
+        target_fs
+    );
+    Ok(())
+}
+
+/// Walk every directory / regular file in `fs` and stage it under
+/// `staging`. Symlinks and device nodes are skipped with a warning;
+/// per-inode owner/mode is not preserved on the host filesystem (a
+/// repack is best-effort metadata-wise — file content is the contract).
+fn stage_fs_to_dir(
+    dev: &mut dyn fstool::block::BlockDevice,
+    fs: &fstool::inspect::AnyFs,
+    staging: &std::path::Path,
+) -> fstool::Result<()> {
+    use fstool::fs::EntryKind;
+    // BFS using a queue of (fs-path, host-path) pairs.
+    let mut queue: Vec<(String, std::path::PathBuf)> =
+        vec![("/".to_string(), staging.to_path_buf())];
+    while let Some((fs_path, host_path)) = queue.pop() {
+        let entries = fs.list(dev, &fs_path)?;
+        for e in entries {
+            if e.name == "." || e.name == ".." || e.name == "lost+found" {
+                continue;
+            }
+            let child_fs = join_fs_path(&fs_path, &e.name);
+            let child_host = host_path.join(&e.name);
+            match e.kind {
+                EntryKind::Dir => {
+                    std::fs::create_dir_all(&child_host)?;
+                    queue.push((child_fs, child_host));
+                }
+                EntryKind::Regular => {
+                    let mut out = std::fs::File::create(&child_host)?;
+                    fs.copy_file_to(dev, &child_fs, &mut out)?;
+                }
+                EntryKind::Symlink
+                | EntryKind::Char
+                | EntryKind::Block
+                | EntryKind::Fifo
+                | EntryKind::Socket
+                | EntryKind::Unknown => {
+                    eprintln!(
+                        "repack: skipping {child_fs:?} ({:?} — not preserved)",
+                        e.kind
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn join_fs_path(parent: &str, leaf: &str) -> String {
+    if parent.ends_with('/') {
+        format!("{parent}{leaf}")
+    } else {
+        format!("{parent}/{leaf}")
+    }
+}
+
+fn repack_into_ext(
+    staging: &std::path::Path,
+    dst: &std::path::Path,
+    fs_type: &str,
+    block_size: u32,
+    explicit_size: u64,
+    shrink: bool,
+    qcow2_cluster_size: u32,
+) -> fstool::Result<()> {
+    use fstool::fs::ext::{BuildPlan, Ext, FsKind};
+    let kind = match fs_type.to_ascii_lowercase().as_str() {
+        "ext2" => FsKind::Ext2,
+        "ext3" => FsKind::Ext3,
+        "ext4" => FsKind::Ext4,
+        other => {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "repack: unknown ext kind {other:?}"
+            )));
+        }
+    };
+    let mut plan = BuildPlan::new(block_size, kind);
+    plan.scan_host_path(staging)?;
+    let mut opts = plan.to_format_opts();
+    let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
+    let final_size = if shrink {
+        plan_size
+    } else if explicit_size > plan_size {
+        // Scale opts.blocks_count up to the requested size; preserve
+        // byte-aligned blocks_per_group invariant.
+        let max_blocks_u64 = explicit_size / opts.block_size as u64;
+        let max_blocks = u32::try_from(max_blocks_u64).unwrap_or(u32::MAX);
+        opts.blocks_count = (max_blocks / 8) * 8;
+        let by_density = (opts.blocks_count as u64 * opts.block_size as u64 / 16_384) as u32;
+        opts.inodes_count = opts.inodes_count.max(by_density);
+        opts.blocks_count as u64 * opts.block_size as u64
+    } else {
+        plan_size
+    };
+
+    let mut dev = fstool::block::create_image(
+        dst,
+        final_size,
+        &fstool::block::CreateOpts {
+            cluster_size: qcow2_cluster_size,
+        },
+    )?;
+    let mut ext = Ext::format_with(dev.as_mut(), &opts)?;
+    ext.populate_from_host_dir(dev.as_mut(), 2, staging)?;
+    ext.flush(dev.as_mut())?;
+    dev.sync()?;
+    Ok(())
+}
+
+fn repack_into_fat32(
+    staging: &std::path::Path,
+    dst: &std::path::Path,
+    explicit_size: u64,
+    shrink: bool,
+    qcow2_cluster_size: u32,
+) -> fstool::Result<()> {
+    use fstool::fs::fat::{Fat32, MIN_FAT32_CLUSTERS};
+
+    let size = if shrink {
+        // Sum file sizes; pad to FAT32 minimum.
+        let total = walk_host_size(staging)?;
+        let needed = total
+            .saturating_mul(2)
+            .max(MIN_FAT32_CLUSTERS as u64 * 1024);
+        needed.div_ceil(512) * 512
+    } else {
+        explicit_size
+    };
+    let total_sectors: u32 = (size / 512).try_into().map_err(|_| {
+        fstool::Error::InvalidArgument(
+            "repack: FAT32 destination size doesn't fit in a u32 sector count".into(),
+        )
+    })?;
+    let mut dev = fstool::block::create_image(
+        dst,
+        size,
+        &fstool::block::CreateOpts {
+            cluster_size: qcow2_cluster_size,
+        },
+    )?;
+    Fat32::build_from_host_dir(dev.as_mut(), total_sectors, staging, 0, *b"REPACKED   ")?;
+    dev.sync()?;
+    Ok(())
+}
+
+fn walk_host_size(root: &std::path::Path) -> fstool::Result<u64> {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        for entry in std::fs::read_dir(&p)? {
+            let entry = entry?;
+            let m = entry.metadata()?;
+            if m.is_dir() {
+                stack.push(entry.path());
+            } else if m.is_file() {
+                total += m.len();
+            }
+        }
+    }
+    Ok(total)
 }
 
 fn shell_cmd(image: &str) -> fstool::Result<()> {

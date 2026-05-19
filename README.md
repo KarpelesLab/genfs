@@ -41,10 +41,13 @@ What works today:
 directory), `fat-build` (bare FAT32 from a directory), `ls`, `cat`,
 `info`, `add` (copy a host file/tree in), `rm` (unlink a file / symlink /
 device / empty directory), `shell` (interactive SFTP-style REPL with
-`ls`/`cd`/`pwd`/`cat`/`put`/`rm`/`mkdir`/`info`). All inspection and
-in-place modification commands accept a `disk.img:N` (1-indexed) target
-to walk into a partition of a GPT or MBR disk image; `fstool info
-disk.img` (no suffix) prints the partition table.
+`ls`/`cd`/`pwd`/`cat`/`put`/`rm`/`mkdir`/`info`), `convert` (byte-level
+raw↔qcow2 conversion with optional grow), `repack` (walk the source
+filesystem and rebuild into a fresh image, with `--shrink` for
+auto-min sizing and `--fs-type` to convert between FS types). All
+inspection and in-place modification commands accept a `disk.img:N`
+(1-indexed) target to walk into a partition of a GPT or MBR disk
+image; `fstool info disk.img` (no suffix) prints the partition table.
 
 **Block layer** — `fstool::block::{FileBackend, MemoryBackend,
 SlicedBackend, Qcow2Backend}`: sparse file-backed devices, in-memory

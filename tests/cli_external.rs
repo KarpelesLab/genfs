@@ -707,3 +707,239 @@ fn cli_fat32_build_ls_cat_info_roundtrip() {
     );
     assert_eq!(out.stdout, b"long-name body\n");
 }
+
+/// `fstool convert` does a byte-for-byte raw ↔ qcow2 round-trip.
+#[test]
+fn cli_convert_raw_qcow2_roundtrip() {
+    if !which("qemu-img") {
+        eprintln!("skipping: qemu-img not installed");
+        return;
+    }
+
+    // Build a small ext4 raw image to use as the convert source.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hello"), b"hello convert\n").unwrap();
+    let raw = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args(["ext-build", "--kind", "ext4"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(raw.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ext-build failed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let qcow = dir.path().join("disk.qcow2");
+    let raw2 = dir.path().join("disk2.img");
+
+    // raw → qcow2
+    let r = Command::new(FSTOOL)
+        .arg("convert")
+        .arg(raw.path())
+        .arg(&qcow)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "convert raw→qcow2 failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // qemu-img check on the qcow2.
+    let chk = Command::new("qemu-img")
+        .arg("check")
+        .arg(&qcow)
+        .output()
+        .unwrap();
+    assert!(chk.status.success(), "qemu-img check failed");
+
+    // qcow2 → raw, must match original byte-for-byte.
+    let r = Command::new(FSTOOL)
+        .arg("convert")
+        .arg(&qcow)
+        .arg(&raw2)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "convert qcow2→raw failed");
+    let a = std::fs::read(raw.path()).unwrap();
+    let b = std::fs::read(&raw2).unwrap();
+    assert_eq!(a, b, "round-tripped raw differs from original");
+
+    // Grow: 64 MiB destination, source still readable through the larger image.
+    let big = dir.path().join("big.qcow2");
+    let r = Command::new(FSTOOL)
+        .arg("convert")
+        .arg(raw.path())
+        .arg(&big)
+        .args(["--size", "64MiB"])
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "convert --size grow failed");
+    let ls = Command::new(FSTOOL)
+        .arg("ls")
+        .arg(&big)
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let s = String::from_utf8_lossy(&ls.stdout);
+    assert!(s.contains("hello"), "grown image lost source content:\n{s}");
+
+    // Shrink request is rejected.
+    let small = dir.path().join("small.qcow2");
+    let r = Command::new(FSTOOL)
+        .arg("convert")
+        .arg(raw.path())
+        .arg(&small)
+        .args(["--size", "1KiB"])
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "shrink should have been rejected");
+    let s = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        s.contains("repack"),
+        "rejection should point to repack:\n{s}"
+    );
+}
+
+/// `fstool repack --shrink` produces a smaller image whose content
+/// matches the source.
+#[test]
+fn cli_repack_shrink() {
+    if !which("e2fsck") || !which("mke2fs") {
+        eprintln!("skipping: e2fsck/mke2fs missing");
+        return;
+    }
+
+    // Make a deliberately oversized ext4 image via mke2fs.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("keep.txt"), b"keep this\n").unwrap();
+    std::fs::create_dir(srcdir.path().join("etc")).unwrap();
+    std::fs::write(srcdir.path().join("etc/conf"), b"v=1\n").unwrap();
+
+    let big = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "16M"])
+        .arg(big.path())
+        .output()
+        .unwrap();
+    let mk = Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg("-L")
+        .arg("src")
+        .arg(big.path())
+        .output()
+        .unwrap();
+    assert!(
+        mk.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&mk.stderr)
+    );
+    let big_len = std::fs::metadata(big.path()).unwrap().len();
+
+    // Repack with --shrink.
+    let shrunk = NamedTempFile::new().unwrap();
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(big.path())
+        .arg(shrunk.path())
+        .arg("--shrink")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "repack --shrink failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let shrunk_len = std::fs::metadata(shrunk.path()).unwrap().len();
+    assert!(
+        shrunk_len < big_len,
+        "repack didn't shrink: {shrunk_len} vs {big_len}"
+    );
+
+    // e2fsck must be clean.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(shrunk.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck on shrunk image failed:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+
+    // Content survived.
+    let cat = Command::new(FSTOOL)
+        .arg("cat")
+        .arg(shrunk.path())
+        .arg("/etc/conf")
+        .output()
+        .unwrap();
+    assert!(cat.status.success());
+    assert_eq!(cat.stdout, b"v=1\n");
+}
+
+/// `fstool repack` cross-FS-type: ext → FAT32.
+#[test]
+fn cli_repack_ext_to_fat32() {
+    if !which("fsck.vfat") || !which("mke2fs") {
+        eprintln!("skipping: fsck.vfat/mke2fs missing");
+        return;
+    }
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("README.txt"), b"cross-fs content\n").unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "8M"])
+        .arg(src.path())
+        .output()
+        .unwrap();
+    Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .output()
+        .unwrap();
+
+    let fat = NamedTempFile::new().unwrap();
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(src.path())
+        .arg(fat.path())
+        .args(["--fs-type", "fat32", "--size", "64MiB"])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "repack ext→fat32 failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let chk = Command::new("fsck.vfat")
+        .args(["-n", "-v"])
+        .arg(fat.path())
+        .output()
+        .unwrap();
+    assert!(
+        chk.status.success(),
+        "fsck.vfat failed on repacked FAT32:\n{}",
+        String::from_utf8_lossy(&chk.stdout)
+    );
+
+    let ls = Command::new(FSTOOL)
+        .arg("ls")
+        .arg(fat.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        s.to_ascii_lowercase().contains("readme.txt"),
+        "missing README.txt in FAT32 output:\n{s}"
+    );
+}

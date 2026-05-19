@@ -22,6 +22,77 @@ fn which(tool: &str) -> Option<std::path::PathBuf> {
     if p.is_empty() { None } else { Some(p.into()) }
 }
 
+/// Read a *default* `mke2fs -t ext4` image — 64bit + flex_bg +
+/// metadata_csum + extents + extra_isize all enabled. Confirms our reader
+/// tolerates the modern feature set for inspection (ls / cat / info).
+#[test]
+fn read_default_mke2fs_ext4_image() {
+    use std::io::Read;
+    let Some(_) = which("mke2fs") else {
+        eprintln!("skipping: mke2fs not installed");
+        return;
+    };
+
+    // Source tree to embed.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(srcdir.path().join("etc")).unwrap();
+    std::fs::write(srcdir.path().join("readme"), b"default ext4\n").unwrap();
+    std::fs::write(srcdir.path().join("etc/conf"), b"x=1\n").unwrap();
+
+    let tmp = NamedTempFile::new().unwrap();
+    let out = Command::new("mke2fs")
+        .args([
+            "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "1024",
+            "-L",
+            "",
+            "-U",
+            "00000000-0000-0000-0000-000000000000",
+            "-E",
+            "nodiscard",
+            "-d",
+        ])
+        .arg(srcdir.path())
+        .arg(tmp.path())
+        .arg("8192")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // fstool must open it and detect ext4.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let ext = Ext::open(&mut dev).unwrap();
+    assert_eq!(ext.kind, FsKind::Ext4);
+    // 64-bit images use 64-byte group descriptors.
+    assert_eq!(ext.sb.group_desc_size(), 64);
+
+    // Root listing must include the embedded tree.
+    let root = ext.list_inode(&mut dev, 2).unwrap();
+    let names: std::collections::HashSet<_> = root.iter().map(|e| e.name.clone()).collect();
+    assert!(names.contains("readme"), "missing /readme: {names:?}");
+    assert!(names.contains("etc"), "missing /etc: {names:?}");
+
+    // File contents come back byte-exact through the extent reader.
+    let ino = ext.path_to_inode(&mut dev, "/readme").unwrap();
+    let mut reader = ext.open_file_reader(&mut dev, ino).unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"default ext4\n");
+
+    let ino = ext.path_to_inode(&mut dev, "/etc/conf").unwrap();
+    let mut reader = ext.open_file_reader(&mut dev, ino).unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"x=1\n");
+}
+
 #[test]
 fn ext4_passes_e2fsck_and_advertises_features() {
     let Some(_) = which("e2fsck") else {

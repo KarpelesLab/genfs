@@ -573,10 +573,14 @@ impl Ext {
     fn flush_metadata(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         let bs = self.layout.block_size as u64;
 
-        // Build encoded GDT (same for every group copy).
+        // Build encoded GDT (same for every group copy). Each descriptor
+        // occupies `desc_size` bytes on disk (32 classic, 64 for 64-bit);
+        // the encoded 32-byte form goes in the low bytes, the rest stays
+        // zero — correct for sub-2^32-block filesystems.
+        let desc_size = self.layout.desc_size;
         let mut gdt = vec![0u8; self.layout.gdt_blocks as usize * bs as usize];
         for (i, g) in self.groups.iter().enumerate() {
-            let off = i * constants::GROUP_DESC_SIZE;
+            let off = i * desc_size;
             gdt[off..off + constants::GROUP_DESC_SIZE].copy_from_slice(&g.desc.encode());
         }
 
@@ -974,7 +978,7 @@ impl Ext {
         let mut sb_buf = [0u8; constants::SUPERBLOCK_SIZE];
         dev.read_at(constants::SUPERBLOCK_OFFSET, &mut sb_buf)?;
         let sb = Superblock::decode(&sb_buf)?;
-        let layout = layout::from_superblock(&sb)?;
+        let mut layout = layout::from_superblock(&sb)?;
 
         // GDT location: same logic as the writer.
         let bs = layout.block_size as u64;
@@ -986,14 +990,19 @@ impl Ext {
         let mut gdt = vec![0u8; layout.gdt_blocks as usize * bs as usize];
         dev.read_at(gdt_off, &mut gdt)?;
 
+        let desc_size = layout.desc_size;
         let mut groups = Vec::with_capacity(layout.groups.len());
         for i in 0..layout.groups.len() {
-            let off = i * constants::GROUP_DESC_SIZE;
-            let desc = GroupDesc::decode(
-                gdt[off..off + constants::GROUP_DESC_SIZE]
-                    .try_into()
-                    .unwrap(),
-            );
+            let off = i * desc_size;
+            let desc = GroupDesc::decode(&gdt[off..off + constants::GROUP_DESC_SIZE]);
+            // The metadata positions in `layout.groups[i]` were *computed*
+            // assuming the classic contiguous layout. With flex_bg (and in
+            // general for any third-party writer) the descriptor is the
+            // authoritative source — overwrite the computed positions with
+            // the on-disk pointers so inode/bitmap reads land correctly.
+            layout.groups[i].block_bitmap = desc.block_bitmap;
+            layout.groups[i].inode_bitmap = desc.inode_bitmap;
+            layout.groups[i].inode_table = desc.inode_table;
             let mut block_bitmap = vec![0u8; bs as usize];
             dev.read_at(desc.block_bitmap as u64 * bs, &mut block_bitmap)?;
             let mut inode_bitmap = vec![0u8; bs as usize];

@@ -36,8 +36,14 @@ impl GroupDesc {
         buf
     }
 
-    /// Decode from the 32-byte on-disk representation.
-    pub fn decode(buf: &[u8; GROUP_DESC_SIZE]) -> Self {
+    /// Decode from an on-disk descriptor. `buf` must be at least 32 bytes;
+    /// only the classic low 32 bytes are read. For a 64-byte
+    /// (`INCOMPAT_64BIT`) descriptor the upper half holds the high 32 bits
+    /// of the bitmap/table block numbers plus checksums — those are zero
+    /// for sub-2³²-block filesystems, which is all genfs writes or opens
+    /// today, so ignoring them is correct here.
+    pub fn decode(buf: &[u8]) -> Self {
+        debug_assert!(buf.len() >= GROUP_DESC_SIZE);
         Self {
             block_bitmap: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
             inode_bitmap: u32::from_le_bytes(buf[4..8].try_into().unwrap()),

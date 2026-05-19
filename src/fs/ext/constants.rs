@@ -19,9 +19,13 @@ pub const SUPERBLOCK_OFFSET: u64 = 1024;
 /// superblock itself is always 1024 bytes.
 pub const SUPERBLOCK_SIZE: usize = 1024;
 
-/// Size of a group descriptor in classic ext2 (32 bytes). 64-bit ext4 doubles
-/// this; v1 stays at 32.
+/// Size of a group descriptor in classic ext2/3 (32 bytes). When the
+/// `INCOMPAT_64BIT` feature is set, descriptors are 64 bytes and the
+/// superblock's `s_desc_size` field records the actual size.
 pub const GROUP_DESC_SIZE: usize = 32;
+
+/// Size of a 64-bit (`INCOMPAT_64BIT`) group descriptor.
+pub const GROUP_DESC_SIZE_64: usize = 64;
 
 /// Default and minimum size of an inode in ext2 (the "good old" rev).
 pub const INODE_SIZE_GOOD_OLD: u16 = 128;

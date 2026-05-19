@@ -56,6 +56,21 @@ pub struct Superblock {
     /// Inode number of the journal (only meaningful with the HAS_JOURNAL
     /// compat feature). 0 for ext2.
     pub journal_inum: u32,
+    /// On-disk size of each group descriptor. 0 means the classic 32-byte
+    /// form; when `INCOMPAT_64BIT` is set this is 64 (or larger).
+    pub desc_size: u16,
+}
+
+impl Superblock {
+    /// Effective group-descriptor size in bytes: `desc_size` if non-zero,
+    /// otherwise the classic 32.
+    pub fn group_desc_size(&self) -> usize {
+        if self.desc_size == 0 {
+            32
+        } else {
+            self.desc_size as usize
+        }
+    }
 }
 
 impl Superblock {
@@ -102,6 +117,7 @@ impl Superblock {
             last_mounted: [0; 64],
             algorithm_usage_bitmap: 0,
             journal_inum: 0,
+            desc_size: 0,
         }
     }
 
@@ -159,7 +175,10 @@ impl Superblock {
         // 206..208: s_padding1 (u16) — left zero
         // 208..224: s_journal_uuid — left zero
         write_u32(p, 224, self.journal_inum);
-        // 228..: s_journal_dev, s_last_orphan, s_hash_seed, ... — left zero
+        // 228..252: s_journal_dev, s_last_orphan, s_hash_seed — left zero
+        // 252: s_def_hash_version (u8), 253: s_jnl_backup_type (u8) — zero
+        write_u16(p, 254, self.desc_size);
+        // 256..: s_default_mount_opts, ... — left zero
         buf
     }
 
@@ -221,6 +240,7 @@ impl Superblock {
             last_mounted,
             algorithm_usage_bitmap: read_u32(buf, 200),
             journal_inum: read_u32(buf, 224),
+            desc_size: read_u16(buf, 254),
         })
     }
 }

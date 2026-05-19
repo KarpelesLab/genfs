@@ -25,9 +25,13 @@ pub struct Layout {
     pub blocks_per_group: u32,
     pub inodes_per_group: u32,
     pub inode_size: u16,
+    /// On-disk size of each group descriptor: 32 (classic) or 64
+    /// (`INCOMPAT_64BIT`). The genfs writer always emits 32; this is 64
+    /// only when a 64-bit image was opened with [`from_superblock`].
+    pub desc_size: usize,
     /// Number of blocks the inode table occupies in each group.
     pub inode_table_blocks: u32,
-    /// Number of GDT blocks (ceil(num_groups * 32 / block_size)).
+    /// Number of GDT blocks (ceil(num_groups * desc_size / block_size)).
     pub gdt_blocks: u32,
     /// One entry per group, in order.
     pub groups: Vec<GroupLayout>,
@@ -185,6 +189,7 @@ pub fn plan(block_size: u32, blocks_count: u32, inodes_count: u32) -> crate::Res
         blocks_per_group,
         inodes_per_group,
         inode_size,
+        desc_size: GROUP_DESC_SIZE,
         inode_table_blocks,
         gdt_blocks,
         groups,
@@ -206,8 +211,8 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
 
     let inode_table_blocks =
         (sb.inodes_per_group as u64 * sb.inode_size as u64).div_ceil(block_size as u64) as u32;
-    let gdt_blocks =
-        (num_groups as u64 * GROUP_DESC_SIZE as u64).div_ceil(block_size as u64) as u32;
+    let desc_size = sb.group_desc_size();
+    let gdt_blocks = (num_groups as u64 * desc_size as u64).div_ceil(block_size as u64) as u32;
 
     let mut groups = Vec::with_capacity(num_groups as usize);
     for g in 0..num_groups {
@@ -246,6 +251,7 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
         blocks_per_group: sb.blocks_per_group,
         inodes_per_group: sb.inodes_per_group,
         inode_size: sb.inode_size,
+        desc_size,
         inode_table_blocks,
         gdt_blocks,
         groups,

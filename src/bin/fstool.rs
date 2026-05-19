@@ -325,10 +325,8 @@ fn ext_build(
 }
 
 fn ls(image: &std::path::Path, path: &str) -> fstool::Result<()> {
-    let mut dev = FileBackend::open(image)?;
-    let ext = Ext::open(&mut dev)?;
-    let ino = ext.path_to_inode(&mut dev, path)?;
-    let entries = ext.list_inode(&mut dev, ino)?;
+    let (mut dev, fs) = fstool::inspect::open_image_file(image)?;
+    let entries = fs.list(&mut dev, path)?;
     let mut out = std::io::stdout().lock();
     for e in &entries {
         let _ = writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name);
@@ -337,28 +335,30 @@ fn ls(image: &std::path::Path, path: &str) -> fstool::Result<()> {
 }
 
 fn cat(image: &std::path::Path, path: &str) -> fstool::Result<()> {
-    let mut dev = FileBackend::open(image)?;
-    let ext = Ext::open(&mut dev)?;
-    let ino = ext.path_to_inode(&mut dev, path)?;
-    let mut reader = ext.open_file_reader(&mut dev, ino)?;
+    let (mut dev, fs) = fstool::inspect::open_image_file(image)?;
     let mut out = std::io::stdout().lock();
-    let mut buf = [0u8; 64 * 1024];
-    use std::io::Read;
-    loop {
-        let n = reader.read(&mut buf).map_err(fstool::Error::from)?;
-        if n == 0 {
-            break;
-        }
-        out.write_all(&buf[..n]).map_err(fstool::Error::from)?;
-    }
+    fs.copy_file_to(&mut dev, path, &mut out)?;
     Ok(())
 }
 
 fn info(image: &std::path::Path) -> fstool::Result<()> {
-    let mut dev = FileBackend::open(image)?;
-    let ext = Ext::open(&mut dev)?;
+    let (mut dev, fs) = fstool::inspect::open_image_file(image)?;
+    println!("fs kind:           {}", fs.kind_string());
+    match &fs {
+        fstool::inspect::AnyFs::Ext(ext) => print_ext_info(ext),
+        fstool::inspect::AnyFs::Fat32(fat) => print_fat_info(fat),
+    }
+    println!();
+    println!("/ listing:");
+    let entries = fs.list(&mut dev, "/")?;
+    for e in &entries {
+        println!("  {:>10}  {:?}  {}", e.inode, e.kind, e.name);
+    }
+    Ok(())
+}
+
+fn print_ext_info(ext: &Ext) {
     let sb = &ext.sb;
-    println!("fs kind:           {:?}", ext.kind);
     println!("block size:        {}", sb.block_size());
     println!("blocks total:      {}", sb.blocks_count);
     println!("blocks free:       {}", sb.free_blocks_count);
@@ -376,13 +376,23 @@ fn info(image: &std::path::Path) -> fstool::Result<()> {
         sb.feature_compat, sb.feature_incompat, sb.feature_ro_compat
     );
     println!("uuid:              {}", format_uuid(&sb.uuid));
-    println!();
-    println!("/ listing:");
-    let entries = ext.list_inode(&mut dev, 2)?;
-    for e in &entries {
-        println!("  {:>6}  {:?}  {}", e.inode, e.kind, e.name);
-    }
-    Ok(())
+}
+
+fn print_fat_info(fat: &fstool::fs::fat::Fat32) {
+    let b = fat.boot_sector();
+    let label = std::str::from_utf8(&b.volume_label)
+        .unwrap_or("?")
+        .trim_end();
+    println!("sector size:       {}", b.bytes_per_sector);
+    println!("sectors / cluster: {}", b.sectors_per_cluster);
+    println!("total sectors:     {}", b.total_sectors);
+    println!("FAT size (sect):   {}", b.fat_size);
+    println!("# of FATs:         {}", b.num_fats);
+    println!("reserved sectors:  {}", b.reserved_sector_count);
+    println!("data clusters:     {}", b.cluster_count());
+    println!("root cluster:      {}", b.root_cluster);
+    println!("volume ID:         {:#010x}", b.volume_id);
+    println!("volume label:      {label:?}");
 }
 
 fn format_uuid(bytes: &[u8; 16]) -> String {

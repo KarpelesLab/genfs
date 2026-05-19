@@ -222,6 +222,111 @@ pub fn pack_83(name: &str) -> [u8; 11] {
     out
 }
 
+/// One slot in a raw directory stream — either an 8.3 entry, an LFN
+/// fragment, a deleted slot, or an end-of-directory marker.
+#[derive(Debug, Clone)]
+pub enum RawSlot {
+    /// First byte is 0x00 — by spec this terminates the directory; the
+    /// walker stops here.
+    End,
+    /// Deleted entry (first byte 0xE5) — skip but keep walking.
+    Deleted,
+    /// A 32-byte LFN fragment.
+    Lfn(LfnFragment),
+    /// A regular 8.3 entry. The volume-label entry shows up here too — the
+    /// caller decides whether to skip it (it has `attr & ATTR_VOLUME_ID`).
+    ShortEntry(DirEntry),
+}
+
+/// A decoded LFN fragment. `order` carries the sequence number (1-based)
+/// in its low 6 bits; bit 0x40 marks the (logically) last fragment, which
+/// appears first on disk.
+#[derive(Debug, Clone)]
+pub struct LfnFragment {
+    pub order: u8,
+    pub checksum: u8,
+    /// 13 UTF-16 code units; 0x0000 marks the end of the name within the
+    /// fragment, 0xFFFF is padding past the end.
+    pub chars: [u16; LFN_CHARS_PER_ENTRY],
+}
+
+impl LfnFragment {
+    /// Decode an LFN fragment from a 32-byte entry. The caller must have
+    /// already confirmed `attr == ATTR_LFN`.
+    pub fn decode(b: &[u8; ENTRY_SIZE]) -> Self {
+        let mut chars = [0u16; LFN_CHARS_PER_ENTRY];
+        for (i, slot) in chars[0..5].iter_mut().enumerate() {
+            *slot = u16::from_le_bytes(b[1 + i * 2..3 + i * 2].try_into().unwrap());
+        }
+        for (i, slot) in chars[5..11].iter_mut().enumerate() {
+            *slot = u16::from_le_bytes(b[14 + i * 2..16 + i * 2].try_into().unwrap());
+        }
+        for (i, slot) in chars[11..13].iter_mut().enumerate() {
+            *slot = u16::from_le_bytes(b[28 + i * 2..30 + i * 2].try_into().unwrap());
+        }
+        Self {
+            order: b[0],
+            checksum: b[13],
+            chars,
+        }
+    }
+}
+
+/// Classify a raw 32-byte directory slot.
+pub fn classify_slot(b: &[u8; ENTRY_SIZE]) -> RawSlot {
+    if b[0] == 0x00 {
+        return RawSlot::End;
+    }
+    if b[0] == 0xE5 {
+        return RawSlot::Deleted;
+    }
+    if b[11] & ATTR_LFN == ATTR_LFN {
+        return RawSlot::Lfn(LfnFragment::decode(b));
+    }
+    // ShortEntry decode rejects 0x00/0xE5/LFN, all already handled above —
+    // unwrap is safe.
+    RawSlot::ShortEntry(DirEntry::decode(b).expect("classified short entry decodes"))
+}
+
+/// Reassemble a long name from an accumulated LFN run that precedes a
+/// short entry. `fragments` is in *on-disk* order (highest order first).
+/// Returns `None` if the run doesn't pass the checksum tying it to
+/// `short_name_83`, or if the sequence numbers are inconsistent — caller
+/// then falls back to the short name.
+pub fn assemble_lfn(fragments: &[LfnFragment], short_name_83: &[u8; 11]) -> Option<String> {
+    if fragments.is_empty() {
+        return None;
+    }
+    let expected_csum = lfn_checksum(short_name_83);
+    // Sequence must descend from N..1, with the first carrying the 0x40 bit.
+    let first = &fragments[0];
+    let n = (first.order & 0x3F) as usize;
+    if n != fragments.len() || first.order & 0x40 == 0 {
+        return None;
+    }
+    for (i, f) in fragments.iter().enumerate() {
+        let want_seq = (n - i) as u8;
+        // The 0x40 bit is only on the first fragment.
+        let mask = if i == 0 { 0x40 } else { 0x00 };
+        if f.order != want_seq | mask {
+            return None;
+        }
+        if f.checksum != expected_csum {
+            return None;
+        }
+    }
+    // Concatenate fragments in *logical* order (seq 1..N), trim at 0x0000.
+    let mut units: Vec<u16> = Vec::with_capacity(n * LFN_CHARS_PER_ENTRY);
+    for f in fragments.iter().rev() {
+        units.extend_from_slice(&f.chars);
+    }
+    let end = units
+        .iter()
+        .position(|&u| u == 0x0000)
+        .unwrap_or(units.len());
+    String::from_utf16(&units[..end]).ok()
+}
+
 /// Generate a unique 8.3 short name for a long name that can't be used
 /// directly. `seq` is a per-directory counter making the result unique.
 /// Form: `FT` + 6 hex digits of `seq` as the base, plus the upper-cased

@@ -5,6 +5,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use std::io::Read;
+
 use fstool::block::FileBackend;
 use fstool::fs::fat::{Fat32, FatFormatOpts};
 use tempfile::{NamedTempFile, TempDir};
@@ -177,4 +179,125 @@ fn host_dir_contents_visible_via_mtools() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"hello, fat32\n");
+}
+
+#[test]
+fn open_reads_back_our_own_image() {
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("hello.txt"), b"hello, fat32\n").unwrap();
+    std::fs::create_dir(src.path().join("docs")).unwrap();
+    std::fs::write(
+        src.path().join("docs").join("LongNameFile.md"),
+        b"long-name-content\n",
+    )
+    .unwrap();
+
+    let tmp = NamedTempFile::new().unwrap();
+    let total_sectors = 64 * 1024 * 1024 / 512;
+    {
+        use fstool::block::BlockDevice;
+        let mut dev = FileBackend::create(tmp.path(), total_sectors as u64 * 512).unwrap();
+        Fat32::build_from_host_dir(
+            &mut dev,
+            total_sectors,
+            src.path(),
+            0xDEAD_BEEF,
+            *b"ROUNDTRIP  ",
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let fs = Fat32::open(&mut dev).unwrap();
+    let root = fs.list_path(&mut dev, "/").unwrap();
+    let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.iter().any(|n| n.eq_ignore_ascii_case("hello.txt")));
+    assert!(names.iter().any(|n| n.eq_ignore_ascii_case("docs")));
+
+    // Long name is preserved verbatim.
+    let docs = fs.list_path(&mut dev, "/docs").unwrap();
+    let docnames: Vec<&str> = docs.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        docnames.contains(&"LongNameFile.md"),
+        "long name not reconstructed: {docnames:?}"
+    );
+
+    // Read a file back through the streaming reader.
+    let mut reader = fs.open_file_reader(&mut dev, "/hello.txt").unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"hello, fat32\n");
+
+    // The deep file, by full path.
+    let mut reader = fs
+        .open_file_reader(&mut dev, "/docs/LongNameFile.md")
+        .unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"long-name-content\n");
+}
+
+#[test]
+fn open_reads_back_an_mkfs_vfat_image() {
+    let Some(_) = which("mkfs.vfat") else {
+        eprintln!("skipping: mkfs.vfat not installed");
+        return;
+    };
+    let Some(_) = which("mcopy") else {
+        eprintln!("skipping: mcopy not installed");
+        return;
+    };
+
+    let tmp = NamedTempFile::new().unwrap();
+    // Zero a 64 MiB file and format it with mkfs.vfat directly.
+    let bytes = 64u64 * 1024 * 1024;
+    std::fs::File::create(tmp.path())
+        .unwrap()
+        .set_len(bytes)
+        .unwrap();
+    let mkfs = Command::new("mkfs.vfat")
+        .args(["-F", "32", "-n", "MKFSVOL", "-i", "ABCDEF12"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        mkfs.status.success(),
+        "mkfs.vfat failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&mkfs.stdout),
+        String::from_utf8_lossy(&mkfs.stderr),
+    );
+
+    // Drop a host file into the image via mcopy so we have something to read.
+    let host_file = TempDir::new().unwrap();
+    let hostf = host_file.path().join("CopiedFile.txt");
+    std::fs::write(&hostf, b"copied via mtools\n").unwrap();
+    let mc = Command::new("mcopy")
+        .args(["-i", &tmp.path().display().to_string()])
+        .arg(&hostf)
+        .arg("::/CopiedFile.txt")
+        .output()
+        .unwrap();
+    assert!(
+        mc.status.success(),
+        "mcopy failed:\nstderr:\n{}",
+        String::from_utf8_lossy(&mc.stderr)
+    );
+
+    // Now read it back with our own reader.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let fs = Fat32::open(&mut dev).unwrap();
+    let root = fs.list_path(&mut dev, "/").unwrap();
+    let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("CopiedFile.txt")),
+        "missing CopiedFile.txt in mkfs.vfat image: {names:?}"
+    );
+
+    let mut reader = fs.open_file_reader(&mut dev, "/CopiedFile.txt").unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"copied via mtools\n");
 }

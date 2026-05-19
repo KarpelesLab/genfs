@@ -229,9 +229,88 @@ fn cli_info_reports_ext4() {
         .unwrap();
     assert!(out.status.success());
     let info = String::from_utf8_lossy(&out.stdout);
-    assert!(info.contains("Ext4"), "info missing kind:\n{info}");
+    assert!(info.contains("ext4"), "info missing kind:\n{info}");
     assert!(
         info.contains("block size"),
         "info missing block size:\n{info}"
     );
+}
+
+/// `fstool fat-build` → `ls` → `cat` → `info` on a FAT32 image. Exercises
+/// the unified inspection dispatch (the CLI doesn't know it's FAT32).
+#[test]
+fn cli_fat32_build_ls_cat_info_roundtrip() {
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("short.txt"), b"short body\n").unwrap();
+    std::fs::create_dir(srcdir.path().join("nest")).unwrap();
+    std::fs::write(
+        srcdir.path().join("nest/A Long Name.md"),
+        b"long-name body\n",
+    )
+    .unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args(["fat-build", "--size", "64MiB", "--label", "CLIFAT"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fat-build failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // info names the FS as fat32.
+    let out = Command::new(FSTOOL)
+        .arg("info")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let info = String::from_utf8_lossy(&out.stdout);
+    assert!(info.contains("fat32"), "info missing fat32:\n{info}");
+    assert!(info.contains("CLIFAT"), "info missing label:\n{info}");
+
+    // ls /
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(listing.contains("short.txt"));
+    assert!(listing.contains("nest"));
+
+    // ls a subdirectory.
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/nest")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let nest = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        nest.contains("A Long Name.md"),
+        "long-name entry missing from /nest:\n{nest}"
+    );
+
+    // cat the deep long-named file.
+    let out = Command::new(FSTOOL)
+        .args(["cat"])
+        .arg(img.path())
+        .arg("/nest/A Long Name.md")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "cat failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"long-name body\n");
 }

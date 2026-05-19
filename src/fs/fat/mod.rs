@@ -387,16 +387,16 @@ impl Fat32 {
         short_seq: &mut u32,
     ) {
         let upper = name.to_ascii_uppercase();
-        let name_83 = if dir::is_valid_83(&upper) {
-            dir::pack_83(&upper)
+        // An LFN run is needed when the on-disk 8.3 name can't reproduce the
+        // original verbatim — either because the original isn't a valid 8.3
+        // name (too long, lower-case, weird chars) or because case was lost.
+        let (name_83, need_lfn) = if dir::is_valid_83(&upper) {
+            (dir::pack_83(&upper), upper != name)
         } else {
             let s = dir::generate_83(name, *short_seq);
             *short_seq += 1;
-            s
+            (s, true)
         };
-        // LFN fragments precede the 8.3 entry whenever the on-disk 8.3 name
-        // doesn't reproduce the original name verbatim.
-        let need_lfn = dir::pack_83(&upper) != name_83 || upper != name;
         if need_lfn {
             let csum = dir::lfn_checksum(&name_83);
             for frag in dir::encode_lfn_run(name, csum) {
@@ -480,6 +480,302 @@ impl Fat32 {
         {
             self.next_free = first;
         }
+    }
+
+    // -- read path --------------------------------------------------------
+
+    /// Open an existing FAT32 volume from `dev`: decode the boot sector,
+    /// validate the FAT32 fs_type signature, and load the primary FAT into
+    /// memory.
+    pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        let mut bs = [0u8; 512];
+        dev.read_at(0, &mut bs)?;
+        let boot = BootSector::decode(&bs)?;
+        if boot.bytes_per_sector as u32 != SECTOR {
+            return Err(crate::Error::Unsupported(format!(
+                "fat32: only 512-byte sectors are supported (got {})",
+                boot.bytes_per_sector
+            )));
+        }
+        // Read the first FAT copy.
+        let fat_bytes_len = boot.fat_size as u64 * SECTOR as u64;
+        let mut fat_bytes = vec![0u8; fat_bytes_len as usize];
+        let fat_off = boot.reserved_sector_count as u64 * SECTOR as u64;
+        dev.read_at(fat_off, &mut fat_bytes)?;
+        let fat = Fat::decode(&fat_bytes);
+        // For an opened volume we don't track a free-pool cursor; set it
+        // past the end so accidental allocation needs an explicit reset.
+        let next_free = fat.capacity() as u32;
+        Ok(Self {
+            boot,
+            fat,
+            next_free,
+        })
+    }
+
+    /// The boot sector — exposed read-only for callers (e.g. `fstool info`).
+    pub fn boot_sector(&self) -> &BootSector {
+        &self.boot
+    }
+
+    /// In-memory FAT — exposed read-only for diagnostics.
+    pub fn fat(&self) -> &Fat {
+        &self.fat
+    }
+
+    /// Walk the cluster chain starting at `start`, collecting every cluster
+    /// in order.
+    pub fn chain_of(&self, start: u32) -> Result<Vec<u32>> {
+        self.fat.chain(start)
+    }
+
+    /// List the entries of a directory by absolute path. `/` resolves to
+    /// the root directory. Returns one [`crate::fs::DirEntry`] per visible
+    /// entry, with `inode` set to the entry's `first_cluster` (FAT has no
+    /// inode numbers, but the cluster number is a stable per-entry id).
+    /// Volume-label entries and `.` / `..` are skipped.
+    pub fn list_path(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let cluster = self.resolve_dir(dev, path)?;
+        self.list_cluster(dev, cluster)
+    }
+
+    /// Open a regular file by absolute path for streaming reads. The
+    /// returned reader holds an in-memory copy of the cluster chain and
+    /// borrows `dev` for the actual block reads.
+    pub fn open_file_reader<'a>(
+        &self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<FatFileReader<'a>> {
+        let (entry, dir_cluster) = self.resolve_entry(dev, path)?;
+        if entry.attr & dir::ATTR_DIRECTORY != 0 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fat32: {path:?} is a directory, not a file"
+            )));
+        }
+        let _ = dir_cluster; // unused once we have the leaf
+        let chain = if entry.first_cluster < 2 {
+            Vec::new() // zero-length file
+        } else {
+            self.chain_of(entry.first_cluster)?
+        };
+        let cluster_bytes = self.cluster_bytes();
+        let data_start = self.boot.data_start_sector() as u64 * SECTOR as u64;
+        let spc = self.boot.sectors_per_cluster;
+        Ok(FatFileReader {
+            dev,
+            chain,
+            cluster_bytes,
+            data_start,
+            spc,
+            remaining: entry.file_size as u64,
+            cluster_idx: 0,
+            cluster_off: 0,
+        })
+    }
+
+    /// Resolve `path` to the cluster number of the named directory, or the
+    /// root cluster for `/` / "".
+    pub fn resolve_dir(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<u32> {
+        let parts = split_path(path);
+        let mut cluster = self.boot.root_cluster;
+        for part in parts {
+            let entries = self.list_cluster_raw(dev, cluster)?;
+            let next = entries
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(part))
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "fat32: no such entry {part:?} under {path:?}"
+                    ))
+                })?;
+            if next.1.attr & dir::ATTR_DIRECTORY == 0 {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "fat32: {part:?} is not a directory"
+                )));
+            }
+            // For ".." pointing at the root, the on-disk first_cluster is 0.
+            cluster = if next.1.first_cluster == 0 {
+                self.boot.root_cluster
+            } else {
+                next.1.first_cluster
+            };
+        }
+        Ok(cluster)
+    }
+
+    /// Resolve `path` to its 8.3 entry plus the cluster of the containing
+    /// directory. Errors if the path is `/` (root has no entry).
+    pub fn resolve_entry(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<(dir::DirEntry, u32)> {
+        let parts = split_path(path);
+        if parts.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "fat32: cannot resolve root \"/\" as a file entry".into(),
+            ));
+        }
+        let mut cluster = self.boot.root_cluster;
+        let (last, prefix) = parts.split_last().unwrap();
+        for part in prefix {
+            let entries = self.list_cluster_raw(dev, cluster)?;
+            let next = entries
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(part))
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "fat32: no such entry {part:?} under {path:?}"
+                    ))
+                })?;
+            cluster = if next.1.first_cluster == 0 {
+                self.boot.root_cluster
+            } else {
+                next.1.first_cluster
+            };
+        }
+        let entries = self.list_cluster_raw(dev, cluster)?;
+        let found = entries
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(last))
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "fat32: no such entry {last:?} under {path:?}"
+                ))
+            })?;
+        Ok((found.1, cluster))
+    }
+
+    /// Read every 32-byte slot of the directory at `dir_cluster`, walking
+    /// the cluster chain to the end. Returns the raw bytes concatenated.
+    fn read_dir_bytes(&self, dev: &mut dyn BlockDevice, dir_cluster: u32) -> Result<Vec<u8>> {
+        let chain = self.chain_of(dir_cluster)?;
+        let cb = self.cluster_bytes() as usize;
+        let mut buf = vec![0u8; chain.len() * cb];
+        for (i, &c) in chain.iter().enumerate() {
+            dev.read_at(self.cluster_offset(c), &mut buf[i * cb..(i + 1) * cb])?;
+        }
+        Ok(buf)
+    }
+
+    /// Walk a directory's slots, reassembling LFN runs into long names.
+    /// Returns `(long-or-short-name, entry)` pairs in on-disk order,
+    /// excluding the volume-label entry and `.` / `..`.
+    fn list_cluster_raw(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+    ) -> Result<Vec<(String, dir::DirEntry)>> {
+        let bytes = self.read_dir_bytes(dev, dir_cluster)?;
+        let mut out = Vec::new();
+        let mut lfn_run: Vec<dir::LfnFragment> = Vec::new();
+        for chunk in bytes.chunks_exact(dir::ENTRY_SIZE) {
+            let slot: &[u8; dir::ENTRY_SIZE] = chunk.try_into().unwrap();
+            match dir::classify_slot(slot) {
+                dir::RawSlot::End => break,
+                dir::RawSlot::Deleted => {
+                    lfn_run.clear();
+                }
+                dir::RawSlot::Lfn(frag) => {
+                    lfn_run.push(frag);
+                }
+                dir::RawSlot::ShortEntry(entry) => {
+                    if entry.attr & dir::ATTR_VOLUME_ID != 0
+                        && entry.attr & dir::ATTR_DIRECTORY == 0
+                    {
+                        // Volume label entry.
+                        lfn_run.clear();
+                        continue;
+                    }
+                    let short_name = entry.short_name_string();
+                    if short_name == "." || short_name == ".." {
+                        lfn_run.clear();
+                        continue;
+                    }
+                    let name = dir::assemble_lfn(&lfn_run, &entry.name_83)
+                        .unwrap_or_else(|| short_name.clone());
+                    lfn_run.clear();
+                    out.push((name, entry));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// List the entries of `dir_cluster` as generic [`crate::fs::DirEntry`]s.
+    fn list_cluster(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        use crate::fs::{DirEntry as FsDirEntry, EntryKind};
+        let entries = self.list_cluster_raw(dev, dir_cluster)?;
+        Ok(entries
+            .into_iter()
+            .map(|(name, e)| FsDirEntry {
+                name,
+                inode: e.first_cluster,
+                kind: if e.attr & dir::ATTR_DIRECTORY != 0 {
+                    EntryKind::Dir
+                } else {
+                    EntryKind::Regular
+                },
+            })
+            .collect())
+    }
+}
+
+/// Split an absolute or relative FAT path into its non-empty components.
+/// `/`, `""`, and `.` all yield an empty vec (= "the root").
+fn split_path(path: &str) -> Vec<&str> {
+    path.split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect()
+}
+
+/// Streaming reader for a FAT32 file. Walks the cluster chain on demand;
+/// the file's bytes are never buffered beyond one [`std::io::Read::read`]
+/// call's destination buffer.
+pub struct FatFileReader<'a> {
+    dev: &'a mut dyn BlockDevice,
+    chain: Vec<u32>,
+    cluster_bytes: u64,
+    data_start: u64,
+    spc: u8,
+    /// Bytes of the file still to be returned.
+    remaining: u64,
+    /// Index into `chain` of the cluster currently being read from.
+    cluster_idx: usize,
+    /// Byte offset into the current cluster.
+    cluster_off: u64,
+}
+
+impl<'a> std::io::Read for FatFileReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || self.cluster_idx >= self.chain.len() {
+            return Ok(0);
+        }
+        let avail_in_cluster = self.cluster_bytes - self.cluster_off;
+        let want = (buf.len() as u64).min(avail_in_cluster).min(self.remaining) as usize;
+        let cluster = self.chain[self.cluster_idx];
+        let cluster_start =
+            self.data_start + (cluster as u64 - 2) * self.spc as u64 * SECTOR as u64;
+        let off = cluster_start + self.cluster_off;
+        self.dev
+            .read_at(off, &mut buf[..want])
+            .map_err(std::io::Error::other)?;
+        self.cluster_off += want as u64;
+        self.remaining -= want as u64;
+        if self.cluster_off == self.cluster_bytes {
+            self.cluster_idx += 1;
+            self.cluster_off = 0;
+        }
+        Ok(want)
     }
 }
 

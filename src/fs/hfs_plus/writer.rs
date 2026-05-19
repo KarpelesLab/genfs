@@ -52,6 +52,33 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 4096;
 /// Volume attribute set on a cleanly unmounted volume.
 pub const VOL_ATTR_UNMOUNTED: u32 = 1 << 8;
 
+/// `kHFSVolumeJournaledMask` per TN1150: set in
+/// `HFSPlusVolumeHeader.attributes` when the volume carries a journal.
+pub const VOL_ATTR_JOURNALED: u32 = 1 << 13;
+
+/// `JournalInfoBlock.flags`: journal lives inside the filesystem (the
+/// volume's own journal-buffer reserved blocks rather than an external
+/// device). TN1150 names this `kJIJournalInFSMask`.
+pub const JI_JOURNAL_IN_FS: u32 = 0x0000_0002;
+
+/// Journal-header magic number, ASCII `"JNLx"` in big-endian word order.
+pub const JOURNAL_HEADER_MAGIC: u32 = 0x4a4e_4c78;
+
+/// Journal-header endian marker. Apple writes `0x12345678` natively
+/// (host byte order on the writing machine); we write it big-endian
+/// because every other multi-byte field in an HFS+ volume header is
+/// big-endian, so a kernel comparing the on-disk value to its native
+/// representation will detect endian mismatch the same way it does for
+/// the rest of the volume.
+pub const JOURNAL_HEADER_ENDIAN: u32 = 0x1234_5678;
+
+/// Default size of the in-volume journal buffer when `FormatOpts::journaled`
+/// is set, expressed in allocation blocks. macOS picks 8 MiB by default;
+/// we ship a stub journal sized at 16 blocks (64 KiB at 4 KiB block_size),
+/// which is enough room to hold a credible empty journal header and to
+/// satisfy a kernel that mounts the volume read-only.
+pub const DEFAULT_JOURNAL_BUFFER_BLOCKS: u32 = 16;
+
 /// File-type modes used on disk (`HFSPlusBSDInfo.fileMode`).
 mod m {
     pub const S_IFDIR: u16 = 0o040000;
@@ -79,6 +106,11 @@ pub struct FormatOpts {
     /// Seconds since 1904-01-01 used for createDate / modifyDate.
     /// HFS+ uses a 1904 epoch; supply `0` to leave dates zeroed.
     pub create_date: u32,
+    /// Emit a journal stub: reserve a journal-info block + journal
+    /// buffer, set the `kHFSVolumeJournaledMask` bit, and lay down a
+    /// clean (transaction-count-zero) journal header. The kernel will
+    /// see a journaled volume with no replay work to do. Default false.
+    pub journaled: bool,
 }
 
 impl Default for FormatOpts {
@@ -86,10 +118,15 @@ impl Default for FormatOpts {
         Self {
             block_size: DEFAULT_BLOCK_SIZE,
             node_size: DEFAULT_NODE_SIZE,
-            extents_nodes: 1,
+            // 4 = 1 header + 3 leaves' worth of headroom; enough for
+            // ~300 overflow records before the tree fills, while still
+            // tiny on disk (32 KiB at default node_size). Volumes
+            // without any fragmented files leave most of this empty.
+            extents_nodes: 4,
             catalog_nodes: 32,
             volume_name: "Untitled".into(),
             create_date: 0,
+            journaled: false,
         }
     }
 }
@@ -161,6 +198,12 @@ pub struct Writer {
     /// key from the BTreeMap key on flush).
     pub(crate) catalog: BTreeMap<OwnedKey, Vec<u8>>,
 
+    /// Extents-overflow records keyed by `(fork_type, file_id, start_block)`.
+    /// Each value is a fixed-size group of up to eight `(start, count)`
+    /// runs (zero-count terminated). Populated whenever a fork's run
+    /// list outgrows the eight inline extents kept in the catalog.
+    pub(crate) overflow_extents: BTreeMap<(u8, u32, u32), [ExtentDescriptor; FORK_EXTENT_COUNT]>,
+
     /// Fork data for the five special files. The extents we record here
     /// are immutable for the lifetime of the build (we size up front and
     /// don't grow them) so a fork that runs out of space is a hard error.
@@ -169,6 +212,23 @@ pub struct Writer {
     pub(crate) catalog_file: ForkData,
     pub(crate) attributes_file: ForkData,
     pub(crate) startup_file: ForkData,
+
+    /// CNID of the `\0\0\0\0HFS+ Private Data` directory, created lazily
+    /// on the first `create_hardlink` call. `None` on volumes that
+    /// have never seen a hard link.
+    pub(crate) private_dir_cnid: Option<u32>,
+    /// Next link-inode number for `iNode<N>` file names inside the
+    /// private-data directory. The on-disk hard-link record stores `N`
+    /// in `HFSPlusBSDInfo.special`; the catalog file inside the
+    /// private directory is keyed by the literal text `iNode<N>`.
+    pub(crate) next_link_inode: u32,
+
+    /// Journal-info block (allocation-block number) and journal-buffer
+    /// start + length (also in allocation blocks), set on a journaled
+    /// format. Both are zero on an unjournaled volume.
+    pub(crate) journal_info_block: u32,
+    pub(crate) journal_buffer_start: u32,
+    pub(crate) journal_buffer_blocks: u32,
 
     /// True once [`flush`] has been called successfully.
     pub(crate) flushed: bool,
@@ -278,6 +338,81 @@ impl Writer {
         }
         self.free_blocks -= n;
         Ok(start)
+    }
+
+    /// Allocate up to `max` contiguous free blocks (at least 1, exactly
+    /// the size of the largest free run discoverable from the bump
+    /// cursor / first-fit scan, capped at `max`). Used by the streaming
+    /// file writer so it can lay user data down across multiple runs
+    /// when no single run is big enough.
+    pub(crate) fn allocate_largest_run(&mut self, max: u32) -> Result<ExtentDescriptor> {
+        if max == 0 {
+            return Err(crate::Error::InvalidArgument(
+                "hfs+ writer: zero-block allocation".into(),
+            ));
+        }
+        if self.free_blocks == 0 {
+            return Err(crate::Error::Unsupported(
+                "hfs+ writer: out of space (0 free blocks)".into(),
+            ));
+        }
+        // Find the largest free run discoverable from the start of the
+        // bitmap. Prefer one that begins at or after `next_alloc` so we
+        // keep the bump-pointer behaviour on the happy path.
+        let mut best: Option<(u32, u32)> = None;
+        let mut run_start: u32 = 0;
+        let mut run_len: u32 = 0;
+        for bit in 0..self.total_blocks {
+            let by = (bit / 8) as usize;
+            let mask = 1u8 << (7 - (bit & 7));
+            if self.bitmap[by] & mask == 0 {
+                if run_len == 0 {
+                    run_start = bit;
+                }
+                run_len += 1;
+                if run_len >= max {
+                    best = Some((run_start, max));
+                    break;
+                }
+            } else {
+                if run_len > 0 {
+                    let candidate = (run_start, run_len);
+                    match best {
+                        Some((_, blen)) if blen >= run_len => {}
+                        _ => best = Some(candidate),
+                    }
+                }
+                run_len = 0;
+            }
+        }
+        if let Some((s, l)) = best {
+            let take = l.min(max);
+            self.set_used(s, take);
+            if s + take > self.next_alloc {
+                self.next_alloc = s + take;
+            }
+            self.free_blocks -= take;
+            return Ok(ExtentDescriptor {
+                start_block: s,
+                block_count: take,
+            });
+        }
+        // Tail of the scan: a free run still in progress.
+        if run_len > 0 {
+            let take = run_len.min(max);
+            self.set_used(run_start, take);
+            if run_start + take > self.next_alloc {
+                self.next_alloc = run_start + take;
+            }
+            self.free_blocks -= take;
+            return Ok(ExtentDescriptor {
+                start_block: run_start,
+                block_count: take,
+            });
+        }
+        Err(crate::Error::Unsupported(
+            "hfs+ writer: fragmented bitmap reports free blocks but no run found".into(),
+        ))
     }
 
     /// Free `n` blocks starting at `start`. Clears the corresponding
@@ -506,13 +641,14 @@ pub(crate) fn encode_volume_header(
     file_count: u32,
     folder_count: u32,
     create_date: u32,
+    journal_info_block: u32,
 ) -> [u8; VolumeHeader::ENCODED_SIZE] {
     let mut b = [0u8; VolumeHeader::ENCODED_SIZE];
     b[0..2].copy_from_slice(&vh.signature);
     b[2..4].copy_from_slice(&vh.version.to_be_bytes());
     b[4..8].copy_from_slice(&vh.attributes.to_be_bytes());
     b[8..12].copy_from_slice(b"10.0"); // lastMountedVersion (cosmetic)
-    b[12..16].copy_from_slice(&0u32.to_be_bytes()); // journalInfoBlock
+    b[12..16].copy_from_slice(&journal_info_block.to_be_bytes());
     b[16..20].copy_from_slice(&create_date.to_be_bytes());
     b[20..24].copy_from_slice(&create_date.to_be_bytes()); // modifyDate
     b[24..28].copy_from_slice(&0u32.to_be_bytes()); // backupDate
@@ -963,6 +1099,25 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     let attributes_file = ForkData::default();
     let startup_file = ForkData::default();
 
+    // Journal stub: one block for the JournalInfoBlock, plus N blocks
+    // of journal buffer. Reserved up-front so the bitmap reflects the
+    // usage from format time onward.
+    let (journal_info_block, journal_buffer_start, journal_buffer_blocks) = if opts.journaled {
+        let info_start = cursor;
+        cursor = cursor.checked_add(1).ok_or_else(|| {
+            crate::Error::InvalidArgument("hfs+ format: journal layout overflow".into())
+        })?;
+        let buf_start = cursor;
+        cursor = cursor
+            .checked_add(DEFAULT_JOURNAL_BUFFER_BLOCKS)
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument("hfs+ format: journal buffer overflow".into())
+            })?;
+        (info_start, buf_start, DEFAULT_JOURNAL_BUFFER_BLOCKS)
+    } else {
+        (0, 0, 0)
+    };
+
     // Sanity: don't run past end of device.
     if cursor > total_blocks {
         return Err(crate::Error::InvalidArgument(format!(
@@ -1015,11 +1170,17 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         next_alloc: cursor,
         free_blocks,
         catalog: BTreeMap::new(),
+        overflow_extents: BTreeMap::new(),
         allocation_file,
         extents_file,
         catalog_file,
         attributes_file,
         startup_file,
+        private_dir_cnid: None,
+        next_link_inode: 1,
+        journal_info_block,
+        journal_buffer_start,
+        journal_buffer_blocks,
         flushed: false,
     };
 
@@ -1100,14 +1261,22 @@ fn layout_special(cursor: &mut u32, blocks: u32, block_size: u32) -> Result<Fork
 // File creation: streaming bytes into bump-allocated blocks
 // ----------------------------------------------------------------------
 
-/// Stream `len` bytes from `src` into a new run of allocation blocks on
-/// `dev`, returning the resulting `ForkData` to embed in a catalog file
-/// record. Uses a 64 KiB scratch buffer; never loads the file in memory.
+/// Stream `len` bytes from `src` into newly-allocated allocation blocks
+/// on `dev`, returning the resulting `ForkData` for `file_id` to embed
+/// in a catalog file record. Uses a 64 KiB scratch buffer; never loads
+/// the file in memory.
+///
+/// If the file fragments past the eight inline extents that fit in
+/// `HFSPlusForkData`, the writer queues the spill into
+/// `writer.overflow_extents` keyed by `(FORK_DATA, file_id, start_fork_block)`.
+/// `flush()` later turns the queued entries into extents-overflow
+/// B-tree records.
 pub(crate) fn stream_data_to_blocks<R: Read>(
     writer: &mut Writer,
     dev: &mut dyn BlockDevice,
     src: &mut R,
     len: u64,
+    file_id: u32,
 ) -> Result<ForkData> {
     if len == 0 {
         return Ok(ForkData {
@@ -1122,42 +1291,117 @@ pub(crate) fn stream_data_to_blocks<R: Read>(
     let total_blocks = u32::try_from(total_blocks_u64).map_err(|_| {
         crate::Error::InvalidArgument("hfs+ writer: file size overflows u32 blocks".into())
     })?;
-    let start = writer.allocate(total_blocks)?;
 
-    let mut written: u64 = 0;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut device_off = u64::from(start) * bs;
-    while written < len {
-        let want = ((len - written) as usize).min(buf.len());
-        let mut filled = 0;
-        while filled < want {
-            let n = src.read(&mut buf[filled..want]).map_err(crate::Error::Io)?;
-            if n == 0 {
-                return Err(crate::Error::InvalidArgument(format!(
-                    "hfs+ writer: source ended early at {} of {len} bytes",
-                    written + filled as u64
-                )));
-            }
-            filled += n;
-        }
-        dev.write_at(device_off, &buf[..filled])?;
-        device_off += filled as u64;
-        written += filled as u64;
+    // Collect the run list as we allocate, so we can record any spill
+    // beyond the 8 inline extents in the extents-overflow tree later.
+    let mut runs: Vec<ExtentDescriptor> = Vec::new();
+    let mut remaining = total_blocks;
+    while remaining > 0 {
+        let run = writer.allocate_largest_run(remaining)?;
+        remaining -= run.block_count;
+        runs.push(run);
     }
-    // Zero-pad the tail of the last block already, because we zeroed
-    // the whole device at format time. Nothing to do.
 
+    // Now stream the source bytes into the runs in order.
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut written: u64 = 0;
+    for run in &runs {
+        let run_bytes = u64::from(run.block_count) * bs;
+        let mut run_off = u64::from(run.start_block) * bs;
+        let mut run_remaining = run_bytes;
+        while run_remaining > 0 && written < len {
+            let want = ((len - written).min(run_remaining)).min(buf.len() as u64) as usize;
+            let mut filled = 0;
+            while filled < want {
+                let n = src.read(&mut buf[filled..want]).map_err(crate::Error::Io)?;
+                if n == 0 {
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "hfs+ writer: source ended early at {} of {len} bytes",
+                        written + filled as u64
+                    )));
+                }
+                filled += n;
+            }
+            dev.write_at(run_off, &buf[..filled])?;
+            run_off += filled as u64;
+            run_remaining -= filled as u64;
+            written += filled as u64;
+        }
+    }
+    // Zero-pad the slack space in the last allocated run (the device
+    // was zeroed at format time, but a block freed by `remove` and
+    // re-handed-out via first-fit may carry stale bytes).
+    if let Some(last) = runs.last() {
+        let last_bytes = u64::from(last.block_count) * bs;
+        let pre_last: u64 = runs
+            .iter()
+            .take(runs.len() - 1)
+            .map(|e| u64::from(e.block_count) * bs)
+            .sum();
+        let used_in_last = len - pre_last;
+        if used_in_last < last_bytes {
+            let zero = vec![0u8; (last_bytes - used_in_last) as usize];
+            let zero_off = u64::from(last.start_block) * bs + used_in_last;
+            dev.write_at(zero_off, &zero)?;
+        }
+    }
+
+    // Pack the run list back into a ForkData (first 8) + extents-overflow
+    // records (remainder, eight per record).
     let mut extents = [ExtentDescriptor::default(); FORK_EXTENT_COUNT];
-    extents[0] = ExtentDescriptor {
-        start_block: start,
-        block_count: total_blocks,
-    };
+    let inline_count = runs.len().min(FORK_EXTENT_COUNT);
+    for (slot, ext) in extents.iter_mut().zip(runs.iter().take(inline_count)) {
+        *slot = *ext;
+    }
+
+    if runs.len() > FORK_EXTENT_COUNT {
+        record_fork_overflow(
+            writer,
+            FORK_DATA,
+            file_id,
+            &extents,
+            &runs[FORK_EXTENT_COUNT..],
+        );
+    }
+
     Ok(ForkData {
         logical_size: len,
         clump_size: writer.block_size,
         total_blocks,
         extents,
     })
+}
+
+/// Register the run list past the eight inline extents into the writer's
+/// pending extents-overflow records. `inline_extents` is the 8-slot
+/// ForkData array, used to compute the fork-block where the overflow
+/// records start. `overflow_runs` are the 9th onward extents in fork order.
+fn record_fork_overflow(
+    writer: &mut Writer,
+    fork_type: u8,
+    file_id: u32,
+    inline_extents: &[ExtentDescriptor; FORK_EXTENT_COUNT],
+    overflow_runs: &[ExtentDescriptor],
+) {
+    // Fork-block index at which the first overflow record begins is the
+    // total block count of the inline extents.
+    let mut start_block: u32 = inline_extents
+        .iter()
+        .map(|e| e.block_count)
+        .fold(0u32, |a, b| a.saturating_add(b));
+
+    for chunk in overflow_runs.chunks(FORK_EXTENT_COUNT) {
+        let mut group = [ExtentDescriptor::default(); FORK_EXTENT_COUNT];
+        for (slot, ext) in group.iter_mut().zip(chunk.iter()) {
+            *slot = *ext;
+        }
+        writer
+            .overflow_extents
+            .insert((fork_type, file_id, start_block), group);
+        for ext in chunk {
+            start_block = start_block.saturating_add(ext.block_count);
+        }
+    }
 }
 
 /// Stream a slice's bytes into newly-allocated blocks. Used for symlink
@@ -1297,6 +1541,314 @@ pub(crate) fn insert_file(
     Ok(())
 }
 
+/// Build the well-known HFS+ private-data directory name. The name
+/// consists of four NUL code units followed by the literal text
+/// `"HFS+ Private Data"`. Apple chose those leading NULs so the
+/// directory sorts ahead of any user-supplied name in the root and
+/// so it never collides with a real file name.
+pub(crate) fn private_data_dir_name() -> UniStr {
+    let mut code_units: Vec<u16> = vec![0, 0, 0, 0];
+    code_units.extend("HFS+ Private Data".encode_utf16());
+    UniStr { code_units }
+}
+
+/// Ensure the HFS+ private-data directory exists under the root and
+/// return its CNID. Created lazily on the first hard-link insert.
+pub(crate) fn ensure_private_dir(writer: &mut Writer) -> Result<u32> {
+    if let Some(cnid) = writer.private_dir_cnid {
+        return Ok(cnid);
+    }
+    let cnid = writer.next_cnid;
+    writer.next_cnid = writer
+        .next_cnid
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+    let name = private_data_dir_name();
+    // mode 0700 / uid root / gid root, S_IFDIR is or'ed in by insert_folder.
+    insert_folder(writer, ROOT_FOLDER_ID, &name, cnid, 0o700, 0, 0)?;
+    writer.private_dir_cnid = Some(cnid);
+    Ok(cnid)
+}
+
+/// Decode the data fork out of a stored file catalog record body.
+/// Used by `create_hardlink` to move an existing file's payload into
+/// a fresh iNode entry.
+pub(crate) fn extract_file_fork(body: &[u8]) -> Result<ForkData> {
+    if body.len() < 88 + FORK_DATA_SIZE {
+        return Err(crate::Error::InvalidImage(
+            "hfs+ writer: short catalog file body".into(),
+        ));
+    }
+    let mut buf = [0u8; FORK_DATA_SIZE];
+    buf.copy_from_slice(&body[88..88 + FORK_DATA_SIZE]);
+    Ok(ForkData::decode(&buf))
+}
+
+/// Read the BSD `(uid, gid, mode)` triple out of a file catalog body.
+pub(crate) fn extract_file_perms(body: &[u8]) -> Result<(u32, u32, u16)> {
+    if body.len() < 48 {
+        return Err(crate::Error::InvalidImage(
+            "hfs+ writer: short catalog file body".into(),
+        ));
+    }
+    let uid = u32::from_be_bytes(body[32..36].try_into().unwrap());
+    let gid = u32::from_be_bytes(body[36..40].try_into().unwrap());
+    let mode = u16::from_be_bytes(body[42..44].try_into().unwrap());
+    Ok((uid, gid, mode))
+}
+
+/// Insert a hard-link "indirect node" record. Same on-disk shape as a
+/// regular file record but with `fileType == 'hlnk'`,
+/// `creator == 'hfs+'` and `bsd.special == link_inode_number`. The
+/// data fork is left empty: the actual bytes live in the `iNode<N>`
+/// file stored in the HFS+ private-data directory.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_hardlink_entry(
+    writer: &mut Writer,
+    parent_id: u32,
+    name: &UniStr,
+    file_id: u32,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    link_inode: u32,
+) -> Result<()> {
+    if name.code_units.is_empty() {
+        return Err(crate::Error::InvalidArgument(
+            "hfs+ writer: hard-link name must not be empty".into(),
+        ));
+    }
+    if !writer.is_dir(parent_id) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "hfs+ writer: parent CNID {parent_id} is not a directory"
+        )));
+    }
+    let key = OwnedKey {
+        parent_id,
+        name: name.clone(),
+    };
+    if writer.catalog.contains_key(&key) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "hfs+ writer: entry {:?} already exists under CNID {parent_id}",
+            name.to_string_lossy()
+        )));
+    }
+    let body = encode_hardlink_body(file_id, mode, uid, gid, link_inode, writer.create_date);
+    writer.catalog.insert(key, body);
+    let thread = encode_thread_body(REC_FILE_THREAD, parent_id, name);
+    writer.catalog.insert(OwnedKey::thread(file_id), thread);
+    writer.bump_valence(parent_id, 1)?;
+    Ok(())
+}
+
+/// Encode a hard-link "indirect node" catalog file body. Same 248-byte
+/// shape as `encode_file_body`, but with the FileInfo tags fixed at
+/// (`'hlnk'`, `'hfs+'`) and `HFSPlusBSDInfo.special` carrying the
+/// link-inode number.
+pub(crate) fn encode_hardlink_body(
+    file_id: u32,
+    file_mode: u16,
+    uid: u32,
+    gid: u32,
+    link_inode: u32,
+    create_date: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(248);
+    out.extend_from_slice(&REC_FILE.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // flags
+    out.extend_from_slice(&0u32.to_be_bytes()); // reserved1
+    out.extend_from_slice(&file_id.to_be_bytes());
+    for _ in 0..5 {
+        out.extend_from_slice(&create_date.to_be_bytes());
+    }
+    encode_bsd(&mut out, file_mode | m::S_IFREG, uid, gid, link_inode);
+    // FileInfo: fileType = "hlnk", creator = "hfs+", remainder zero.
+    out.extend_from_slice(b"hlnk");
+    out.extend_from_slice(b"hfs+");
+    out.extend_from_slice(&[0u8; 8]);
+    // ExtendedFileInfo
+    out.extend_from_slice(&[0u8; 16]);
+    out.extend_from_slice(&0u32.to_be_bytes()); // textEncoding
+    out.extend_from_slice(&0u32.to_be_bytes()); // reserved2
+    encode_fork(&ForkData::default(), &mut out);
+    encode_fork(&ForkData::default(), &mut out);
+    debug_assert_eq!(out.len(), 248);
+    out
+}
+
+/// Promote an existing file to a hard-link pair.
+///
+/// On entry: `(src_parent, src_name)` names a regular file (not a
+/// symlink, not already an hlnk) in the catalog, and `(dst_parent,
+/// dst_name)` is an unused name in an existing directory.
+///
+/// On success:
+/// * a fresh `iNode<N>` file lives in the HFS+ private-data directory
+///   carrying the source's data fork (no bytes are moved on disk —
+///   the catalog is the only thing that changes);
+/// * the source entry is overwritten with an `hlnk`/`hfs+` indirect
+///   record pointing at `N`;
+/// * the destination entry is created as a second `hlnk`/`hfs+`
+///   indirect record also pointing at `N`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn promote_to_hardlink(
+    writer: &mut Writer,
+    src_parent: u32,
+    src_name: &UniStr,
+    dst_parent: u32,
+    dst_name: &UniStr,
+) -> Result<u32> {
+    // Forbid self-link: a hard link to itself would corrupt the catalog.
+    if src_parent == dst_parent
+        && compare_unistr(src_name, dst_name, false) == std::cmp::Ordering::Equal
+    {
+        return Err(crate::Error::InvalidArgument(
+            "hfs+ writer: source and destination hard-link paths are the same".into(),
+        ));
+    }
+    if !writer.is_dir(dst_parent) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "hfs+ writer: destination parent CNID {dst_parent} is not a directory"
+        )));
+    }
+    let dst_key = OwnedKey {
+        parent_id: dst_parent,
+        name: dst_name.clone(),
+    };
+    if writer.catalog.contains_key(&dst_key) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "hfs+ writer: destination {:?} already exists",
+            dst_name.to_string_lossy()
+        )));
+    }
+    let src_key = OwnedKey {
+        parent_id: src_parent,
+        name: src_name.clone(),
+    };
+    let src_body = writer.catalog.get(&src_key).ok_or_else(|| {
+        crate::Error::InvalidArgument(format!(
+            "hfs+ writer: source {:?} not found under CNID {src_parent}",
+            src_name.to_string_lossy()
+        ))
+    })?;
+    if src_body.len() < 248 || i16::from_be_bytes([src_body[0], src_body[1]]) != REC_FILE {
+        return Err(crate::Error::InvalidArgument(
+            "hfs+ writer: hard-link source must be an existing regular file".into(),
+        ));
+    }
+    // Reject symlinks and already-hardlink sources.
+    let mut file_type = [0u8; 4];
+    file_type.copy_from_slice(&src_body[48..52]);
+    let mut creator = [0u8; 4];
+    creator.copy_from_slice(&src_body[52..56]);
+    if &file_type == b"slnk" {
+        return Err(crate::Error::Unsupported(
+            "hfs+ writer: hard-linking a symbolic link is not supported".into(),
+        ));
+    }
+    if &file_type == b"hlnk" && &creator == b"hfs+" {
+        return Err(crate::Error::Unsupported(
+            "hfs+ writer: hard-linking an existing hard-link entry is not supported".into(),
+        ));
+    }
+    let src_file_id = u32::from_be_bytes(src_body[8..12].try_into().unwrap());
+    let (uid, gid, mode_full) = extract_file_perms(src_body)?;
+    let src_fork = extract_file_fork(src_body)?;
+    let src_body_clone = src_body.clone();
+
+    // Lazily create the private-data directory. After this call the
+    // directory's CNID is in `writer.private_dir_cnid`.
+    let private_dir = ensure_private_dir(writer)?;
+
+    // Allocate the link-inode number and the iNode catalog file's CNID.
+    let link_inode = writer.next_link_inode;
+    writer.next_link_inode = writer
+        .next_link_inode
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("hfs+: link-inode space exhausted".into()))?;
+    let inode_cnid = writer.next_cnid;
+    writer.next_cnid = writer
+        .next_cnid
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+
+    // Build the iNode<N> file. Re-use the source's data fork verbatim —
+    // no bytes change on disk — but rebuild the body with the new
+    // file_id so the catalog stays consistent. Reset Finder tags to
+    // zero since the iNode is just storage, not a user-facing file.
+    let inode_name_str = format!("iNode{link_inode}");
+    let inode_name = UniStr::from_str_lossy(&inode_name_str);
+    let inode_body = encode_file_body(
+        inode_cnid,
+        mode_full,
+        uid,
+        gid,
+        writer.create_date,
+        *b"\0\0\0\0",
+        *b"\0\0\0\0",
+        &src_fork,
+    );
+    writer.catalog.insert(
+        OwnedKey {
+            parent_id: private_dir,
+            name: inode_name.clone(),
+        },
+        inode_body,
+    );
+    writer.catalog.insert(
+        OwnedKey::thread(inode_cnid),
+        encode_thread_body(REC_FILE_THREAD, private_dir, &inode_name),
+    );
+    writer.bump_valence(private_dir, 1)?;
+
+    // If the source file had spilled extents, re-key them under the
+    // iNode CNID instead of the old source CNID.
+    if src_file_id != inode_cnid {
+        let stolen_keys: Vec<(u8, u32, u32)> = writer
+            .overflow_extents
+            .range((FORK_DATA, src_file_id, 0)..=(FORK_DATA, src_file_id, u32::MAX))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in stolen_keys {
+            if let Some(group) = writer.overflow_extents.remove(&k) {
+                writer
+                    .overflow_extents
+                    .insert((FORK_DATA, inode_cnid, k.2), group);
+            }
+        }
+    }
+
+    // Replace the source entry with an hlnk record. We do this in place
+    // (same catalog key) by overwriting the stored body — preserves the
+    // existing source file_id (its CNID), which keeps any open thread
+    // record under that CNID valid. Drop the file's thread record though,
+    // since callers shouldn't be able to resolve the old src_file_id
+    // back to a regular file anymore.
+    let _ = src_body_clone; // anchored for safety; no longer needed.
+    let src_hlnk = encode_hardlink_body(
+        src_file_id,
+        mode_full,
+        uid,
+        gid,
+        link_inode,
+        writer.create_date,
+    );
+    writer.catalog.insert(src_key, src_hlnk);
+
+    // Create the destination hlnk record under a fresh CNID (every
+    // catalog file needs a unique fileID).
+    let dst_cnid = writer.next_cnid;
+    writer.next_cnid = writer
+        .next_cnid
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+    insert_hardlink_entry(
+        writer, dst_parent, dst_name, dst_cnid, mode_full, uid, gid, link_inode,
+    )?;
+
+    Ok(link_inode)
+}
+
 /// Remove an entry and (for files) free its data fork.
 pub(crate) fn remove_entry(writer: &mut Writer, parent_id: u32, name: &UniStr) -> Result<()> {
     let key = OwnedKey {
@@ -1338,6 +1890,24 @@ pub(crate) fn remove_entry(writer: &mut Writer, parent_id: u32, name: &UniStr) -
                     continue;
                 }
                 writer.free(ext.start_block, ext.block_count);
+            }
+            // Drain any spilled extents-overflow records for this file
+            // and free the blocks they describe. Records keyed by
+            // (FORK_DATA, cnid, _) belong to this file.
+            let overflow_keys: Vec<(u8, u32, u32)> = writer
+                .overflow_extents
+                .range((FORK_DATA, cnid, 0)..=(FORK_DATA, cnid, u32::MAX))
+                .map(|(k, _)| *k)
+                .collect();
+            for key in overflow_keys {
+                if let Some(group) = writer.overflow_extents.remove(&key) {
+                    for ext in &group {
+                        if ext.block_count == 0 {
+                            continue;
+                        }
+                        writer.free(ext.start_block, ext.block_count);
+                    }
+                }
             }
             cnid
         }
@@ -1383,26 +1953,45 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
 
     let built = build_btree(records, writer.node_size, cat_total_nodes)?;
     write_btree_to_fork(dev, &built.nodes, &writer.catalog_file, writer.node_size)?;
-    // 2. Extents-overflow tree (empty header node only).
+    // 2. Extents-overflow tree. Empty when no fork has spilled past 8
+    //    inline extents; otherwise the records we queued in
+    //    `writer.overflow_extents` get serialised here.
     let ext_total_nodes = {
         let bytes = u64::from(writer.extents_file.total_blocks) * u64::from(writer.block_size);
         u32::try_from(bytes / u64::from(writer.node_size)).map_err(|_| {
             crate::Error::Unsupported("hfs+ writer: extents-overflow node count overflow".into())
         })?
     };
-    let _ = EXTENT_RECORD_SIZE; // intentionally unused: empty tree
-    let _ = FORK_DATA; // ditto
-    let ext_built = build_btree(Vec::new(), writer.node_size, ext_total_nodes)?;
+    let mut ext_records: Vec<PackedRecord> = Vec::with_capacity(writer.overflow_extents.len());
+    for ((fork_type, file_id, start_block), group) in &writer.overflow_extents {
+        let key = encode_extent_key(*fork_type, *file_id, *start_block);
+        let mut body = vec![0u8; EXTENT_RECORD_SIZE];
+        for (i, ext) in group.iter().enumerate() {
+            let off = i * 8;
+            body[off..off + 4].copy_from_slice(&ext.start_block.to_be_bytes());
+            body[off + 4..off + 8].copy_from_slice(&ext.block_count.to_be_bytes());
+        }
+        ext_records.push(PackedRecord { key, body });
+    }
+    let ext_built = build_btree(ext_records, writer.node_size, ext_total_nodes)?;
+    let mut ext_nodes_owned: Vec<Vec<u8>> = ext_built.nodes;
+    // Patch the extents-overflow header to reflect its actual key
+    // geometry: maxKeyLength = 10 bytes, keyCompareType = 0 (binary).
+    // The catalog tree's geometry (516 / 0xCF) lives in `header_node()`,
+    // which we share with the catalog path.
+    if let Some(header) = ext_nodes_owned.first_mut() {
+        let h = NODE_DESCRIPTOR_SIZE;
+        if header.len() >= h + HEADER_REC_SIZE {
+            header[h + 20..h + 22].copy_from_slice(&(EXTENT_KEY_PAYLOAD_LEN as u16).to_be_bytes());
+            header[h + 37] = 0; // binary compare
+        }
+    }
     write_btree_to_fork(
         dev,
-        &ext_built.nodes,
+        &ext_nodes_owned,
         &writer.extents_file,
         writer.node_size,
     )?;
-
-    // Build the extents-overflow header node properly. The empty-tree
-    // path above already produced a valid header node — leave it.
-    let _ = encode_extent_key; // used only when we grow overflow.
 
     // 3. Allocation bitmap.
     let bm_off =
@@ -1411,7 +2000,26 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     // Pad the rest of the allocation-file blocks with zero already done
     // by zero_range at format time.
 
-    // 4. Volume header (primary + alternate).
+    // 4. Journal stub. Emitted only when the volume was formatted with
+    //    `FormatOpts::journaled = true`. We write a self-consistent
+    //    `JournalInfoBlock` followed by a zeroed journal buffer whose
+    //    first 512 bytes carry a clean journal header (no transactions
+    //    to replay). The kernel will see a journaled volume that does
+    //    not need replay on mount.
+    if writer.journal_buffer_blocks > 0 {
+        let bs = u64::from(writer.block_size);
+        let jbuf_offset = u64::from(writer.journal_buffer_start) * bs;
+        let jbuf_size = u64::from(writer.journal_buffer_blocks) * bs;
+        let info_off = u64::from(writer.journal_info_block) * bs;
+        let info = encode_journal_info_block(jbuf_offset, jbuf_size);
+        dev.write_at(info_off, &info)?;
+        let hdr = encode_journal_header(jbuf_size);
+        dev.write_at(jbuf_offset, &hdr)?;
+        // Mark the journaled attribute in the volume header.
+        vh.attributes |= VOL_ATTR_JOURNALED;
+    }
+
+    // 5. Volume header (primary + alternate).
     vh.free_blocks = writer.free_blocks;
     vh.next_catalog_id = writer.next_cnid;
     // Count files vs. folders by scanning catalog (record types 1/2).
@@ -1437,6 +2045,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         file_count,
         folder_count,
         writer.create_date,
+        writer.journal_info_block,
     );
     dev.write_at(VOLUME_HEADER_OFFSET, &buf)?;
 
@@ -1453,6 +2062,87 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     dev.sync()?;
     writer.flushed = true;
     Ok(())
+}
+
+/// Encode a 180-byte `JournalInfoBlock` for an in-volume journal. The
+/// rest of the block is left zero (matches what Apple does — the
+/// reserved area is large and unused).
+///
+/// TN1150 layout, condensed:
+///
+/// ```text
+/// 0       4   flags                  (kJIJournalInFSMask = 2)
+/// 4       32  device_signature[8]    (zero for in-volume journals)
+/// 36      8   offset                 (byte offset of journal buffer)
+/// 44      8   size                   (byte size of journal buffer)
+/// 52      37  ext_jnl_uuid           (zeroed)
+/// 89      48  machine_serial_num     (zeroed)
+/// ...     ... reserved
+/// ```
+fn encode_journal_info_block(buf_offset: u64, buf_size: u64) -> [u8; 512] {
+    let mut b = [0u8; 512];
+    b[0..4].copy_from_slice(&JI_JOURNAL_IN_FS.to_be_bytes());
+    // device_signature[8]: 32 bytes of zero.
+    b[36..44].copy_from_slice(&buf_offset.to_be_bytes());
+    b[44..52].copy_from_slice(&buf_size.to_be_bytes());
+    // ext_jnl_uuid + machine_serial_num + reserved: zeroed.
+    b
+}
+
+/// Encode the journal header that lives at the start of the journal
+/// buffer. With `start == end == jhdr_size` and no transactions queued,
+/// the kernel concludes there is nothing to replay.
+///
+/// TN1150 / Apple `journal.h`:
+///
+/// ```text
+/// 0    4   magic       0x4a4e4c78 "JNLx"
+/// 4    4   endian      0x12345678
+/// 8    8   start       (= jhdr_size, no transactions)
+/// 16   8   end         (= start)
+/// 24   8   size        journal buffer size in bytes
+/// 32   4   blhdr_size  block-list-header size (== sector size, 512)
+/// 36   4   checksum    CRC over the header w/ this field 0
+/// 40   4   jhdr_size   size of this header (== 512)
+/// ```
+fn encode_journal_header(buf_size: u64) -> [u8; 512] {
+    let mut b = [0u8; 512];
+    let jhdr_size: u32 = 512;
+    b[0..4].copy_from_slice(&JOURNAL_HEADER_MAGIC.to_be_bytes());
+    b[4..8].copy_from_slice(&JOURNAL_HEADER_ENDIAN.to_be_bytes());
+    b[8..16].copy_from_slice(&u64::from(jhdr_size).to_be_bytes());
+    b[16..24].copy_from_slice(&u64::from(jhdr_size).to_be_bytes());
+    b[24..32].copy_from_slice(&buf_size.to_be_bytes());
+    b[32..36].copy_from_slice(&jhdr_size.to_be_bytes()); // blhdr_size (use jhdr_size)
+    // Checksum over the header with the checksum field zeroed.
+    b[36..40].copy_from_slice(&0u32.to_be_bytes());
+    b[40..44].copy_from_slice(&jhdr_size.to_be_bytes());
+    let csum = journal_header_checksum(&b);
+    b[36..40].copy_from_slice(&csum.to_be_bytes());
+    b
+}
+
+/// CRC-32 over the journal header bytes with the checksum field
+/// zeroed. We use Apple's variant (CRC-32 with reflected polynomial
+/// 0xEDB88320, initial 0xFFFFFFFF, finalise without XOR) — that's
+/// the same algorithm zlib calls "CRC32" minus the final XOR.
+fn journal_header_checksum(buf: &[u8]) -> u32 {
+    // Compute over the entire 512-byte header. Apple's journal code
+    // only covers the journal-header struct (jhdr_size bytes), which is
+    // exactly the 512-byte sector we built.
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in buf {
+        let mut c = (crc ^ u32::from(byte)) & 0xff;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+        }
+        crc = (crc >> 8) ^ c;
+    }
+    crc
 }
 
 /// Write a sequence of pre-encoded B-tree nodes into the fork's first
@@ -1563,7 +2253,7 @@ mod tests {
             attributes_file: ForkData::default(),
             startup_file: ForkData::default(),
         };
-        let buf = encode_volume_header(&vh, 24, 0, 0, 0);
+        let buf = encode_volume_header(&vh, 24, 0, 0, 0, 0);
         let decoded = VolumeHeader::decode(&buf).unwrap();
         assert_eq!(decoded.signature, SIG_HFS_PLUS);
         assert_eq!(decoded.version, 4);
@@ -1720,5 +2410,344 @@ mod tests {
     /// inspect free_blocks across mutating calls without flushing.
     fn hfs_test_writer(hfs: &crate::fs::hfs_plus::HfsPlus) -> &Writer {
         hfs.test_writer().expect("writable handle")
+    }
+
+    /// Fragment the writer's allocation bitmap so that the only free
+    /// space is a series of `hole_count` evenly-sized holes (each
+    /// `hole_blocks` blocks long), each separated from the next by at
+    /// least one used "fence" block. Returns the hole starting-block
+    /// indices. Used by the spill tests below to coerce
+    /// `stream_data_to_blocks` into producing many small extents.
+    fn make_holes(writer: &mut Writer, hole_blocks: u32, hole_count: u32) -> Vec<u32> {
+        let mut holes = Vec::with_capacity(hole_count as usize);
+        // Reserve a fence block before the first hole.
+        let _ = writer.allocate(1).unwrap();
+        for _ in 0..hole_count {
+            holes.push(writer.allocate(hole_blocks).unwrap());
+            let _ = writer.allocate(1).unwrap();
+        }
+        // Drain everything that's still free past the fenced region so
+        // the only free space left, post-free, is the holes themselves.
+        while writer.free_blocks > 0 {
+            if writer.allocate_largest_run(writer.free_blocks).is_err() {
+                break;
+            }
+        }
+        for &h in &holes {
+            writer.free(h, hole_blocks);
+        }
+        holes
+    }
+
+    #[test]
+    fn extents_overflow_spill_round_trips() {
+        // 16 MiB volume so the bitmap, catalog, and overflow trees
+        // leave us enough room to fragment.
+        let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+        let opts = FormatOpts {
+            volume_name: "Spill".into(),
+            extents_nodes: 4, // header + room for a couple of leaves
+            ..FormatOpts::default()
+        };
+        let (mut vh, mut writer) = format(&mut dev, &opts).unwrap();
+
+        // Carve 16 single-block holes so a write of 16 blocks must
+        // produce 16 separate extents — 8 inline + 8 spilled into the
+        // extents-overflow B-tree.
+        let holes = make_holes(&mut writer, 1, 16);
+        assert_eq!(holes.len(), 16);
+
+        // The data we'll write: distinct bytes per block so the
+        // ordering of the runs is verifiable on read-back.
+        let bs = writer.block_size as usize;
+        let mut payload = vec![0u8; bs * 16];
+        for (block_idx, chunk) in payload.chunks_mut(bs).enumerate() {
+            chunk.fill((block_idx as u8).wrapping_add(0x10));
+        }
+
+        // Pick a fresh CNID for the file we're about to materialise.
+        let file_cnid = writer.next_cnid;
+        writer.next_cnid += 1;
+        let mut src = std::io::Cursor::new(&payload);
+        let fork = stream_data_to_blocks(
+            &mut writer,
+            &mut dev,
+            &mut src,
+            payload.len() as u64,
+            file_cnid,
+        )
+        .unwrap();
+
+        // We expect exactly 8 inline extents and 8 overflow extents.
+        assert_eq!(fork.total_blocks, 16);
+        assert_eq!(
+            fork.extents.iter().filter(|e| e.block_count > 0).count(),
+            FORK_EXTENT_COUNT,
+            "all 8 inline extents should be populated"
+        );
+        let overflow_record_count = writer
+            .overflow_extents
+            .range((FORK_DATA, file_cnid, 0)..=(FORK_DATA, file_cnid, u32::MAX))
+            .count();
+        assert_eq!(
+            overflow_record_count, 1,
+            "8 spilled extents fit in a single overflow record"
+        );
+
+        // Wire the catalog entry up under root.
+        let name = UniStr::from_str_lossy("spill.bin");
+        insert_file(
+            &mut writer,
+            ROOT_FOLDER_ID,
+            &name,
+            file_cnid,
+            0o644,
+            0,
+            0,
+            *b"\0\0\0\0",
+            *b"\0\0\0\0",
+            &fork,
+            false,
+        )
+        .unwrap();
+
+        flush(&mut writer, &mut vh, &mut dev).unwrap();
+
+        // Re-open and read back, byte-for-byte.
+        let hfs = crate::fs::hfs_plus::HfsPlus::open(&mut dev).unwrap();
+        let size = hfs.file_size(&mut dev, "/spill.bin").unwrap();
+        assert_eq!(size, payload.len() as u64);
+        let mut reader = hfs.open_file_reader(&mut dev, "/spill.bin").unwrap();
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut got).unwrap();
+        assert_eq!(got, payload, "spilled file must read back byte-exact");
+    }
+
+    #[test]
+    fn extents_overflow_spill_many_records() {
+        // Force at least 20 separate extents — more than fits in one
+        // overflow leaf record (each record holds 8 extents) — to
+        // exercise multi-record packing in the overflow tree.
+        let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+        let opts = FormatOpts {
+            volume_name: "Spill2".into(),
+            extents_nodes: 4,
+            ..FormatOpts::default()
+        };
+        let (mut vh, mut writer) = format(&mut dev, &opts).unwrap();
+        let holes = make_holes(&mut writer, 1, 20);
+        assert_eq!(holes.len(), 20);
+
+        let bs = writer.block_size as usize;
+        let mut payload = vec![0u8; bs * 20];
+        for (i, chunk) in payload.chunks_mut(bs).enumerate() {
+            chunk.fill(((i + 1) as u8).wrapping_mul(7));
+        }
+        let cnid = writer.next_cnid;
+        writer.next_cnid += 1;
+        let mut src = std::io::Cursor::new(&payload);
+        let fork =
+            stream_data_to_blocks(&mut writer, &mut dev, &mut src, payload.len() as u64, cnid)
+                .unwrap();
+        assert_eq!(fork.total_blocks, 20);
+        // 8 inline + 12 spilled, packed 8-per-record => 2 overflow records.
+        let overflow_record_count = writer
+            .overflow_extents
+            .range((FORK_DATA, cnid, 0)..=(FORK_DATA, cnid, u32::MAX))
+            .count();
+        assert_eq!(overflow_record_count, 2);
+
+        insert_file(
+            &mut writer,
+            ROOT_FOLDER_ID,
+            &UniStr::from_str_lossy("multi.bin"),
+            cnid,
+            0o644,
+            0,
+            0,
+            *b"\0\0\0\0",
+            *b"\0\0\0\0",
+            &fork,
+            false,
+        )
+        .unwrap();
+        flush(&mut writer, &mut vh, &mut dev).unwrap();
+
+        let hfs = crate::fs::hfs_plus::HfsPlus::open(&mut dev).unwrap();
+        let mut reader = hfs.open_file_reader(&mut dev, "/multi.bin").unwrap();
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut got).unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn remove_frees_overflow_extents() {
+        let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+        let opts = FormatOpts {
+            extents_nodes: 4,
+            ..FormatOpts::default()
+        };
+        let (mut vh, mut writer) = format(&mut dev, &opts).unwrap();
+        let _holes = make_holes(&mut writer, 1, 12);
+
+        let before_free = writer.free_blocks;
+
+        let bs = writer.block_size as usize;
+        let payload = vec![0xAB; bs * 12];
+        let cnid = writer.next_cnid;
+        writer.next_cnid += 1;
+        let mut src = std::io::Cursor::new(&payload);
+        let fork =
+            stream_data_to_blocks(&mut writer, &mut dev, &mut src, payload.len() as u64, cnid)
+                .unwrap();
+        let name = UniStr::from_str_lossy("to-remove.bin");
+        insert_file(
+            &mut writer,
+            ROOT_FOLDER_ID,
+            &name,
+            cnid,
+            0o644,
+            0,
+            0,
+            *b"\0\0\0\0",
+            *b"\0\0\0\0",
+            &fork,
+            false,
+        )
+        .unwrap();
+        // Sanity: overflow records were created.
+        assert!(!writer.overflow_extents.is_empty());
+
+        // Now remove and verify both inline + overflow blocks come back.
+        remove_entry(&mut writer, ROOT_FOLDER_ID, &name).unwrap();
+        assert!(writer.overflow_extents.is_empty());
+        assert_eq!(writer.free_blocks, before_free);
+
+        flush(&mut writer, &mut vh, &mut dev).unwrap();
+    }
+
+    #[test]
+    fn create_hardlink_round_trips() {
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = FormatOpts::default();
+        let mut hfs = crate::fs::hfs_plus::HfsPlus::format(&mut dev, &opts).unwrap();
+
+        // Source file with distinctive bytes.
+        let data = b"hard-link payload\n".repeat(64); // ~ 1 KiB
+        let mut src = std::io::Cursor::new(&data);
+        hfs.create_file(&mut dev, "/src", &mut src, data.len() as u64, 0o644, 0, 0)
+            .unwrap();
+        let link_inode = hfs.create_hardlink(&mut dev, "/src", "/dst").unwrap();
+        assert_eq!(link_inode, 1, "first hard link gets iNode number 1");
+        hfs.flush(&mut dev).unwrap();
+
+        // Re-open from disk and verify both names yield the same bytes.
+        let hfs2 = crate::fs::hfs_plus::HfsPlus::open(&mut dev).unwrap();
+        for path in ["/src", "/dst"] {
+            let size = hfs2.file_size(&mut dev, path).unwrap();
+            assert_eq!(size, data.len() as u64, "size for {path}");
+            let mut reader = hfs2.open_file_reader(&mut dev, path).unwrap();
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut got).unwrap();
+            assert_eq!(got, data, "bytes for {path}");
+        }
+
+        // The HFS+ private-data directory must exist with one iNode child.
+        let root = hfs2.list_path(&mut dev, "/").unwrap();
+        assert!(
+            root.iter().any(|e| e.name.contains("HFS+ Private Data")),
+            "private-data directory should appear in root listing, got {:?}",
+            root.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn create_hardlink_rejects_self_link_and_symlink() {
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = FormatOpts::default();
+        let mut hfs = crate::fs::hfs_plus::HfsPlus::format(&mut dev, &opts).unwrap();
+
+        let data = b"x";
+        let mut src = std::io::Cursor::new(&data[..]);
+        hfs.create_file(&mut dev, "/file", &mut src, 1, 0o644, 0, 0)
+            .unwrap();
+        // Same source / destination path: error.
+        assert!(hfs.create_hardlink(&mut dev, "/file", "/file").is_err());
+
+        // Symlinks may not be hard-linked.
+        hfs.create_symlink(&mut dev, "/sym", "/file", 0o777, 0, 0)
+            .unwrap();
+        assert!(hfs.create_hardlink(&mut dev, "/sym", "/sym-link").is_err());
+    }
+
+    #[test]
+    fn create_hardlink_then_third_link_shares_inode() {
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = FormatOpts::default();
+        let mut hfs = crate::fs::hfs_plus::HfsPlus::format(&mut dev, &opts).unwrap();
+
+        let data = b"three-way link\n";
+        let mut src = std::io::Cursor::new(&data[..]);
+        hfs.create_file(&mut dev, "/a", &mut src, data.len() as u64, 0o644, 0, 0)
+            .unwrap();
+        let _ = hfs.create_hardlink(&mut dev, "/a", "/b").unwrap();
+        // Creating a hard link *to an existing hard link* is not
+        // supported in v1 (the source would itself already be an hlnk
+        // record, which `promote_to_hardlink` rejects).
+        assert!(hfs.create_hardlink(&mut dev, "/a", "/c").is_err());
+    }
+
+    #[test]
+    fn format_journaled_sets_attribute_bit() {
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = FormatOpts {
+            journaled: true,
+            ..FormatOpts::default()
+        };
+        let (mut vh, mut writer) = format(&mut dev, &opts).unwrap();
+        assert!(writer.journal_buffer_blocks > 0);
+        assert!(writer.journal_info_block != 0);
+        flush(&mut writer, &mut vh, &mut dev).unwrap();
+        assert!(
+            vh.attributes & VOL_ATTR_JOURNALED != 0,
+            "journaled volume must set kHFSVolumeJournaledMask",
+        );
+
+        // Read the volume header off disk and confirm the bit + the
+        // journal-info-block pointer survive the round trip.
+        let parsed = crate::fs::hfs_plus::volume_header::read_volume_header(&mut dev).unwrap();
+        assert!(parsed.attributes & VOL_ATTR_JOURNALED != 0);
+
+        // The journal info block field is at offset 0x00C in the
+        // 512-byte header. Read it directly.
+        let mut raw = [0u8; 512];
+        dev.read_at(VOLUME_HEADER_OFFSET, &mut raw).unwrap();
+        let jib = u32::from_be_bytes(raw[12..16].try_into().unwrap());
+        assert_eq!(jib, writer.journal_info_block);
+
+        // The journal header at the start of the journal buffer must
+        // begin with the JNLx magic.
+        let mut hdr = [0u8; 16];
+        dev.read_at(
+            u64::from(writer.journal_buffer_start) * u64::from(writer.block_size),
+            &mut hdr,
+        )
+        .unwrap();
+        let magic = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+        assert_eq!(magic, JOURNAL_HEADER_MAGIC);
+        let endian = u32::from_be_bytes(hdr[4..8].try_into().unwrap());
+        assert_eq!(endian, JOURNAL_HEADER_ENDIAN);
+    }
+
+    #[test]
+    fn format_unjournaled_does_not_touch_journal_fields() {
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = FormatOpts::default();
+        let (mut vh, mut writer) = format(&mut dev, &opts).unwrap();
+        flush(&mut writer, &mut vh, &mut dev).unwrap();
+        assert_eq!(vh.attributes & VOL_ATTR_JOURNALED, 0);
+        // No blocks reserved for journal.
+        assert_eq!(writer.journal_info_block, 0);
+        assert_eq!(writer.journal_buffer_blocks, 0);
     }
 }

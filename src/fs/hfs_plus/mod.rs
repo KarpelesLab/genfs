@@ -1,23 +1,35 @@
-//! HFS+ — Apple's legacy macOS filesystem (pre-2017). Read-only support.
+//! HFS+ — Apple's legacy macOS filesystem (pre-2017).
 //!
 //! ## Status
 //!
-//! Read-only v1.1: open, list directories, stream regular file
-//! contents, read symbolic-link targets, and resolve hard links to
-//! their underlying indirect-node iNodes. Files whose data fork spills
+//! Read and write support.
+//!
+//! Read side: open, list directories, stream regular file contents,
+//! read symbolic-link targets, and resolve hard links to their
+//! underlying indirect-node iNodes. Files whose data fork spills
 //! beyond eight inline extents are read through the extents-overflow
 //! B-tree.
+//!
+//! Write side: format a fresh volume, create directories, regular
+//! files, symbolic links, and hard links; remove empty directories
+//! and files (with their forks). The writer keeps user data forks
+//! streaming-only (64 KiB scratch) and spills fragmented files into
+//! the extents-overflow B-tree when their run list outgrows the eight
+//! inline extents in a catalog record. An optional journal stub
+//! (clean, no transactions to replay) can be requested via
+//! [`writer::FormatOpts::journaled`].
 //!
 //! Implementation is based on Apple Technical Note TN1150, the
 //! canonical public reference for HFS+ on-disk structures.
 //!
 //! ## Scope and deferred features
 //!
-//! * Write support is out of scope entirely.
-//! * No journal replay — the on-disk catalog is read as-is.
+//! * No journal replay on read — the on-disk catalog is read as-is.
 //! * HFSX case-sensitive comparison is honoured at the catalog-key
 //!   level; non-ASCII case folding follows a simplified table.
-//! * Extended-attribute B-tree (`attributesFile`) is not parsed.
+//! * Extended-attribute B-tree (`attributesFile`) is not parsed or
+//!   written.
+//! * Resource forks are always written as empty.
 //!
 //! ## Module layout
 //!
@@ -187,7 +199,7 @@ impl HfsPlus {
             .next_cnid
             .checked_add(1)
             .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
-        let fork = writer::stream_data_to_blocks(w, dev, src, len)?;
+        let fork = writer::stream_data_to_blocks(w, dev, src, len, cnid)?;
         writer::insert_file(
             w,
             parent_id,
@@ -230,6 +242,34 @@ impl HfsPlus {
             w, parent_id, &name, cnid, mode, uid, gid, *b"slnk", *b"rhap", &fork, true,
         )?;
         Ok(cnid)
+    }
+
+    /// Create a hard link at `dst_path` pointing at the same on-disk
+    /// content as `src_path`. After the call:
+    ///
+    /// * the data fork that previously lived under `src_path` is owned
+    ///   by an `iNode<N>` file inside the HFS+ private-data directory;
+    /// * both `src_path` and `dst_path` are `hlnk`/`hfs+` indirect-node
+    ///   catalog entries with `BSDInfo.special == N`;
+    /// * the read path (`open_file_reader`, `list_path`, …) follows the
+    ///   hlnk pointer transparently and exposes the original bytes
+    ///   under both names.
+    ///
+    /// Returns the link-inode number `N`. Errors if `src_path` is a
+    /// directory, a symlink, or an already-existing hard link.
+    pub fn create_hardlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        src_path: &str,
+        dst_path: &str,
+    ) -> Result<u32> {
+        let (src_parent, src_name) = self.resolve_create_target(src_path)?;
+        let (dst_parent, dst_name) = self.resolve_create_target(dst_path)?;
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
+        writer::promote_to_hardlink(w, src_parent, &src_name, dst_parent, &dst_name)
     }
 
     /// Remove a file, symlink, or empty directory at `path`.

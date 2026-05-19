@@ -130,20 +130,56 @@ fn fold_case(c: u16) -> u16 {
 /// Lexicographic compare of two HFSUniStr255 values using case-insensitive
 /// folding for the "H+" variant. For "HX" we'd compare verbatim; the
 /// catalog driver hands a flag.
+///
+/// In the "H+" case-folding table some code points fold to zero, which
+/// means "ignore in comparison" — TN1150 §"Case-Insensitive String
+/// Comparison Algorithm" specifies this so that names with embedded
+/// "invisible" characters (notably the 4 leading NULs Apple uses for
+/// the `HFS+ Private Data` directory) sort by their visible portion.
+/// `fsck.hfsplus` enforces this: a "b-tree key ... is out of order"
+/// assertion fires if a name with leading NULs isn't placed where its
+/// non-NUL tail would land.
 pub fn compare_unistr(a: &UniStr, b: &UniStr, case_sensitive: bool) -> Ordering {
-    let n = a.code_units.len().min(b.code_units.len());
-    for i in 0..n {
-        let (ai, bi) = if case_sensitive {
-            (a.code_units[i], b.code_units[i])
-        } else {
-            (fold_case(a.code_units[i]), fold_case(b.code_units[i]))
-        };
-        match ai.cmp(&bi) {
-            Ordering::Equal => continue,
-            o => return o,
+    if case_sensitive {
+        // Binary compare — no folding, no ignored code units.
+        let n = a.code_units.len().min(b.code_units.len());
+        for i in 0..n {
+            match a.code_units[i].cmp(&b.code_units[i]) {
+                Ordering::Equal => continue,
+                o => return o,
+            }
+        }
+        return a.code_units.len().cmp(&b.code_units.len());
+    }
+    // Case-folding path: walk each side, skipping over ignorable units
+    // (those whose fold value is 0), and compare the folded values
+    // step-by-step.
+    let mut ai = 0usize;
+    let mut bi = 0usize;
+    loop {
+        while ai < a.code_units.len() && fold_case(a.code_units[ai]) == 0 {
+            ai += 1;
+        }
+        while bi < b.code_units.len() && fold_case(b.code_units[bi]) == 0 {
+            bi += 1;
+        }
+        match (ai < a.code_units.len(), bi < b.code_units.len()) {
+            (false, false) => return Ordering::Equal,
+            (false, true) => return Ordering::Less,
+            (true, false) => return Ordering::Greater,
+            (true, true) => {
+                let av = fold_case(a.code_units[ai]);
+                let bv = fold_case(b.code_units[bi]);
+                match av.cmp(&bv) {
+                    Ordering::Equal => {
+                        ai += 1;
+                        bi += 1;
+                    }
+                    o => return o,
+                }
+            }
         }
     }
-    a.code_units.len().cmp(&b.code_units.len())
 }
 
 /// A decoded catalog key.

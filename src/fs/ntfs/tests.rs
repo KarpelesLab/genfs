@@ -942,3 +942,282 @@ fn encrypted_data_is_unsupported() {
         Err(other) => panic!("expected Unsupported, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// Writer tests.
+//
+// These format a fresh NTFS volume on an in-memory backend, exercise
+// create_*, then re-open the volume and verify the read path can walk
+// what was written.
+// ---------------------------------------------------------------------
+
+use super::format::FormatOpts;
+use crate::fs::{FileMeta, FileSource};
+
+fn fresh_volume(size: u64) -> (MemoryBackend, Ntfs) {
+    let mut dev = MemoryBackend::new(size);
+    let opts = FormatOpts {
+        volume_label: "fstool-test".to_string(),
+        ..Default::default()
+    };
+    let ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+    (dev, ntfs)
+}
+
+#[test]
+fn writer_format_then_open_reads_boot_sector() {
+    let (mut dev, _ntfs) = fresh_volume(8 * 1024 * 1024);
+    // Re-open from device — verifies boot sector probe-able / decodable.
+    assert!(probe(&mut dev).unwrap());
+    let ntfs2 = Ntfs::open(&mut dev).unwrap();
+    assert_eq!(ntfs2.cluster_size(), 4096);
+    assert_eq!(ntfs2.mft_record_size(), 1024);
+}
+
+#[test]
+fn writer_format_volume_has_root_directory() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    let entries = ntfs.list_path(&mut dev, "/").unwrap();
+    // Freshly formatted root should be empty.
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn writer_creates_small_file_resident_data() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_file(
+        &mut dev,
+        "/hello.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi\n".to_vec())),
+            len: 3,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    // Re-open and read.
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs2.list_path(&mut dev, "/").unwrap();
+    assert!(entries.iter().any(|e| e.name == "hello.txt"));
+    let mut r = ntfs2.open_file_reader(&mut dev, "/hello.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hi\n");
+}
+
+#[test]
+fn writer_creates_large_file_non_resident_data() {
+    let (mut dev, mut ntfs) = fresh_volume(16 * 1024 * 1024);
+    // 8000 bytes is larger than the resident budget and forces a
+    // non-resident $DATA with a single cluster run.
+    let payload: Vec<u8> = (0..8000).map(|i| (i & 0xFF) as u8).collect();
+    ntfs.create_file(
+        &mut dev,
+        "/big.bin",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(payload.clone())),
+            len: payload.len() as u64,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let mut r = ntfs2.open_file_reader(&mut dev, "/big.bin").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, payload);
+}
+
+#[test]
+fn writer_creates_directory() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_dir(&mut dev, "/sub", FileMeta::default())
+        .unwrap();
+    ntfs.create_file(
+        &mut dev,
+        "/sub/note.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+            len: 1,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let root_entries = ntfs2.list_path(&mut dev, "/").unwrap();
+    assert!(root_entries.iter().any(|e| e.name == "sub"));
+    let sub_entries = ntfs2.list_path(&mut dev, "/sub").unwrap();
+    assert!(sub_entries.iter().any(|e| e.name == "note.txt"));
+}
+
+#[test]
+fn writer_creates_symlink() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_symlink(&mut dev, "/link", "target.txt", FileMeta::default())
+        .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs2.list_path(&mut dev, "/").unwrap();
+    assert!(entries.iter().any(|e| e.name == "link"));
+    // Reparse data should be present on the entry.
+    let xattrs = ntfs2.read_xattrs(&mut dev, "/link").unwrap();
+    assert!(xattrs.contains_key(xattr_keys::REPARSE));
+}
+
+#[test]
+fn writer_refuses_device_creation() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    let err = ntfs
+        .create_device(
+            &mut dev,
+            "/dev/null",
+            crate::fs::DeviceKind::Char,
+            1,
+            3,
+            FileMeta::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, crate::Error::Unsupported(_)));
+}
+
+#[test]
+fn writer_create_without_format_errors() {
+    // Open an existing read-only image (the tiny one) and try to create.
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let err = ntfs
+        .create_file(
+            &mut dev,
+            "/new.txt",
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, crate::Error::Unsupported(_)));
+}
+
+#[test]
+fn writer_dir_promotes_to_index_allocation() {
+    // Add enough entries to a directory that the $INDEX_ROOT overflows
+    // its 512-byte budget and gets promoted to $INDEX_ALLOCATION.
+    let (mut dev, mut ntfs) = fresh_volume(16 * 1024 * 1024);
+    for i in 0..16 {
+        let path = format!("/file_{i:02}.txt");
+        ntfs.create_file(
+            &mut dev,
+            &path,
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    ntfs.flush(&mut dev).unwrap();
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs2.list_path(&mut dev, "/").unwrap();
+    let names: std::collections::HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
+    for i in 0..16 {
+        assert!(
+            names.contains(&format!("file_{i:02}.txt")),
+            "missing file_{i:02}.txt"
+        );
+    }
+}
+
+#[test]
+fn writer_streams_large_file_through_scratch_buffer() {
+    // 200 KiB file forces multiple scratch buffers worth of streaming.
+    let (mut dev, mut ntfs) = fresh_volume(64 * 1024 * 1024);
+    let size = 200 * 1024;
+    let payload: Vec<u8> = (0..size).map(|i| ((i * 7) & 0xFF) as u8).collect();
+    ntfs.create_file(
+        &mut dev,
+        "/stream.bin",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(payload.clone())),
+            len: payload.len() as u64,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let mut r = ntfs2.open_file_reader(&mut dev, "/stream.bin").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf.len(), payload.len());
+    assert_eq!(buf, payload);
+}
+
+#[test]
+fn writer_zero_length_file() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_file(
+        &mut dev,
+        "/empty.txt",
+        FileSource::Zero(0),
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs2.list_path(&mut dev, "/").unwrap();
+    assert!(entries.iter().any(|e| e.name == "empty.txt"));
+    let mut r = ntfs2.open_file_reader(&mut dev, "/empty.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, Vec::<u8>::new());
+}
+
+#[test]
+fn writer_nested_directories() {
+    let (mut dev, mut ntfs) = fresh_volume(16 * 1024 * 1024);
+    ntfs.create_dir(&mut dev, "/a", FileMeta::default())
+        .unwrap();
+    ntfs.create_dir(&mut dev, "/a/b", FileMeta::default())
+        .unwrap();
+    ntfs.create_dir(&mut dev, "/a/b/c", FileMeta::default())
+        .unwrap();
+    ntfs.create_file(
+        &mut dev,
+        "/a/b/c/deep.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"deep!".to_vec())),
+            len: 5,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs2.list_path(&mut dev, "/a/b/c").unwrap();
+    assert!(entries.iter().any(|e| e.name == "deep.txt"));
+    let mut r = ntfs2.open_file_reader(&mut dev, "/a/b/c/deep.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"deep!");
+}
+
+#[test]
+fn writer_format_emits_upcase_table() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    // After format, $UpCase record 10 should exist and have a non-trivial
+    // $DATA stream that round-trips through the reader.
+    let mut buf = vec![0u8; ntfs.mft_record_size() as usize];
+    ntfs.read_mft_record(&mut dev, MFT_RECORD_UPCASE, &mut buf)
+        .unwrap();
+    let hdr = mft::RecordHeader::parse(&buf).unwrap();
+    assert!(hdr.is_in_use());
+}

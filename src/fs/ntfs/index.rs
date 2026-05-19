@@ -245,8 +245,11 @@ impl IndexBlockHeader {
 
     /// Total bytes the walker should scan starting at `entries_start()`.
     pub fn entries_byte_len(&self) -> usize {
-        // `bytes_in_use` covers the index header (16 bytes) + entries
-        // stream; subtract the 16 byte header.
-        (self.bytes_in_use as usize).saturating_sub(16)
+        // `bytes_in_use` is measured from the index header start (offset
+        // 0x18 in the INDX block). It includes the 16-byte header **plus**
+        // any padding / USA bytes that sit between the header and the
+        // first entry. Subtract `first_entry_offset` to get the entries-
+        // stream length exactly.
+        (self.bytes_in_use as usize).saturating_sub(self.first_entry_offset as usize)
     }
 }

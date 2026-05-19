@@ -69,10 +69,10 @@ pub fn apply_fixup(buf: &mut [u8], sector_size: usize) -> Result<()> {
     Ok(())
 }
 
-/// Apply the inverse fixup transform for test fixtures. Place the original
+/// Apply the inverse fixup transform. Used both by test fixtures and by
+/// the writer when emitting fresh MFT / INDX records: place the original
 /// last-two-bytes of every sector into the USA, then stamp the USN into
-/// those tails.
-#[cfg(test)]
+/// those tails so subsequent `apply_fixup` calls round-trip.
 pub fn install_fixup(buf: &mut [u8], sector_size: usize, usn: u16) {
     let usa_offset = u16::from_le_bytes([buf[4], buf[5]]) as usize;
     let usa_size = u16::from_le_bytes([buf[6], buf[7]]) as usize;

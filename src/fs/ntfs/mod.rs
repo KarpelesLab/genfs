@@ -62,10 +62,13 @@ pub mod attribute;
 pub mod attribute_list;
 pub mod boot;
 pub mod compression;
+pub mod format;
 pub mod index;
 pub mod mft;
 pub mod run_list;
 pub mod secure;
+pub mod upcase_gen;
+pub mod writer;
 
 use attribute::{
     ATTR_FLAG_COMPRESSED, ATTR_FLAG_ENCRYPTED, AttributeIter, AttributeKind, FileName,
@@ -115,6 +118,9 @@ pub struct Ntfs {
     /// `None` means "haven't tried yet". An empty `Some(_)` means we tried
     /// and the image had no usable `$Secure`.
     sii_cache: Option<HashMap<u32, (u64, u32)>>,
+    /// Writer state — populated only after `Ntfs::format` (or
+    /// `Ntfs::open_for_write`). Read-only opens leave this `None`.
+    writer: Option<writer::WriterState>,
 }
 
 impl Ntfs {
@@ -134,6 +140,7 @@ impl Ntfs {
             mft_runs: Vec::new(),
             upcase: None,
             sii_cache: None,
+            writer: None,
         })
     }
 

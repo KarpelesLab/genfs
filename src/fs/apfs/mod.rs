@@ -46,15 +46,20 @@
 //!   detected via `APFS_INCOMPAT_SEALED_VOLUME` and refused.
 //! - **No FusionDrive tiering** (the secondary `nx_efi_jumpstart`
 //!   structures, tier-2 omap, etc.).
-//! - **No xattrs, no resource forks, no clones, no compressed files**
+//! - **Xattrs:** embedded xattrs are surfaced by
+//!   [`Apfs::read_xattrs`]. Dstream-backed xattrs (`XATTR_DATA_STREAM`)
+//!   are silently skipped on read and refused on write.
+//! - **No resource forks, no clones, no compressed files**
 //!   (`UF_COMPRESSED` files are read as if they had no data).
 //! - **Fletcher-64 checksum is computed but not enforced** by default —
 //!   we accept blocks whose checksum fails and emit no warnings, because
 //!   real images often disagree with the spec in subtle ways and we'd
 //!   rather return data than refuse it. The checksum helper is still
 //!   exposed for callers that want to enforce it.
-//! - **Writer is single-leaf-only.** See [`mod@write`] for the per-feature
-//!   limits.
+//! - **Writer** supports multi-leaf fs-trees and multi-leaf omaps with
+//!   one internal level above the leaves. Trees too large for that
+//!   single internal level return `Unsupported`. See [`mod@write`] for
+//!   the per-feature limits.
 //!
 //! ## References
 //!
@@ -77,8 +82,8 @@ use crate::block::BlockDevice;
 
 use fstree::{DrecKeyLayout, FsKeyTarget, FsTreeCtx, RangeScan};
 use jrec::{
-    APFS_TYPE_DIR_REC, APFS_TYPE_FILE_EXTENT, APFS_TYPE_INODE, DT_DIR, DT_LNK, DT_REG, DrecKey,
-    DrecVal, FileExtentVal, InodeVal,
+    APFS_TYPE_DIR_REC, APFS_TYPE_FILE_EXTENT, APFS_TYPE_INODE, APFS_TYPE_XATTR, DT_DIR, DT_LNK,
+    DT_REG, DrecKey, DrecVal, FileExtentVal, InodeVal,
 };
 use obj::{OBJECT_TYPE_MASK, ObjPhys};
 use omap::{OmapPhys, lookup as omap_lookup};
@@ -471,6 +476,71 @@ impl Apfs {
     ) -> Result<Vec<crate::fs::DirEntry>> {
         let target_oid = self.resolve_path_to_oid(dev, path)?;
         self.list_dir(dev, target_oid)
+    }
+
+    /// Read every extended attribute attached to the inode at `path`.
+    ///
+    /// APFS xattrs are individual fs-tree records keyed by
+    /// `(parent_oid, APFS_TYPE_XATTR, name)`; this walks that prefix
+    /// range and returns each `(name → value)` pair as a `HashMap`.
+    ///
+    /// Only embedded (`XATTR_DATA_EMBEDDED`) xattrs are returned;
+    /// dstream-backed xattrs (`XATTR_DATA_STREAM`) are silently skipped
+    /// because the writer never emits them and our reader doesn't yet
+    /// resolve the secondary dstream object. Callers that need
+    /// large-xattr support should run their own scan via the lower-level
+    /// `fstree::RangeScan` API.
+    pub fn read_xattrs(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>> {
+        let target_oid = self.resolve_path_to_oid(dev, path)?;
+        let target = FsKeyTarget {
+            oid: target_oid,
+            kind: APFS_TYPE_XATTR,
+            tail: &[],
+            drec_layout: self.drec_layout,
+        };
+        let block_size = self.block_size;
+        let mut ctx = self.fs_ctx.borrow_mut();
+        let mut out = std::collections::HashMap::new();
+        let mut scan =
+            RangeScan::start(&self.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+                read_at_paddr(dev, paddr, block_size, buf)
+            })?;
+        while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })? {
+            // Key: j_xattr_key_t = j_key_t(8) + u16 name_len + name[name_len]
+            if kb.len() < 10 {
+                continue;
+            }
+            let nlen = u16::from_le_bytes(kb[8..10].try_into().unwrap()) as usize;
+            if 10 + nlen > kb.len() || nlen == 0 {
+                continue;
+            }
+            let raw = &kb[10..10 + nlen];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            let name = String::from_utf8_lossy(&raw[..end]).into_owned();
+            // Value: j_xattr_val_t = u16 flags + u16 xdata_len + xdata
+            if vb.len() < 4 {
+                continue;
+            }
+            let flags = u16::from_le_bytes(vb[0..2].try_into().unwrap());
+            let xdata_len = u16::from_le_bytes(vb[2..4].try_into().unwrap()) as usize;
+            const XATTR_DATA_EMBEDDED: u16 = 0x0002;
+            if flags & XATTR_DATA_EMBEDDED == 0 {
+                // Dstream-backed xattr — skip silently.
+                continue;
+            }
+            if 4 + xdata_len > vb.len() {
+                continue;
+            }
+            let value = vb[4..4 + xdata_len].to_vec();
+            out.insert(name, value);
+        }
+        Ok(out)
     }
 
     /// Open a regular file for streaming reads. The returned reader

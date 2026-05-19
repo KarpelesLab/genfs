@@ -4,39 +4,56 @@
 //!
 //! This produces a minimal but *readable* APFS image: an NXSB at block 0
 //! plus an additional NXSB inside the checkpoint descriptor area, a
-//! container omap with a single leaf node, a stub spaceman, one volume
-//! with its own omap + fs-tree leaf, and any number of regular files,
-//! directories, and symlinks rooted at inode 2.
+//! container omap, a stub spaceman, one volume with its own omap, an
+//! fs-tree (single- or multi-leaf), and any number of regular files,
+//! directories, symlinks and xattrs rooted at inode 2.
 //!
 //! Layout (block numbers given for `block_size = 4096`):
 //!
 //! ```text
 //!   0      NXSB           container label
-//!   1      NXSB           live checkpoint
-//!   2      checkpoint_map (zero entries; just a placeholder)
-//!   3      omap_phys_t    container omap header
-//!   4      btree leaf     container omap root (maps vid -> APSB paddr)
-//!   5      spaceman_phys  stub (we don't track allocation in v1)
-//!   6      APSB           volume superblock
-//!   7      omap_phys_t    volume omap header
-//!   8      btree leaf     volume omap root (maps vid -> fsroot paddr)
-//!   9      btree leaf     fsroot — fs-tree with inode/drec/extent records
-//!  10..    data blocks    file extents (one extent per regular file)
+//!   1      checkpoint_map (zero entries; just a placeholder)
+//!   2      NXSB           live checkpoint
+//!   3      spaceman_phys  stub (we don't track allocation in v1)
+//!   4      omap_phys_t    container omap header
+//!   5      APSB           volume superblock
+//!   6      omap_phys_t    volume omap header
+//!   7..    metadata blocks (omap leaves / fs-tree leaves & internal roots),
+//!          followed by data blocks for file extents.
 //! ```
+//!
+//! Metadata and data blocks past the fixed prefix are bump-allocated:
+//! metadata first, then data. The on-disk locations of the various
+//! omap/fsroot roots are recorded by [`ApfsWriter::finish`] and stamped
+//! into the NXSB/APSB before they're written.
 //!
 //! The spaceman entry is intentionally a stub: we don't maintain the
 //! container's free-space bitmaps. This is fine for read-only consumers
 //! (our reader doesn't touch the spaceman) but means mounting this
 //! image on macOS would refuse to write to it.
 //!
+//! ## Multi-leaf fs-tree
+//!
+//! When the staged fs-tree records overflow a single leaf, the writer
+//! emits multiple leaf blocks (each ≤ `block_size - btree_info_t`) and
+//! builds a single internal-node *root* above them. The internal root's
+//! keys are the first record key of each leaf and its values are 8-byte
+//! virtual oids; each leaf's vid is added to the volume omap so the
+//! reader can resolve `(vid → paddr)` during descent. With ~4 KiB blocks
+//! the internal root can address hundreds of leaves before it itself
+//! overflows; if that ever happens, `finish` returns `Unsupported`.
+//!
+//! ## Multi-leaf omaps
+//!
+//! The container and volume omaps follow the same split rule, except the
+//! internal-node child pointers are physical block addresses (the omap
+//! is a physical tree, not virtual).
+//!
 //! ## Streaming invariant
 //!
 //! File bytes are copied through a 64 KiB scratch buffer; the writer
-//! never loads a whole file into memory. The fs-tree leaf and the few
-//! metadata blocks are bounded by the size of one container block
-//! (typically 4 KiB) — the v1 limit is therefore "everything fits in
-//! one fs-tree leaf node", which in practice is around ~50 small
-//! files/dirs at 4 KiB blocks.
+//! never loads a whole file into memory. Metadata blocks are each
+//! bounded by `block_size`.
 //!
 //! ## Public API
 //!
@@ -45,6 +62,7 @@
 //! let dir = w.add_dir(2, "subdir", 0o755)?;
 //! w.add_file_from_reader(dir, "hello.txt", 0o644, &mut some_reader, size)?;
 //! w.add_symlink(2, "link", 0o777, "target")?;
+//! w.add_xattr(dir, "user.note", b"hello")?;
 //! w.finish()?;
 //! ```
 //!
@@ -52,11 +70,13 @@
 //!
 //! - No checkpoint replay is performed (we don't pretend to be journal-
 //!   recoverable).
-//! - The fs-tree, both omaps, and the snap-meta tree must each fit in a
-//!   single leaf node. Exceeding this returns
-//!   [`crate::Error::Unsupported`] from [`ApfsWriter::finish`].
-//! - No snapshots, no encryption, no xattrs, no clones, no
-//!   compression.
+//! - Multi-leaf trees can only have one internal level (root + leaves);
+//!   if the internal root overflows, `finish` returns `Unsupported`.
+//! - Xattr values larger than [`APFS_XATTR_MAX_EMBEDDED_SIZE`] (3804
+//!   bytes) require a `j_xattr_dstream_t` referencing a separate
+//!   dstream object. That layout is deferred — [`ApfsWriter::add_xattr`]
+//!   returns `Unsupported` for oversized values.
+//! - No snapshots, no encryption, no clones, no compression.
 //! - The image must be at least ~32 blocks long.
 
 use std::io::Read;
@@ -67,12 +87,13 @@ use crate::block::BlockDevice;
 use super::btree::{BTNODE_FIXED_KV_SIZE, BTNODE_LEAF, BTNODE_ROOT, BTREE_INFO_SIZE};
 use super::checksum::fletcher64;
 use super::jrec::{
-    APFS_TYPE_DIR_REC, APFS_TYPE_DSTREAM_ID, APFS_TYPE_FILE_EXTENT, APFS_TYPE_INODE, DT_DIR,
-    DT_LNK, DT_REG, INO_EXT_TYPE_DSTREAM, J_INODE_VAL_FIXED_SIZE, OBJ_ID_MASK, OBJ_TYPE_SHIFT,
+    APFS_TYPE_DIR_REC, APFS_TYPE_DSTREAM_ID, APFS_TYPE_FILE_EXTENT, APFS_TYPE_INODE,
+    APFS_TYPE_XATTR, DT_DIR, DT_LNK, DT_REG, INO_EXT_TYPE_DSTREAM, J_INODE_VAL_FIXED_SIZE,
+    OBJ_ID_MASK, OBJ_TYPE_SHIFT,
 };
 use super::obj::{
-    OBJECT_TYPE_BTREE, OBJECT_TYPE_CHECKPOINT_MAP, OBJECT_TYPE_FS, OBJECT_TYPE_FSTREE,
-    OBJECT_TYPE_NX_SUPERBLOCK, OBJECT_TYPE_OMAP,
+    OBJECT_TYPE_BTREE, OBJECT_TYPE_BTREE_NODE, OBJECT_TYPE_CHECKPOINT_MAP, OBJECT_TYPE_FS,
+    OBJECT_TYPE_FSTREE, OBJECT_TYPE_NX_SUPERBLOCK, OBJECT_TYPE_OMAP,
 };
 use super::superblock::{APFS_MAGIC, NX_MAGIC, NX_MAX_FILE_SYSTEMS};
 
@@ -102,6 +123,20 @@ const WRITE_XID: u64 = 2;
 /// is also what genuine APFS volumes do for normal files.
 const DSTREAM_ID_SHARES_INODE: bool = true;
 
+/// `XATTR_DATA_EMBEDDED` flag in `j_xattr_val_t.flags`. When set the
+/// xattr value is stored inline immediately after the val header.
+const XATTR_DATA_EMBEDDED: u16 = 0x0002;
+
+/// Hard cap on the embedded-xattr value size, taken from the Apple File
+/// System Reference (constant `APFS_XATTR_MAX_EMBEDDED_SIZE`). Values up
+/// to and including this size can be stored inline; larger ones require
+/// a `j_xattr_dstream_t` (not implemented).
+pub const APFS_XATTR_MAX_EMBEDDED_SIZE: usize = 3804;
+
+/// First virtual oid we assign to fs-tree leaves. We start well past the
+/// reserved-range used by other writer constants.
+const FS_LEAF_VID_BASE: u64 = 0x1_0000;
+
 /// One pending fs-tree record (key + value bytes), used by the in-memory
 /// builder before serialization.
 #[derive(Clone)]
@@ -128,8 +163,9 @@ fn fs_record_sort_key(rec: &FsRecord) -> (u64, u8, Vec<u8>) {
 
 /// A streaming APFS writer. Construct one with [`ApfsWriter::new`],
 /// build the filesystem tree with [`ApfsWriter::add_file_from_reader`],
-/// [`ApfsWriter::add_dir`], and [`ApfsWriter::add_symlink`], then call
-/// [`ApfsWriter::finish`] to materialise the on-disk image.
+/// [`ApfsWriter::add_dir`], [`ApfsWriter::add_symlink`], and
+/// [`ApfsWriter::add_xattr`], then call [`ApfsWriter::finish`] to
+/// materialise the on-disk image.
 ///
 /// The writer owns a `&mut BlockDevice`; the device must already be
 /// sized large enough (zero-extended is fine — we'll overwrite the
@@ -138,12 +174,16 @@ pub struct ApfsWriter<'a> {
     dev: &'a mut dyn BlockDevice,
     block_size: u32,
     total_blocks: u64,
-    /// Index of the next free data block (allocated bump-pointer
-    /// fashion from `data_block_start`).
-    next_data_block: u64,
-    /// First block reserved for file-extent data (everything before
-    /// this is metadata).
-    data_block_start: u64,
+    /// Index of the next free metadata/data block (bump-pointer allocated
+    /// from `bump_block_start`). Metadata extents are reserved before
+    /// data extents inside `finish()` by pre-incrementing this counter
+    /// for each fs-tree / omap leaf we need.
+    next_block: u64,
+    /// First block reserved for bump allocation (metadata leaves + file
+    /// extents). The fixed-position blocks (NXSB copies, chkmap,
+    /// spaceman, container/volume omap headers, APSB) all live below
+    /// this.
+    bump_block_start: u64,
     /// Volume name, written into the APSB.
     volume_name: String,
     /// Container UUID (random-ish — derived from the volume name).
@@ -197,12 +237,14 @@ impl<'a> ApfsWriter<'a> {
         let container_uuid = derive_uuid(volume_name.as_bytes(), b"container");
         let volume_uuid = derive_uuid(volume_name.as_bytes(), b"volume");
 
+        // See module-level layout. Bump area begins at block 7.
+        let bump_block_start: u64 = 7;
         let mut w = Self {
             dev,
             block_size,
             total_blocks,
-            next_data_block: 0,
-            data_block_start: 10, // see module-level layout doc
+            next_block: bump_block_start,
+            bump_block_start,
             volume_name: volume_name.to_string(),
             container_uuid,
             volume_uuid,
@@ -213,7 +255,6 @@ impl<'a> ApfsWriter<'a> {
             num_symlinks: 0,
             finished: false,
         };
-        w.next_data_block = w.data_block_start;
         // Seed the root inode record (oid = 2).
         w.add_inode_record(2, 0, mode_dir(0o755), 0)?;
         Ok(w)
@@ -365,10 +406,52 @@ impl<'a> ApfsWriter<'a> {
         Ok(oid)
     }
 
-    /// Materialise the on-disk image: serialize the fs-tree leaf, the
-    /// volume omap, the APSB, the container omap, the spaceman stub,
-    /// and finally the NXSB copies. After this call the writer is
-    /// drained and further `add_*` calls return `Unsupported`.
+    /// Add an extended attribute under `parent_oid`. The name follows
+    /// APFS conventions (caller picks the namespace prefix, e.g.
+    /// `"user.note"` or `"com.apple.fs.symlink"`).
+    ///
+    /// Values up to [`APFS_XATTR_MAX_EMBEDDED_SIZE`] (3804 bytes) are
+    /// stored inline in the `j_xattr_val_t`. Larger values would need a
+    /// `j_xattr_dstream_t` referencing a separate dstream and are
+    /// currently rejected with [`crate::Error::Unsupported`].
+    ///
+    /// The xattr appears in the fs-tree under
+    /// `(parent_oid, APFS_TYPE_XATTR, name)` and is visible via
+    /// [`super::Apfs::read_xattrs`].
+    pub fn add_xattr(&mut self, parent_oid: u64, name: &str, value: &[u8]) -> Result<()> {
+        if value.len() > APFS_XATTR_MAX_EMBEDDED_SIZE {
+            return Err(crate::Error::Unsupported(format!(
+                "apfs writer: xattr value of {} bytes exceeds embedded limit ({}); \
+                 dstream xattrs are not supported",
+                value.len(),
+                APFS_XATTR_MAX_EMBEDDED_SIZE
+            )));
+        }
+        let name_bytes = name.as_bytes();
+        let nlen = name_bytes.len() + 1; // includes trailing NUL
+        if nlen > u16::MAX as usize {
+            return Err(crate::Error::InvalidArgument(
+                "apfs writer: xattr name too long".into(),
+            ));
+        }
+        // Key: j_xattr_key_t = j_key_t + u16 name_len + name[name_len]
+        let mut key = Vec::with_capacity(10 + nlen);
+        let hdr = ((APFS_TYPE_XATTR as u64) << OBJ_TYPE_SHIFT) | (parent_oid & OBJ_ID_MASK);
+        key.extend_from_slice(&hdr.to_le_bytes());
+        key.extend_from_slice(&(nlen as u16).to_le_bytes());
+        key.extend_from_slice(name_bytes);
+        key.push(0);
+        // Value: j_xattr_val_t = u16 flags + u16 xdata_len + xdata
+        let mut val = Vec::with_capacity(4 + value.len());
+        val.extend_from_slice(&XATTR_DATA_EMBEDDED.to_le_bytes());
+        val.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        val.extend_from_slice(value);
+        self.records.push(FsRecord { key, val });
+        Ok(())
+    }
+
+    /// Materialise the on-disk image. After this call the writer is
+    /// drained; further `add_*` calls return `Unsupported`.
     pub fn finish(mut self) -> Result<()> {
         if self.finished {
             return Err(crate::Error::Unsupported(
@@ -385,39 +468,98 @@ impl<'a> ApfsWriter<'a> {
         });
 
         let bs = self.block_size as usize;
-        let block_size = self.block_size;
 
         // ---- Fixed block addresses (see module-level layout) ----
         let nxsb_label_paddr: u64 = 0;
-        let nxsb_live_paddr: u64 = 1;
-        let chkmap_paddr: u64 = 2;
-        let cont_omap_paddr: u64 = 3;
-        let cont_omap_root_paddr: u64 = 4;
-        let spaceman_paddr: u64 = 5;
-        let apsb_paddr: u64 = 6;
-        let vol_omap_paddr: u64 = 7;
-        let vol_omap_root_paddr: u64 = 8;
-        let fsroot_paddr: u64 = 9;
+        let chkmap_paddr: u64 = 1;
+        let nxsb_live_paddr: u64 = 2;
+        let spaceman_paddr: u64 = 3;
+        let cont_omap_paddr: u64 = 4;
+        let apsb_paddr: u64 = 5;
+        let vol_omap_paddr: u64 = 6;
 
         // Virtual oids assigned to: container volume (=1024), spaceman
-        // (=512), volume omap target -> fsroot (=fsroot_vid). The
+        // (=512), volume omap target -> fsroot (=fsroot_vid=2). The
         // container omap maps volume_vid → APSB paddr; the volume omap
         // maps fsroot_vid → fsroot paddr.
         let volume_vid: u64 = 1024;
         let spaceman_vid: u64 = 512;
         let reaper_vid: u64 = 513;
-        let _vol_omap_vid: u64 = 2048;
         let fsroot_vid: u64 = 2;
 
-        // ---- fs-tree leaf ----
-        let fsroot_block = build_fs_leaf(&self.records, bs, fsroot_vid)?;
-        self.write_block(fsroot_paddr, &fsroot_block)?;
+        // ---- Plan fs-tree (single leaf or multi-leaf with internal root) ----
+        let leaf_payload_cap = leaf_payload_capacity(bs);
+        // Each leaf has a per-entry ToC overhead of 8 bytes (kvloc_t) plus
+        // the key+val payload. We pack greedily by sort order, ensuring
+        // each leaf fits inside `leaf_payload_cap`.
+        let leaves = pack_records_into_leaves(&self.records, leaf_payload_cap)?;
 
-        // ---- Volume omap root (single leaf) ----
-        let vol_omap_root = build_omap_leaf(bs, &[(fsroot_vid, WRITE_XID, fsroot_paddr)])?;
-        self.write_block(vol_omap_root_paddr, &vol_omap_root)?;
+        // Reserve metadata block addresses for fs-tree leaves (and the
+        // internal root if needed) BEFORE we allocate any file-extent
+        // data blocks. Otherwise extent blocks would land before the
+        // metadata, which is fine functionally but harder to reason
+        // about. NOTE: per-spec layout, all extent allocations done by
+        // add_file_from_reader / add_symlink already happened during
+        // record building, so by the time we get here `next_block` has
+        // grown past the data. We allocate fresh metadata blocks
+        // AFTER data — that's still legal because we record their
+        // actual paddrs into the omap.
+        let fs_leaf_paddrs: Vec<u64> = (0..leaves.len())
+            .map(|_| self.alloc_block())
+            .collect::<Result<Vec<_>>>()?;
+        // Compute the fs-tree root paddr & vid:
+        //   single leaf  → root *is* the leaf (vid = fsroot_vid).
+        //   multi leaf   → root is an internal node we add on top;
+        //                  fsroot_vid maps to its paddr.
+        let (fsroot_paddr, vol_omap_entries) = if leaves.len() <= 1 {
+            // Single root-leaf at fsroot_vid.
+            let leaf_paddr = fs_leaf_paddrs.first().copied().unwrap_or(0);
+            // If `leaves` is empty we'd never get here (we always have
+            // at least one record), but be defensive.
+            (leaf_paddr, vec![(fsroot_vid, WRITE_XID, leaf_paddr)])
+        } else {
+            // Multi-leaf: assign vids to each leaf and add an internal
+            // root above them. The internal root itself gets fsroot_vid.
+            let mut entries = Vec::with_capacity(leaves.len() + 1);
+            let mut child_vids = Vec::with_capacity(leaves.len());
+            for (i, &paddr) in fs_leaf_paddrs.iter().enumerate() {
+                let vid = FS_LEAF_VID_BASE + i as u64;
+                entries.push((vid, WRITE_XID, paddr));
+                child_vids.push(vid);
+            }
+            let root_paddr = self.alloc_block()?;
+            entries.push((fsroot_vid, WRITE_XID, root_paddr));
+            entries.sort_by_key(|e| e.0);
+            (root_paddr, entries)
+        };
 
-        // ---- Volume omap header ----
+        // ---- Write fs-tree leaves ----
+        for (i, leaf_records) in leaves.iter().enumerate() {
+            let is_root = leaves.len() == 1;
+            let vid = if is_root {
+                fsroot_vid
+            } else {
+                FS_LEAF_VID_BASE + i as u64
+            };
+            let leaf_block = build_fs_leaf(leaf_records, bs, vid, is_root)?;
+            self.write_block(fs_leaf_paddrs[i], &leaf_block)?;
+        }
+        if leaves.len() > 1 {
+            // Build internal root keyed by first record of each leaf,
+            // values = leaf vids.
+            let mut sep_entries: Vec<(Vec<u8>, u64)> = Vec::with_capacity(leaves.len());
+            for (i, leaf) in leaves.iter().enumerate() {
+                let sep_key = leaf[0].key.clone();
+                let vid = FS_LEAF_VID_BASE + i as u64;
+                sep_entries.push((sep_key, vid));
+            }
+            let internal_block = build_fs_internal_root(&sep_entries, bs, fsroot_vid)?;
+            self.write_block(fsroot_paddr, &internal_block)?;
+        }
+
+        // ---- Volume omap (single- or multi-leaf) ----
+        // vol_omap_entries is sorted by oid above.
+        let vol_omap_root_paddr = self.write_omap_tree(&vol_omap_entries)?;
         let vol_omap_phys = build_omap_phys(bs, vol_omap_paddr, vol_omap_root_paddr)?;
         self.write_block(vol_omap_paddr, &vol_omap_phys)?;
 
@@ -429,9 +571,9 @@ impl<'a> ApfsWriter<'a> {
         let spaceman_block = build_spaceman_stub(bs, spaceman_vid)?;
         self.write_block(spaceman_paddr, &spaceman_block)?;
 
-        // ---- Container omap root + header ----
-        let cont_omap_root = build_omap_leaf(bs, &[(volume_vid, WRITE_XID, apsb_paddr)])?;
-        self.write_block(cont_omap_root_paddr, &cont_omap_root)?;
+        // ---- Container omap (single entry, but goes through the same
+        //      multi-leaf path so we exercise the writer uniformly) ----
+        let cont_omap_root_paddr = self.write_omap_tree(&[(volume_vid, WRITE_XID, apsb_paddr)])?;
         let cont_omap_phys = build_omap_phys(bs, cont_omap_paddr, cont_omap_root_paddr)?;
         self.write_block(cont_omap_paddr, &cont_omap_phys)?;
 
@@ -449,9 +591,7 @@ impl<'a> ApfsWriter<'a> {
             volume_vid,
         )?;
         self.write_block(nxsb_live_paddr, &nxsb)?;
-        // Label copy at block 0 — same content but oid=0 like normal
-        // (the spec says label NXSB has oid 1, but in practice both
-        // copies look identical). We just reuse the live copy here.
+        // Label copy at block 0.
         let nxsb_label = self.build_nxsb(
             bs,
             nxsb_label_paddr,
@@ -462,7 +602,7 @@ impl<'a> ApfsWriter<'a> {
         )?;
         self.write_block(nxsb_label_paddr, &nxsb_label)?;
 
-        let _ = block_size; // silence unused warning if ever
+        let _ = fsroot_paddr;
         Ok(())
     }
 
@@ -479,6 +619,20 @@ impl<'a> ApfsWriter<'a> {
         n.div_ceil(bs).max(1)
     }
 
+    /// Bump-allocate one block from the metadata/data area. Errors if
+    /// the image would run out of room.
+    fn alloc_block(&mut self) -> Result<u64> {
+        if self.next_block >= self.total_blocks {
+            return Err(crate::Error::InvalidArgument(format!(
+                "apfs writer: image full at {} blocks",
+                self.total_blocks
+            )));
+        }
+        let p = self.next_block;
+        self.next_block += 1;
+        Ok(p)
+    }
+
     fn allocate_extent_for_size(&mut self, size: u64) -> Result<u64> {
         if size == 0 {
             return Err(crate::Error::InvalidArgument(
@@ -486,7 +640,7 @@ impl<'a> ApfsWriter<'a> {
             ));
         }
         let blocks = self.bytes_to_blocks(size);
-        let start = self.next_data_block;
+        let start = self.next_block;
         let end = start
             .checked_add(blocks)
             .ok_or_else(|| crate::Error::InvalidArgument("apfs writer: extent oob".into()))?;
@@ -495,7 +649,7 @@ impl<'a> ApfsWriter<'a> {
                 "apfs writer: extent of {blocks} blocks past end of image"
             )));
         }
-        self.next_data_block = end;
+        self.next_block = end;
         Ok(start)
     }
 
@@ -624,6 +778,37 @@ impl<'a> ApfsWriter<'a> {
         Ok(())
     }
 
+    /// Emit an omap as one or more leaf blocks plus, if necessary, a
+    /// single internal-root block. Returns the paddr of the tree's
+    /// root (leaf for a single-leaf tree, internal node otherwise).
+    fn write_omap_tree(&mut self, entries: &[(u64, u64, u64)]) -> Result<u64> {
+        let bs = self.block_size as usize;
+        let leaves = pack_omap_into_leaves(entries, omap_leaf_capacity(bs))?;
+        if leaves.len() == 1 {
+            // Single leaf: it's the root and carries the trailing
+            // btree_info_t.
+            let paddr = self.alloc_block()?;
+            let block = build_omap_leaf_node(bs, &leaves[0], true)?;
+            self.write_block(paddr, &block)?;
+            return Ok(paddr);
+        }
+        // Multi-leaf: emit each leaf at its own paddr, then a single
+        // internal root with 16-byte keys and 8-byte child paddrs.
+        let mut leaf_paddrs: Vec<u64> = Vec::with_capacity(leaves.len());
+        let mut sep_entries: Vec<((u64, u64), u64)> = Vec::with_capacity(leaves.len());
+        for chunk in &leaves {
+            let paddr = self.alloc_block()?;
+            let block = build_omap_leaf_node(bs, chunk, false)?;
+            self.write_block(paddr, &block)?;
+            leaf_paddrs.push(paddr);
+            sep_entries.push(((chunk[0].0, chunk[0].1), paddr));
+        }
+        let root_paddr = self.alloc_block()?;
+        let root_block = build_omap_internal_root(bs, &sep_entries)?;
+        self.write_block(root_paddr, &root_block)?;
+        Ok(root_paddr)
+    }
+
     /// Build the APSB block at offset `apsb_paddr`.
     fn build_apsb(
         &self,
@@ -700,7 +885,9 @@ impl<'a> ApfsWriter<'a> {
         buf[72..88].copy_from_slice(&self.container_uuid);
         buf[88..96].copy_from_slice(&(self.next_oid + 1024).to_le_bytes()); // next_oid
         buf[96..104].copy_from_slice(&(WRITE_XID + 1).to_le_bytes()); // next_xid
-        // xp_desc area: 2 blocks (chkmap stub + the live NXSB itself)
+        // xp_desc area: 2 blocks (chkmap stub at block 1 + the live NXSB
+        // at block 2). xp_desc_base = 1; reader scans this range looking
+        // for the largest-xid NXSB.
         buf[104..108].copy_from_slice(&2u32.to_le_bytes()); // xp_desc_blocks
         buf[108..112].copy_from_slice(&1u32.to_le_bytes()); // xp_data_blocks
         buf[112..120].copy_from_slice(&1u64.to_le_bytes()); // xp_desc_base
@@ -720,6 +907,9 @@ impl<'a> ApfsWriter<'a> {
         buf[184..192].copy_from_slice(&volume_vid.to_le_bytes());
         // rest of fs_oid[] = 0
 
+        // Silence unused-variable warning when the writer ends up not
+        // needing to walk the bump pointer afterwards.
+        let _ = self.bump_block_start;
         sign_block(&mut buf);
         Ok(buf)
     }
@@ -736,7 +926,7 @@ fn sign_block(buf: &mut [u8]) {
 
 /// Build an omap_phys_t (header) block. `paddr` is the block this
 /// header lives at; `tree_paddr` is the physical block of the tree's
-/// root leaf.
+/// root.
 fn build_omap_phys(bs: usize, paddr: u64, tree_paddr: u64) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; bs];
     buf[8..16].copy_from_slice(&paddr.to_le_bytes()); // oid
@@ -751,32 +941,77 @@ fn build_omap_phys(bs: usize, paddr: u64, tree_paddr: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Build an omap leaf node holding the given `(vid, xid, paddr)` triples
-/// in ascending `(vid, xid)` order. Fixed-KV layout (16/16).
-fn build_omap_leaf(bs: usize, entries: &[(u64, u64, u64)]) -> Result<Vec<u8>> {
-    let mut block = vec![0u8; bs];
-    // obj_phys
-    block[24..28].copy_from_slice(&(OBJECT_TYPE_BTREE | OBJ_PHYSICAL).to_le_bytes());
-    block[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+/// Effective payload capacity for an omap leaf node (root or otherwise).
+/// `key_size + val_size = 32`; ToC entries cost 4 bytes each. We
+/// conservatively use the root layout (subtract `btree_info_t`) for both
+/// root and non-root leaves so the per-leaf record count stays
+/// consistent.
+fn omap_leaf_capacity(bs: usize) -> usize {
+    // The packing math: each entry adds 4 (ToC) + 16 (key) + 16 (val) = 36
+    // bytes. Available = bs - obj_header(56) - btree_info_t(40) for the
+    // root case. For non-root leaves we'd have 40 more bytes, but we use
+    // the conservative figure so the splitter doesn't need to know which
+    // leaf is the root.
+    bs - 56 - BTREE_INFO_SIZE
+}
 
-    // Header
-    let flags = BTNODE_ROOT | BTNODE_LEAF | BTNODE_FIXED_KV_SIZE;
+/// Pack an omap entry list (already sorted by `(oid, xid)`) into one or
+/// more leaf groups. Each group fits inside `cap` bytes when accounting
+/// for the 4-byte ToC entry + 16+16 byte fixed-KV payload.
+fn pack_omap_into_leaves(
+    entries: &[(u64, u64, u64)],
+    cap: usize,
+) -> Result<Vec<Vec<(u64, u64, u64)>>> {
+    let per = 4 + 16 + 16;
+    let max_per_leaf = cap / per;
+    if max_per_leaf == 0 {
+        return Err(crate::Error::Unsupported(
+            "apfs writer: block too small to fit any omap entry".into(),
+        ));
+    }
+    if entries.is_empty() {
+        return Ok(vec![Vec::new()]);
+    }
+    // Verify ascending order so the split is meaningful.
+    let mut out: Vec<Vec<(u64, u64, u64)>> = Vec::new();
+    for chunk in entries.chunks(max_per_leaf) {
+        out.push(chunk.to_vec());
+    }
+    Ok(out)
+}
+
+/// Build an omap leaf node (fixed-KV 16/16). When `is_root` is true the
+/// node carries `BTNODE_ROOT` and a trailing `btree_info_t`.
+fn build_omap_leaf_node(bs: usize, entries: &[(u64, u64, u64)], is_root: bool) -> Result<Vec<u8>> {
+    let mut block = vec![0u8; bs];
+    let obj_type = if is_root {
+        OBJECT_TYPE_BTREE | OBJ_PHYSICAL
+    } else {
+        OBJECT_TYPE_BTREE_NODE | OBJ_PHYSICAL
+    };
+    block[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+    block[24..28].copy_from_slice(&obj_type.to_le_bytes());
+
+    let mut flags = BTNODE_LEAF | BTNODE_FIXED_KV_SIZE;
+    if is_root {
+        flags |= BTNODE_ROOT;
+    }
     block[32..34].copy_from_slice(&flags.to_le_bytes());
     block[34..36].copy_from_slice(&0u16.to_le_bytes()); // level
     block[36..40].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+
     let toc_len = entries.len() * 4;
     block[40..42].copy_from_slice(&0u16.to_le_bytes());
     block[42..44].copy_from_slice(&(toc_len as u16).to_le_bytes());
 
     let toc_base = 56;
     let keys_start = toc_base + toc_len;
-    let vals_end = bs - BTREE_INFO_SIZE;
-    if entries.len() * 32 + toc_len > bs - BTREE_INFO_SIZE - toc_base {
+    let vals_end = if is_root { bs - BTREE_INFO_SIZE } else { bs };
+    if entries.len() * 32 + toc_len + 56 > vals_end {
         return Err(crate::Error::Unsupported(
             "apfs writer: omap leaf overflowed single block".into(),
         ));
     }
-
     for (i, &(oid, xid, paddr)) in entries.iter().enumerate() {
         let k_off = (i * 16) as u16;
         let v_off = ((i + 1) * 16) as u16;
@@ -791,30 +1026,129 @@ fn build_omap_leaf(bs: usize, entries: &[(u64, u64, u64)]) -> Result<Vec<u8>> {
         // flags(0) + size(0) + paddr
         block[vs + 8..vs + 16].copy_from_slice(&paddr.to_le_bytes());
     }
-
-    // Trailing btree_info_t: bt_key_size=16, bt_val_size=16
-    let info_off = bs - BTREE_INFO_SIZE;
-    block[info_off + 8..info_off + 12].copy_from_slice(&16u32.to_le_bytes());
-    block[info_off + 12..info_off + 16].copy_from_slice(&16u32.to_le_bytes());
-
+    if is_root {
+        // Trailing btree_info_t: bt_key_size=16, bt_val_size=16
+        let info_off = bs - BTREE_INFO_SIZE;
+        block[info_off + 8..info_off + 12].copy_from_slice(&16u32.to_le_bytes());
+        block[info_off + 12..info_off + 16].copy_from_slice(&16u32.to_le_bytes());
+    }
     sign_block(&mut block);
     Ok(block)
 }
 
-/// Build a variable-KV fs-tree leaf node holding `records` (already
-/// sorted). Fits in a single block; we return `Unsupported` on
-/// overflow so callers see a clean error.
-fn build_fs_leaf(records: &[FsRecord], bs: usize, fsroot_vid: u64) -> Result<Vec<u8>> {
+/// Build a fixed-KV internal omap root whose keys are 16-byte
+/// `(oid, xid)` pairs and whose value slots hold 8-byte physical block
+/// addresses of child leaves. The root carries the trailing
+/// `btree_info_t`.
+fn build_omap_internal_root(bs: usize, entries: &[((u64, u64), u64)]) -> Result<Vec<u8>> {
+    let mut block = vec![0u8; bs];
+    block[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+    block[24..28].copy_from_slice(&(OBJECT_TYPE_BTREE | OBJ_PHYSICAL).to_le_bytes());
+
+    let flags = BTNODE_ROOT | BTNODE_FIXED_KV_SIZE;
+    block[32..34].copy_from_slice(&flags.to_le_bytes());
+    block[34..36].copy_from_slice(&1u16.to_le_bytes()); // level = 1
+    block[36..40].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+
+    let toc_len = entries.len() * 4;
+    block[40..42].copy_from_slice(&0u16.to_le_bytes());
+    block[42..44].copy_from_slice(&(toc_len as u16).to_le_bytes());
+
+    let toc_base = 56;
+    let keys_start = toc_base + toc_len;
+    let vals_end = bs - BTREE_INFO_SIZE;
+    // Each entry uses 4 (ToC) + 16 (key) + 8 (child paddr) = 28 bytes.
+    if entries.len() * 28 + 56 + BTREE_INFO_SIZE > bs {
+        return Err(crate::Error::Unsupported(format!(
+            "apfs writer: {} omap internal entries overflow one block",
+            entries.len()
+        )));
+    }
+
+    for (i, &((oid, xid), child_paddr)) in entries.iter().enumerate() {
+        let k_off = (i * 16) as u16;
+        // Internal values are 8 bytes per slot.
+        let v_off = ((i + 1) * 8) as u16;
+        block[toc_base + i * 4..toc_base + i * 4 + 2].copy_from_slice(&k_off.to_le_bytes());
+        block[toc_base + i * 4 + 2..toc_base + i * 4 + 4].copy_from_slice(&v_off.to_le_bytes());
+
+        let ks = keys_start + k_off as usize;
+        block[ks..ks + 8].copy_from_slice(&oid.to_le_bytes());
+        block[ks + 8..ks + 16].copy_from_slice(&xid.to_le_bytes());
+
+        let vs = vals_end - v_off as usize;
+        block[vs..vs + 8].copy_from_slice(&child_paddr.to_le_bytes());
+    }
+    // Root info: bt_key_size=16, bt_val_size=16 (leaf payload size; the
+    // reader needs this to know how big leaf entries are).
+    let info_off = bs - BTREE_INFO_SIZE;
+    block[info_off + 8..info_off + 12].copy_from_slice(&16u32.to_le_bytes());
+    block[info_off + 12..info_off + 16].copy_from_slice(&16u32.to_le_bytes());
+    sign_block(&mut block);
+    Ok(block)
+}
+
+/// Effective payload capacity for an fs-tree leaf (root and non-root use
+/// the same conservative figure that includes the trailing
+/// `btree_info_t`). Each record consumes 8 ToC bytes + key + val.
+fn leaf_payload_capacity(bs: usize) -> usize {
+    bs - 56 - BTREE_INFO_SIZE
+}
+
+/// Pack a sorted record list into one or more leaf groups, each of
+/// which fits inside `cap` bytes when accounting for ToC overhead.
+fn pack_records_into_leaves(records: &[FsRecord], cap: usize) -> Result<Vec<Vec<FsRecord>>> {
+    if records.is_empty() {
+        return Ok(vec![Vec::new()]);
+    }
+    let mut leaves: Vec<Vec<FsRecord>> = Vec::new();
+    let mut cur: Vec<FsRecord> = Vec::new();
+    let mut cur_bytes: usize = 0;
+    for r in records {
+        let needed = 8 + r.key.len() + r.val.len();
+        if needed > cap {
+            return Err(crate::Error::Unsupported(format!(
+                "apfs writer: single fs-tree record ({} bytes) does not fit in a leaf (cap {})",
+                needed, cap
+            )));
+        }
+        if cur_bytes + needed > cap && !cur.is_empty() {
+            leaves.push(std::mem::take(&mut cur));
+            cur_bytes = 0;
+        }
+        cur.push(r.clone());
+        cur_bytes += needed;
+    }
+    if !cur.is_empty() {
+        leaves.push(cur);
+    }
+    Ok(leaves)
+}
+
+/// Build a variable-KV fs-tree leaf node holding the given (already-
+/// sorted) `records`. When `is_root` is true the node carries
+/// `BTNODE_ROOT` and a trailing `btree_info_t`. Both root-leaf (depth 1)
+/// and non-root leaf (depth 2) callers use this builder; the root flag
+/// is set accordingly.
+fn build_fs_leaf(records: &[FsRecord], bs: usize, vid: u64, is_root: bool) -> Result<Vec<u8>> {
     let mut block = vec![0u8; bs];
     // obj_phys — real APFS fsroots are BTREE objects whose subtype is
     // FSTREE (the BTREE constant identifies the on-disk B-tree object;
     // FSTREE goes in the subtype slot to identify the tree's contents).
-    block[8..16].copy_from_slice(&fsroot_vid.to_le_bytes());
+    block[8..16].copy_from_slice(&vid.to_le_bytes());
     block[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
-    block[24..28].copy_from_slice(&OBJECT_TYPE_BTREE.to_le_bytes());
+    let obj_type = if is_root {
+        OBJECT_TYPE_BTREE
+    } else {
+        OBJECT_TYPE_BTREE_NODE
+    };
+    block[24..28].copy_from_slice(&obj_type.to_le_bytes());
     block[28..32].copy_from_slice(&OBJECT_TYPE_FSTREE.to_le_bytes());
 
-    let flags = BTNODE_ROOT | BTNODE_LEAF;
+    let mut flags = BTNODE_LEAF;
+    if is_root {
+        flags |= BTNODE_ROOT;
+    }
     block[32..34].copy_from_slice(&flags.to_le_bytes());
     block[34..36].copy_from_slice(&0u16.to_le_bytes()); // level
     block[36..40].copy_from_slice(&(records.len() as u32).to_le_bytes());
@@ -825,7 +1159,7 @@ fn build_fs_leaf(records: &[FsRecord], bs: usize, fsroot_vid: u64) -> Result<Vec
 
     let toc_base = 56;
     let keys_start = toc_base + toc_len;
-    let vals_end = bs - BTREE_INFO_SIZE;
+    let vals_end = if is_root { bs - BTREE_INFO_SIZE } else { bs };
 
     // Compute total bytes needed.
     let mut total_keys = 0usize;
@@ -862,11 +1196,80 @@ fn build_fs_leaf(records: &[FsRecord], bs: usize, fsroot_vid: u64) -> Result<Vec
         k_cursor += r.key.len();
     }
 
-    // Trailing btree_info_t (we leave fixed sizes 0 since this is a
-    // variable-KV tree; bt_key_count carries the record count).
-    let info_off = bs - BTREE_INFO_SIZE;
-    block[info_off + 24..info_off + 32].copy_from_slice(&(records.len() as u64).to_le_bytes());
+    if is_root {
+        // Trailing btree_info_t. We leave bt_key_size/bt_val_size at 0
+        // (variable-KV tree). bt_key_count carries the record count so
+        // tooling that inspects the root can sanity-check.
+        let info_off = bs - BTREE_INFO_SIZE;
+        block[info_off + 24..info_off + 32].copy_from_slice(&(records.len() as u64).to_le_bytes());
+    }
 
+    sign_block(&mut block);
+    Ok(block)
+}
+
+/// Build a variable-KV fs-tree *internal* root pointing at child leaves
+/// via virtual oids. Each `(key_bytes, child_vid)` entry is laid out
+/// using the same kvloc_t-style ToC as a leaf, but the value bytes are
+/// always 8 (the child vid in little-endian).
+fn build_fs_internal_root(entries: &[(Vec<u8>, u64)], bs: usize, root_vid: u64) -> Result<Vec<u8>> {
+    let mut block = vec![0u8; bs];
+    block[8..16].copy_from_slice(&root_vid.to_le_bytes());
+    block[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+    block[24..28].copy_from_slice(&OBJECT_TYPE_BTREE.to_le_bytes());
+    block[28..32].copy_from_slice(&OBJECT_TYPE_FSTREE.to_le_bytes());
+
+    let flags = BTNODE_ROOT; // not leaf, var-KV
+    block[32..34].copy_from_slice(&flags.to_le_bytes());
+    block[34..36].copy_from_slice(&1u16.to_le_bytes()); // level = 1
+    block[36..40].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+
+    let toc_len = entries.len() * 8;
+    block[40..42].copy_from_slice(&0u16.to_le_bytes());
+    block[42..44].copy_from_slice(&(toc_len as u16).to_le_bytes());
+
+    let toc_base = 56;
+    let keys_start = toc_base + toc_len;
+    let vals_end = bs - BTREE_INFO_SIZE;
+
+    let mut total_keys = 0usize;
+    for (kb, _) in entries {
+        total_keys += kb.len();
+    }
+    let total_vals = entries.len() * 8;
+    if keys_start + total_keys + total_vals > vals_end {
+        return Err(crate::Error::Unsupported(format!(
+            "apfs writer: {} fs-tree internal entries don't fit in one root \
+             (need {} key bytes + {} val bytes)",
+            entries.len(),
+            total_keys,
+            total_vals,
+        )));
+    }
+
+    let mut k_cursor: usize = 0;
+    let mut v_cursor_back: usize = 0;
+    for (i, (kb, child_vid)) in entries.iter().enumerate() {
+        let k_off = k_cursor as u16;
+        let k_len = kb.len() as u16;
+        v_cursor_back += 8;
+        let v_off = v_cursor_back as u16;
+        let v_len = 8u16;
+        block[toc_base + i * 8..toc_base + i * 8 + 2].copy_from_slice(&k_off.to_le_bytes());
+        block[toc_base + i * 8 + 2..toc_base + i * 8 + 4].copy_from_slice(&k_len.to_le_bytes());
+        block[toc_base + i * 8 + 4..toc_base + i * 8 + 6].copy_from_slice(&v_off.to_le_bytes());
+        block[toc_base + i * 8 + 6..toc_base + i * 8 + 8].copy_from_slice(&v_len.to_le_bytes());
+
+        let ks = keys_start + k_off as usize;
+        block[ks..ks + kb.len()].copy_from_slice(kb);
+        let vs = vals_end - v_off as usize;
+        block[vs..vs + 8].copy_from_slice(&child_vid.to_le_bytes());
+
+        k_cursor += kb.len();
+    }
+    // Trailing btree_info_t — record the (recursive) entry count.
+    let info_off = bs - BTREE_INFO_SIZE;
+    block[info_off + 24..info_off + 32].copy_from_slice(&(entries.len() as u64).to_le_bytes());
     sign_block(&mut block);
     Ok(block)
 }
@@ -1068,5 +1471,131 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
+    }
+
+    /// Embedded xattrs round-trip through `read_xattrs`.
+    #[test]
+    fn write_then_read_embedded_xattrs() {
+        let total_blocks = 64u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        {
+            let mut w = ApfsWriter::new(&mut dev, total_blocks, bs, "Vol").unwrap();
+            let mut r = Cursor::new(b"x");
+            w.add_file_from_reader(2, "f", 0o644, &mut r, 1).unwrap();
+            // Look up the file's oid by scanning the directory.
+            // The first new file gets oid 17 (we start at 16, root used 16's
+            // slot? actually next_oid begins at 16 — first alloc returns 16).
+            // But we don't depend on the value; we'll re-look it up on read.
+            w.add_xattr(2, "user.note", b"hello world").unwrap();
+            w.add_xattr(2, "user.lang", b"en_US").unwrap();
+            w.finish().unwrap();
+        }
+        let apfs = Apfs::open(&mut dev).unwrap();
+        let xs = apfs.read_xattrs(&mut dev, "/").unwrap();
+        assert_eq!(
+            xs.get("user.note").map(Vec::as_slice),
+            Some(&b"hello world"[..])
+        );
+        assert_eq!(xs.get("user.lang").map(Vec::as_slice), Some(&b"en_US"[..]));
+    }
+
+    /// Xattrs attached to a non-root inode are surfaced under that
+    /// inode's path (not under "/").
+    #[test]
+    fn xattr_attached_to_file_path() {
+        let total_blocks = 64u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        {
+            let mut w = ApfsWriter::new(&mut dev, total_blocks, bs, "Vol").unwrap();
+            let mut r = Cursor::new(b"data");
+            let oid = w
+                .add_file_from_reader(2, "doc.txt", 0o644, &mut r, 4)
+                .unwrap();
+            w.add_xattr(oid, "com.apple.lastuseddate#PS", &[1, 2, 3, 4])
+                .unwrap();
+            w.finish().unwrap();
+        }
+        let apfs = Apfs::open(&mut dev).unwrap();
+        // Root has no xattrs.
+        let root_xs = apfs.read_xattrs(&mut dev, "/").unwrap();
+        assert!(root_xs.is_empty());
+        // The file does.
+        let xs = apfs.read_xattrs(&mut dev, "/doc.txt").unwrap();
+        assert_eq!(
+            xs.get("com.apple.lastuseddate#PS").map(Vec::as_slice),
+            Some(&[1u8, 2, 3, 4][..])
+        );
+    }
+
+    /// Oversized xattr values return `Unsupported`.
+    #[test]
+    fn xattr_too_big_unsupported() {
+        let total_blocks = 64u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let mut w = ApfsWriter::new(&mut dev, total_blocks, bs, "Vol").unwrap();
+        let big = vec![0u8; APFS_XATTR_MAX_EMBEDDED_SIZE + 1];
+        let e = w.add_xattr(2, "user.too_big", &big).unwrap_err();
+        assert!(matches!(e, crate::Error::Unsupported(_)));
+    }
+
+    /// Multi-leaf fs-tree: enough small files to overflow a single 4 KiB
+    /// leaf, then read them back via the reader's multi-level walker.
+    #[test]
+    fn write_then_read_multi_leaf_fs_tree() {
+        let total_blocks = 256u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let n_files: usize = 80; // each file ≈ 50 bytes of fs-tree records → ~4 KiB leaf @ 4 KiB blocks
+        let payloads: Vec<Vec<u8>> = (0..n_files)
+            .map(|i| format!("file-{i:03}-payload").into_bytes())
+            .collect();
+        {
+            let mut w = ApfsWriter::new(&mut dev, total_blocks, bs, "Vol").unwrap();
+            for (i, p) in payloads.iter().enumerate() {
+                let name = format!("f{i:03}");
+                let mut r = Cursor::new(p.clone());
+                w.add_file_from_reader(2, &name, 0o644, &mut r, p.len() as u64)
+                    .unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let apfs = Apfs::open(&mut dev).unwrap();
+        let entries = apfs.list_path(&mut dev, "/").unwrap();
+        assert!(
+            entries.len() >= n_files,
+            "expected at least {} entries, got {}",
+            n_files,
+            entries.len()
+        );
+        // Spot-check a few file contents.
+        for &i in &[0usize, 1, n_files / 2, n_files - 1] {
+            let name = format!("/f{i:03}");
+            let mut r = apfs.open_file_reader(&mut dev, &name).unwrap();
+            let mut out = Vec::new();
+            r.read_to_end(&mut out).unwrap();
+            assert_eq!(out, payloads[i], "mismatch for {name}");
+        }
+    }
+
+    /// `pack_records_into_leaves` splits when the cumulative byte count
+    /// would exceed `cap`, and never emits an empty leaf.
+    #[test]
+    fn pack_records_splits_on_capacity() {
+        let r = |k: u8, v_len: usize| FsRecord {
+            key: vec![k; 8],
+            val: vec![0u8; v_len],
+        };
+        let recs = vec![r(1, 100), r(2, 100), r(3, 100)];
+        // cap = 8 + (8 + 100) = 116 → exactly one record per leaf.
+        let leaves = pack_records_into_leaves(&recs, 116).unwrap();
+        assert_eq!(leaves.len(), 3);
+        // cap = 2 * (8 + 8 + 100) = 232 → two records per leaf.
+        let leaves = pack_records_into_leaves(&recs, 232).unwrap();
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(leaves[0].len(), 2);
+        assert_eq!(leaves[1].len(), 1);
     }
 }

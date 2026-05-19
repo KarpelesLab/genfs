@@ -1,4 +1,10 @@
 //! Exercises the `fstool` binary end to end via its CLI.
+//!
+//! Whole file is Unix-only: the fixtures construct POSIX-permission /
+//! symlink trees and shell out to Linux-only tools (`mke2fs`, `e2fsck`,
+//! `debugfs`, `truncate`, etc.) for cross-validation.
+
+#![cfg(unix)]
 
 use std::process::Command;
 

@@ -1,6 +1,13 @@
 //! External validation: produce ext2 images and check them with `e2fsck`
 //! (e2fsprogs) and `debugfs`. Each test skips silently when the required
 //! tool isn't on PATH so `cargo test` still passes on minimal CI images.
+//!
+//! Whole file is Unix-only: the source-tree fixtures use POSIX-style
+//! symlinks + permission bits, and the cross-validation tools
+//! (`e2fsck`, `debugfs`, `mke2fs`, `truncate`) only exist on
+//! Unix-like systems.
+
+#![cfg(unix)]
 
 use std::io::Write;
 use std::path::Path;

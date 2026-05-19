@@ -125,6 +125,13 @@ fn gpt_validates_with_sgdisk() {
 
 #[test]
 fn mbr_validates_with_fdisk() {
+    // macOS ships its own `fdisk(8)` with completely different
+    // command-line syntax (and no `-l` flag) — the test only makes sense
+    // against util-linux fdisk.
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: util-linux fdisk only exists on Linux");
+        return;
+    }
     let Some(_) = which("fdisk") else {
         eprintln!("skipping: fdisk not installed");
         return;

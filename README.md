@@ -47,13 +47,19 @@ to walk into a partition of a GPT or MBR disk image; `fstool info
 disk.img` (no suffix) prints the partition table.
 
 **Block layer** — `fstool::block::{FileBackend, MemoryBackend,
-SlicedBackend}`: sparse file-backed devices, in-memory devices for tests,
-bounds-checked sub-range views for carving partitions. `FileBackend` also
-handles real block devices on Unix (`/dev/sdX`, `/dev/nvme0n1`, loop
-devices): capacity is queried via the kernel ioctl (`BLKGETSIZE64` on
-Linux, `DKIOCGETBLOCK*` on macOS) and the open uses `O_EXCL` so the
-kernel refuses if any partition is mounted. The CLI's `ext-build` /
-`fat-build` require `--force` when the output is a block device.
+SlicedBackend, Qcow2Backend}`: sparse file-backed devices, in-memory
+devices for tests, bounds-checked sub-range views for carving
+partitions, and qcow2 (QEMU's copy-on-write disk format) for both
+reading existing v2/v3 images and writing fresh v3 ones with
+allocate-on-write. `FileBackend` also handles real block devices on
+Unix (`/dev/sdX`, `/dev/nvme0n1`, loop devices): capacity is queried
+via the kernel ioctl (`BLKGETSIZE64` on Linux, `DKIOCGETBLOCK*` on
+macOS) and the open uses `O_EXCL` so the kernel refuses if any
+partition is mounted. The CLI's `ext-build` / `fat-build` require
+`--force` when the output is a block device. Path-based factories
+(`block::open_image`, `block::create_image`) auto-dispatch by
+qcow2 magic / file extension, so qcow2 output is as simple as
+`fstool ext-build src -o out.qcow2`.
 
 **Partition tables** — `fstool::part::{Mbr, Gpt}`: write and read
 4-primary MBR and 128-entry GPT (protective MBR, primary + backup

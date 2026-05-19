@@ -58,6 +58,11 @@ enum Command {
         /// a real device without an explicit opt-in.
         #[arg(long)]
         force: bool,
+        /// qcow2 cluster size (only honoured when OUTPUT ends in
+        /// `.qcow2` / `.qcow` / `.q2`). Accepts `64KiB`, `1MiB`, or a
+        /// bare byte count; must be a power of two ≥ 512. Default 64 KiB.
+        #[arg(long, value_name = "SIZE", default_value = "64KiB")]
+        cluster_size: String,
     },
 
     /// Build a bare FAT32 image from a host directory. FAT32 has no
@@ -85,6 +90,10 @@ enum Command {
         /// a real device without an explicit opt-in.
         #[arg(long)]
         force: bool,
+        /// qcow2 cluster size (only honoured when OUTPUT is a qcow2
+        /// path). Default 64 KiB.
+        #[arg(long, value_name = "SIZE", default_value = "64KiB")]
+        cluster_size: String,
     },
 
     /// List a directory inside an image. One entry per line:
@@ -201,7 +210,16 @@ fn run(cli: Cli) -> fstool::Result<()> {
             block_size,
             sparse,
             force,
-        } => ext_build(&src_dir, &output, kind.into(), block_size, sparse, force),
+            cluster_size,
+        } => ext_build(
+            &src_dir,
+            &output,
+            kind.into(),
+            block_size,
+            sparse,
+            force,
+            &cluster_size,
+        ),
         Command::FatBuild {
             src_dir,
             output,
@@ -209,7 +227,16 @@ fn run(cli: Cli) -> fstool::Result<()> {
             label,
             volume_id,
             force,
-        } => fat_build(&src_dir, &output, size.as_deref(), &label, volume_id, force),
+            cluster_size,
+        } => fat_build(
+            &src_dir,
+            &output,
+            size.as_deref(),
+            &label,
+            volume_id,
+            force,
+            &cluster_size,
+        ),
         Command::Ls { image, path } => ls(&image, &path),
         Command::Cat { image, path } => cat(&image, &path),
         Command::Info { image } => info(&image),
@@ -285,10 +312,12 @@ fn fat_build(
     label: &str,
     volume_id: u32,
     force: bool,
+    cluster_size: &str,
 ) -> fstool::Result<()> {
     use fstool::block::file::is_block_device;
     use fstool::fs::fat::Fat32;
 
+    let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
     let is_device = is_block_device(output);
     require_force_for_device(output, is_device, force)?;
 
@@ -310,8 +339,14 @@ fn fat_build(
         )
     })?;
     let label_bytes = fat32_label_bytes(label);
-    let mut dev = FileBackend::create(output, bytes)?;
-    Fat32::build_from_host_dir(&mut dev, total_sectors, src_dir, volume_id, label_bytes)?;
+    let mut dev = fstool::block::create_image(
+        output,
+        bytes,
+        &fstool::block::CreateOpts {
+            cluster_size: qcow2_cluster_size,
+        },
+    )?;
+    Fat32::build_from_host_dir(dev.as_mut(), total_sectors, src_dir, volume_id, label_bytes)?;
     dev.sync()?;
     eprintln!(
         "wrote {} ({} bytes, fat32{}, label {:?})",
@@ -345,10 +380,12 @@ fn ext_build(
     block_size: u32,
     sparse: bool,
     force: bool,
+    cluster_size: &str,
 ) -> fstool::Result<()> {
     use fstool::block::file::is_block_device;
     use fstool::fs::ext::BuildPlan;
 
+    let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
     let is_device = is_block_device(output);
     require_force_for_device(output, is_device, force)?;
 
@@ -357,13 +394,20 @@ fn ext_build(
     let mut opts = plan.to_format_opts();
     opts.sparse = sparse;
     let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
-    let mut dev = FileBackend::create(output, plan_size)?;
+    let mut dev = fstool::block::create_image(
+        output,
+        plan_size,
+        &fstool::block::CreateOpts {
+            cluster_size: qcow2_cluster_size,
+        },
+    )?;
 
     // On a block device the actual capacity is fixed by the hardware —
     // expand the FS to fill it instead of leaving most of the device
     // unused. blocks_count must stay a multiple of 8 for the block bitmap
     // to be byte-aligned, and inode density gets scaled to mke2fs's
-    // 1-inode-per-16-KiB convention.
+    // 1-inode-per-16-KiB convention. (qcow2 always reports its virtual
+    // size as plan_size, so this branch only triggers for block devices.)
     let actual_size = dev.total_size();
     if actual_size > plan_size {
         let max_blocks_u64 = actual_size / opts.block_size as u64;
@@ -374,9 +418,9 @@ fn ext_build(
     }
     let final_size = opts.blocks_count as u64 * opts.block_size as u64;
 
-    let mut ext = Ext::format_with(&mut dev, &opts)?;
-    ext.populate_from_host_dir(&mut dev, 2, src_dir)?;
-    ext.flush(&mut dev)?;
+    let mut ext = Ext::format_with(dev.as_mut(), &opts)?;
+    ext.populate_from_host_dir(dev.as_mut(), 2, src_dir)?;
+    ext.flush(dev.as_mut())?;
     dev.sync()?;
     eprintln!(
         "wrote {} ({} bytes, {:?}{}{}, {} inodes, {} blocks)",
@@ -389,6 +433,23 @@ fn ext_build(
         opts.blocks_count
     );
     Ok(())
+}
+
+/// Parse the `--cluster-size` flag's value into a u32 byte count.
+/// Errors if not a power of two or below the 512-byte minimum.
+fn parse_cluster_size(s: &str) -> fstool::Result<u32> {
+    let bytes = fstool::spec::parse_size(s)?;
+    if !bytes.is_power_of_two() {
+        return Err(fstool::Error::InvalidArgument(format!(
+            "--cluster-size {s} must be a power of two"
+        )));
+    }
+    if bytes < 512 || bytes > u32::MAX as u64 {
+        return Err(fstool::Error::InvalidArgument(format!(
+            "--cluster-size {s} out of range (512..=u32::MAX)"
+        )));
+    }
+    Ok(bytes as u32)
 }
 
 /// Refuse to format a block device without --force; emit a clear message

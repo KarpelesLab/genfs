@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::Result;
-use crate::block::{BlockDevice, FileBackend};
+use crate::block::BlockDevice;
 use crate::fs::ext::{Ext, FsKind};
 use crate::fs::rootdevs::RootDevs;
 
@@ -190,8 +190,8 @@ fn build_bare_ext(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     let block_size = fs.block_size.unwrap_or(1024);
     let opts = ext_format_opts(fs, kind, block_size, None)?;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
-    let mut dev = FileBackend::create(output, size)?;
-    format_ext_into(&mut dev, fs, &opts)?;
+    let mut dev = crate::block::create_image(output, size, &crate::block::CreateOpts::default())?;
+    format_ext_into(dev.as_mut(), fs, &opts)?;
     dev.sync()?;
     Ok(())
 }
@@ -211,8 +211,8 @@ fn build_bare_fat32(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     })?;
     let label = fat32_volume_label(fs.volume_label.as_deref());
     let volume_id = fs.volume_id.unwrap_or(0);
-    let mut dev = FileBackend::create(output, bytes)?;
-    format_fat32_into(&mut dev, fs, total_sectors, volume_id, label)?;
+    let mut dev = crate::block::create_image(output, bytes, &crate::block::CreateOpts::default())?;
+    format_fat32_into(dev.as_mut(), fs, total_sectors, volume_id, label)?;
     dev.sync()?;
     Ok(())
 }
@@ -411,15 +411,16 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
     }
 
     // Create the backing file and write the partition table.
-    let mut dev = FileBackend::create(output, total_bytes)?;
+    let mut dev =
+        crate::block::create_image(output, total_bytes, &crate::block::CreateOpts::default())?;
     match table.as_str() {
         "gpt" => {
             let gpt = Gpt::build(placed.clone())?;
-            gpt.write(&mut dev)?;
+            gpt.write(dev.as_mut())?;
         }
         "mbr" => {
             let mbr = Mbr::new(placed.clone())?;
-            mbr.write(&mut dev)?;
+            mbr.write(dev.as_mut())?;
         }
         _ => unreachable!(),
     }
@@ -439,7 +440,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
             continue;
         };
         let part_bytes = placed[i].size_lba * SECTOR;
-        let mut slice = slice_partition(table_obj.as_ref(), &mut dev, i)?;
+        let mut slice = slice_partition(table_obj.as_ref(), dev.as_mut(), i)?;
         match fs.fs_type.to_ascii_lowercase().as_str() {
             "ext2" | "ext3" | "ext4" => {
                 let kind = parse_fs_kind(&fs.fs_type)?;

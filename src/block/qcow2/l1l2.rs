@@ -176,6 +176,40 @@ impl L1L2 {
         self.l1[l1_idx] = value;
     }
 
+    /// Look up `vaddr`'s mapping for *writing*: if no L1/L2 entry exists,
+    /// allocate the L2 cluster (via `alloc_data_cluster`) and (later)
+    /// the data cluster. Returns the cluster offset of the L2 table
+    /// covering `vaddr` (allocated if needed) and the in-L2 index.
+    /// The caller follows up with [`Self::ensure_data_cluster`].
+    pub fn ensure_l2<F: Read + Write + Seek>(
+        &mut self,
+        file: &mut F,
+        vaddr: u64,
+        alloc_cluster: &mut dyn FnMut(&mut F) -> Result<u64>,
+    ) -> Result<(u64, usize)> {
+        let (l1_idx, l2_idx, _) = self.split_addr(vaddr);
+        if l1_idx >= self.l1.len() {
+            return Err(crate::Error::OutOfBounds {
+                offset: vaddr,
+                len: self.cluster_size,
+                size: (self.l1.len() as u64) * (self.l2_entries as u64) * self.cluster_size,
+            });
+        }
+        let l1_entry = self.l1[l1_idx];
+        let l2_off = l1_entry & OFFSET_MASK;
+        if l2_off == 0 {
+            // Allocate a new L2 cluster.
+            let l2_cluster_idx = alloc_cluster(file)?;
+            let new_l2_off = l2_cluster_idx * self.cluster_size;
+            self.insert_empty_l2(new_l2_off);
+            self.l1[l1_idx] = new_l2_off | COPIED;
+            return Ok((new_l2_off, l2_idx));
+        }
+        // Make sure the L2 is in cache so set_l2_entry can find it.
+        let _ = self.load_l2(file, l2_off)?;
+        Ok((l2_off, l2_idx))
+    }
+
     /// Write every dirty L2 cluster back to disk, then the L1 table.
     pub fn flush<F: Write + Seek>(&mut self, file: &mut F) -> Result<()> {
         for (&off, entry) in self.l2_cache.iter_mut() {

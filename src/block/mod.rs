@@ -51,6 +51,49 @@ pub fn open_image(path: &Path) -> crate::Result<Box<dyn BlockDevice>> {
     }
 }
 
+/// Options for [`create_image`].
+#[derive(Debug, Clone, Copy)]
+pub struct CreateOpts {
+    /// qcow2 cluster size in bytes (power of two, ≥ 512). Default 64 KiB,
+    /// matching qemu-img. Ignored when creating a raw image.
+    pub cluster_size: u32,
+}
+
+impl Default for CreateOpts {
+    fn default() -> Self {
+        Self {
+            cluster_size: 65_536,
+        }
+    }
+}
+
+/// Create a new image at `path` of capacity `virtual_size` bytes. The
+/// backend is chosen by the path's extension: `.qcow2` (or `.qcow` /
+/// `.q2`) → [`Qcow2Backend`], everything else → [`FileBackend`] (sparse
+/// raw file or block device).
+pub fn create_image(
+    path: &Path,
+    virtual_size: u64,
+    opts: &CreateOpts,
+) -> crate::Result<Box<dyn BlockDevice>> {
+    if is_qcow2_extension(path) {
+        Ok(Box::new(Qcow2Backend::create(
+            path,
+            virtual_size,
+            opts.cluster_size,
+        )?))
+    } else {
+        Ok(Box::new(FileBackend::create(path, virtual_size)?))
+    }
+}
+
+fn is_qcow2_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    matches!(ext.to_ascii_lowercase().as_str(), "qcow2" | "qcow" | "q2")
+}
+
 /// A seekable byte-addressable store of fixed capacity.
 ///
 /// Implementors compose `Read + Write + Seek` so the standard library's

@@ -31,13 +31,15 @@
 
 pub mod header;
 pub mod l1l2;
+pub mod refcount;
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use header::Header;
-use l1l2::L1L2;
+use l1l2::{COPIED, L1L2};
+use refcount::Refcount;
 
 use super::BlockDevice;
 use crate::Result;
@@ -48,8 +50,11 @@ pub struct Qcow2Backend {
     header: Header,
     cluster_size: u64,
     l1l2: L1L2,
-    /// Virtual cursor for the `Read`/`Write`/`Seek` impls. The file's
-    /// own cursor is repositioned per-cluster on the read side.
+    refcount: Refcount,
+    /// Current backing-file size in bytes; grows when allocate-on-write
+    /// extends the file past the previous EOF.
+    file_len: u64,
+    /// Virtual cursor for the `Read`/`Write`/`Seek` impls.
     cursor: u64,
 }
 
@@ -77,11 +82,133 @@ impl Qcow2Backend {
         let header = Header::decode(&buf)?;
         let cluster_size = header.cluster_size();
         let l1l2 = L1L2::load(&mut file, &header)?;
+        let refcount = Refcount::load(&mut file, &header)?;
+        let file_len = file.metadata()?.len();
         Ok(Self {
             file,
             header,
             cluster_size,
             l1l2,
+            refcount,
+            file_len,
+            cursor: 0,
+        })
+    }
+
+    /// Format a fresh qcow2 v3 image at `path`. The file is created
+    /// (truncating any existing one) and seeded with the header, an
+    /// empty refcount table + refcount block, and an L1 table. All
+    /// data clusters are allocate-on-write.
+    pub fn create<P: AsRef<Path>>(path: P, virtual_size: u64, cluster_size: u32) -> Result<Self> {
+        if !cluster_size.is_power_of_two() || cluster_size < 512 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "qcow2: cluster_size {cluster_size} must be a power of two ≥ 512"
+            )));
+        }
+        let cs = cluster_size as u64;
+        let cluster_bits = cs.trailing_zeros();
+
+        // Compute L1 size: one L2 cluster covers (cs/8) clusters, which
+        // covers (cs/8) * cs virtual bytes. l1 entries needed:
+        let l2_coverage = (cs / 8) * cs;
+        let l1_size = virtual_size.div_ceil(l2_coverage) as u32;
+        // L1 size must be a power of two? No — but it does need to fit
+        // in some number of clusters. Round up `l1_size` to a multiple
+        // of (cs / 8) so the L1 table is a whole number of clusters.
+        let l1_per_cluster = (cs / 8) as u32;
+        let l1_clusters = l1_size.div_ceil(l1_per_cluster);
+        let l1_size = l1_clusters * l1_per_cluster;
+
+        // Layout (in clusters):
+        //   0:                header
+        //   1:                refcount table (1 cluster)
+        //   2:                refcount block 0
+        //   3..3+l1_clusters: L1 table
+        let refcount_table_cluster = 1u64;
+        let refcount_block_cluster = 2u64;
+        let l1_first_cluster = 3u64;
+        let next_free_cluster = l1_first_cluster + l1_clusters as u64;
+        let file_len = next_free_cluster * cs;
+
+        // The clusters we just laid out must all have refcount=1.
+        let initial: Vec<u64> = {
+            let mut v = Vec::new();
+            v.push(0); // header
+            v.push(refcount_table_cluster);
+            v.push(refcount_block_cluster);
+            for i in 0..l1_clusters as u64 {
+                v.push(l1_first_cluster + i);
+            }
+            v
+        };
+
+        // Build the header.
+        let header = Header {
+            version: header::VERSION_V3,
+            backing_file_offset: 0,
+            backing_file_size: 0,
+            cluster_bits,
+            size: virtual_size,
+            crypt_method: 0,
+            l1_size,
+            l1_table_offset: l1_first_cluster * cs,
+            refcount_table_offset: refcount_table_cluster * cs,
+            refcount_table_clusters: 1,
+            nb_snapshots: 0,
+            snapshots_offset: 0,
+            incompatible_features: 0,
+            compatible_features: 0,
+            autoclear_features: 0,
+            refcount_order: 4,
+            header_length: header::V3_HEADER_LEN as u32,
+        };
+
+        // Create the backing file at exactly `file_len` bytes,
+        // zero-filled by `set_len` (sparse).
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path.as_ref())?;
+        file.set_len(file_len)?;
+
+        // Write the header at byte 0, padded to the cluster.
+        file.seek(SeekFrom::Start(0))?;
+        let mut cluster0 = vec![0u8; cs as usize];
+        cluster0[..header::V3_HEADER_LEN].copy_from_slice(&header.encode_v3());
+        file.write_all(&cluster0)?;
+
+        // L1 table starts all-zero — set_len already zero-filled it.
+        let mut l1l2 = L1L2 {
+            cluster_size: cs,
+            cluster_bits,
+            l2_entries: (cs / 8) as usize,
+            l1: vec![0u64; l1_size as usize],
+            l1_table_offset: l1_first_cluster * cs,
+            l2_cache: std::collections::HashMap::new(),
+            l2_cache_cap: 32,
+        };
+
+        // Refcount table + initial refcount block live in memory; flush
+        // them so the on-disk view matches.
+        let mut refcount = Refcount::new_fresh(
+            cs,
+            refcount_table_cluster * cs,
+            refcount_block_cluster * cs,
+            &initial,
+        );
+        refcount.flush(&mut file)?;
+        l1l2.flush(&mut file)?;
+        file.sync_data()?;
+
+        Ok(Self {
+            file,
+            header,
+            cluster_size: cs,
+            l1l2,
+            refcount,
+            file_len,
             cursor: 0,
         })
     }
@@ -99,6 +226,94 @@ impl Qcow2Backend {
     /// The decoded header — exposed for diagnostics.
     pub fn header(&self) -> &Header {
         &self.header
+    }
+
+    /// Write `buf` to virtual offset `offset`, allocating physical
+    /// clusters and L2 tables on demand.
+    fn write_virtual(&mut self, mut offset: u64, mut buf: &[u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(crate::Error::OutOfBounds {
+                offset,
+                len: buf.len() as u64,
+                size: self.header.size,
+            })?;
+        if end > self.header.size {
+            return Err(crate::Error::OutOfBounds {
+                offset,
+                len: buf.len() as u64,
+                size: self.header.size,
+            });
+        }
+        let cs = self.cluster_size;
+        while !buf.is_empty() {
+            let in_cluster = offset & (cs - 1);
+            let take = ((cs - in_cluster) as usize).min(buf.len());
+            let (chunk, rest) = buf.split_at(take);
+            let cluster_start = offset - in_cluster;
+            let phys = self.ensure_mapping(cluster_start)?;
+            self.file.seek(SeekFrom::Start(phys + in_cluster))?;
+            self.file.write_all(chunk)?;
+            offset += take as u64;
+            buf = rest;
+        }
+        Ok(())
+    }
+
+    /// Make sure the cluster covering virtual offset `vaddr_cluster_aligned`
+    /// has a physical mapping, allocating one if not. Returns the
+    /// physical byte offset of the cluster.
+    fn ensure_mapping(&mut self, vaddr: u64) -> Result<u64> {
+        let (l1_idx, l2_idx, _) = self.l1l2.split_addr(vaddr);
+        let l1_entry = self.l1l2.l1[l1_idx];
+        let l2_off = l1_entry & l1l2::OFFSET_MASK;
+        let (l2_off, _) = if l2_off == 0 {
+            // Allocate an L2 cluster.
+            let cluster_idx = self
+                .refcount
+                .alloc_cluster(&mut self.file, &mut self.file_len)?;
+            // Make sure the file is long enough to hold the new L2 cluster.
+            let new_end = (cluster_idx + 1) * self.cluster_size;
+            if new_end > self.file_len {
+                self.file_len = new_end;
+            }
+            self.file.set_len(self.file_len)?;
+            let new_l2_off = cluster_idx * self.cluster_size;
+            self.l1l2.insert_empty_l2(new_l2_off);
+            self.l1l2.set_l1(l1_idx, new_l2_off | COPIED);
+            (new_l2_off, l2_idx)
+        } else {
+            // Cache-load the L2 if it isn't already in cache.
+            let _ = self.l1l2.lookup(&mut self.file, vaddr)?;
+            (l2_off, l2_idx)
+        };
+
+        let l2_entry = self
+            .l1l2
+            .l2_cache
+            .get(&l2_off)
+            .expect("L2 just loaded/created")
+            .entries[l2_idx];
+        let data_off = l2_entry & l1l2::OFFSET_MASK;
+        if data_off != 0 {
+            return Ok(data_off);
+        }
+        // Allocate a data cluster.
+        let data_cluster = self
+            .refcount
+            .alloc_cluster(&mut self.file, &mut self.file_len)?;
+        let new_data_off = data_cluster * self.cluster_size;
+        let new_end = new_data_off + self.cluster_size;
+        if new_end > self.file_len {
+            self.file_len = new_end;
+        }
+        self.file.set_len(self.file_len)?;
+        self.l1l2
+            .set_l2_entry(l2_off, l2_idx, new_data_off | COPIED)?;
+        Ok(new_data_off)
     }
 
     /// Read `buf.len()` bytes starting at virtual offset `offset`. Walks
@@ -159,17 +374,22 @@ impl Read for Qcow2Backend {
 }
 
 impl Write for Qcow2Backend {
-    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-        // Phase A is read-only; writes land in Phase B (refcount +
-        // allocate-on-write). Erroring here keeps the BlockDevice trait
-        // contract honest without pretending the write succeeded.
-        Err(io::Error::other(
-            "qcow2: write path not implemented (Phase B)",
-        ))
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let remaining = self.header.size.saturating_sub(self.cursor);
+        let n = (buf.len() as u64).min(remaining) as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        self.write_virtual(self.cursor, &buf[..n])
+            .map_err(io::Error::other)?;
+        self.cursor += n as u64;
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // No buffered writes to flush.
+        // The qcow2 layer flushes its metadata on `sync`; the std
+        // `Write::flush` contract just says "drain buffered data", and
+        // we have no internal buffer.
         Ok(())
     }
 }
@@ -202,6 +422,8 @@ impl BlockDevice for Qcow2Backend {
     }
 
     fn sync(&mut self) -> Result<()> {
+        self.l1l2.flush(&mut self.file)?;
+        self.refcount.flush(&mut self.file)?;
         self.file.sync_data()?;
         Ok(())
     }
@@ -210,16 +432,26 @@ impl BlockDevice for Qcow2Backend {
         self.read_virtual(offset, buf)
     }
 
-    fn write_at(&mut self, _offset: u64, _buf: &[u8]) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "qcow2: write path not implemented (Phase B)".into(),
-        ))
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.write_virtual(offset, buf)
     }
 
-    fn zero_range(&mut self, _offset: u64, _len: u64) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "qcow2: write path not implemented (Phase B)".into(),
-        ))
+    fn zero_range(&mut self, offset: u64, len: u64) -> Result<()> {
+        // We don't implement discard/punch here — just write zeros
+        // through the allocator. That's allocation-heavy for big ranges
+        // but produces a correct image and matches the BlockDevice
+        // trait's default behaviour.
+        if len == 0 {
+            return Ok(());
+        }
+        let zero = vec![0u8; 4096];
+        let mut written = 0u64;
+        while written < len {
+            let n = (len - written).min(zero.len() as u64) as usize;
+            self.write_virtual(offset + written, &zero[..n])?;
+            written += n as u64;
+        }
+        Ok(())
     }
 }
 
@@ -294,10 +526,6 @@ mod tests {
         let mut tail = [0u8; 16];
         let err = back.read_at(virtual_size, &mut tail).unwrap_err();
         assert!(matches!(err, crate::Error::OutOfBounds { .. }));
-
-        // Write path errors with Unsupported in Phase A.
-        let err = back.write_at(0, &[0u8; 16]).unwrap_err();
-        assert!(matches!(err, crate::Error::Unsupported(_)));
 
         // Read trait works via cursor.
         back.seek(SeekFrom::Start(0)).unwrap();

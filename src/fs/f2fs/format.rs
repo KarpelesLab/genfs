@@ -231,7 +231,11 @@ pub(crate) fn write_superblocks(
     buf[0x3C..0x40].copy_from_slice(&geom.segment_count_nat.to_le_bytes());
     buf[0x40..0x44].copy_from_slice(&geom.segment_count_ssa.to_le_bytes());
     buf[0x44..0x48].copy_from_slice(&geom.segment_count_main.to_le_bytes());
-    buf[0x48..0x4C].copy_from_slice(&0u32.to_le_bytes()); // segment0_blkaddr
+    // F2FS requires `segment0_blkaddr == cp_blkaddr` — segment 0 starts
+    // where the first checkpoint pack lives (right after the two SB
+    // copies). fsck.f2fs reports `Mismatch segment0(N) cp_blkaddr(M)`
+    // when they disagree.
+    buf[0x48..0x4C].copy_from_slice(&geom.cp_blkaddr.to_le_bytes()); // segment0_blkaddr
     buf[0x4C..0x50].copy_from_slice(&geom.cp_blkaddr.to_le_bytes());
     buf[0x50..0x54].copy_from_slice(&geom.sit_blkaddr.to_le_bytes());
     buf[0x54..0x58].copy_from_slice(&geom.nat_blkaddr.to_le_bytes());

@@ -56,6 +56,15 @@ pub struct Checkpoint {
     /// pulled from the cp_pack_start_sum block. Newer than the on-disk
     /// NAT pages and must be consulted first.
     pub nat_journal: Vec<NatJournalEntry>,
+    /// `cur_node_segno[3]` — main-area segments currently in use for
+    /// hot / warm / cold node blocks. Writer leaves the upper 5 slots
+    /// (kernel size is `[8]`) zero.
+    pub cur_node_segno: [u32; 3],
+    /// `cur_node_blkoff[3]` — next free block within each node curseg.
+    pub cur_node_blkoff: [u16; 3],
+    /// `cur_data_segno[3]` / `cur_data_blkoff[3]` — same for data.
+    pub cur_data_segno: [u32; 3],
+    pub cur_data_blkoff: [u16; 3],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -196,6 +205,11 @@ fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
     let sit_ver_bitmap_bytesize = r32(0x9C);
     let nat_ver_bitmap_bytesize = r32(0xA0);
     // 0xA4 checksum_offset — used to locate the CRC at `try_load`.
+    let r16 = |o: usize| u16::from_le_bytes(buf[o..o + 2].try_into().unwrap());
+    let cur_node_segno = [r32(0x24), r32(0x28), r32(0x2C)];
+    let cur_node_blkoff = [r16(0x44), r16(0x46), r16(0x48)];
+    let cur_data_segno = [r32(0x54), r32(0x58), r32(0x5C)];
+    let cur_data_blkoff = [r16(0x74), r16(0x76), r16(0x78)];
 
     Ok(Checkpoint {
         version,
@@ -215,6 +229,10 @@ fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
         cur_nat_pack: 0,
         cur_sit_pack: 0,
         nat_journal: Vec::new(),
+        cur_node_segno,
+        cur_node_blkoff,
+        cur_data_segno,
+        cur_data_blkoff,
     })
 }
 
@@ -270,9 +288,25 @@ pub(crate) fn encode_cp_head_writer(cp: &Checkpoint) -> Vec<u8> {
     buf[0x10..0x18].copy_from_slice(&cp.valid_block_count.to_le_bytes());
     buf[0x18..0x1C].copy_from_slice(&cp.rsvd_segment_count.to_le_bytes());
     buf[0x1C..0x20].copy_from_slice(&cp.overprov_segment_count.to_le_bytes());
-    // 0x20 free_segment_count, 0x24..0x84 cur_*_segno + cur_*_blkoff
-    // tables — left zero for a fresh image; fsck tolerates that as long
-    // as ckpt_flags carries `CP_UMOUNT_FLAG`.
+    // 0x20: free_segment_count (left at zero — fsck doesn't recompute it).
+    // 0x24..0x44: cur_node_segno[8]; 0x44..0x54: cur_node_blkoff[8].
+    // 0x54..0x74: cur_data_segno[8]; 0x74..0x84: cur_data_blkoff[8].
+    for (i, s) in cp.cur_node_segno.iter().enumerate() {
+        let o = 0x24 + i * 4;
+        buf[o..o + 4].copy_from_slice(&s.to_le_bytes());
+    }
+    for (i, o16) in cp.cur_node_blkoff.iter().enumerate() {
+        let o = 0x44 + i * 2;
+        buf[o..o + 2].copy_from_slice(&o16.to_le_bytes());
+    }
+    for (i, s) in cp.cur_data_segno.iter().enumerate() {
+        let o = 0x54 + i * 4;
+        buf[o..o + 4].copy_from_slice(&s.to_le_bytes());
+    }
+    for (i, o16) in cp.cur_data_blkoff.iter().enumerate() {
+        let o = 0x74 + i * 2;
+        buf[o..o + 2].copy_from_slice(&o16.to_le_bytes());
+    }
     buf[0x84..0x88].copy_from_slice(&cp.flags.to_le_bytes());
     buf[0x88..0x8C].copy_from_slice(&cp.cp_pack_total_block_count.to_le_bytes());
     buf[0x8C..0x90].copy_from_slice(&cp.cp_pack_start_sum.to_le_bytes());

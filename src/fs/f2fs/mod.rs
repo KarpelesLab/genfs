@@ -135,6 +135,10 @@ impl F2fs {
                 cur_nat_pack: 0,
                 cur_sit_pack: 0,
                 nat_journal: Vec::new(),
+                cur_node_segno: [0, 1, 2],
+                cur_node_blkoff: [0, 0, 0],
+                cur_data_segno: [3, 4, 5],
+                cur_data_blkoff: [0, 0, 0],
             },
             writer: Some(writer),
         };
@@ -681,6 +685,10 @@ mod tests {
             cur_nat_pack: 0,
             cur_sit_pack: 0,
             nat_journal: Vec::new(),
+            cur_node_segno: [0, 1, 2],
+            cur_node_blkoff: [0, 0, 0],
+            cur_data_segno: [3, 4, 5],
+            cur_data_blkoff: [0, 0, 0],
         };
         let cp_head = encode_cp_head(&cp);
         dev.write_at(cp_blkaddr as u64 * bs, &cp_head).unwrap();
@@ -866,6 +874,10 @@ mod tests {
             cur_nat_pack: 1,
             cur_sit_pack: 1,
             nat_journal: Vec::new(),
+            cur_node_segno: [0, 1, 2],
+            cur_node_blkoff: [0, 0, 0],
+            cur_data_segno: [3, 4, 5],
+            cur_data_blkoff: [0, 0, 0],
         };
         let buf = encode_cp_head(&cp2);
         let addr = (cp_blk + layout.blocks_per_seg) as u64 * F2FS_BLKSIZE as u64;
@@ -1147,6 +1159,10 @@ mod tests {
             cur_nat_pack: 0,
             cur_sit_pack: 0,
             nat_journal: Vec::new(),
+            cur_node_segno: [0, 1, 2],
+            cur_node_blkoff: [0, 0, 0],
+            cur_data_segno: [3, 4, 5],
+            cur_data_blkoff: [0, 0, 0],
         };
         dev.write_at(cp_blkaddr as u64 * bs, &encode_cp_head(&cp))
             .unwrap();

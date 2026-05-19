@@ -315,15 +315,6 @@ pub(crate) fn encode_nat_page(entries: &[(u8, u32, u32)]) -> Vec<u8> {
 /// segments worth of bitmaps. v1 marks every block of every used segment
 /// as valid (we never reclaim); unused segments stay zero.
 ///
-/// Layout per SIT entry (64 bytes here for simplicity, F2FS spec uses
-/// 74 packed): `vblocks u16 | valid_map[blocks_per_seg / 8] | mtime u64`.
-/// Our reader doesn't decode the SIT, so the exact stride is only
-/// observed by `fsck.f2fs`. SIT pages have no trailing CRC (same as
-/// NAT pages — see `encode_nat_page`).
-pub(crate) fn encode_sit_page() -> Vec<u8> {
-    vec![0u8; F2FS_BLKSIZE]
-}
-
 /// Encode a 4 KiB SSA page. Each entry is a `f2fs_summary` (7 bytes) that
 /// records `(nid, version, ofs_in_node)` for the block at that offset in
 /// the parent segment. SSA blocks are `struct f2fs_summary_block` —

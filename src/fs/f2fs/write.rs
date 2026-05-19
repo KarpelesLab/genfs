@@ -147,9 +147,24 @@ pub struct Writer {
     /// node, root) — we hand out from 4 upward, with nid 3 reserved for
     /// the root directory.
     pub(crate) next_nid: u32,
-    /// Next main-area block to allocate. Starts at `main_blkaddr` and
-    /// grows monotonically (no reuse).
-    pub(crate) next_main_blk: u32,
+    /// Next NODE block to allocate. Lives in one of `node_segments`.
+    /// When the current segment fills, the allocator pulls a fresh
+    /// segment from the free-segment pool.
+    pub(crate) next_node_blk: u32,
+    /// Next DATA block to allocate. Same lifecycle as `next_node_blk`
+    /// but for data-typed segments.
+    pub(crate) next_data_blk: u32,
+    /// Main-segment offsets currently or previously written by
+    /// CURSEG_HOT_NODE. The LAST entry is the active one (the curseg's
+    /// `segno`), all earlier entries are full. SIT entries for every
+    /// segment in this list get `(CURSEG_HOT_NODE << 10) | valid_count`
+    /// in their `vblocks` so fsck's `fsck_chk_curseg_info` is happy.
+    pub(crate) node_segments: Vec<u32>,
+    /// Main-segment offsets written by CURSEG_HOT_DATA.
+    pub(crate) data_segments: Vec<u32>,
+    /// Next free main-segment offset for spillover allocation. Starts
+    /// at 6 — the 6 reserved cursegs occupy segments 0..5.
+    pub(crate) next_free_seg: u32,
     /// All inodes we've created or modified — keyed by nid. The root is
     /// always present.
     pub(crate) inodes: BTreeMap<u32, InodeRec>,
@@ -194,11 +209,24 @@ impl Writer {
         );
         children.insert(3, Vec::new());
 
+        // Reserved layout for the 6 cursegs (matches mkfs.f2fs):
+        //   main seg 0 → CURSEG_HOT_NODE (root inode lives here)
+        //   main seg 1 → CURSEG_WARM_NODE (unused, kept empty)
+        //   main seg 2 → CURSEG_COLD_NODE (unused, kept empty)
+        //   main seg 3 → CURSEG_HOT_DATA
+        //   main seg 4 → CURSEG_WARM_DATA (unused, kept empty)
+        //   main seg 5 → CURSEG_COLD_DATA (unused, kept empty)
+        //   main seg 6+ → free pool for hot_node / hot_data spillover.
+        let data_seg_offset = 3u32 * geom.blocks_per_seg;
         Self {
             geom,
             sb,
             next_nid: 4,
-            next_main_blk: root_phys + 1, // reserve root inode block
+            next_node_blk: root_phys + 1, // reserve root inode block (seg 0)
+            next_data_blk: root_phys + data_seg_offset,
+            node_segments: vec![0],
+            data_segments: vec![3],
+            next_free_seg: 6,
             inodes,
             direct_nodes: BTreeMap::new(),
             indirect_nodes: BTreeMap::new(),
@@ -214,18 +242,57 @@ impl Writer {
         n
     }
 
-    /// Allocate one main-area block. Caller writes the content
-    /// immediately.
-    fn alloc_block(&mut self) -> Result<u32> {
-        let blk = self.next_main_blk;
-        let end = self.geom.main_blkaddr as u64
-            + (self.geom.segment_count_main as u64) * (self.geom.blocks_per_seg as u64);
-        if (blk as u64) >= end {
+    /// Returns the absolute block address of segment `seg` (main offset).
+    fn seg_to_blk(&self, seg: u32) -> u32 {
+        self.geom.main_blkaddr + seg * self.geom.blocks_per_seg
+    }
+
+    /// Claim a fresh main-area segment from the free pool. Used when a
+    /// curseg fills up and needs spillover capacity.
+    fn alloc_fresh_segment(&mut self) -> Result<u32> {
+        let s = self.next_free_seg;
+        if s >= self.geom.segment_count_main {
             return Err(crate::Error::InvalidArgument(
-                "f2fs: main area exhausted".into(),
+                "f2fs: main area exhausted (no free segments)".into(),
             ));
         }
-        self.next_main_blk += 1;
+        self.next_free_seg += 1;
+        Ok(s)
+    }
+
+    /// Allocate one NODE block (CURSEG_HOT_NODE). When the active node
+    /// segment fills, claim a new one from the free pool and switch to
+    /// it; the CP head's `cur_node_segno[0]` will reflect the latest.
+    fn alloc_node_block(&mut self) -> Result<u32> {
+        let active_seg = *self
+            .node_segments
+            .last()
+            .expect("node_segments seeded in new()");
+        let seg_end = self.seg_to_blk(active_seg) + self.geom.blocks_per_seg;
+        if self.next_node_blk >= seg_end {
+            let fresh = self.alloc_fresh_segment()?;
+            self.node_segments.push(fresh);
+            self.next_node_blk = self.seg_to_blk(fresh);
+        }
+        let blk = self.next_node_blk;
+        self.next_node_blk += 1;
+        Ok(blk)
+    }
+
+    /// Allocate one DATA block (CURSEG_HOT_DATA). Same spillover behavior.
+    fn alloc_data_block(&mut self) -> Result<u32> {
+        let active_seg = *self
+            .data_segments
+            .last()
+            .expect("data_segments seeded in new()");
+        let seg_end = self.seg_to_blk(active_seg) + self.geom.blocks_per_seg;
+        if self.next_data_blk >= seg_end {
+            let fresh = self.alloc_fresh_segment()?;
+            self.data_segments.push(fresh);
+            self.next_data_blk = self.seg_to_blk(fresh);
+        }
+        let blk = self.next_data_blk;
+        self.next_data_blk += 1;
         Ok(blk)
     }
 
@@ -344,7 +411,7 @@ impl Writer {
                 filled += take;
             }
             // Allocate + write the data block.
-            let phys = self.alloc_block()?;
+            let phys = self.alloc_data_block()?;
             dev.write_at(phys as u64 * bs, &block_buf)?;
             self.place_data_block(nid, logical_idx, phys)?;
             logical_idx += 1;
@@ -440,11 +507,7 @@ impl Writer {
             self.next_nid += 1;
             n
         };
-        let phys = {
-            let blk = self.next_main_blk;
-            self.next_main_blk += 1;
-            blk
-        };
+        let phys = self.alloc_node_block()?;
         self.indirect_nodes.get_mut(&parent).unwrap().nids[outer] = inid;
         self.indirect_nodes.insert(
             inid,
@@ -472,11 +535,7 @@ impl Writer {
             self.next_nid += 1;
             n
         };
-        let phys = {
-            let blk = self.next_main_blk;
-            self.next_main_blk += 1;
-            blk
-        };
+        let phys = self.alloc_node_block()?;
         // Re-borrow to set the slot.
         self.inodes.get_mut(&parent_nid).unwrap().i_nid[slot] = dnid;
         self.direct_nodes.insert(
@@ -504,11 +563,7 @@ impl Writer {
             self.next_nid += 1;
             n
         };
-        let phys = {
-            let blk = self.next_main_blk;
-            self.next_main_blk += 1;
-            blk
-        };
+        let phys = self.alloc_node_block()?;
         self.inodes.get_mut(&parent_nid).unwrap().i_nid[slot] = inid;
         self.indirect_nodes.insert(
             inid,
@@ -536,11 +591,7 @@ impl Writer {
             self.next_nid += 1;
             n
         };
-        let phys = {
-            let blk = self.next_main_blk;
-            self.next_main_blk += 1;
-            blk
-        };
+        let phys = self.alloc_node_block()?;
         self.indirect_nodes.get_mut(&parent).unwrap().nids[outer] = dnid;
         self.direct_nodes.insert(
             dnid,
@@ -568,7 +619,7 @@ impl Writer {
             )));
         }
         let nid = self.alloc_nid();
-        let inode_blk = self.alloc_block()?;
+        let inode_blk = self.alloc_node_block()?;
         let mode = S_IFREG | (meta.mode & 0x0FFF);
         self.inodes.insert(
             nid,
@@ -616,7 +667,7 @@ impl Writer {
             )));
         }
         let nid = self.alloc_nid();
-        let inode_blk = self.alloc_block()?;
+        let inode_blk = self.alloc_node_block()?;
         let mode = S_IFDIR | (meta.mode & 0x0FFF);
         self.inodes.insert(
             nid,
@@ -674,7 +725,7 @@ impl Writer {
             ));
         }
         let nid = self.alloc_nid();
-        let inode_blk = self.alloc_block()?;
+        let inode_blk = self.alloc_node_block()?;
         let mode = S_IFLNK | (meta.mode & 0x0FFF);
         self.inodes.insert(
             nid,
@@ -725,7 +776,7 @@ impl Writer {
             DeviceKind::Socket => (S_IFSOCK, F2FS_FT_SOCK),
         };
         let nid = self.alloc_nid();
-        let inode_blk = self.alloc_block()?;
+        let inode_blk = self.alloc_node_block()?;
         // Pack devt into the first 8 bytes of inline_payload.
         let mut payload = vec![0u8; 8];
         let devt =
@@ -873,7 +924,7 @@ impl Writer {
             // Allocate one data block for now. Multi-block dentry growth
             // is handled at flush time.
             if ino.i_addr[0] == 0 {
-                let phys = self.alloc_block()?;
+                let phys = self.alloc_data_block()?;
                 self.inodes.get_mut(&parent_nid).unwrap().i_addr[0] = phys;
                 self.inodes.get_mut(&parent_nid).unwrap().blocks = 1;
             }
@@ -945,7 +996,7 @@ impl Writer {
                 ino.i_addr[0]
             };
             if first_phys == 0 {
-                let phys = self.alloc_block()?;
+                let phys = self.alloc_data_block()?;
                 self.inodes.get_mut(&dir_nid).unwrap().i_addr[0] = phys;
                 block_addrs.push(phys);
             } else {
@@ -953,7 +1004,7 @@ impl Writer {
             }
             // Blocks 1..N — allocate + register.
             for idx in 1..chunks.len() {
-                let phys = self.alloc_block()?;
+                let phys = self.alloc_data_block()?;
                 self.place_data_block(dir_nid, idx as u64, phys)?;
                 block_addrs.push(phys);
             }
@@ -970,12 +1021,14 @@ impl Writer {
 
         // 2) Write every direct-node block.
         for (_, d) in self.direct_nodes.iter() {
-            let blk = encode_direct_node_with_crc(&d.addrs);
+            let ino = find_owner_of_dnode(self, d.nid);
+            let blk = encode_direct_node_with_crc(&d.addrs, d.nid, ino);
             dev.write_at(d.on_disk_block as u64 * bs, &blk)?;
         }
         // 3) Write every indirect-node block.
         for (_, ind) in self.indirect_nodes.iter() {
-            let blk = encode_indirect_node_with_crc(&ind.nids);
+            let ino = find_owner_of_indirect(self, ind.nid);
+            let blk = encode_indirect_node_with_crc(&ind.nids, ind.nid, ino);
             dev.write_at(ind.on_disk_block as u64 * bs, &blk)?;
         }
         // 4) Write every inode block.
@@ -1041,11 +1094,76 @@ impl Writer {
             }
         }
 
-        // 6) SIT — blank, but with valid CRC footers across the whole region.
-        let sit_blocks = self.geom.segment_count_sit * self.geom.blocks_per_seg;
-        let sit_blk = super::format::encode_sit_page();
-        for i in 0..sit_blocks {
-            dev.write_at((self.geom.sit_blkaddr + i) as u64 * bs, &sit_blk)?;
+        // 6) SIT — one entry per main-area segment. Each entry is
+        //    `vblocks u16 | valid_map[64] | mtime u64` (74 bytes packed).
+        //    `vblocks = (curseg_type << 10) | valid_count`. fsck.f2fs's
+        //    `fsck_chk_curseg_info` rejects the image if the curseg's
+        //    segment SIT entry doesn't carry the matching high bits.
+        //
+        //    For each segment in `node_segments` we set
+        //    `(CURSEG_HOT_NODE << 10) | n` where n is the count of
+        //    blocks actually placed there; same for `data_segments`
+        //    with `CURSEG_HOT_DATA`. Segments 1, 2, 4, 5 stay at zero
+        //    valid_count but carry the WARM/COLD type bits so the
+        //    unused-but-named cursegs validate.
+        let main_segs = self.geom.segment_count_main as usize;
+        let bps = self.geom.blocks_per_seg as usize;
+        let sit_segments_per_half = self.geom.segment_count_sit / 2;
+        let sit_pages_per_half = (sit_segments_per_half * self.geom.blocks_per_seg) as usize;
+        let sit_entries_per_block = F2FS_BLKSIZE / 74;
+        let mut sit_pages: Vec<Vec<u8>> = vec![vec![0u8; F2FS_BLKSIZE]; sit_pages_per_half];
+
+        // Per-segment derived state: (curseg_type bits, valid_block_count).
+        // None entries stay zero (unused segments).
+        let mut seg_state: Vec<(u16, usize)> = vec![(0, 0); main_segs];
+        // Reserved/unused curseg "homes" carry their type bits but zero count.
+        seg_state[1] = (4, 0); // CURSEG_WARM_NODE
+        seg_state[2] = (5, 0); // CURSEG_COLD_NODE
+        seg_state[4] = (1, 0); // CURSEG_WARM_DATA
+        seg_state[5] = (2, 0); // CURSEG_COLD_DATA
+        // Walk node_segments: full earlier ones, partial-current last.
+        let node_active_blk = self.next_node_blk;
+        for (i, &seg) in self.node_segments.iter().enumerate() {
+            let count = if i + 1 < self.node_segments.len() {
+                bps
+            } else {
+                (node_active_blk - self.seg_to_blk(seg)) as usize
+            };
+            seg_state[seg as usize] = (3, count); // CURSEG_HOT_NODE
+        }
+        let data_active_blk = self.next_data_blk;
+        for (i, &seg) in self.data_segments.iter().enumerate() {
+            let count = if i + 1 < self.data_segments.len() {
+                bps
+            } else {
+                (data_active_blk - self.seg_to_blk(seg)) as usize
+            };
+            seg_state[seg as usize] = (0, count); // CURSEG_HOT_DATA
+        }
+
+        for (segno, (curseg_type, valid_bits)) in seg_state.iter().enumerate() {
+            let page_idx = segno / sit_entries_per_block;
+            if page_idx >= sit_pages.len() {
+                break;
+            }
+            let entry_idx = segno % sit_entries_per_block;
+            let off = entry_idx * 74;
+            let page = &mut sit_pages[page_idx];
+            let vblocks = (curseg_type << 10) | ((*valid_bits as u16) & 0x03FF);
+            page[off..off + 2].copy_from_slice(&vblocks.to_le_bytes());
+            for bit in 0..*valid_bits {
+                let byte_idx = off + 2 + (bit / 8);
+                let mask = 1u8 << (bit % 8);
+                page[byte_idx] |= mask;
+            }
+        }
+        // Write both halves of the SIT (shadow paging — content is
+        // identical on a fresh image with an empty SIT version bitmap).
+        for half in 0..2u32 {
+            for (pidx, page) in sit_pages.iter().enumerate() {
+                let phys = self.geom.sit_blkaddr + half * (sit_pages_per_half as u32) + pidx as u32;
+                dev.write_at(phys as u64 * bs, page)?;
+            }
         }
 
         // 7) SSA — blank, with CRC footers.
@@ -1072,7 +1190,34 @@ impl Writer {
         //    at cp_blkaddr+1). With that block all-zeros, n_nats=0
         //    and n_sits=0 in the journal slot, so the journal walk
         //    produces zero phantom entries.
-        let valid_blocks = (self.next_main_blk - self.geom.main_blkaddr) as u64;
+        // Total allocated main-area blocks: sum across every segment
+        // that node/data spillover claimed.
+        let bps_u32 = self.geom.blocks_per_seg;
+        let node_used_total: u32 = self
+            .node_segments
+            .iter()
+            .enumerate()
+            .map(|(i, &seg)| {
+                if i + 1 < self.node_segments.len() {
+                    bps_u32
+                } else {
+                    self.next_node_blk - self.seg_to_blk(seg)
+                }
+            })
+            .sum();
+        let data_used_total: u32 = self
+            .data_segments
+            .iter()
+            .enumerate()
+            .map(|(i, &seg)| {
+                if i + 1 < self.data_segments.len() {
+                    bps_u32
+                } else {
+                    self.next_data_blk - self.seg_to_blk(seg)
+                }
+            })
+            .sum();
+        let valid_blocks = (node_used_total as u64) + (data_used_total as u64);
         // fsck.f2fs (Android fork + Ubuntu 24.04 build) refuses a CP
         // that has any of `rsvd_segment_count == 0`,
         // `overprov_segment_count == 0`, or `fsmeta < F2FS_MIN_SEGMENT`
@@ -1102,6 +1247,20 @@ impl Writer {
         let log_bps = self.geom.log_blocks_per_seg;
         let sit_ver_bitmap_bytesize = ((self.geom.segment_count_sit / 2) << log_bps) / 8;
         let nat_ver_bitmap_bytesize = ((self.geom.segment_count_nat / 2) << log_bps) / 8;
+        // Curseg layout: 3 node cursegs (HOT/WARM/COLD), 3 data
+        // cursegs. HOT_NODE / HOT_DATA segnos track the LAST entry in
+        // `node_segments` / `data_segments` (the active segment after
+        // any spillover); their blkoff is the offset within that
+        // segment of the next free block. WARM/COLD point at the
+        // reserved segments 1, 2, 4, 5 (always empty, blkoff=0).
+        let hot_node_seg = *self.node_segments.last().unwrap();
+        let hot_data_seg = *self.data_segments.last().unwrap();
+        let hot_node_blkoff = (self.next_node_blk - self.seg_to_blk(hot_node_seg)) as u16;
+        let hot_data_blkoff = (self.next_data_blk - self.seg_to_blk(hot_data_seg)) as u16;
+        let cur_node_segno = [hot_node_seg, 1, 2];
+        let cur_node_blkoff = [hot_node_blkoff, 0, 0];
+        let cur_data_segno = [hot_data_seg, 4, 5];
+        let cur_data_blkoff = [hot_data_blkoff, 0, 0];
         let cp = Checkpoint {
             version: 1,
             user_block_count,
@@ -1118,6 +1277,10 @@ impl Writer {
             cur_nat_pack: 0,
             cur_sit_pack: 0,
             nat_journal: Vec::new(),
+            cur_node_segno,
+            cur_node_blkoff,
+            cur_data_segno,
+            cur_data_blkoff,
         };
         let cp_bytes = super::checkpoint::encode_cp_head_writer(&cp);
         let total = cp.cp_pack_total_block_count as u64;
@@ -1293,6 +1456,20 @@ fn set_bit(bitmap: &mut [u8], i: usize) {
 
 /// Encode an inode block from an [`InodeRec`] (optionally inlining a
 /// dentry payload).
+/// Stamp the 24-byte `struct node_footer` at the end of a 4 KiB node
+/// block: nid u32, ino u32, flag u32, cp_ver u64, next_blkaddr u32.
+/// `cp_ver` matches the CP head's `checkpoint_ver` (we always write 1
+/// on a fresh image — see write.rs flush()).
+fn write_node_footer(buf: &mut [u8], nid: u32, ino: u32) {
+    const NODE_FOOTER_OFFSET: usize = F2FS_BLKSIZE - 24;
+    let o = NODE_FOOTER_OFFSET;
+    buf[o..o + 4].copy_from_slice(&nid.to_le_bytes());
+    buf[o + 4..o + 8].copy_from_slice(&ino.to_le_bytes());
+    buf[o + 8..o + 12].copy_from_slice(&0u32.to_le_bytes()); // flag
+    buf[o + 12..o + 20].copy_from_slice(&1u64.to_le_bytes()); // cp_ver
+    buf[o + 20..o + 24].copy_from_slice(&0u32.to_le_bytes()); // next_blkaddr
+}
+
 fn encode_inode_block(ino: &InodeRec, inline_children: Option<&[Dentry]>) -> Vec<u8> {
     let mut buf = vec![0u8; F2FS_BLKSIZE];
     buf[0x00..0x02].copy_from_slice(&ino.mode.to_le_bytes());
@@ -1328,38 +1505,41 @@ fn encode_inode_block(ino: &InodeRec, inline_children: Option<&[Dentry]>) -> Vec
         }
     }
 
-    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
-    buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+    // Node blocks carry no trailing CRC — the last 24 bytes are the
+    // `struct node_footer` instead. fsck.f2fs reads footer.nid and
+    // footer.ino to validate the block, and writing a u32 at offset
+    // 4092 would clobber next_blkaddr.
+    write_node_footer(&mut buf, ino.nid, ino.nid);
     buf
 }
 
-/// 4 KiB direct-node block: 1018 le u32 pointers + trailing CRC.
-fn encode_direct_node_with_crc(ptrs: &[u32; ADDRS_PER_BLOCK]) -> Vec<u8> {
+/// 4 KiB direct-node block: 1018 le u32 data-block pointers + node_footer.
+fn encode_direct_node_with_crc(ptrs: &[u32; ADDRS_PER_BLOCK], nid: u32, ino: u32) -> Vec<u8> {
     let mut buf = vec![0u8; F2FS_BLKSIZE];
+    const FOOTER_OFFSET: usize = F2FS_BLKSIZE - 24;
     for (i, p) in ptrs.iter().enumerate() {
         let o = i * 4;
-        if o + 4 > F2FS_BLK_CSUM_OFFSET {
+        if o + 4 > FOOTER_OFFSET {
             break;
         }
         buf[o..o + 4].copy_from_slice(&p.to_le_bytes());
     }
-    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
-    buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+    write_node_footer(&mut buf, nid, ino);
     buf
 }
 
-/// 4 KiB indirect-node block: 1018 le u32 nids + trailing CRC.
-fn encode_indirect_node_with_crc(nids: &[u32; NIDS_PER_BLOCK]) -> Vec<u8> {
+/// 4 KiB indirect-node block: 1018 le u32 nids + node_footer.
+fn encode_indirect_node_with_crc(nids: &[u32; NIDS_PER_BLOCK], nid: u32, ino: u32) -> Vec<u8> {
     let mut buf = vec![0u8; F2FS_BLKSIZE];
+    const FOOTER_OFFSET: usize = F2FS_BLKSIZE - 24;
     for (i, n) in nids.iter().enumerate() {
         let o = i * 4;
-        if o + 4 > F2FS_BLK_CSUM_OFFSET {
+        if o + 4 > FOOTER_OFFSET {
             break;
         }
         buf[o..o + 4].copy_from_slice(&n.to_le_bytes());
     }
-    let crc = super::constants::f2fs_crc32(&buf[..F2FS_BLK_CSUM_OFFSET]);
-    buf[F2FS_BLK_CSUM_OFFSET..F2FS_BLK_CSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+    write_node_footer(&mut buf, nid, ino);
     buf
 }
 
@@ -1454,7 +1634,7 @@ mod tests {
         // Allocate an inode record by hand at nid 4 (next_nid).
         let inode_nid = writer.next_nid;
         writer.next_nid += 1;
-        let inode_blk = writer.alloc_block().unwrap();
+        let inode_blk = writer.alloc_node_block().unwrap();
         writer.inodes.insert(
             inode_nid,
             InodeRec {
@@ -1483,7 +1663,7 @@ mod tests {
         let triple_base = ADDRS_PER_INODE as u64 + (ADDRS_PER_BLOCK as u64) * 2 + double_span;
         let idx = triple_base + 7;
 
-        let phys = writer.alloc_block().unwrap();
+        let phys = writer.alloc_data_block().unwrap();
         writer.place_data_block(inode_nid, idx, phys).unwrap();
 
         // Now we expect: i_nid[NID_TRIPLE_INDIRECT] points at a top
@@ -1534,7 +1714,7 @@ mod tests {
             let writer = fs.writer.as_mut().unwrap();
             let nid = writer.next_nid;
             writer.next_nid += 1;
-            let inode_blk = writer.alloc_block().unwrap();
+            let inode_blk = writer.alloc_node_block().unwrap();
             writer.inodes.insert(
                 nid,
                 InodeRec {
@@ -1570,7 +1750,7 @@ mod tests {
 
         let phys = {
             let writer = fs.writer.as_mut().unwrap();
-            let p = writer.alloc_block().unwrap();
+            let p = writer.alloc_data_block().unwrap();
             writer.place_data_block(inode_nid, idx, p).unwrap();
             // Mark inode size so the reader serves exactly one byte from
             // the planted block.
@@ -1624,7 +1804,7 @@ mod tests {
         let writer = fs.writer.as_mut().unwrap();
         let inode_nid = writer.next_nid;
         writer.next_nid += 1;
-        let inode_blk = writer.alloc_block().unwrap();
+        let inode_blk = writer.alloc_node_block().unwrap();
         writer.inodes.insert(
             inode_nid,
             InodeRec {
@@ -1648,7 +1828,7 @@ mod tests {
         );
         let double_span = (NIDS_PER_BLOCK as u64) * (ADDRS_PER_BLOCK as u64) * 2;
         let triple_base = ADDRS_PER_INODE as u64 + (ADDRS_PER_BLOCK as u64) * 2 + double_span;
-        let phys = writer.alloc_block().unwrap();
+        let phys = writer.alloc_data_block().unwrap();
         writer
             .place_data_block(inode_nid, triple_base, phys)
             .unwrap();

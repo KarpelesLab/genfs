@@ -10,6 +10,8 @@
 //! Full TOML-spec-driven `fstool build` and `fstool add` / `fstool rm` land
 //! in P5b / P5c — see the project README.
 
+mod shell;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -137,6 +139,15 @@ enum Command {
         #[arg(value_name = "FS_PATH")]
         fs_path: String,
     },
+
+    /// Open an interactive shell over an image. Maintains a virtual cwd
+    /// and reads commands from stdin; type `help` once inside for the
+    /// command list, or `quit` (or EOF) to leave.
+    Shell {
+        /// Path to the image file (modified in place when you `put` or `rm`).
+        #[arg(value_name = "IMAGE")]
+        image: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -193,7 +204,19 @@ fn run(cli: Cli) -> fstool::Result<()> {
             fs_dest,
         } => add(&image, &host_src, &fs_dest),
         Command::Rm { image, fs_path } => rm(&image, &fs_path),
+        Command::Shell { image } => shell_cmd(&image),
     }
+}
+
+fn shell_cmd(image: &std::path::Path) -> fstool::Result<()> {
+    let mut dev = FileBackend::open(image)?;
+    let fs = fstool::inspect::AnyFs::open(&mut dev)?;
+    let mut sh = shell::Shell::new(fs);
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    sh.run(&mut dev, stdin.lock(), stdout.lock())?;
+    dev.sync()?;
+    Ok(())
 }
 
 fn rm(image: &std::path::Path, fs_path: &str) -> fstool::Result<()> {

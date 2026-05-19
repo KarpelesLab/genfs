@@ -236,6 +236,114 @@ fn cli_info_reports_ext4() {
     );
 }
 
+/// `fstool shell` runs an SFTP-style REPL. Drive it with a scripted
+/// stdin and assert the captured stdout contains the right output for
+/// each command.
+#[test]
+fn cli_shell_navigates_and_mutates() {
+    if !which("e2fsck") {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    }
+
+    // Build a small ext4 with a file and a subdirectory.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(srcdir.path().join("docs")).unwrap();
+    std::fs::write(srcdir.path().join("docs/readme"), b"deep body\n").unwrap();
+    std::fs::write(srcdir.path().join("top.txt"), b"top body\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args(["ext-build", "--kind", "ext4"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ext-build failed");
+
+    // Drive the shell.
+    let extra = NamedTempFile::new().unwrap();
+    std::fs::write(extra.path(), b"shell-added\n").unwrap();
+    let script = format!(
+        "pwd\n\
+         ls /\n\
+         cd docs\n\
+         pwd\n\
+         cat readme\n\
+         cd ..\n\
+         mkdir /new\n\
+         put {} /new/copy.txt\n\
+         cat /new/copy.txt\n\
+         rm /top.txt\n\
+         ls /\n\
+         quit\n",
+        extra.path().display()
+    );
+
+    let mut child = std::process::Command::new(FSTOOL)
+        .arg("shell")
+        .arg(img.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "shell exited non-zero:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    assert!(
+        stdout.contains("top.txt"),
+        "missing top.txt in /:\n{stdout}"
+    );
+    assert!(stdout.contains("docs/"), "missing docs/ in /:\n{stdout}");
+    assert!(stdout.contains("/docs"), "pwd after cd docs:\n{stdout}");
+    assert!(stdout.contains("deep body"), "cat readme output:\n{stdout}");
+    assert!(
+        stdout.contains("shell-added"),
+        "cat of added file:\n{stdout}"
+    );
+    // After `rm /top.txt`, the listing must no longer show it. The
+    // assertion below counts occurrences — the script does `ls /` twice,
+    // so before-rm it appears once; after-rm it shouldn't appear in the
+    // second listing. We just check the FINAL state via a fresh `ls`.
+    let final_listing = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&final_listing.stdout);
+    assert!(!s.contains("top.txt"), "top.txt should be gone:\n{s}");
+    assert!(s.contains("new"), "/new should exist:\n{s}");
+
+    // e2fsck still clean after all the shell mutations.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after shell mutations:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+}
+
 /// FAT32 add/rm through `fstool`: parallel to the ext test.
 #[test]
 fn cli_fat32_add_and_rm() {

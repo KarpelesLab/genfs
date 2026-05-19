@@ -189,6 +189,22 @@ impl AnyFs {
         }
     }
 
+    /// Create an empty directory at `path`. The parent must already
+    /// exist. For ext the mode is 0o755 (umask 022 over 0o777); FAT has
+    /// no Unix permissions.
+    pub fn mkdir(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        match self {
+            Self::Ext(ext) => {
+                let meta = crate::fs::FileMeta {
+                    mode: 0o755,
+                    ..crate::fs::FileMeta::default()
+                };
+                ext.create_dir(dev, std::path::Path::new(path), meta)
+            }
+            Self::Fat32(fat) => fat.add_dir(dev, path),
+        }
+    }
+
     /// Remove an entry at `path` — a file, symlink, device, or empty
     /// directory. Non-empty directories are rejected.
     pub fn remove(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {

@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "fstool"
-path = "src/bin/fstool.rs"
+path = "src/bin/fstool/main.rs"
 
 [dependencies]
 thiserror = "2"

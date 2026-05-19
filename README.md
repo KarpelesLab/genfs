@@ -40,7 +40,8 @@ What works today:
 **CLI** — `build` (from a TOML spec), `ext-build` (bare ext FS from a
 directory), `fat-build` (bare FAT32 from a directory), `ls`, `cat`,
 `info`, `add` (copy a host file/tree in), `rm` (unlink a file / symlink /
-device / empty directory).
+device / empty directory), `shell` (interactive SFTP-style REPL with
+`ls`/`cd`/`pwd`/`cat`/`put`/`rm`/`mkdir`/`info`).
 
 **Block layer** — `fstool::block::{FileBackend, MemoryBackend,
 SlicedBackend}`: sparse file-backed devices, in-memory devices for tests,
@@ -182,9 +183,8 @@ In-place modification is restricted to whole-file granularity in v1 (add,
 remove, replace). Partial-file rewrites are explicitly out of scope until
 there's a use case that demands them.
 
-Not yet implemented: a FAT32 reader (open / ls / cat / info — the v1 path
-is write-only); `sparse_super` / `flex_bg` on the ext4 *write* path
-(the reader handles both); an interactive SFTP-style shell.
+Not yet implemented: `flex_bg` on the ext4 *write* path (the reader
+handles it).
 
 ## Licence
 

@@ -1549,15 +1549,21 @@ fn encode_inode_block(
     buf[0x30..0x38].copy_from_slice(&(ino.mtime as u64).to_le_bytes());
     buf[0x50..0x54].copy_from_slice(&ino.flags.to_le_bytes());
 
+    // Inline payload sits at `i_addr[DEF_INLINE_RESERVED_SIZE]` (=
+    // i_addr[1]), NOT at `i_addr[0]` — fsck.f2fs's `inline_data_addr`
+    // skips the first `__le32` slot. Mismatching this by 4 bytes was
+    // why fsck reported `dots: 0` despite the writer emitting both
+    // "." and "..".
+    const INLINE_PAYLOAD_OFFSET: usize = I_ADDR_OFFSET + 4;
     if ino.inline_flags & F2FS_INLINE_DENTRY != 0 {
         let kids = inline_children.unwrap_or(&[]);
         let payload = encode_inline_dentry_payload(ino.nid, parent_nid, kids);
-        let n = payload.len().min(buf.len() - I_ADDR_OFFSET - 8);
-        buf[I_ADDR_OFFSET..I_ADDR_OFFSET + n].copy_from_slice(&payload[..n]);
+        let n = payload.len().min(buf.len() - INLINE_PAYLOAD_OFFSET - 8);
+        buf[INLINE_PAYLOAD_OFFSET..INLINE_PAYLOAD_OFFSET + n].copy_from_slice(&payload[..n]);
     } else if ino.inline_flags & F2FS_INLINE_DATA != 0 {
         let payload = &ino.inline_payload;
-        let n = payload.len().min(buf.len() - I_ADDR_OFFSET - 8);
-        buf[I_ADDR_OFFSET..I_ADDR_OFFSET + n].copy_from_slice(&payload[..n]);
+        let n = payload.len().min(buf.len() - INLINE_PAYLOAD_OFFSET - 8);
+        buf[INLINE_PAYLOAD_OFFSET..INLINE_PAYLOAD_OFFSET + n].copy_from_slice(&payload[..n]);
     } else {
         for (i, a) in ino.i_addr.iter().enumerate() {
             let o = I_ADDR_OFFSET + i * 4;

@@ -651,10 +651,11 @@ mod tests {
         // Write inline-dentry payload INTO root inode block (after encode) if applicable.
         if root_inode.inline_flags & F2FS_INLINE_DENTRY != 0 {
             // Encode the inode block first, then overlay the inline dentry region
-            // at I_ADDR_OFFSET. Layout: bitmap | reserved | dentries | names.
+            // at I_ADDR_OFFSET + 4 (i_addr[DEF_INLINE_RESERVED_SIZE]).
+            // Layout: bitmap | reserved | dentries | names.
             let mut blk = encode_inode_block(&root_inode);
             let payload = encode_inline_dentries_payload(&child_entries_for_dir);
-            let off = super::inode::I_ADDR_OFFSET;
+            let off = super::inode::I_ADDR_OFFSET + 4;
             let n = payload.len().min(blk.len() - off - 8); // leave footer alone
             blk[off..off + n].copy_from_slice(&payload[..n]);
             // Re-stamp the CRC32 footer.
@@ -773,12 +774,12 @@ mod tests {
             i_nid: [0; super::constants::NIDS_PER_INODE],
         };
         // Write the literal bytes into the inline payload region of i_addr.
+        // F2FS lays out inline data starting at `i_addr[DEF_INLINE_RESERVED_SIZE]`
+        // (= i_addr[1]); slot 0 is reserved (matches `inline_data_addr` in
+        // fsck.f2fs).
         let bytes_as_words = payload;
         for (i, b) in bytes_as_words.iter().enumerate() {
-            // pack one byte per i_addr slot is wasteful; use the natural
-            // approach — overlay raw bytes via encode time. We encode by
-            // writing into the first few i_addr entries' bytes.
-            let slot = i / 4;
+            let slot = (i / 4) + 1;
             let off = i % 4;
             let mut bs4 = ino.i_addr[slot].to_le_bytes();
             bs4[off] = *b;
@@ -1120,7 +1121,7 @@ mod tests {
         }];
         let mut blk = encode_inode_block(&root_inode);
         let payload_buf = encode_inline_dentries_payload(&root_entries);
-        let off = super::inode::I_ADDR_OFFSET;
+        let off = super::inode::I_ADDR_OFFSET + 4;
         let n = payload_buf.len().min(blk.len() - off - 8);
         blk[off..off + n].copy_from_slice(&payload_buf[..n]);
         let crc =

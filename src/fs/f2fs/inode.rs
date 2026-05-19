@@ -53,12 +53,14 @@ impl F2fsInode {
     }
 
     /// Raw bytes view of the inline-data / inline-dentry payload region
-    /// inside the inode block. The literal data starts where `i_addr`
-    /// would have been (offset 0xD0) and runs for `4 * 923 + 4 * 5` =
-    /// 3712 bytes, the longest contiguous run inside the inode block
-    /// before the node footer.
+    /// inside the inode block. The literal data starts at
+    /// `i_addr[DEF_INLINE_RESERVED_SIZE]` (= `i_addr[1]`, offset 0xD4),
+    /// NOT at `i_addr[0]` — fsck.f2fs's `inline_data_addr` skips one
+    /// `__le32` slot. Mismatching this by 4 bytes makes the reader
+    /// drift one dentry slot relative to what fsck.f2fs and the kernel
+    /// see.
     pub fn inline_payload<'a>(&self, block: &'a [u8]) -> &'a [u8] {
-        let off = I_ADDR_OFFSET;
+        let off = I_ADDR_OFFSET + 4;
         let end = (off + ADDRS_PER_INODE * 4 + NIDS_PER_INODE * 4).min(block.len());
         &block[off..end]
     }

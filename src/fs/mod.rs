@@ -19,10 +19,14 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+pub mod apfs;
+pub mod exfat;
 pub mod ext;
 pub mod fat;
+pub mod hfs_plus;
 pub mod rootdevs;
 pub mod tar;
+pub mod xfs;
 
 pub use rootdevs::{DeviceEntry, RootDevs};
 

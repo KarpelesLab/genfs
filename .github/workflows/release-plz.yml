@@ -32,11 +32,27 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz
+        id: release-plz
         uses: release-plz/action@v0.5
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # release-plz creates the GitHub Release with the workflow's
+      # GITHUB_TOKEN. GitHub deliberately suppresses downstream workflow
+      # triggers for GITHUB_TOKEN-originated events to prevent recursion,
+      # so `release: published` doesn't fire. workflow_dispatch is the
+      # exception — chain into release-binaries explicitly per release.
+      - name: Trigger release-binaries for each new release
+        if: ${{ steps.release-plz.outputs.releases_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          echo "$RELEASES" | jq -r '.[].tag_name' | while read -r tag; do
+            echo "Dispatching release-binaries for $tag"
+            gh workflow run release-binaries.yml -f tag="$tag"
+          done
 
   release-plz-pr:
     name: release-plz PR

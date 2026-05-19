@@ -29,11 +29,27 @@ use crate::Result;
 
 pub mod file;
 pub mod memory;
+pub mod qcow2;
 pub mod sliced;
 
 pub use file::FileBackend;
 pub use memory::MemoryBackend;
+pub use qcow2::Qcow2Backend;
 pub use sliced::SlicedBackend;
+
+use std::path::Path;
+
+/// Open `path` as a [`BlockDevice`], picking the backend automatically.
+/// qcow2 files (detected by magic `"QFI\xfb"`) get a [`Qcow2Backend`];
+/// everything else — regular files, block devices — gets a
+/// [`FileBackend`]. The detection reads just the first four bytes.
+pub fn open_image(path: &Path) -> crate::Result<Box<dyn BlockDevice>> {
+    if Qcow2Backend::probe(path)? {
+        Ok(Box::new(Qcow2Backend::open(path)?))
+    } else {
+        Ok(Box::new(FileBackend::open(path)?))
+    }
+}
 
 /// A seekable byte-addressable store of fixed capacity.
 ///

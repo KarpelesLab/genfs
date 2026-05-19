@@ -25,7 +25,8 @@ jobs:
             e2fsprogs \
             genext2fs \
             dosfstools \
-            mtools
+            mtools \
+            qemu-utils
           # Sanity-check that everything we cross-validate against is on PATH.
           which sgdisk
           which fdisk
@@ -36,6 +37,7 @@ jobs:
           which fsck.vfat
           which mdir
           which mtype
+          which qemu-img
 
       - uses: dtolnay/rust-toolchain@stable
         with:

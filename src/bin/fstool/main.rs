@@ -436,15 +436,15 @@ fn info(image: &str) -> fstool::Result<()> {
     // table, print the table instead of trying to open it as a single
     // filesystem (which would fail).
     if target.partition.is_none() {
-        let mut disk = FileBackend::open(&target.path)?;
-        if let Some(table) = fstool::inspect::detect_partition_table(&mut disk)? {
+        let mut disk = fstool::block::open_image(&target.path)?;
+        if let Some(table) = fstool::inspect::detect_partition_table(disk.as_mut())? {
             print_partition_table(&target.path, disk.total_size(), &table);
             return Ok(());
         }
         // No table — fall through to the bare-FS info below using the
         // already-opened disk.
-        let fs = fstool::inspect::AnyFs::open(&mut disk)?;
-        print_fs_info(&mut disk, &fs);
+        let fs = fstool::inspect::AnyFs::open(disk.as_mut())?;
+        print_fs_info(disk.as_mut(), &fs);
         return Ok(());
     }
     fstool::inspect::with_target_device(&target, |dev| {

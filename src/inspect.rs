@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
-use crate::block::{BlockDevice, FileBackend};
+use crate::block::BlockDevice;
 use crate::fs::ext::Ext;
 use crate::fs::fat::Fat32;
 use crate::fs::{DirEntry, Filesystem};
@@ -276,11 +276,11 @@ fn add_host_tree_into_fat32(
     Ok(())
 }
 
-/// One-shot helper: open `path` as a file-backed device, identify the FS,
-/// and return the handle. Useful for CLI subcommands.
-pub fn open_image_file(path: &Path) -> Result<(FileBackend, AnyFs)> {
-    let mut dev = FileBackend::open(path)?;
-    let fs = AnyFs::open(&mut dev)?;
+/// One-shot helper: open `path` (regular file, block device, or qcow2),
+/// identify the filesystem on it, and return the handle.
+pub fn open_image_file(path: &Path) -> Result<(Box<dyn BlockDevice>, AnyFs)> {
+    let mut dev = crate::block::open_image(path)?;
+    let fs = AnyFs::open(dev.as_mut())?;
     Ok((dev, fs))
 }
 
@@ -407,18 +407,18 @@ pub fn with_target_device<F, R>(target: &Target, op: F) -> Result<R>
 where
     F: FnOnce(&mut dyn BlockDevice) -> Result<R>,
 {
-    let mut disk = FileBackend::open(&target.path)?;
+    let mut disk = crate::block::open_image(&target.path)?;
     match target.partition {
-        None => op(&mut disk),
+        None => op(disk.as_mut()),
         Some(idx) => {
-            let table = detect_partition_table(&mut disk)?.ok_or_else(|| {
+            let table = detect_partition_table(disk.as_mut())?.ok_or_else(|| {
                 crate::Error::InvalidArgument(format!(
                     "{}: no partition table found, can't target partition {}",
                     target.path.display(),
                     idx + 1
                 ))
             })?;
-            let mut slice = slice_partition(table.as_table(), &mut disk, idx)?;
+            let mut slice = slice_partition(table.as_table(), disk.as_mut(), idx)?;
             op(&mut slice)
         }
     }
@@ -472,7 +472,7 @@ mod tests {
 
         let (mut dev, fs) = open_image_file(tmp.path()).unwrap();
         assert_eq!(fs.kind(), FsKind::Ext);
-        let entries = fs.list(&mut dev, "/").unwrap();
+        let entries = fs.list(dev.as_mut(), "/").unwrap();
         // Default ext format includes lost+found.
         assert!(entries.iter().any(|e| e.name == "lost+found"));
     }

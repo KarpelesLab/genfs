@@ -65,6 +65,16 @@ pub struct Checkpoint {
     /// `cur_data_segno[3]` / `cur_data_blkoff[3]` — same for data.
     pub cur_data_segno: [u32; 3],
     pub cur_data_blkoff: [u16; 3],
+    /// `free_segment_count` (offset 0x20) — number of main-area segments
+    /// with `valid_blocks == 0` that aren't currently a curseg.
+    pub free_segment_count: u32,
+    /// `valid_node_count` (offset 0x90) — total active NAT entries.
+    pub valid_node_count: u32,
+    /// `valid_inode_count` (offset 0x94) — number of actual inodes
+    /// (= node entries that have S_IFMT set and a footer.ino == nid).
+    pub valid_inode_count: u32,
+    /// `next_free_nid` (offset 0x98) — first NAT slot not allocated.
+    pub next_free_nid: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -210,6 +220,10 @@ fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
     let cur_node_blkoff = [r16(0x44), r16(0x46), r16(0x48)];
     let cur_data_segno = [r32(0x54), r32(0x58), r32(0x5C)];
     let cur_data_blkoff = [r16(0x74), r16(0x76), r16(0x78)];
+    let free_segment_count = r32(0x20);
+    let valid_node_count = r32(0x90);
+    let valid_inode_count = r32(0x94);
+    let next_free_nid = r32(0x98);
 
     Ok(Checkpoint {
         version,
@@ -233,6 +247,10 @@ fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
         cur_node_blkoff,
         cur_data_segno,
         cur_data_blkoff,
+        free_segment_count,
+        valid_node_count,
+        valid_inode_count,
+        next_free_nid,
     })
 }
 
@@ -288,7 +306,7 @@ pub(crate) fn encode_cp_head_writer(cp: &Checkpoint) -> Vec<u8> {
     buf[0x10..0x18].copy_from_slice(&cp.valid_block_count.to_le_bytes());
     buf[0x18..0x1C].copy_from_slice(&cp.rsvd_segment_count.to_le_bytes());
     buf[0x1C..0x20].copy_from_slice(&cp.overprov_segment_count.to_le_bytes());
-    // 0x20: free_segment_count (left at zero — fsck doesn't recompute it).
+    buf[0x20..0x24].copy_from_slice(&cp.free_segment_count.to_le_bytes());
     // 0x24..0x44: cur_node_segno[8]; 0x44..0x54: cur_node_blkoff[8].
     // 0x54..0x74: cur_data_segno[8]; 0x74..0x84: cur_data_blkoff[8].
     for (i, s) in cp.cur_node_segno.iter().enumerate() {
@@ -310,6 +328,9 @@ pub(crate) fn encode_cp_head_writer(cp: &Checkpoint) -> Vec<u8> {
     buf[0x84..0x88].copy_from_slice(&cp.flags.to_le_bytes());
     buf[0x88..0x8C].copy_from_slice(&cp.cp_pack_total_block_count.to_le_bytes());
     buf[0x8C..0x90].copy_from_slice(&cp.cp_pack_start_sum.to_le_bytes());
+    buf[0x90..0x94].copy_from_slice(&cp.valid_node_count.to_le_bytes());
+    buf[0x94..0x98].copy_from_slice(&cp.valid_inode_count.to_le_bytes());
+    buf[0x98..0x9C].copy_from_slice(&cp.next_free_nid.to_le_bytes());
     buf[0x9C..0xA0].copy_from_slice(&cp.sit_ver_bitmap_bytesize.to_le_bytes());
     buf[0xA0..0xA4].copy_from_slice(&cp.nat_ver_bitmap_bytesize.to_le_bytes());
     // `checksum_offset` = where the CRC32 will go. mkfs.f2fs uses 4092

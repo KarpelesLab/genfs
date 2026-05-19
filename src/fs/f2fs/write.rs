@@ -1305,6 +1305,44 @@ impl Writer {
         let cur_node_blkoff = [hot_node_blkoff, 0, 0];
         let cur_data_segno = [hot_data_seg, 4, 5];
         let cur_data_blkoff = [hot_data_blkoff, 0, 0];
+        // Counters fsck verifies against the on-disk truth:
+        //   valid_node_count = total NAT entries (inodes + dnodes + indnodes)
+        //   valid_inode_count = inode count
+        //   free_segment_count = main-area segments with vblocks=0 and
+        //     not pointed to by any cur_*_segno
+        //   next_free_nid = next nid the writer would hand out
+        let valid_node_count =
+            (self.inodes.len() + self.direct_nodes.len() + self.indirect_nodes.len()) as u32;
+        let valid_inode_count = self.inodes.len() as u32;
+        // Free segments: every main segment that isn't a curseg "home"
+        // AND isn't a spillover segment we've used.
+        let cursegs: [u32; 6] = [
+            cur_data_segno[0],
+            cur_data_segno[1],
+            cur_data_segno[2],
+            cur_node_segno[0],
+            cur_node_segno[1],
+            cur_node_segno[2],
+        ];
+        let used: std::collections::HashSet<u32> = self
+            .node_segments
+            .iter()
+            .chain(self.data_segments.iter())
+            .copied()
+            .collect();
+        let mut free_segment_count = 0u32;
+        for seg in 0..self.geom.segment_count_main {
+            // A "free" segment in fsck's terms: vblocks=0 (i.e. not in
+            // node_segments / data_segments) AND not a curseg slot.
+            if cursegs.contains(&seg) {
+                continue;
+            }
+            if used.contains(&seg) {
+                continue;
+            }
+            free_segment_count += 1;
+        }
+        let next_free_nid = self.next_nid;
         let cp = Checkpoint {
             version: 1,
             user_block_count,
@@ -1325,6 +1363,10 @@ impl Writer {
             cur_node_blkoff,
             cur_data_segno,
             cur_data_blkoff,
+            free_segment_count,
+            valid_node_count,
+            valid_inode_count,
+            next_free_nid,
         };
         let cp_bytes = super::checkpoint::encode_cp_head_writer(&cp);
         let total = cp.cp_pack_total_block_count as u64;

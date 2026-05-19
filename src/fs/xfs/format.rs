@@ -53,8 +53,7 @@ use super::superblock::Superblock;
 /// formatter is opinionated — 4 KiB blocks, 512-byte v5 inodes, one
 /// allocation group of however many blocks the device holds — and only
 /// exposes the cosmetic knobs that don't change the on-disk geometry.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FormatOpts {
     /// 16-byte filesystem UUID. Defaults to all-zero; pass a random one
     /// if you want each image to be uniquely identifiable.
@@ -65,7 +64,6 @@ pub struct FormatOpts {
     /// atime / mtime / ctime / crtime fields. Defaults to 0.
     pub mtime: u32,
 }
-
 
 // ----- on-disk magic numbers (per the XFS Algorithms doc, chapter 7) ----
 

@@ -378,8 +378,7 @@ mod tests {
         ];
         let base = 200u64;
         let (payload, hdr_off) =
-            encode_xattr_table(std::slice::from_ref(&set), base, Compression::Unknown(0))
-                .unwrap();
+            encode_xattr_table(std::slice::from_ref(&set), base, Compression::Unknown(0)).unwrap();
         let mut dev = MemoryBackend::new(base + payload.len() as u64 + 64);
         dev.write_at(base, &payload).unwrap();
         let mut r = XattrReader::new();

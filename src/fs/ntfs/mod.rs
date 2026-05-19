@@ -776,10 +776,9 @@ impl Ntfs {
                             out.insert(xattr_keys::REPARSE.into(), value.to_vec());
                         }
                     }
-                    TYPE_DATA if !attr.name.is_empty()
-                        && !ads_names.contains(&attr.name) => {
-                            ads_names.push(attr.name.clone());
-                        }
+                    TYPE_DATA if !attr.name.is_empty() && !ads_names.contains(&attr.name) => {
+                        ads_names.push(attr.name.clone());
+                    }
                     _ => {}
                 }
             }

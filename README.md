@@ -46,7 +46,12 @@ raw↔qcow2 conversion with optional grow), `repack` (walk the source
 filesystem and rebuild into a fresh image, with `--shrink` for
 auto-min sizing and `--fs-type` to convert between FS types — preserves
 symlinks, device nodes, mode and uid/gid for ext → ext via a direct
-FS-to-FS copier, no host filesystem involvement). All
+FS-to-FS copier, no host filesystem involvement). ext xattrs round-trip
+through repack — both inline (extended-inode-body) source xattrs and
+external `file_acl`-block ones are read; the destination always writes
+to an external block with a correctly-computed CRC32C when
+`metadata_csum` is on. `debugfs ea_get` confirms identical values
+after repack. All
 inspection and in-place modification commands accept a `disk.img:N`
 (1-indexed) target to walk into a partition of a GPT or MBR disk
 image; `fstool info disk.img` (no suffix) prints the partition table.

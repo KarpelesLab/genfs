@@ -548,12 +548,11 @@ fn copy_ext_dir(
         };
         let name = e.name.as_bytes();
         let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
-        match mode_type {
+        // Read source xattrs once per entry; preserve them across the
+        // create + (optional) recursion.
+        let xattrs = src.read_xattrs(src_dev, e.inode)?;
+        let new_ino = match mode_type {
             t if t == fstool::fs::ext::constants::S_IFREG => {
-                // Stream cluster-by-cluster: read the source file's bytes
-                // into the destination ext's per-block buffer via a
-                // borrowed Read — no host filesystem involvement, no
-                // 'static-lifetime wrappers.
                 let mut reader = src.open_file_reader(src_dev, e.inode)?;
                 dst.add_file_to_streaming(
                     dst_dev,
@@ -562,19 +561,20 @@ fn copy_ext_dir(
                     &mut reader,
                     inode.size as u64,
                     meta,
-                )?;
+                )?
             }
             t if t == fstool::fs::ext::constants::S_IFDIR => {
-                let new_ino = dst.add_dir_to(dst_dev, dst_ino, name, meta)?;
-                copy_ext_dir(src_dev, src, e.inode, dst_dev, dst, new_ino)?;
+                let child_ino = dst.add_dir_to(dst_dev, dst_ino, name, meta)?;
+                copy_ext_dir(src_dev, src, e.inode, dst_dev, dst, child_ino)?;
+                child_ino
             }
             t if t == fstool::fs::ext::constants::S_IFLNK => {
                 let target = src.read_symlink_target(src_dev, e.inode)?;
-                dst.add_symlink_to(dst_dev, dst_ino, name, target.as_bytes(), meta)?;
+                dst.add_symlink_to(dst_dev, dst_ino, name, target.as_bytes(), meta)?
             }
             t if t == fstool::fs::ext::constants::S_IFCHR => {
                 let (major, minor) = decode_devnum(inode.block[0]);
-                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Char, major, minor, meta)?;
+                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Char, major, minor, meta)?
             }
             t if t == fstool::fs::ext::constants::S_IFBLK => {
                 let (major, minor) = decode_devnum(inode.block[0]);
@@ -586,20 +586,24 @@ fn copy_ext_dir(
                     major,
                     minor,
                     meta,
-                )?;
+                )?
             }
             t if t == fstool::fs::ext::constants::S_IFIFO => {
-                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Fifo, 0, 0, meta)?;
+                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Fifo, 0, 0, meta)?
             }
             t if t == fstool::fs::ext::constants::S_IFSOCK => {
-                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Socket, 0, 0, meta)?;
+                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Socket, 0, 0, meta)?
             }
             _ => {
                 eprintln!(
                     "repack: skipping inode {} ({:?}) — unknown mode {:#o}",
                     e.inode, e.name, inode.mode
                 );
+                continue;
             }
+        };
+        if !xattrs.is_empty() {
+            dst.set_xattrs(dst_dev, new_ino, &xattrs)?;
         }
     }
     Ok(())

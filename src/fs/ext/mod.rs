@@ -28,6 +28,7 @@ pub mod group;
 pub mod inode;
 pub mod layout;
 pub mod superblock;
+pub mod xattr;
 
 pub use build_plan::BuildPlan;
 
@@ -1629,6 +1630,95 @@ impl Ext {
     /// Open a streaming reader over the regular file at `ino`. The reader
     /// holds a mutable borrow of `dev` for its lifetime; reads pull the
     /// file's data blocks lazily through a per-block fetch.
+    /// Read this inode's extended attributes. Combines two storage
+    /// locations: inline xattrs in the extended inode body (when
+    /// `inode_size > 128`, post-`i_extra_isize`) and external block
+    /// xattrs (pointed at by `inode.file_acl`). Inline entries come
+    /// first to match the kernel's ordering.
+    ///
+    /// The per-block CRC32C isn't validated here.
+    pub fn read_xattrs(&self, dev: &mut dyn BlockDevice, ino: u32) -> Result<Vec<xattr::Xattr>> {
+        let mut out = Vec::new();
+        // Inline xattrs only exist when the on-disk inode is bigger than
+        // the classic 128 bytes.
+        if self.layout.inode_size > inode::INODE_BASE_SIZE as u16 {
+            out.extend(self.read_inline_xattrs(dev, ino)?);
+        }
+        let inode = self.read_inode(dev, ino)?;
+        if inode.file_acl != 0 {
+            let bs = self.layout.block_size as usize;
+            let mut block = vec![0u8; bs];
+            dev.read_at(inode.file_acl as u64 * bs as u64, &mut block)?;
+            out.extend(xattr::decode_block(&block)?);
+        }
+        Ok(out)
+    }
+
+    /// Read inline xattrs from the extended-inode area. `read_inode`
+    /// only returns the 128-byte base struct, so this re-reads the full
+    /// on-disk inode (`layout.inode_size` bytes) and walks anything past
+    /// the standard fields + `i_extra_isize`.
+    fn read_inline_xattrs(&self, dev: &mut dyn BlockDevice, ino: u32) -> Result<Vec<xattr::Xattr>> {
+        let (group, idx) = self.inode_location(ino);
+        let table_block = self.layout.groups[group as usize].inode_table;
+        let bs = self.layout.block_size as u64;
+        let inode_size = self.layout.inode_size as usize;
+        let off = table_block as u64 * bs + idx as u64 * inode_size as u64;
+        let mut buf = vec![0u8; inode_size];
+        dev.read_at(off, &mut buf)?;
+        // i_extra_isize is the first u16 of the extended area at offset 128.
+        if buf.len() < 130 {
+            return Ok(Vec::new());
+        }
+        let extra_isize = u16::from_le_bytes(buf[128..130].try_into().unwrap()) as usize;
+        let inline_start = inode::INODE_BASE_SIZE + extra_isize;
+        if inline_start >= buf.len() {
+            return Ok(Vec::new());
+        }
+        xattr::decode_inline(&buf[inline_start..])
+    }
+
+    /// Attach the given extended attributes to a freshly-staged inode.
+    /// Allocates one data block, encodes the xattrs into it, stamps the
+    /// CRC32C if `metadata_csum` is on, points `inode.file_acl` at the
+    /// new block, and sets `COMPAT_EXT_ATTR` on the superblock.
+    ///
+    /// `ino` MUST refer to an inode that was just added via one of the
+    /// `add_*_to` methods (i.e. it lives in `self.inodes`). Setting
+    /// xattrs on a disk-resident inode is a separate code path and is
+    /// not implemented in v1.
+    pub fn set_xattrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u32,
+        xattrs: &[xattr::Xattr],
+    ) -> Result<()> {
+        if xattrs.is_empty() {
+            return Ok(());
+        }
+        let bs = self.layout.block_size;
+        let mut block = xattr::encode_block(xattrs, bs as usize)?;
+        let block_num = self.alloc_data_block()?;
+        if self.has_metadata_csum() {
+            xattr::stamp_checksum(&mut block, self.csum_seed(), block_num as u64);
+        }
+        dev.write_at(block_num as u64 * bs as u64, &block)?;
+
+        let entry = self
+            .inodes
+            .iter_mut()
+            .find(|(i, _)| *i == ino)
+            .ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "ext: set_xattrs on disk-resident inode {ino} not yet supported"
+                ))
+            })?;
+        entry.1.file_acl = block_num;
+        entry.1.blocks_512 += bs / 512;
+        self.sb.feature_compat |= constants::feature::COMPAT_EXT_ATTR;
+        Ok(())
+    }
+
     /// Read the target of the symlink at inode `ino`. Errors if the inode
     /// isn't a symlink.
     ///

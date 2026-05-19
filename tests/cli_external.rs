@@ -1043,3 +1043,97 @@ fn cli_repack_preserves_symlinks_and_mode() {
         String::from_utf8_lossy(&fsck.stdout)
     );
 }
+
+/// `fstool repack` preserves ext xattrs through the FS-to-FS copy.
+/// Source is an mke2fs image with `debugfs ea_set`-stamped xattrs;
+/// destination must report identical values via `debugfs ea_get`.
+#[test]
+fn cli_repack_preserves_xattrs() {
+    if !which("mke2fs") || !which("debugfs") || !which("e2fsck") {
+        eprintln!("skipping: e2fsprogs missing");
+        return;
+    }
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("withxattr.txt"), b"hi\n").unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "16M"])
+        .arg(src.path())
+        .output()
+        .unwrap();
+    Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .output()
+        .unwrap();
+
+    // Stamp xattrs onto the source via debugfs.
+    for cmd in [
+        r#"ea_set /withxattr.txt user.foo "hello-xattr""#,
+        r#"ea_set /withxattr.txt security.selinux "system_u:object_r:demo_t:s0""#,
+        r#"ea_set /withxattr.txt trusted.opaque "blob""#,
+    ] {
+        let out = Command::new("debugfs")
+            .args(["-w", "-R"])
+            .arg(cmd)
+            .arg(src.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "debugfs ea_set failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Repack with shrink.
+    let dst = NamedTempFile::new().unwrap();
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(src.path())
+        .arg(dst.path())
+        .arg("--shrink")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "repack failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // e2fsck on destination must be clean.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after repack:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+
+    // Each xattr must round-trip via debugfs ea_get.
+    let cases = [
+        ("user.foo", "hello-xattr"),
+        ("security.selinux", "system_u:object_r:demo_t:s0"),
+        ("trusted.opaque", "blob"),
+    ];
+    for (name, expected) in cases {
+        let out = Command::new("debugfs")
+            .args(["-R"])
+            .arg(format!("ea_get /withxattr.txt {name}"))
+            .arg(dst.path())
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains(expected),
+            "xattr {name:?} lost or wrong:\nstdout:\n{s}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

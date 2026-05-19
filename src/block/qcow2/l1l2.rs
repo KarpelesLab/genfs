@@ -170,7 +170,7 @@ impl L1L2 {
         Ok(())
     }
 
-    /// Set L1[l1_idx] = value and mark the L1 table for flush.
+    /// Set `L1[l1_idx]` = value and mark the L1 table for flush.
     /// (Phase A doesn't write; this is for Phase B's allocator.)
     pub fn set_l1(&mut self, l1_idx: usize, value: u64) {
         self.l1[l1_idx] = value;
@@ -180,7 +180,7 @@ impl L1L2 {
     /// allocate the L2 cluster (via `alloc_data_cluster`) and (later)
     /// the data cluster. Returns the cluster offset of the L2 table
     /// covering `vaddr` (allocated if needed) and the in-L2 index.
-    /// The caller follows up with [`Self::ensure_data_cluster`].
+    /// The caller follows up with a data-cluster allocation.
     pub fn ensure_l2<F: Read + Write + Seek>(
         &mut self,
         file: &mut F,

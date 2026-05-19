@@ -1051,15 +1051,28 @@ impl Writer {
             dev.write_at((self.geom.ssa_blkaddr + i) as u64 * bs, &ssa_blk)?;
         }
 
-        // 8) Checkpoint pack: write a fresh CP0 head + summary. CP1 is
+        // 8) Checkpoint pack: write a fresh CP0 head + footer. CP1 is
         //    deliberately left as the previous version (lower) so the
         //    reader picks CP0.
+        //
+        //    F2FS layout per the kernel docs §"Checkpoint":
+        //      [ head CP    ]  block cp_blkaddr
+        //      [ summaries  ]  blocks cp_blkaddr+1 .. cp_blkaddr + total - 2
+        //      [ footer CP  ]  block cp_blkaddr + total - 1   (must duplicate head)
+        //    fsck.f2fs's `validate_checkpoint` reads BOTH the head and
+        //    the footer (`cp_page_2 = cp_addr + total_block_count - 1`)
+        //    and requires both to decode as valid CP-head blocks. We
+        //    write a 2-block pack with footer = head; for a fresh
+        //    image the NAT journal is empty, so the CP head's bytes
+        //    at the footer position double as a zero-journal summary
+        //    (n_nats=0 at the journal slot — the upper bytes of
+        //    `checkpoint_ver` decode as zero).
         let valid_blocks = (self.next_main_blk - self.geom.main_blkaddr) as u64;
         let cp = Checkpoint {
             version: 1,
             user_block_count: self.geom.total_blocks,
             valid_block_count: valid_blocks,
-            flags: 0,
+            flags: super::constants::CP_UMOUNT_FLAG,
             cp_pack_start_sum: 1,
             cp_pack_total_block_count: 2,
             cp_payload: 0,
@@ -1070,20 +1083,20 @@ impl Writer {
             cur_sit_pack: 0,
             nat_journal: Vec::new(),
         };
-        dev.write_at(
-            self.geom.cp_blkaddr as u64 * bs,
-            &super::checkpoint::encode_cp_head_writer(&cp),
-        )?;
-        // Empty NAT journal in the summary block — every nid lives in the
-        // on-disk NAT pages we just wrote.
-        dev.write_at(
-            (self.geom.cp_blkaddr as u64 + 1) * bs,
-            &super::checkpoint::encode_empty_journal_block(),
-        )?;
-        // Mark CP1 invalid by zeroing its head (zero-magic ⇒ bad CRC).
+        let cp_bytes = super::checkpoint::encode_cp_head_writer(&cp);
+        // Head at block cp_blkaddr.
+        dev.write_at(self.geom.cp_blkaddr as u64 * bs, &cp_bytes)?;
+        // Footer at block cp_blkaddr + total_block_count - 1 = +1.
+        dev.write_at((self.geom.cp_blkaddr as u64 + 1) * bs, &cp_bytes)?;
+        // Mark CP1 invalid by zeroing its head + footer (zero-magic
+        // and zero-checksum_offset both fail validate_checkpoint).
         let zero = vec![0u8; F2FS_BLKSIZE];
         dev.write_at(
             (self.geom.cp_blkaddr + self.geom.blocks_per_seg) as u64 * bs,
+            &zero,
+        )?;
+        dev.write_at(
+            (self.geom.cp_blkaddr + self.geom.blocks_per_seg + 1) as u64 * bs,
             &zero,
         )?;
         dev.sync()?;

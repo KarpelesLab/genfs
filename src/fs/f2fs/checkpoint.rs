@@ -277,12 +277,16 @@ pub(crate) fn encode_cp_head_writer(cp: &Checkpoint) -> Vec<u8> {
 
 /// Encode an empty NAT-journal summary block — used by the writer when
 /// every nid is persisted to the on-disk NAT pages instead of the
-/// journal.
+/// journal. Currently unused by the live writer (a 2-block CP pack uses
+/// a head + duplicate-footer, no separate summary slot) but retained
+/// for tests and future expansion to multi-block CP packs.
+#[allow(dead_code)]
 pub(crate) fn encode_empty_journal_block() -> Vec<u8> {
     encode_nat_journal_block_writer(&[])
 }
 
 /// Encode a NAT-journal block. Layout mirrors [`decode_nat_journal`].
+#[allow(dead_code)]
 pub(crate) fn encode_nat_journal_block_writer(entries: &[NatJournalEntry]) -> Vec<u8> {
     let mut buf = vec![0u8; F2FS_BLKSIZE];
     buf[0..2].copy_from_slice(&(entries.len() as u16).to_le_bytes());

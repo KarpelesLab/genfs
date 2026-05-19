@@ -88,12 +88,19 @@ pub const F2FS_INLINE_DENTRY: u8 = 0x04;
 pub const F2FS_INLINE_XATTR: u8 = 0x01;
 pub const F2FS_DATA_EXIST: u8 = 0x08;
 
-/// Checkpoint flag bits we care about (others ignored).
-pub const CP_COMPACT_SUM_FLAG: u32 = 0x0001;
-pub const CP_ORPHAN_PRESENT_FLAG: u32 = 0x0002;
-pub const CP_UMOUNT_FLAG: u32 = 0x0004;
-pub const CP_FASTBOOT_FLAG: u32 = 0x0008;
-pub const CP_CRC_RECOVERY_FLAG: u32 = 0x0010;
+/// Checkpoint flag bits. Values per `include/linux/f2fs_fs.h` in the
+/// kernel master tree (every flag here matches the canonical value).
+pub const CP_UMOUNT_FLAG: u32 = 0x0000_0001;
+pub const CP_ORPHAN_PRESENT_FLAG: u32 = 0x0000_0002;
+pub const CP_COMPACT_SUM_FLAG: u32 = 0x0000_0004;
+pub const CP_ERROR_FLAG: u32 = 0x0000_0008;
+pub const CP_FSCK_FLAG: u32 = 0x0000_0010;
+pub const CP_FASTBOOT_FLAG: u32 = 0x0000_0020;
+pub const CP_CRC_RECOVERY_FLAG: u32 = 0x0000_0040;
+pub const CP_NAT_BITS_FLAG: u32 = 0x0000_0080;
+pub const CP_TRIMMED_FLAG: u32 = 0x0000_0100;
+pub const CP_NOCRC_RECOVERY_FLAG: u32 = 0x0000_0200;
+pub const CP_LARGE_NAT_BITMAP_FLAG: u32 = 0x0000_0400;
 
 /// Reserved/special block addresses. Anything `>= 1` and `< NEW_ADDR`
 /// is a real allocation; the two specials below mark "not yet on disk"

@@ -129,37 +129,72 @@ pub fn file_type_byte(k: crate::fs::EntryKind) -> u8 {
     }
 }
 
+/// Size of the trailing "checksum dirent" that `metadata_csum` reserves at
+/// the end of every directory data block: an 8-byte fake entry header
+/// (inode=0, rec_len=12, name_len=0, file_type=0xDE) plus a 4-byte CRC32C.
+pub const CSUM_TAIL_LEN: usize = 12;
+
+/// `file_type` byte of the fake checksum dirent.
+pub const DENT_CHECKSUM: u8 = 0xDE;
+
+/// Number of bytes in a `block_size`-byte directory block available for
+/// real entries: the whole block, minus the 12-byte checksum tail when
+/// `csum_tail` is set.
+pub fn usable_dir_len(block_size: u32, csum_tail: bool) -> usize {
+    if csum_tail {
+        block_size as usize - CSUM_TAIL_LEN
+    } else {
+        block_size as usize
+    }
+}
+
+/// Write the 12-byte checksum-dirent header at the tail of a dir block
+/// (with the checksum field left zero — it is stamped at flush time).
+/// `buf` must be a full `block_size`-byte block.
+pub fn write_dir_csum_tail(buf: &mut [u8]) {
+    let off = buf.len() - CSUM_TAIL_LEN;
+    buf[off..off + 4].fill(0); // inode = 0
+    buf[off + 4..off + 6].copy_from_slice(&(CSUM_TAIL_LEN as u16).to_le_bytes()); // rec_len
+    buf[off + 6] = 0; // name_len
+    buf[off + 7] = DENT_CHECKSUM; // file_type marker
+    buf[off + 8..off + 12].fill(0); // checksum (stamped later)
+}
+
 /// Build an "empty placeholder" directory data block: a single entry with
-/// inode=0, name_len=0, rec_len=block_size. e2fsck accepts this as a
-/// well-formed (but empty) dir block. genext2fs uses this to pad
-/// pre-allocated dirs like lost+found.
-pub fn make_empty_dir_block(block_size: u32) -> Vec<u8> {
+/// inode=0, name_len=0, rec_len spanning the usable region. e2fsck accepts
+/// this as a well-formed (but empty) dir block. With `csum_tail` the last
+/// 12 bytes hold the checksum dirent instead.
+pub fn make_empty_dir_block(block_size: u32, csum_tail: bool) -> Vec<u8> {
     let mut buf = vec![0u8; block_size as usize];
-    // inode (4 bytes) is already zero.
-    // rec_len at offset 4..6 = block_size.
-    buf[4..6].copy_from_slice(&(block_size as u16).to_le_bytes());
-    // name_len at offset 6..8 = 0 (already zero).
+    let usable = usable_dir_len(block_size, csum_tail);
+    // inode (4 bytes) already zero; rec_len spans the usable region.
+    buf[4..6].copy_from_slice(&(usable as u16).to_le_bytes());
+    if csum_tail {
+        write_dir_csum_tail(&mut buf);
+    }
     buf
 }
 
 /// Build the directory data block for a fresh directory: just "." and "..".
-/// The "." entry points at `self_inode`, ".." at `parent_inode`. `block_size`
-/// is the FS block size in bytes; the ".." entry's `rec_len` is extended so
-/// it fills the whole block.
+/// The "." entry points at `self_inode`, ".." at `parent_inode`. The ".."
+/// entry's `rec_len` is extended to fill the usable region; with
+/// `csum_tail` the last 12 bytes hold the checksum dirent.
 pub fn make_initial_dir_block(
     self_inode: u32,
     parent_inode: u32,
     block_size: u32,
     with_filetype: bool,
+    csum_tail: bool,
 ) -> Vec<u8> {
+    let usable = usable_dir_len(block_size, csum_tail);
     let mut buf = Vec::with_capacity(block_size as usize);
 
     // "." entry
     let dot_rec = min_rec_len(1) as u16;
     encode_entry(&mut buf, self_inode, b".", dot_rec, DENT_DIR, with_filetype);
 
-    // ".." entry fills the rest of the block
-    let dotdot_rec = (block_size as usize - buf.len()) as u16;
+    // ".." entry fills the rest of the usable region.
+    let dotdot_rec = (usable - buf.len()) as u16;
     encode_entry(
         &mut buf,
         parent_inode,
@@ -169,7 +204,11 @@ pub fn make_initial_dir_block(
         with_filetype,
     );
 
-    debug_assert_eq!(buf.len(), block_size as usize);
+    debug_assert_eq!(buf.len(), usable);
+    buf.resize(block_size as usize, 0);
+    if csum_tail {
+        write_dir_csum_tail(&mut buf);
+    }
     buf
 }
 
@@ -197,7 +236,7 @@ mod tests {
 
     #[test]
     fn initial_dir_block_round_trips() {
-        let buf = make_initial_dir_block(2, 2, 1024, false);
+        let buf = make_initial_dir_block(2, 2, 1024, false, false);
         assert_eq!(buf.len(), 1024);
         let first = decode_entry(&buf, false).unwrap();
         assert_eq!(first.inode, 2);
@@ -206,6 +245,23 @@ mod tests {
         assert_eq!(second.inode, 2);
         assert_eq!(second.name, b"..");
         assert_eq!(first.rec_len + second.rec_len, 1024);
+    }
+
+    #[test]
+    fn initial_dir_block_with_csum_tail() {
+        let buf = make_initial_dir_block(2, 2, 1024, true, true);
+        assert_eq!(buf.len(), 1024);
+        // The tail dirent occupies the last 12 bytes: inode=0, rec_len=12,
+        // name_len=0, file_type=0xDE.
+        let tail = &buf[1024 - CSUM_TAIL_LEN..];
+        assert_eq!(u32::from_le_bytes(tail[0..4].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(tail[4..6].try_into().unwrap()), 12);
+        assert_eq!(tail[6], 0);
+        assert_eq!(tail[7], DENT_CHECKSUM);
+        // The real entries ("." + "..") cover exactly the usable region.
+        let first = decode_entry(&buf, true).unwrap();
+        let second = decode_entry(&buf[first.rec_len..], true).unwrap();
+        assert_eq!(first.rec_len + second.rec_len, 1024 - CSUM_TAIL_LEN);
     }
 
     #[test]

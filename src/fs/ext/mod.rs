@@ -133,6 +133,10 @@ pub struct Ext {
     /// indirect-block tables, which we assemble in memory). Regular file
     /// data is NOT staged here — it streams straight to the device.
     data_blocks: Vec<(u32, Vec<u8>)>,
+    /// Directory data blocks staged in `data_blocks`, tagged with their
+    /// owning directory inode. Used at flush time to stamp the per-block
+    /// CRC32C checksum tail when `metadata_csum` is active.
+    dir_blocks: Vec<(u32, u32)>,
 }
 
 impl Ext {
@@ -223,7 +227,25 @@ impl Ext {
             next_inode: 0,
             inodes: Vec::new(),
             data_blocks: Vec::new(),
+            dir_blocks: Vec::new(),
         };
+
+        // Set feature flags up front — before create_root / create_lost_found
+        // run — so those build their directory blocks with the right layout
+        // (FILETYPE dirents, metadata_csum tail). The journal feature is set
+        // here too; allocate_journal itself runs further down.
+        if matches!(opts.kind, FsKind::Ext4) {
+            ext.sb.feature_incompat |= constants::feature::INCOMPAT_EXTENTS;
+            // FILETYPE is required for metadata_csum's directory checksum
+            // tail (the tail uses the dirent file_type byte as its marker),
+            // and matches mke2fs ext4 anyway.
+            ext.sb.feature_incompat |= constants::feature::INCOMPAT_FILETYPE;
+            // Match mke2fs: a fresh ext4 carries CRC32C metadata checksums.
+            ext.sb.feature_ro_compat |= constants::feature::RO_COMPAT_METADATA_CSUM;
+        }
+        if opts.kind.has_journal() {
+            ext.sb.feature_compat |= constants::feature::COMPAT_HAS_JOURNAL;
+        }
 
         // Reserve inodes 1..first_ino-1 (1..=10 for dynamic rev).
         let first_ino = ext.sb.first_ino;
@@ -247,18 +269,29 @@ impl Ext {
                 opts.journal_blocks
             };
             ext.allocate_journal(blocks, opts.mtime)?;
-            // Set feature flag + journal_inum on the superblock.
-            ext.sb.feature_compat |= constants::feature::COMPAT_HAS_JOURNAL;
             ext.sb.journal_inum = constants::INO_JOURNAL;
-        }
-        // ext4-only feature flags.
-        if matches!(opts.kind, FsKind::Ext4) {
-            ext.sb.feature_incompat |= constants::feature::INCOMPAT_EXTENTS;
         }
 
         ext.recompute_free_counts();
         ext.flush_metadata(dev)?;
         Ok(ext)
+    }
+
+    /// Whether the `metadata_csum` feature is active on this filesystem.
+    fn has_metadata_csum(&self) -> bool {
+        self.sb.feature_ro_compat & constants::feature::RO_COMPAT_METADATA_CSUM != 0
+    }
+
+    /// Whether directory entries carry a `file_type` byte (`INCOMPAT_FILETYPE`).
+    fn has_filetype(&self) -> bool {
+        self.sb.feature_incompat & constants::feature::INCOMPAT_FILETYPE != 0
+    }
+
+    /// The filesystem-wide checksum seed. genfs never sets the
+    /// `metadata_csum_seed` feature, so the seed is always derived from the
+    /// UUID.
+    fn csum_seed(&self) -> u32 {
+        csum::fs_seed(&self.sb.uuid, None)
     }
 
     /// Wire `data_blocks` into an inode's block-pointer array. Picks the
@@ -379,7 +412,10 @@ impl Ext {
         set_bit(&mut self.groups[0].inode_bitmap, ino - 1);
 
         let blk = self.alloc_data_block()?;
-        let block_bytes = dir::make_initial_dir_block(ino, ino, self.layout.block_size, false);
+        let csum_tail = self.has_metadata_csum();
+        let with_filetype = self.has_filetype();
+        let block_bytes =
+            dir::make_initial_dir_block(ino, ino, self.layout.block_size, with_filetype, csum_tail);
 
         let mut inode = Inode::directory(self.layout.block_size, 0o755, 0, 0, mtime);
         inode.block[0] = blk;
@@ -388,6 +424,7 @@ impl Ext {
         self.groups[0].desc.used_dirs_count += 1;
         self.inodes.push((ino, inode));
         self.data_blocks.push((blk, block_bytes));
+        self.dir_blocks.push((blk, ino));
         Ok(())
     }
 
@@ -409,13 +446,20 @@ impl Ext {
         let meta_blocks = self.fill_block_pointers(&mut inode, &data_blocks)?;
         inode.blocks_512 = (target_data_blocks + meta_blocks) * (bs / 512);
 
-        // First data block: "." / "..".
-        let dir_block = dir::make_initial_dir_block(ino, INO_ROOT_DIR, bs, false);
+        // First data block: "." / "..". All blocks of lost+found are
+        // directory blocks owned by inode `ino`.
+        let csum_tail = self.has_metadata_csum();
+        let with_filetype = self.has_filetype();
+        let dir_block =
+            dir::make_initial_dir_block(ino, INO_ROOT_DIR, bs, with_filetype, csum_tail);
         self.data_blocks.push((data_blocks[0], dir_block));
+        self.dir_blocks.push((data_blocks[0], ino));
         // All trailing data blocks: empty-placeholder entry so e2fsck reads
         // them as well-formed empty dir blocks.
         for &blk in &data_blocks[1..] {
-            self.data_blocks.push((blk, dir::make_empty_dir_block(bs)));
+            self.data_blocks
+                .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
+            self.dir_blocks.push((blk, ino));
         }
 
         self.groups[0].desc.used_dirs_count += 1;
@@ -423,7 +467,13 @@ impl Ext {
 
         // Add to root dir + bump root's link count (a new subdir's ".." is
         // a fresh link to the parent).
-        self.add_entry_to_dir_block_for(dev, INO_ROOT_DIR, b"lost+found", ino)?;
+        self.add_entry_to_dir_block_for(
+            dev,
+            INO_ROOT_DIR,
+            b"lost+found",
+            ino,
+            constants::DENT_DIR,
+        )?;
         self.patch_inode(dev, INO_ROOT_DIR, |i| i.links_count += 1)?;
         Ok(())
     }
@@ -437,6 +487,7 @@ impl Ext {
         dir_inode: u32,
         name: &[u8],
         child_ino: u32,
+        file_type: u8,
     ) -> Result<()> {
         self.ensure_inode_staged(dev, dir_inode)?;
         // Resolve the dir's first data block via file_block (handles both
@@ -454,13 +505,20 @@ impl Ext {
             )));
         }
         self.ensure_block_staged(dev, dir_block_num)?;
+        // This block is a directory block; tag it so flush stamps its
+        // checksum tail (no-op if already recorded).
+        if !self.dir_blocks.iter().any(|(b, _)| *b == dir_block_num) {
+            self.dir_blocks.push((dir_block_num, dir_inode));
+        }
+        let usable = dir::usable_dir_len(self.layout.block_size, self.has_metadata_csum());
+        let with_filetype = self.has_filetype();
         let block = self
             .data_blocks
             .iter_mut()
             .find(|(b, _)| *b == dir_block_num)
             .map(|(_, bytes)| bytes)
             .unwrap();
-        append_dir_entry(block, name, child_ino, constants::DENT_DIR, false)
+        append_dir_entry(block, name, child_ino, file_type, with_filetype, usable)
     }
 
     /// Mutate an inode in place. If the inode isn't already in the staged
@@ -578,11 +636,34 @@ impl Ext {
         // occupies `desc_size` bytes on disk (32 classic, 64 for 64-bit);
         // the encoded 32-byte form goes in the low bytes, the rest stays
         // zero — correct for sub-2^32-block filesystems.
+        //
+        // With metadata_csum, each descriptor also carries the CRC32C of
+        // its group's block + inode bitmaps (offsets 24 / 26) and a
+        // descriptor checksum (`bg_checksum`, offset 30) chained after the
+        // seed and the group number.
         let desc_size = self.layout.desc_size;
+        let with_csum = self.has_metadata_csum();
+        let seed = self.csum_seed();
+        // Bitmap checksums cover only the in-use prefix of each bitmap:
+        // blocks_per_group/8 bytes for the block bitmap, inodes_per_group/8
+        // for the inode bitmap (both group counts are multiples of 8).
+        let bbm_len = (self.layout.blocks_per_group / 8) as usize;
+        let ibm_len = (self.layout.inodes_per_group / 8) as usize;
         let mut gdt = vec![0u8; self.layout.gdt_blocks as usize * bs as usize];
         for (i, g) in self.groups.iter().enumerate() {
             let off = i * desc_size;
-            gdt[off..off + constants::GROUP_DESC_SIZE].copy_from_slice(&g.desc.encode());
+            let desc = &mut gdt[off..off + desc_size];
+            desc[..constants::GROUP_DESC_SIZE].copy_from_slice(&g.desc.encode());
+            if with_csum {
+                let bbm = csum::bitmap(seed, &g.block_bitmap[..bbm_len]) as u16;
+                let ibm = csum::bitmap(seed, &g.inode_bitmap[..ibm_len]) as u16;
+                desc[24..26].copy_from_slice(&bbm.to_le_bytes());
+                desc[26..28].copy_from_slice(&ibm.to_le_bytes());
+                // bg_checksum is computed over the descriptor with its own
+                // 2 bytes zeroed (they already are — fresh buffer).
+                let bg = csum::group_desc(seed, i as u32, desc);
+                desc[30..32].copy_from_slice(&bg.to_le_bytes());
+            }
         }
 
         // For each group with a superblock copy, write SB (skip primary for
@@ -620,11 +701,29 @@ impl Ext {
             let (group, idx_in_group) = self.inode_location(*ino);
             let table_block = self.layout.groups[group as usize].inode_table;
             let off = table_block as u64 * bs + idx_in_group as u64 * self.layout.inode_size as u64;
-            dev.write_at(off, &inode.encode())?;
+            dev.write_at(off, &self.encode_inode(*ino, inode))?;
         }
 
-        // Write staged data blocks.
-        for (blk, bytes) in &self.data_blocks {
+        // Write staged data blocks. Directory blocks get their CRC32C
+        // checksum-tail stamped first when metadata_csum is active: the
+        // checksum covers the whole block minus its trailing 4 bytes,
+        // chained after the seed, the owning dir's inode number, and that
+        // inode's generation.
+        for (blk, bytes) in &mut self.data_blocks {
+            if with_csum && let Some((_, dir_ino)) = self.dir_blocks.iter().find(|(b, _)| b == blk)
+            {
+                let generation = self
+                    .inodes
+                    .iter()
+                    .find(|(i, _)| i == dir_ino)
+                    .map(|(_, i)| i.generation)
+                    .unwrap_or(0);
+                // The checksum covers everything before the 12-byte tail
+                // dirent; the value is stored in that tail's last 4 bytes.
+                let n = bytes.len();
+                let c = csum::dir_block(seed, *dir_ino, generation, &bytes[..n - 12]);
+                bytes[n - 4..].copy_from_slice(&c.to_le_bytes());
+            }
             dev.write_at(*blk as u64 * bs, bytes)?;
         }
 
@@ -634,12 +733,32 @@ impl Ext {
         Ok(())
     }
 
+    /// Encode an inode, stamping its CRC32C checksum (`l_i_checksum_lo` at
+    /// offset 124) when `metadata_csum` is set. With 128-byte inodes there
+    /// is no room for `i_checksum_hi`, so only the low 16 bits are stored —
+    /// the kernel handles a 16-bit inode checksum for small inodes.
+    fn encode_inode(&self, ino: u32, inode: &Inode) -> [u8; inode::INODE_BASE_SIZE] {
+        let mut buf = inode.encode();
+        if self.has_metadata_csum() {
+            // The checksum field is already zero in `buf` (Inode::encode
+            // writes osd2 from an all-zero array), so the checksum covers
+            // the inode with the field implicitly zeroed.
+            let c = csum::inode(self.csum_seed(), ino, inode.generation, &buf);
+            buf[124..126].copy_from_slice(&((c & 0xffff) as u16).to_le_bytes());
+        }
+        buf
+    }
+
     /// Encode a superblock, stamping the CRC32C `s_checksum` field when the
     /// `metadata_csum` feature is set. Without the feature the field stays
     /// zero (the kernel ignores it).
     fn encode_sb(&self, sb: &Superblock) -> [u8; constants::SUPERBLOCK_SIZE] {
         let mut buf = sb.encode();
-        if self.sb.feature_ro_compat & constants::feature::RO_COMPAT_METADATA_CSUM != 0 {
+        if self.has_metadata_csum() {
+            // s_checksum_type (offset 0x175) must be 1 (CRC32C) — the kernel
+            // refuses to mount a metadata_csum FS otherwise. Set it before
+            // computing the checksum so it's covered.
+            buf[0x175] = 1;
             let c = csum::superblock(&buf);
             buf[1020..1024].copy_from_slice(&c.to_le_bytes());
         }
@@ -706,7 +825,7 @@ impl Ext {
         debug_assert_eq!(remaining, 0);
 
         self.inodes.push((ino, inode));
-        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino)?;
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_REG)?;
         Ok(ino)
     }
 
@@ -731,12 +850,16 @@ impl Ext {
             inode.block[0] = blk;
         }
         inode.blocks_512 = bs / 512;
-        let block_bytes = dir::make_initial_dir_block(ino, parent_ino, bs, false);
+        let csum_tail = self.has_metadata_csum();
+        let with_filetype = self.has_filetype();
+        let block_bytes =
+            dir::make_initial_dir_block(ino, parent_ino, bs, with_filetype, csum_tail);
         self.data_blocks.push((blk, block_bytes));
+        self.dir_blocks.push((blk, ino));
         self.inodes.push((ino, inode));
         self.groups[0].desc.used_dirs_count += 1;
 
-        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino)?;
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
         self.patch_inode(dev, parent_ino, |i| i.links_count += 1)?;
         Ok(ino)
     }
@@ -789,7 +912,7 @@ impl Ext {
         }
 
         self.inodes.push((ino, inode));
-        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino)?;
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_LNK)?;
         Ok(ino)
     }
 
@@ -822,8 +945,14 @@ impl Ext {
             meta.gid,
             meta.mtime,
         );
+        let ft = match kind {
+            DeviceKind::Char => constants::DENT_CHR,
+            DeviceKind::Block => constants::DENT_BLK,
+            DeviceKind::Fifo => constants::DENT_FIFO,
+            DeviceKind::Socket => constants::DENT_SOCK,
+        };
         self.inodes.push((ino, inode));
-        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino)?;
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, ft)?;
         Ok(ino)
     }
 
@@ -1066,6 +1195,7 @@ impl Ext {
             next_inode,
             inodes: Vec::new(),
             data_blocks: Vec::new(),
+            dir_blocks: Vec::new(),
         })
     }
 
@@ -1499,15 +1629,18 @@ fn kind_from_mode(mode: u16) -> crate::fs::EntryKind {
     }
 }
 
-/// Append a dir entry to a 4 KiB-aligned directory block by shrinking the
-/// existing last entry to its natural minimum and writing the new entry
-/// into the freed tail.
+/// Append a dir entry to a directory block by shrinking the existing last
+/// entry to its natural minimum and writing the new entry into the freed
+/// tail. `usable` is the byte length available for real entries — the whole
+/// block, or `block_size - 12` when `metadata_csum` reserves a checksum
+/// tail. The last real entry's `rec_len` runs up to `usable`.
 fn append_dir_entry(
     block: &mut [u8],
     name: &[u8],
     inode: u32,
     file_type: u8,
     with_filetype: bool,
+    usable: usize,
 ) -> Result<()> {
     let needed = dir::min_rec_len(name.len());
     let mut off = 0usize;
@@ -1517,7 +1650,7 @@ fn append_dir_entry(
             crate::Error::InvalidImage("corrupt dir entry while appending".into())
         })?;
         let next = off + entry.rec_len;
-        if next >= block.len() {
+        if next >= usable {
             last_off = off;
             break;
         }

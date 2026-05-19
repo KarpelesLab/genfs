@@ -86,13 +86,12 @@ pub fn inode(seed: u32, inode_num: u32, generation: u32, inode: &[u8]) -> u32 {
 }
 
 /// Directory-leaf-block checksum. Chained: seed → inode number → inode
-/// generation → the directory block bytes *excluding* the trailing 4-byte
-/// checksum slot. The 12-byte fake "checksum dirent" at the block tail IS
-/// included in the summed range.
-pub fn dir_block(seed: u32, dir_inode: u32, dir_generation: u32, block_without_csum: &[u8]) -> u32 {
+/// generation → the directory block bytes *before* the 12-byte checksum
+/// dirent at the block tail. Pass `&block[..block_size - 12]`.
+pub fn dir_block(seed: u32, dir_inode: u32, dir_generation: u32, block_before_tail: &[u8]) -> u32 {
     let c = raw_update(seed, &dir_inode.to_le_bytes());
     let c = raw_update(c, &dir_generation.to_le_bytes());
-    raw_update(c, block_without_csum)
+    raw_update(c, block_before_tail)
 }
 
 #[cfg(test)]

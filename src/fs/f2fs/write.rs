@@ -1009,12 +1009,13 @@ impl Writer {
                 ind.on_disk_block,
             ));
         }
-        // Make sure the three reserved nids (0, 1, 2) get a "present" entry
-        // so the NAT pages aren't tripping the reader's "block_addr == 0"
-        // error path if they get walked accidentally.
-        all_nodes.push((0, 0, self.geom.cp_blkaddr)); // meta pseudo-inode
-        all_nodes.push((1, 1, self.geom.cp_blkaddr));
-        all_nodes.push((2, 2, self.geom.cp_blkaddr));
+        // Reserved nids (0, 1=node_ino, 2=meta_ino) intentionally have NO
+        // NAT entry. They are virtual inodes that never resolve via NAT,
+        // and fsck.f2fs's `build_nat_area_bitmap` rejects any entry whose
+        // block_addr is below `main_blkaddr` — so writing block_addr =
+        // cp_blkaddr here is what was tripping it earlier. Leaving the
+        // slots as zero in the page is the correct "absent" representation
+        // (NULL_ADDR for both ino and block_addr).
 
         for (nid, owner, blk) in all_nodes {
             let page_idx = (nid as usize) / super::constants::NAT_ENTRY_PER_BLOCK;
@@ -1051,22 +1052,23 @@ impl Writer {
             dev.write_at((self.geom.ssa_blkaddr + i) as u64 * bs, &ssa_blk)?;
         }
 
-        // 8) Checkpoint pack: write a fresh CP0 head + footer. CP1 is
-        //    deliberately left as the previous version (lower) so the
-        //    reader picks CP0.
+        // 8) Checkpoint pack: write a fresh CP0 as an 8-block pack —
+        //    matching what Android f2fs-tools' mkfs.f2fs produces for a
+        //    fresh image. CP1 is deliberately zeroed so the reader picks
+        //    CP0.
         //
-        //    F2FS layout per the kernel docs §"Checkpoint":
-        //      [ head CP    ]  block cp_blkaddr
-        //      [ summaries  ]  blocks cp_blkaddr+1 .. cp_blkaddr + total - 2
-        //      [ footer CP  ]  block cp_blkaddr + total - 1   (must duplicate head)
-        //    fsck.f2fs's `validate_checkpoint` reads BOTH the head and
-        //    the footer (`cp_page_2 = cp_addr + total_block_count - 1`)
-        //    and requires both to decode as valid CP-head blocks. We
-        //    write a 2-block pack with footer = head; for a fresh
-        //    image the NAT journal is empty, so the CP head's bytes
-        //    at the footer position double as a zero-journal summary
-        //    (n_nats=0 at the journal slot — the upper bytes of
-        //    `checkpoint_ver` decode as zero).
+        //    F2FS layout per the kernel docs §"Checkpoint" and
+        //    `__write_checkpoint` (NR_CURSEG_DATA_TYPE + NR_CURSEG_NODE_TYPE = 6):
+        //      block cp_blkaddr+0                     head CP
+        //      blocks cp_blkaddr+1 .. cp_blkaddr+3    hot/warm/cold data summaries
+        //      blocks cp_blkaddr+4 .. cp_blkaddr+6    hot/warm/cold node summaries
+        //      block cp_blkaddr+7                     footer CP (= head copy)
+        //    fsck.f2fs reads `cp_page_2 = cp_addr + total - 1` as a
+        //    second CP head, AND walks the NAT journal at
+        //    `cp_pack_start_sum` (which lives in the hot_data summary
+        //    at cp_blkaddr+1). With that block all-zeros, n_nats=0
+        //    and n_sits=0 in the journal slot, so the journal walk
+        //    produces zero phantom entries.
         let valid_blocks = (self.next_main_blk - self.geom.main_blkaddr) as u64;
         // fsck.f2fs (Android fork + Ubuntu 24.04 build) refuses a CP
         // that has any of `rsvd_segment_count == 0`,
@@ -1105,7 +1107,7 @@ impl Writer {
             overprov_segment_count,
             flags: super::constants::CP_UMOUNT_FLAG,
             cp_pack_start_sum: 1,
-            cp_pack_total_block_count: 2,
+            cp_pack_total_block_count: 8,
             cp_payload: 0,
             head_blkaddr: self.geom.cp_blkaddr,
             nat_ver_bitmap_bytesize,
@@ -1115,21 +1117,29 @@ impl Writer {
             nat_journal: Vec::new(),
         };
         let cp_bytes = super::checkpoint::encode_cp_head_writer(&cp);
-        // Head at block cp_blkaddr.
+        let total = cp.cp_pack_total_block_count as u64;
+        // Head at block cp_blkaddr+0.
         dev.write_at(self.geom.cp_blkaddr as u64 * bs, &cp_bytes)?;
-        // Footer at block cp_blkaddr + total_block_count - 1 = +1.
-        dev.write_at((self.geom.cp_blkaddr as u64 + 1) * bs, &cp_bytes)?;
-        // Mark CP1 invalid by zeroing its head + footer (zero-magic
-        // and zero-checksum_offset both fail validate_checkpoint).
+        // Summary blocks 1 .. total-2: all zeros (the journal slots in
+        // the hot_data summary at +1 thus have n_nats=0 / n_sits=0,
+        // so fsck's NAT/SIT journal walks produce no entries).
         let zero = vec![0u8; F2FS_BLKSIZE];
+        for off in 1..(total - 1) {
+            dev.write_at((self.geom.cp_blkaddr as u64 + off) * bs, &zero)?;
+        }
+        // Footer at block cp_blkaddr + total - 1 (must duplicate head).
         dev.write_at(
-            (self.geom.cp_blkaddr + self.geom.blocks_per_seg) as u64 * bs,
-            &zero,
+            (self.geom.cp_blkaddr as u64 + total - 1) * bs,
+            &cp_bytes,
         )?;
-        dev.write_at(
-            (self.geom.cp_blkaddr + self.geom.blocks_per_seg + 1) as u64 * bs,
-            &zero,
-        )?;
+        // Mark CP1 invalid by zeroing every block it would occupy.
+        // Zero magic and zero checksum_offset both fail
+        // validate_checkpoint, so any of the 8 blocks landing on
+        // cp_page_1 / cp_page_2 will reject CP1.
+        let cp1_base = (self.geom.cp_blkaddr + self.geom.blocks_per_seg) as u64;
+        for off in 0..total {
+            dev.write_at((cp1_base + off) * bs, &zero)?;
+        }
         dev.sync()?;
         Ok(())
     }

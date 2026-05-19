@@ -45,7 +45,12 @@ device / empty directory), `shell` (interactive SFTP-style REPL with
 
 **Block layer** — `fstool::block::{FileBackend, MemoryBackend,
 SlicedBackend}`: sparse file-backed devices, in-memory devices for tests,
-bounds-checked sub-range views for carving partitions.
+bounds-checked sub-range views for carving partitions. `FileBackend` also
+handles real block devices on Unix (`/dev/sdX`, `/dev/nvme0n1`, loop
+devices): capacity is queried via the kernel ioctl (`BLKGETSIZE64` on
+Linux, `DKIOCGETBLOCK*` on macOS) and the open uses `O_EXCL` so the
+kernel refuses if any partition is mounted. The CLI's `ext-build` /
+`fat-build` require `--force` when the output is a block device.
 
 **Partition tables** — `fstool::part::{Mbr, Gpt}`: write and read
 4-primary MBR and 128-entry GPT (protective MBR, primary + backup

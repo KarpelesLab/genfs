@@ -28,6 +28,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
 crc32c = "0.6.8"
 
+# Needed on Unix for the BLKGETSIZE64 / DKIOCGETBLOCKCOUNT ioctls used to
+# query the size of a block device, plus the O_EXCL open flag that refuses
+# devices with a mounted partition.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 env_logger = "0.11"

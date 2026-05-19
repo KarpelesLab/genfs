@@ -208,6 +208,7 @@ dependencies = [
  "crc32c",
  "crc32fast",
  "env_logger",
+ "libc",
  "log",
  "serde",
  "tempfile",

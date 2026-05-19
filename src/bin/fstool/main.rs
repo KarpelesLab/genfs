@@ -40,7 +40,9 @@ enum Command {
         /// Source directory on the host filesystem.
         #[arg(value_name = "SRC_DIR")]
         src_dir: PathBuf,
-        /// Output image file. Will be created (truncating any existing file).
+        /// Output image file or block device. Block devices are formatted
+        /// to their full capacity; regular files are auto-sized to the
+        /// source tree.
         #[arg(short = 'o', long = "output", value_name = "IMAGE")]
         output: PathBuf,
         /// Which ext flavour to write.
@@ -52,27 +54,37 @@ enum Command {
         /// Write files sparsely: all-zero blocks become holes.
         #[arg(long)]
         sparse: bool,
+        /// Required when OUTPUT is a block device — refuses to format
+        /// a real device without an explicit opt-in.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Build a bare FAT32 image from a host directory. FAT32 has no
     /// streaming auto-size (it needs ≥ 65525 clusters → ~33 MiB minimum),
-    /// so `--size` is required.
+    /// so `--size` is required for regular-file output; block-device
+    /// output uses the device's full capacity instead.
     FatBuild {
         /// Source directory on the host filesystem.
         #[arg(value_name = "SRC_DIR")]
         src_dir: PathBuf,
-        /// Output image file. Will be created (truncating any existing file).
+        /// Output image file or block device.
         #[arg(short = 'o', long = "output", value_name = "IMAGE")]
         output: PathBuf,
-        /// Image size, e.g. "64MiB" or "1GiB".
+        /// Image size, e.g. "64MiB" or "1GiB". Ignored when OUTPUT is a
+        /// block device (the device's capacity wins).
         #[arg(long, value_name = "SIZE")]
-        size: String,
+        size: Option<String>,
         /// Volume label (up to 11 ASCII bytes, upper-cased).
         #[arg(long, default_value = "NO NAME")]
         label: String,
         /// Volume ID / serial number. Default 0 for reproducible output.
         #[arg(long, default_value_t = 0)]
         volume_id: u32,
+        /// Required when OUTPUT is a block device — refuses to format
+        /// a real device without an explicit opt-in.
+        #[arg(long)]
+        force: bool,
     },
 
     /// List a directory inside an image. One entry per line:
@@ -186,14 +198,16 @@ fn run(cli: Cli) -> fstool::Result<()> {
             kind,
             block_size,
             sparse,
-        } => ext_build(&src_dir, &output, kind.into(), block_size, sparse),
+            force,
+        } => ext_build(&src_dir, &output, kind.into(), block_size, sparse, force),
         Command::FatBuild {
             src_dir,
             output,
             size,
             label,
             volume_id,
-        } => fat_build(&src_dir, &output, &size, &label, volume_id),
+            force,
+        } => fat_build(&src_dir, &output, size.as_deref(), &label, volume_id, force),
         Command::Ls { image, path } => ls(&image, &path),
         Command::Cat { image, path } => cat(&image, &path),
         Command::Info { image } => info(&image),
@@ -260,23 +274,43 @@ fn build(spec_path: &std::path::Path, output: &std::path::Path) -> fstool::Resul
 fn fat_build(
     src_dir: &std::path::Path,
     output: &std::path::Path,
-    size: &str,
+    size: Option<&str>,
     label: &str,
     volume_id: u32,
+    force: bool,
 ) -> fstool::Result<()> {
+    use fstool::block::file::is_block_device;
     use fstool::fs::fat::Fat32;
-    let bytes = fstool::spec::parse_size(size)?;
+
+    let is_device = is_block_device(output);
+    require_force_for_device(output, is_device, force)?;
+
+    let bytes = if is_device {
+        // Capacity comes from the device; --size is ignored.
+        let dev = FileBackend::open(output)?;
+        dev.total_size()
+    } else {
+        let s = size.ok_or_else(|| {
+            fstool::Error::InvalidArgument(
+                "fat-build: --size is required when OUTPUT is a regular file".into(),
+            )
+        })?;
+        fstool::spec::parse_size(s)?
+    };
     let total_sectors: u32 = (bytes / 512).try_into().map_err(|_| {
-        fstool::Error::InvalidArgument("fat-build: --size doesn't fit in a u32 sector count".into())
+        fstool::Error::InvalidArgument(
+            "fat-build: device size doesn't fit in a u32 sector count".into(),
+        )
     })?;
     let label_bytes = fat32_label_bytes(label);
     let mut dev = FileBackend::create(output, bytes)?;
     Fat32::build_from_host_dir(&mut dev, total_sectors, src_dir, volume_id, label_bytes)?;
     dev.sync()?;
     eprintln!(
-        "wrote {} ({} bytes, fat32, label {:?})",
+        "wrote {} ({} bytes, fat32{}, label {:?})",
         output.display(),
         bytes,
+        if is_device { ", block device" } else { "" },
         label
     );
     Ok(())
@@ -303,27 +337,66 @@ fn ext_build(
     kind: FsKind,
     block_size: u32,
     sparse: bool,
+    force: bool,
 ) -> fstool::Result<()> {
+    use fstool::block::file::is_block_device;
     use fstool::fs::ext::BuildPlan;
+
+    let is_device = is_block_device(output);
+    require_force_for_device(output, is_device, force)?;
+
     let mut plan = BuildPlan::new(block_size, kind);
     plan.scan_host_path(src_dir)?;
     let mut opts = plan.to_format_opts();
     opts.sparse = sparse;
-    let size = opts.blocks_count as u64 * opts.block_size as u64;
-    let mut dev = FileBackend::create(output, size)?;
+    let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(output, plan_size)?;
+
+    // On a block device the actual capacity is fixed by the hardware —
+    // expand the FS to fill it instead of leaving most of the device
+    // unused. blocks_count must stay a multiple of 8 for the block bitmap
+    // to be byte-aligned, and inode density gets scaled to mke2fs's
+    // 1-inode-per-16-KiB convention.
+    let actual_size = dev.total_size();
+    if actual_size > plan_size {
+        let max_blocks_u64 = actual_size / opts.block_size as u64;
+        let max_blocks = u32::try_from(max_blocks_u64).unwrap_or(u32::MAX);
+        opts.blocks_count = (max_blocks / 8) * 8;
+        let by_density = (opts.blocks_count as u64 * opts.block_size as u64 / 16_384) as u32;
+        opts.inodes_count = opts.inodes_count.max(by_density);
+    }
+    let final_size = opts.blocks_count as u64 * opts.block_size as u64;
+
     let mut ext = Ext::format_with(&mut dev, &opts)?;
     ext.populate_from_host_dir(&mut dev, 2, src_dir)?;
     ext.flush(&mut dev)?;
     dev.sync()?;
     eprintln!(
-        "wrote {} ({} bytes, {:?}{}, {} inodes, {} blocks)",
+        "wrote {} ({} bytes, {:?}{}{}, {} inodes, {} blocks)",
         output.display(),
-        size,
+        final_size,
         kind,
         if sparse { ", sparse" } else { "" },
+        if is_device { ", block device" } else { "" },
         opts.inodes_count,
         opts.blocks_count
     );
+    Ok(())
+}
+
+/// Refuse to format a block device without --force; emit a clear message
+/// pointing at the flag.
+fn require_force_for_device(
+    output: &std::path::Path,
+    is_device: bool,
+    force: bool,
+) -> fstool::Result<()> {
+    if is_device && !force {
+        return Err(fstool::Error::InvalidArgument(format!(
+            "refusing to format block device {} without --force",
+            output.display()
+        )));
+    }
     Ok(())
 }
 

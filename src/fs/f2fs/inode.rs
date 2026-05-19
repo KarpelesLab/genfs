@@ -66,10 +66,14 @@ impl F2fsInode {
     }
 }
 
-/// Offset of `i_addr[0]` inside an inode block. The 0xD0 prefix holds:
-/// mode, links, size, atime/ctime/mtime, blocks, uid, gid, generation,
-/// flags, plus a few extent-cache fields and the inline bitfield.
-pub(crate) const I_ADDR_OFFSET: usize = 0xD0;
+/// Offset of `i_addr[0]` inside an inode block, matching the kernel's
+/// `struct f2fs_inode` packed layout: 92 bytes of fixed fields (mode,
+/// uid, timestamps, etc.) + 255 bytes `i_name` + 1 byte `i_dir_level`
+/// + 12 bytes `f2fs_extent` = 360 = 0x168.
+///
+/// Note: the inline payload (inline_data / inline_dentry) starts at
+/// `i_addr[DEF_INLINE_RESERVED_SIZE]` = `i_addr[1]` = `I_ADDR_OFFSET + 4`.
+pub(crate) const I_ADDR_OFFSET: usize = 0x168;
 
 /// Decode a 4 KiB inode block.
 pub fn decode_inode_block(buf: &[u8]) -> crate::Result<F2fsInode> {

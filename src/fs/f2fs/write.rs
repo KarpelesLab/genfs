@@ -1552,7 +1552,15 @@ fn encode_inode_block(
     buf[0x20..0x28].copy_from_slice(&(ino.atime as u64).to_le_bytes());
     buf[0x28..0x30].copy_from_slice(&(ino.ctime as u64).to_le_bytes());
     buf[0x30..0x38].copy_from_slice(&(ino.mtime as u64).to_le_bytes());
+    // Per kernel `struct f2fs_inode`:
+    //   0x38..0x44  i_atime_nsec, i_ctime_nsec, i_mtime_nsec (left 0)
+    //   0x44..0x48  i_generation (0)
+    //   0x48..0x4C  i_current_depth (0)
+    //   0x4C..0x50  i_xattr_nid (0)
+    //   0x50..0x54  i_flags
+    //   0x54..0x58  i_pino — fsck verifies this matches the parent NAT entry
     buf[0x50..0x54].copy_from_slice(&ino.flags.to_le_bytes());
+    buf[0x54..0x58].copy_from_slice(&parent_nid.to_le_bytes());
 
     // Inline payload sits at `i_addr[DEF_INLINE_RESERVED_SIZE]` (=
     // i_addr[1]), NOT at `i_addr[0]` — fsck.f2fs's `inline_data_addr`

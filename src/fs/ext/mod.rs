@@ -88,6 +88,12 @@ pub struct FormatOpts {
     /// data block. The file still reads back identically. Off by default
     /// so plain ext2 output stays byte-for-byte comparable with genext2fs.
     pub sparse: bool,
+    /// When true, only groups 0 and 1 plus groups whose number is a power
+    /// of 3, 5, or 7 hold a superblock + GDT backup; the rest skip them.
+    /// Advertised on disk by `RO_COMPAT_SPARSE_SUPER`. Off by default so
+    /// raw-ext2 output stays binary-exact with genext2fs (which doesn't
+    /// emit sparse_super); on by default for ext3/ext4 (which match mke2fs).
+    pub sparse_super: bool,
 }
 
 impl Default for FormatOpts {
@@ -104,6 +110,7 @@ impl Default for FormatOpts {
             create_lost_found: true,
             journal_blocks: 0,
             sparse: false,
+            sparse_super: false,
         }
     }
 }
@@ -152,7 +159,12 @@ impl Ext {
     /// image is a valid ext2 containing just the root directory (and
     /// `/lost+found` if requested in `opts`).
     pub fn format_with(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Self> {
-        let layout = layout::plan(opts.block_size, opts.blocks_count, opts.inodes_count)?;
+        let layout = layout::plan_with(
+            opts.block_size,
+            opts.blocks_count,
+            opts.inodes_count,
+            opts.sparse_super,
+        )?;
         let total_bytes = layout.blocks_count as u64 * layout.block_size as u64;
         if dev.total_size() < total_bytes {
             return Err(crate::Error::InvalidArgument(format!(
@@ -251,6 +263,9 @@ impl Ext {
             ext.sb.feature_incompat |= constants::feature::INCOMPAT_FILETYPE;
             // Match mke2fs: a fresh ext4 carries CRC32C metadata checksums.
             ext.sb.feature_ro_compat |= constants::feature::RO_COMPAT_METADATA_CSUM;
+        }
+        if opts.sparse_super {
+            ext.sb.feature_ro_compat |= constants::feature::RO_COMPAT_SPARSE_SUPER;
         }
         if opts.kind.has_journal() {
             ext.sb.feature_compat |= constants::feature::COMPAT_HAS_JOURNAL;
@@ -689,32 +704,31 @@ impl Ext {
             }
         }
 
-        // For each group with a superblock copy, write SB (skip primary for
-        // last step), GDT, bitmaps.
+        // For each group: write SB + GDT backup only when this group holds
+        // one (under sparse_super, groups 0/1 and powers of 3/5/7 do);
+        // bitmaps live in every group regardless.
         for (i, g) in self.layout.groups.iter().enumerate() {
-            if !g.has_superblock {
-                continue;
-            }
-            if i != 0 {
-                let mut sb_copy = self.sb.clone();
-                sb_copy.block_group_nr = i as u16;
-                dev.write_at(g.start_block as u64 * bs, &self.encode_sb(&sb_copy))?;
-            }
-            // GDT block(s):
-            // - group 0 (first_data_block=1): GDT at block 2 (after SB at 1)
-            // - group 0 (first_data_block=0): GDT at block 1 (SB shares block 0)
-            // - other groups: GDT at start_block + 1 (after the SB copy)
-            let gdt_off = if i == 0 {
-                if self.layout.first_data_block == 1 {
-                    2 * bs
-                } else {
-                    bs
+            if g.has_superblock {
+                if i != 0 {
+                    let mut sb_copy = self.sb.clone();
+                    sb_copy.block_group_nr = i as u16;
+                    dev.write_at(g.start_block as u64 * bs, &self.encode_sb(&sb_copy))?;
                 }
-            } else {
-                (g.start_block as u64 + 1) * bs
-            };
-            dev.write_at(gdt_off, &gdt)?;
-
+                // GDT block(s):
+                // - group 0 (first_data_block=1): GDT at block 2 (after SB at 1)
+                // - group 0 (first_data_block=0): GDT at block 1 (SB shares block 0)
+                // - other groups: GDT at start_block + 1 (after the SB copy)
+                let gdt_off = if i == 0 {
+                    if self.layout.first_data_block == 1 {
+                        2 * bs
+                    } else {
+                        bs
+                    }
+                } else {
+                    (g.start_block as u64 + 1) * bs
+                };
+                dev.write_at(gdt_off, &gdt)?;
+            }
             dev.write_at(g.block_bitmap as u64 * bs, &self.groups[i].block_bitmap)?;
             dev.write_at(g.inode_bitmap as u64 * bs, &self.groups[i].inode_bitmap)?;
         }

@@ -202,6 +202,10 @@ impl BuildPlan {
     /// Other fields take their defaults; the caller can override them
     /// before passing to [`super::Ext::format_with`].
     pub fn to_format_opts(&self) -> super::FormatOpts {
+        // Default sparse_super on for ext3/ext4 (matches mke2fs); leave it
+        // off for ext2 so raw-ext2 output stays binary-exact with
+        // `genext2fs -d`, which doesn't emit RO_COMPAT_SPARSE_SUPER.
+        let sparse_super = !matches!(self.kind, super::FsKind::Ext2);
         super::FormatOpts {
             kind: self.kind,
             block_size: self.block_size,
@@ -209,6 +213,7 @@ impl BuildPlan {
             inodes_count: self.inodes_count(),
             create_lost_found: self.create_lost_found,
             journal_blocks: self.journal_blocks,
+            sparse_super,
             ..super::FormatOpts::default()
         }
     }

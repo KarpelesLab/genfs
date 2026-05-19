@@ -67,11 +67,43 @@ pub struct GroupLayout {
     pub meta_blocks: u32,
 }
 
+/// Whether group `g` (out of `num_groups`) holds a superblock + GDT
+/// backup when `RO_COMPAT_SPARSE_SUPER` is active. The rule (from the
+/// ext kernel docs): groups 0 and 1 always; otherwise only groups whose
+/// number is a power of 3, 5, or 7.
+pub fn group_has_sparse_super(g: u32) -> bool {
+    if g <= 1 {
+        return true;
+    }
+    is_power_of(g, 3) || is_power_of(g, 5) || is_power_of(g, 7)
+}
+
+fn is_power_of(mut n: u32, base: u32) -> bool {
+    if n == 0 {
+        return false;
+    }
+    while n % base == 0 {
+        n /= base;
+    }
+    n == 1
+}
+
 /// Compute a layout for `(block_size, blocks_count, inodes_count)`.
 ///
 /// Returns [`crate::Error::InvalidArgument`] if the requested geometry cannot fit
 /// the metadata overhead.
 pub fn plan(block_size: u32, blocks_count: u32, inodes_count: u32) -> crate::Result<Layout> {
+    plan_with(block_size, blocks_count, inodes_count, false)
+}
+
+/// Compute a layout, optionally enabling `RO_COMPAT_SPARSE_SUPER` — groups
+/// 0, 1, and powers-of-3/5/7 hold backups; the rest skip them.
+pub fn plan_with(
+    block_size: u32,
+    blocks_count: u32,
+    inodes_count: u32,
+    sparse_super: bool,
+) -> crate::Result<Layout> {
     if !block_size.is_power_of_two() || block_size < 1024 {
         return Err(crate::Error::InvalidArgument(format!(
             "ext: block_size must be a power of two ≥ 1024, got {block_size}"
@@ -149,8 +181,13 @@ pub fn plan(block_size: u32, blocks_count: u32, inodes_count: u32) -> crate::Res
         let nominal_end = start + blocks_per_group - 1;
         let end = nominal_end.min(blocks_count - 1);
 
-        // Every group gets a superblock + GDT copy in v1 (no SPARSE_SUPER).
-        let has_sb = true;
+        // With sparse_super only groups 0, 1, and powers-of-3/5/7 hold
+        // backups; otherwise every group does.
+        let has_sb = if sparse_super {
+            group_has_sparse_super(g)
+        } else {
+            true
+        };
 
         // Block layout within the group:
         //   [SB? + GDT?] -> block bitmap -> inode bitmap -> inode table -> data
@@ -214,17 +251,22 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
     let desc_size = sb.group_desc_size();
     let gdt_blocks = (num_groups as u64 * desc_size as u64).div_ceil(block_size as u64) as u32;
 
+    let sparse_super =
+        sb.feature_ro_compat & super::constants::feature::RO_COMPAT_SPARSE_SUPER != 0;
     let mut groups = Vec::with_capacity(num_groups as usize);
     for g in 0..num_groups {
         let start = sb.first_data_block + g * sb.blocks_per_group;
         let nominal_end = start + sb.blocks_per_group - 1;
         let end = nominal_end.min(sb.blocks_count - 1);
-        // For an existing image we don't yet know which groups have a
-        // superblock copy (depends on SPARSE_SUPER); for v1 we assume every
-        // group has one when reading too. The descriptor's bitmap/table
-        // pointers (which we read from disk separately) are the source of
-        // truth for actual positions.
-        let has_sb = true;
+        // With sparse_super, only groups 0, 1, and powers of 3/5/7 hold
+        // backups; without it, every group does. The descriptor's
+        // bitmap/table pointers (read from disk separately) remain the
+        // source of truth for actual block positions.
+        let has_sb = if sparse_super {
+            group_has_sparse_super(g)
+        } else {
+            true
+        };
         let meta_first = start + if has_sb { 1 + gdt_blocks } else { 0 };
         let block_bitmap = meta_first;
         let inode_bitmap = meta_first + 1;

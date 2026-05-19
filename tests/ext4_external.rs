@@ -304,3 +304,94 @@ fn ext4_open_reads_extent_file() {
     reader.read_to_end(&mut body).unwrap();
     assert_eq!(body, b"extent-encoded payload\n");
 }
+
+/// With sparse_super, only groups 0, 1 and powers of 3/5/7 carry SB
+/// backups. Builds a multi-group ext4 and checks via `dumpe2fs` that
+/// the right groups are flagged with "Backup superblock".
+#[test]
+fn ext4_sparse_super_skips_non_backup_groups() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("dumpe2fs") else {
+        eprintln!("skipping: dumpe2fs not installed");
+        return;
+    };
+
+    // 4 groups (32 MiB at 1 KiB blocks).
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        blocks_count: 32 * 1024,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        sparse_super: true,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    Ext::format_with(&mut dev, &opts).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // e2fsck must stay clean.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed on sparse_super image:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+
+    // dumpe2fs reports per-group metadata. With 4 groups: 0, 1, 3 are
+    // backup; 2 is not (2 is not a power of 3/5/7). Group 3 IS (3 = 3^1).
+    let dump = Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let header = String::from_utf8_lossy(&dump.stdout);
+    assert!(
+        header.contains("sparse_super"),
+        "sparse_super flag missing from dumpe2fs:\n{header}"
+    );
+
+    let dump = Command::new("dumpe2fs").arg(tmp.path()).output().unwrap();
+    let body = String::from_utf8_lossy(&dump.stdout);
+    // dumpe2fs lists each group's "Primary superblock" / "Backup
+    // superblock" / no superblock at all.
+    let mut g2_has_sb = false;
+    let mut g3_has_sb = false;
+    let mut current_group: Option<u32> = None;
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("Group ") {
+            // "Group 2: (Blocks 16385-24576) ..."
+            let num: u32 = rest
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .trim_end_matches(':')
+                .parse()
+                .unwrap_or(0);
+            current_group = Some(num);
+        }
+        if matches!(current_group, Some(2)) && line.contains("superblock at") {
+            g2_has_sb = true;
+        }
+        if matches!(current_group, Some(3)) && line.contains("superblock at") {
+            g3_has_sb = true;
+        }
+    }
+    assert!(
+        !g2_has_sb,
+        "group 2 should NOT have a backup superblock with sparse_super:\n{body}"
+    );
+    assert!(
+        g3_has_sb,
+        "group 3 SHOULD have a backup superblock (3 is a power of 3):\n{body}"
+    );
+}

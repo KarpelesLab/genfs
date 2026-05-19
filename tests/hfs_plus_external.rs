@@ -241,3 +241,95 @@ fn newfs_hfsplus_image_opens_via_fstool() {
         "freshly-formatted root should be empty, got: {entries:?}"
     );
 }
+
+/// Debug helper: dumps mkfs.hfsplus's extents-overflow header bytes
+/// alongside ours. Always fails to surface the diff in CI logs.
+#[test]
+fn dump_mkfs_vs_fstool_extents_header() {
+    let Some(newfs) = which("newfs_hfsplus").or_else(|| which("newfs_hfs")) else {
+        eprintln!("skipping: newfs_hfsplus / newfs_hfs not installed");
+        return;
+    };
+
+    // mkfs image
+    let mkfs_tmp = NamedTempFile::new().unwrap();
+    std::fs::File::create(mkfs_tmp.path())
+        .and_then(|f| f.set_len(VOL_BYTES))
+        .unwrap();
+    let out = Command::new(&newfs)
+        .arg("-v")
+        .arg("MkfsHFS")
+        .arg(mkfs_tmp.path())
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        eprintln!(
+            "skipping: newfs refused to format: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let mkfs_bytes = std::fs::read(mkfs_tmp.path()).unwrap();
+
+    // fstool image — same setup as writer_image_passes_fsck_hfs
+    let fstool_tmp = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(fstool_tmp.path(), VOL_BYTES).unwrap();
+        let opts = FormatOpts {
+            volume_name: "FstoolHFS".into(),
+            ..FormatOpts::default()
+        };
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+        hfs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+    let fstool_bytes = std::fs::read(fstool_tmp.path()).unwrap();
+
+    // Parse VH offsets for both
+    let parse = |buf: &[u8], label: &str| -> String {
+        let vh = &buf[1024..1024 + 512];
+        let sig = u16::from_be_bytes([vh[0], vh[1]]);
+        let bs = u32::from_be_bytes(vh[0x28..0x2C].try_into().unwrap()) as usize;
+        let ext_start = u32::from_be_bytes(vh[0xC0 + 16..0xC0 + 20].try_into().unwrap()) as usize;
+        let ext_clump = u32::from_be_bytes(vh[0xC0 + 8..0xC0 + 12].try_into().unwrap());
+        let ext_total = u32::from_be_bytes(vh[0xC0 + 12..0xC0 + 16].try_into().unwrap());
+        let ext_off = ext_start * bs;
+        let header_bytes = &buf[ext_off..ext_off + 256];
+        let mut s = String::new();
+        s += &format!("== {label} ==\n");
+        s += &format!(
+            "  VH sig=0x{:04x} bs={} ext_start={} ext_clump={} ext_total={}\n",
+            sig, bs, ext_start, ext_clump, ext_total
+        );
+        s += &format!(
+            "  header byte 0..32 (descriptor):\n   {:02x?}\n",
+            &header_bytes[..32]
+        );
+        s += &format!(
+            "  header byte 32..64 (start of BTHeaderRec):\n   {:02x?}\n",
+            &header_bytes[32..64]
+        );
+        s += &format!("  header byte 64..96:\n   {:02x?}\n", &header_bytes[64..96]);
+        s += &format!(
+            "  header byte 96..128:\n   {:02x?}\n",
+            &header_bytes[96..128]
+        );
+        s += &format!(
+            "  header byte 128..256 (user/map area):\n   {:02x?}\n",
+            &header_bytes[128..256]
+        );
+        // Last 16 bytes (record offsets)
+        let ns_field = u16::from_be_bytes(header_bytes[32..34].try_into().unwrap()) as usize;
+        let node_end = ext_off + ns_field;
+        s += &format!(
+            "  nodeSize={} → tail offsets: {:02x?}\n",
+            ns_field,
+            &buf[node_end - 16..node_end]
+        );
+        s
+    };
+
+    let m = parse(&mkfs_bytes, "mkfs.hfsplus");
+    let f = parse(&fstool_bytes, "fstool");
+    panic!("\n{m}\n{f}");
+}

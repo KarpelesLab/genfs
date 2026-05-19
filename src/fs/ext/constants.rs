@@ -91,6 +91,12 @@ pub mod feature {
     pub const COMPAT_EXT_ATTR: u32 = 0x0008;
     pub const COMPAT_RESIZE_INODE: u32 = 0x0010;
     pub const COMPAT_DIR_INDEX: u32 = 0x0020;
+    /// `sparse_super2`: when set, the superblock's `s_backup_bgs[2]` lists
+    /// the only two block groups that hold SB+GDT backups; all other groups
+    /// skip them. The kernel docs place this flag in the `s_feature_compat`
+    /// field (despite the historical "RO_COMPAT_SPARSE_SUPER2" name some
+    /// userspace tools use).
+    pub const COMPAT_SPARSE_SUPER2: u32 = 0x0200;
 
     // incompat
     pub const INCOMPAT_COMPRESSION: u32 = 0x0001;

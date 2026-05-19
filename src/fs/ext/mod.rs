@@ -109,6 +109,19 @@ pub struct FormatOpts {
     /// with the pre-flex_bg writer; opt in by setting this to 4 (mke2fs's
     /// default for small/medium FSes, 16 groups per unit).
     pub log_groups_per_flex: u8,
+    /// When true, emit 64-byte group descriptors and advertise
+    /// `INCOMPAT_64BIT` + `INCOMPAT_META_BG` in the superblock. Required
+    /// for filesystems whose block count exceeds 2³² (≈ 16 TiB with 4 KiB
+    /// blocks). The reader transparently handles either descriptor size.
+    /// Off by default — the v1 writer never emits block numbers above 2³²,
+    /// so the upper halves remain zero.
+    pub use_64bit: bool,
+    /// When true, emit the `sparse_super2` compat feature: SB+GDT backups
+    /// live in exactly the two block groups listed (rather than groups 0,
+    /// 1, and powers-of-3/5/7 under classic `sparse_super`). The two
+    /// groups are recorded in `s_backup_bgs[2]`; the writer picks
+    /// `[1, last_group]` automatically. Off by default.
+    pub sparse_super2: bool,
 }
 
 impl Default for FormatOpts {
@@ -127,6 +140,8 @@ impl Default for FormatOpts {
             sparse: false,
             sparse_super: false,
             log_groups_per_flex: 0,
+            use_64bit: false,
+            sparse_super2: false,
         }
     }
 }
@@ -199,12 +214,45 @@ impl Ext {
     /// `/lost+found` if requested in `opts`).
     pub fn format_with(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Self> {
         opts.check_flex_bg()?;
-        let layout = layout::plan_full(
+        // Pre-compute the sparse-super mode and the `s_backup_bgs` pair so
+        // both the layout planner and the on-disk superblock agree on
+        // which groups carry SB+GDT backups.
+        //
+        // For `sparse_super2` we need to know the group count to pick the
+        // two backup groups (`[1, last]` matches mke2fs's default). Probe
+        // the layout once with All to get `num_groups`, then replan with
+        // the real mode if sparse_super2 is on.
+        let (sparse_mode, backup_bgs) = if opts.sparse_super2 {
+            // First pass: just need group count.
+            let probe = layout::plan_layout(
+                opts.block_size,
+                opts.blocks_count,
+                opts.inodes_count,
+                layout::SparseSuperMode::All,
+                opts.log_groups_per_flex,
+                opts.use_64bit,
+            )?;
+            let last = probe.num_groups().saturating_sub(1);
+            // For a single-group FS use [0, 0] — group 0 always carries
+            // the primary SB anyway.
+            let bgs = if probe.num_groups() <= 1 {
+                [0, 0]
+            } else {
+                [1, last]
+            };
+            (layout::SparseSuperMode::Two(bgs), bgs)
+        } else if opts.sparse_super {
+            (layout::SparseSuperMode::Classic, [0, 0])
+        } else {
+            (layout::SparseSuperMode::All, [0, 0])
+        };
+        let layout = layout::plan_layout(
             opts.block_size,
             opts.blocks_count,
             opts.inodes_count,
-            opts.sparse_super,
+            sparse_mode,
             opts.log_groups_per_flex,
+            opts.use_64bit,
         )?;
         let total_bytes = layout.blocks_count as u64 * layout.block_size as u64;
         if dev.total_size() < total_bytes {
@@ -319,6 +367,25 @@ impl Ext {
         if opts.log_groups_per_flex > 0 {
             ext.sb.feature_incompat |= constants::feature::INCOMPAT_FLEX_BG;
             ext.sb.log_groups_per_flex = opts.log_groups_per_flex;
+        }
+        // 64-bit FS: 64-byte group descriptors carry the upper half of the
+        // bitmap/itable block numbers. Kernel docs pair `INCOMPAT_64BIT`
+        // with `INCOMPAT_META_BG`; set both. `s_desc_size = 64` tells the
+        // reader to expect the wider descriptor.
+        if opts.use_64bit {
+            ext.sb.feature_incompat |= constants::feature::INCOMPAT_64BIT;
+            ext.sb.feature_incompat |= constants::feature::INCOMPAT_META_BG;
+            ext.sb.desc_size = constants::GROUP_DESC_SIZE_64 as u16;
+        }
+        // sparse_super2: backups only in the two listed groups. Mutually
+        // exclusive with `sparse_super` in semantics (the layout planner
+        // gives `Two` precedence), but the kernel docs put each flag in
+        // its own feature word so both bits *could* be set. We only flip
+        // the sparse_super2 bit; the on-disk `s_backup_bgs` array carries
+        // the actual group numbers.
+        if opts.sparse_super2 {
+            ext.sb.feature_compat |= constants::feature::COMPAT_SPARSE_SUPER2;
+            ext.sb.backup_bgs = backup_bgs;
         }
 
         // Reserve inodes 1..first_ino-1 (1..=10 for dynamic rev).
@@ -743,14 +810,25 @@ impl Ext {
             let desc = &mut gdt[off..off + desc_size];
             desc[..constants::GROUP_DESC_SIZE].copy_from_slice(&g.desc.encode());
             if with_csum {
-                let bbm = csum::bitmap(seed, &g.block_bitmap[..bbm_len]) as u16;
-                let ibm = csum::bitmap(seed, &g.inode_bitmap[..ibm_len]) as u16;
-                desc[24..26].copy_from_slice(&bbm.to_le_bytes());
-                desc[26..28].copy_from_slice(&ibm.to_le_bytes());
+                // Bitmap checksums are 16-bit on a 32-byte descriptor (low
+                // half only at offsets 0x18 / 0x1A), 32-bit on a 64-byte
+                // descriptor (low half + high half at offsets 0x38 / 0x3A).
+                let bbm_full = csum::bitmap(seed, &g.block_bitmap[..bbm_len]);
+                let ibm_full = csum::bitmap(seed, &g.inode_bitmap[..ibm_len]);
+                let bbm_lo = bbm_full as u16;
+                let ibm_lo = ibm_full as u16;
+                desc[0x18..0x1A].copy_from_slice(&bbm_lo.to_le_bytes());
+                desc[0x1A..0x1C].copy_from_slice(&ibm_lo.to_le_bytes());
+                if desc_size >= 64 {
+                    let bbm_hi = (bbm_full >> 16) as u16;
+                    let ibm_hi = (ibm_full >> 16) as u16;
+                    desc[0x38..0x3A].copy_from_slice(&bbm_hi.to_le_bytes());
+                    desc[0x3A..0x3C].copy_from_slice(&ibm_hi.to_le_bytes());
+                }
                 // bg_checksum is computed over the descriptor with its own
                 // 2 bytes zeroed (they already are — fresh buffer).
                 let bg = csum::group_desc(seed, i as u32, desc);
-                desc[30..32].copy_from_slice(&bg.to_le_bytes());
+                desc[0x1E..0x20].copy_from_slice(&bg.to_le_bytes());
             }
         }
 
@@ -2289,5 +2367,138 @@ mod tests {
             .read_to_end(&mut buf)
             .expect("read");
         assert_eq!(&buf, &payload);
+    }
+
+    #[test]
+    fn use_64bit_sets_feature_and_desc_size() {
+        // With `use_64bit` the writer must advertise INCOMPAT_64BIT +
+        // INCOMPAT_META_BG and emit 64-byte descriptors.
+        let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            use_64bit: true,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let ext = Ext::format_with(&mut dev, &opts).expect("format 64bit");
+        assert_eq!(ext.sb.desc_size, constants::GROUP_DESC_SIZE_64 as u16);
+        assert!(
+            ext.sb.feature_incompat & constants::feature::INCOMPAT_64BIT != 0,
+            "INCOMPAT_64BIT must be set"
+        );
+        assert!(
+            ext.sb.feature_incompat & constants::feature::INCOMPAT_META_BG != 0,
+            "INCOMPAT_META_BG must be set (the kernel pair with 64BIT)"
+        );
+        assert_eq!(
+            ext.layout.desc_size,
+            constants::GROUP_DESC_SIZE_64,
+            "layout planner must widen desc_size when use_64bit is on"
+        );
+    }
+
+    #[test]
+    fn use_64bit_round_trip_add_and_read() {
+        // Round-trip: format with 64-byte descriptors, add a file, reopen,
+        // verify the reopened image keeps the same feature set + reads back.
+        let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            use_64bit: true,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format 64bit");
+        let payload = b"hello 64-bit".to_vec();
+        ext.add_file_to_streaming(
+            &mut dev,
+            constants::INO_ROOT_DIR,
+            b"big.txt",
+            &mut payload.as_slice(),
+            payload.len() as u64,
+            FileMeta {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                atime: 0,
+                ctime: 0,
+            },
+        )
+        .expect("add file");
+        ext.flush(&mut dev).expect("flush");
+
+        let reopened = Ext::open(&mut dev).expect("reopen 64bit");
+        assert_eq!(reopened.sb.desc_size, constants::GROUP_DESC_SIZE_64 as u16);
+        assert!(
+            reopened.sb.feature_incompat & constants::feature::INCOMPAT_64BIT != 0,
+            "round-tripped image must keep INCOMPAT_64BIT"
+        );
+        assert_eq!(reopened.layout.desc_size, constants::GROUP_DESC_SIZE_64);
+        let ino = reopened
+            .path_to_inode(&mut dev, "/big.txt")
+            .expect("path lookup");
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        reopened
+            .open_file_reader(&mut dev, ino)
+            .expect("open reader")
+            .read_to_end(&mut buf)
+            .expect("read");
+        assert_eq!(&buf, &payload);
+    }
+
+    #[test]
+    fn sparse_super2_off_by_default() {
+        // Default opts must keep sparse_super2 off (COMPAT_SPARSE_SUPER2 = 0).
+        let mut dev = MemoryBackend::new(1024 * 1024);
+        let ext = Ext::format_with(&mut dev, &FormatOpts::default()).expect("format default");
+        assert_eq!(
+            ext.sb.feature_compat & constants::feature::COMPAT_SPARSE_SUPER2,
+            0
+        );
+        assert_eq!(ext.sb.backup_bgs, [0, 0]);
+    }
+
+    #[test]
+    fn sparse_super2_records_backup_bgs_and_skips_other_groups() {
+        // 4 groups at 4 KiB blocks. With sparse_super2 only groups [1,
+        // last=3] hold SB+GDT backups; group 2 must not.
+        let mut dev = MemoryBackend::new(512u64 * 1024 * 1024);
+        let blocks_per_group = 8 * 4096u32;
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 4 * blocks_per_group,
+            inodes_count: 4096,
+            sparse_super2: true,
+            ..FormatOpts::default()
+        };
+        let ext = Ext::format_with(&mut dev, &opts).expect("format sparse_super2");
+        assert_eq!(ext.layout.num_groups(), 4);
+        assert!(
+            ext.sb.feature_compat & constants::feature::COMPAT_SPARSE_SUPER2 != 0,
+            "COMPAT_SPARSE_SUPER2 must be set"
+        );
+        assert_eq!(ext.sb.backup_bgs, [1, 3]);
+        // Group 0 is always implicit (it holds the primary SB). Group 1
+        // and group 3 (the two listed) carry backups; group 2 must not.
+        assert!(ext.layout.groups[0].has_superblock);
+        assert!(ext.layout.groups[1].has_superblock);
+        assert!(!ext.layout.groups[2].has_superblock);
+        assert!(ext.layout.groups[3].has_superblock);
+
+        // Round-trip: reopen and verify the on-disk superblock parses the
+        // same way (backup_bgs decoded, sparse_super2 honoured).
+        let reopened = Ext::open(&mut dev).expect("reopen sparse_super2");
+        assert_eq!(reopened.sb.backup_bgs, [1, 3]);
+        assert!(reopened.sb.feature_compat & constants::feature::COMPAT_SPARSE_SUPER2 != 0);
+        assert!(!reopened.layout.groups[2].has_superblock);
     }
 }

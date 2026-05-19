@@ -204,19 +204,42 @@ impl BuildPlan {
     /// Build a [`super::FormatOpts`] populated with the recommended counts.
     /// Other fields take their defaults; the caller can override them
     /// before passing to [`super::Ext::format_with`].
+    ///
+    /// For ext4 the flex_bg feature is auto-enabled when the resulting
+    /// filesystem has enough block groups to benefit
+    /// (`FormatOpts::default_log_groups_per_flex`). ext2/ext3 stay
+    /// flex-bg-less so raw output remains byte-exact with `genext2fs`.
     pub fn to_format_opts(&self) -> super::FormatOpts {
         // Default sparse_super on for ext3/ext4 (matches mke2fs); leave it
         // off for ext2 so raw-ext2 output stays binary-exact with
         // `genext2fs -d`, which doesn't emit RO_COMPAT_SPARSE_SUPER.
         let sparse_super = !matches!(self.kind, super::FsKind::Ext2);
+
+        let blocks_count = self.blocks_count();
+
+        // flex_bg auto-enable: ext4 only. Estimate the number of groups
+        // from blocks_count / blocks_per_group using the same rule the
+        // layout planner uses (`min(8 * block_size, blocks_count)`). For
+        // ext2/ext3 we keep `log_groups_per_flex = 0` so the legacy
+        // genext2fs-byte-exactness path is undisturbed.
+        let log_groups_per_flex = if matches!(self.kind, super::FsKind::Ext4) {
+            let max_per_group = 8 * self.block_size;
+            let blocks_per_group = max_per_group.min(blocks_count);
+            let num_groups = blocks_count.div_ceil(blocks_per_group);
+            super::FormatOpts::default_log_groups_per_flex(num_groups)
+        } else {
+            0
+        };
+
         super::FormatOpts {
             kind: self.kind,
             block_size: self.block_size,
-            blocks_count: self.blocks_count(),
+            blocks_count,
             inodes_count: self.inodes_count(),
             create_lost_found: self.create_lost_found,
             journal_blocks: self.journal_blocks,
             sparse_super,
+            log_groups_per_flex,
             ..super::FormatOpts::default()
         }
     }
@@ -296,6 +319,56 @@ mod tests {
         let with_journal = plan.blocks_count();
         // ext3 needs ~1024 extra blocks for the journal
         assert!(with_journal > no_journal + 900);
+    }
+
+    #[test]
+    fn ext4_to_format_opts_keeps_flex_off_for_small_fs() {
+        // A handful of files at 4 KiB blocks lands well under 16 groups,
+        // so the flex_bg auto-enable threshold should not trip.
+        let mut plan = BuildPlan::new(4096, FsKind::Ext4);
+        plan.add_file(1024);
+        plan.add_dir();
+        let opts = plan.to_format_opts();
+        assert_eq!(opts.kind, FsKind::Ext4);
+        assert_eq!(opts.log_groups_per_flex, 0);
+    }
+
+    #[test]
+    fn ext4_to_format_opts_enables_flex_at_16_groups() {
+        // We need ≥ 16 block groups. At bs=4096 each group covers
+        // 8 * 4096 = 32768 blocks (= 128 MiB). 16 groups ⇒ ≥ 2 GiB.
+        // The BuildPlan blocks_count() includes a 10% margin, so we
+        // need ≈ 2 GiB of file data to push past the threshold. Use
+        // one giant file (3 GiB) to land comfortably above 16 groups.
+        let mut plan = BuildPlan::new(4096, FsKind::Ext4);
+        plan.add_file(3 * 1024 * 1024 * 1024);
+        let blocks = plan.blocks_count();
+        let blocks_per_group = 8 * 4096u32;
+        let groups = blocks.div_ceil(blocks_per_group);
+        assert!(groups >= 16, "test setup needs ≥ 16 groups, got {groups}");
+        let opts = plan.to_format_opts();
+        assert_eq!(opts.kind, FsKind::Ext4);
+        assert_eq!(opts.log_groups_per_flex, 4);
+    }
+
+    #[test]
+    fn ext2_to_format_opts_never_enables_flex() {
+        // Even with a huge tree, ext2 must keep log_groups_per_flex = 0
+        // so raw-ext2 output stays binary-exact with `genext2fs -d`.
+        let mut plan = BuildPlan::new(4096, FsKind::Ext2);
+        plan.add_file(512 * 1024 * 1024);
+        let opts = plan.to_format_opts();
+        assert_eq!(opts.kind, FsKind::Ext2);
+        assert_eq!(opts.log_groups_per_flex, 0);
+    }
+
+    #[test]
+    fn ext3_to_format_opts_never_enables_flex() {
+        let mut plan = BuildPlan::new(4096, FsKind::Ext3);
+        plan.add_file(512 * 1024 * 1024);
+        let opts = plan.to_format_opts();
+        assert_eq!(opts.kind, FsKind::Ext3);
+        assert_eq!(opts.log_groups_per_flex, 0);
     }
 
     #[test]

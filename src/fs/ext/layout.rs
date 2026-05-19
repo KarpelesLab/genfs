@@ -12,7 +12,7 @@
 //! All of this is a pure function so we can unit-test the layout decisions
 //! against known-good genext2fs / mke2fs outputs.
 
-use super::constants::{GROUP_DESC_SIZE, INODE_SIZE_DYNAMIC};
+use super::constants::{GROUP_DESC_SIZE, GROUP_DESC_SIZE_64, INODE_SIZE_DYNAMIC};
 
 /// Result of [`plan`]. Holds the choices the writer needs to lay out an
 /// ext2 image; one [`GroupLayout`] per block group.
@@ -26,8 +26,9 @@ pub struct Layout {
     pub inodes_per_group: u32,
     pub inode_size: u16,
     /// On-disk size of each group descriptor: 32 (classic) or 64
-    /// (`INCOMPAT_64BIT`). The genfs writer always emits 32; this is 64
-    /// only when a 64-bit image was opened with [`from_superblock`].
+    /// (`INCOMPAT_64BIT`). The writer emits 64 when
+    /// `FormatOpts::use_64bit` is set; the reader picks up whichever
+    /// size the on-disk `s_desc_size` advertises.
     pub desc_size: usize,
     /// Number of blocks the inode table occupies in each group.
     pub inode_table_blocks: u32,
@@ -68,8 +69,11 @@ pub struct GroupLayout {
     pub start_block: u32,
     /// Last block (absolute, inclusive) of this group.
     pub end_block: u32,
-    /// Whether this group holds a superblock + GDT copy. For v1 every group
-    /// gets a copy (no SPARSE_SUPER).
+    /// Whether this group holds a superblock + GDT image (primary in
+    /// group 0, backup elsewhere). The defaulting depends on
+    /// [`SparseSuperMode`]: every group under `All`, the sparse rule
+    /// under `Classic`, or just the two listed groups (plus group 0)
+    /// under `Two`.
     pub has_superblock: bool,
     /// Absolute block number of this group's block bitmap.
     pub block_bitmap: u32,
@@ -124,6 +128,37 @@ pub fn plan_with(
     plan_full(block_size, blocks_count, inodes_count, sparse_super, 0)
 }
 
+/// Selects which (if any) groups carry SB+GDT backups, beyond the classic
+/// "every group" / `RO_COMPAT_SPARSE_SUPER` rules.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum SparseSuperMode {
+    /// Backups in every group (classic ext2).
+    #[default]
+    All,
+    /// `RO_COMPAT_SPARSE_SUPER`: groups 0, 1, and powers of 3/5/7.
+    Classic,
+    /// `sparse_super2`: backups in exactly the two groups listed
+    /// (typically `[group 1, last group]`).
+    Two([u32; 2]),
+}
+
+impl SparseSuperMode {
+    /// Whether group `g` carries a SB+GDT image (primary or backup). Group
+    /// 0 always does — it holds the *primary* superblock + GDT, regardless
+    /// of `sparse_super` / `sparse_super2` settings. Other groups only
+    /// carry the SB+GDT if the rules say so.
+    pub fn group_has_backup(self, g: u32) -> bool {
+        if g == 0 {
+            return true;
+        }
+        match self {
+            SparseSuperMode::All => true,
+            SparseSuperMode::Classic => group_has_sparse_super(g),
+            SparseSuperMode::Two([a, b]) => g == a || g == b,
+        }
+    }
+}
+
 /// Full layout planner with optional `INCOMPAT_FLEX_BG` packing.
 ///
 /// `log_groups_per_flex == 0` disables flex_bg (classic per-group metadata
@@ -138,6 +173,33 @@ pub fn plan_full(
     inodes_count: u32,
     sparse_super: bool,
     log_groups_per_flex: u8,
+) -> crate::Result<Layout> {
+    let mode = if sparse_super {
+        SparseSuperMode::Classic
+    } else {
+        SparseSuperMode::All
+    };
+    plan_layout(
+        block_size,
+        blocks_count,
+        inodes_count,
+        mode,
+        log_groups_per_flex,
+        false,
+    )
+}
+
+/// Layout planner with full opt-in feature surface: choice of sparse-super
+/// mode, optional `INCOMPAT_FLEX_BG` packing, and optional `INCOMPAT_64BIT`
+/// (which only affects `desc_size`/`gdt_blocks` — the on-disk layout itself
+/// is otherwise unchanged for sub-2³² block filesystems).
+pub fn plan_layout(
+    block_size: u32,
+    blocks_count: u32,
+    inodes_count: u32,
+    sparse_super_mode: SparseSuperMode,
+    log_groups_per_flex: u8,
+    use_64bit: bool,
 ) -> crate::Result<Layout> {
     if !block_size.is_power_of_two() || block_size < 1024 {
         return Err(crate::Error::InvalidArgument(format!(
@@ -211,8 +273,15 @@ pub fn plan_full(
     let inode_table_bytes = inodes_per_group as u64 * inode_size as u64;
     let inode_table_blocks = inode_table_bytes.div_ceil(block_size as u64) as u32;
 
-    // GDT size: 32 bytes per descriptor.
-    let gdt_bytes = num_groups as u64 * GROUP_DESC_SIZE as u64;
+    // GDT size: 32 bytes per descriptor in the classic layout, 64 with
+    // `INCOMPAT_64BIT`. The wider descriptor pulls in the upper-half
+    // bitmap/itable pointers and the bg_checksum_hi field.
+    let desc_size = if use_64bit {
+        GROUP_DESC_SIZE_64
+    } else {
+        GROUP_DESC_SIZE
+    };
+    let gdt_bytes = num_groups as u64 * desc_size as u64;
     let gdt_blocks = gdt_bytes.div_ceil(block_size as u64) as u32;
 
     let flex_size: u32 = if log_groups_per_flex == 0 {
@@ -227,13 +296,10 @@ pub fn plan_full(
         let nominal_end = start + blocks_per_group - 1;
         let end = nominal_end.min(blocks_count - 1);
 
-        // With sparse_super only groups 0, 1, and powers-of-3/5/7 hold
-        // backups; otherwise every group does.
-        let has_sb = if sparse_super {
-            group_has_sparse_super(g)
-        } else {
-            true
-        };
+        // Whether this group carries a SB+GDT backup. The classic ext2
+        // case is "every group"; `sparse_super` keeps only groups 0, 1, and
+        // powers of 3/5/7; `sparse_super2` keeps only the two listed groups.
+        let has_sb = sparse_super_mode.group_has_backup(g);
         let sb_gdt_blocks: u32 = if has_sb { 1 + gdt_blocks } else { 0 };
         let local_meta_start = start + sb_gdt_blocks;
 
@@ -321,7 +387,7 @@ pub fn plan_full(
         blocks_per_group,
         inodes_per_group,
         inode_size,
-        desc_size: GROUP_DESC_SIZE,
+        desc_size,
         inode_table_blocks,
         gdt_blocks,
         log_groups_per_flex,
@@ -347,8 +413,19 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
     let desc_size = sb.group_desc_size();
     let gdt_blocks = (num_groups as u64 * desc_size as u64).div_ceil(block_size as u64) as u32;
 
-    let sparse_super =
+    // `sparse_super2` (compat 0x200) takes precedence over `sparse_super`:
+    // it pins backups to the two listed groups regardless. Otherwise fall
+    // back to the classic sparse-super rule, or "every group" if neither.
+    let sparse_super2_on = sb.feature_compat & super::constants::feature::COMPAT_SPARSE_SUPER2 != 0;
+    let sparse_super_on =
         sb.feature_ro_compat & super::constants::feature::RO_COMPAT_SPARSE_SUPER != 0;
+    let sparse_super_mode = if sparse_super2_on {
+        SparseSuperMode::Two(sb.backup_bgs)
+    } else if sparse_super_on {
+        SparseSuperMode::Classic
+    } else {
+        SparseSuperMode::All
+    };
     let flex_bg_on = sb.feature_incompat & super::constants::feature::INCOMPAT_FLEX_BG != 0;
     let log_groups_per_flex = if flex_bg_on {
         sb.log_groups_per_flex
@@ -366,16 +443,12 @@ pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layo
         let start = sb.first_data_block + g * sb.blocks_per_group;
         let nominal_end = start + sb.blocks_per_group - 1;
         let end = nominal_end.min(sb.blocks_count - 1);
-        // With sparse_super, only groups 0, 1, and powers of 3/5/7 hold
-        // backups; without it, every group does. These are the *expected*
-        // positions — `Ext::open` overwrites bitmap/inode-table pointers
-        // with the on-disk descriptor values, which remain the source of
-        // truth for actual block locations.
-        let has_sb = if sparse_super {
-            group_has_sparse_super(g)
-        } else {
-            true
-        };
+        // Whether this group is expected to carry a SB+GDT backup. The
+        // on-disk descriptor pointers (read by `Ext::open` and patched into
+        // `layout.groups`) remain the source of truth for actual block
+        // locations; `has_superblock` only controls where we *write* SB+GDT
+        // backups on flush.
+        let has_sb = sparse_super_mode.group_has_backup(g);
         let sb_gdt_blocks: u32 = if has_sb { 1 + gdt_blocks } else { 0 };
         let local_meta_start = start + sb_gdt_blocks;
 
@@ -592,5 +665,58 @@ mod tests {
             assert_eq!(a.groups[i].data_start, b.groups[i].data_start);
             assert_eq!(a.groups[i].meta_blocks, b.groups[i].meta_blocks);
         }
+    }
+
+    #[test]
+    fn use_64bit_widens_desc_size_and_gdt() {
+        // INCOMPAT_64BIT moves the on-disk descriptor from 32 → 64 bytes,
+        // which doubles the GDT footprint in blocks.
+        let a = plan_layout(4096, 4 * 32768, 1024, SparseSuperMode::All, 0, false).unwrap();
+        let b = plan_layout(4096, 4 * 32768, 1024, SparseSuperMode::All, 0, true).unwrap();
+        assert_eq!(a.desc_size, GROUP_DESC_SIZE);
+        assert_eq!(b.desc_size, GROUP_DESC_SIZE_64);
+        // Both planners agree on num_groups; GDT byte count doubles.
+        assert_eq!(a.num_groups(), b.num_groups());
+    }
+
+    #[test]
+    fn sparse_super_mode_two_keeps_only_listed_groups() {
+        // SparseSuperMode::Two([1, 3]) keeps backups in group 0 (primary),
+        // 1, and 3. Group 2 must skip the SB+GDT prefix and start data
+        // right at its first block.
+        let layout = plan_layout(
+            4096,
+            4 * 32768,
+            1024,
+            SparseSuperMode::Two([1, 3]),
+            0,
+            false,
+        )
+        .unwrap();
+        assert!(layout.groups[0].has_superblock);
+        assert!(layout.groups[1].has_superblock);
+        assert!(!layout.groups[2].has_superblock);
+        assert!(layout.groups[3].has_superblock);
+        // Even without SB+GDT, group 2 still owns its own bitmap +
+        // inode-table prefix. The invariant we *can* check is that
+        // group 2 saves exactly `1 + gdt_blocks` of metadata vs group 1
+        // (which carries the backup).
+        let sb_gdt = 1 + layout.gdt_blocks;
+        assert_eq!(
+            layout.groups[1].meta_blocks - layout.groups[2].meta_blocks,
+            sb_gdt,
+            "group 2 saves exactly 1 + gdt_blocks of metadata vs a group with a backup",
+        );
+    }
+
+    #[test]
+    fn sparse_super_mode_group_zero_is_always_primary() {
+        // Even when group 0 isn't in the [a, b] backup list, group 0
+        // always carries the primary SB+GDT.
+        let mode = SparseSuperMode::Two([5, 9]);
+        assert!(mode.group_has_backup(0));
+        assert!(!mode.group_has_backup(2));
+        assert!(mode.group_has_backup(5));
+        assert!(mode.group_has_backup(9));
     }
 }

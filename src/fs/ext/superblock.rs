@@ -63,6 +63,10 @@ pub struct Superblock {
     /// of groups packed into one flex unit when `INCOMPAT_FLEX_BG` is
     /// active. 0 means the classic one-group-at-a-time metadata layout.
     pub log_groups_per_flex: u8,
+    /// `s_backup_bgs[2]` at offset 0x24C. The two block-group numbers
+    /// that hold SB+GDT backups when the `sparse_super2` compat feature
+    /// is set. Zero otherwise.
+    pub backup_bgs: [u32; 2],
 }
 
 impl Superblock {
@@ -123,6 +127,7 @@ impl Superblock {
             journal_inum: 0,
             desc_size: 0,
             log_groups_per_flex: 0,
+            backup_bgs: [0, 0],
         }
     }
 
@@ -190,6 +195,10 @@ impl Superblock {
         // 0x175..: s_checksum_type, padding, ... — left zero. (The
         // metadata-checksum path in mod.rs sets 0x175 directly when
         // needed.)
+        // 0x24C..0x254: s_backup_bgs[2] — populated when the
+        // `sparse_super2` compat feature is on.
+        write_u32(p, 0x24C, self.backup_bgs[0]);
+        write_u32(p, 0x250, self.backup_bgs[1]);
         buf
     }
 
@@ -253,6 +262,7 @@ impl Superblock {
             journal_inum: read_u32(buf, 224),
             desc_size: read_u16(buf, 254),
             log_groups_per_flex: buf[0x174],
+            backup_bgs: [read_u32(buf, 0x24C), read_u32(buf, 0x250)],
         })
     }
 }

@@ -1088,6 +1088,15 @@ impl Writer {
             .saturating_sub(rsvd_segment_count)
             .saturating_sub(overprov_segment_count);
         let user_block_count = (usable_segs as u64) * bps_u64;
+        // SIT and NAT each occupy `segment_count_X` segments, split into
+        // two halves for shadow paging. The versioning bitmap covers
+        // one half — one bit per data block in that half:
+        //   bytes = ((segs / 2) << log_blocks_per_seg) / 8
+        // fsck.f2fs's `sanity_check_ckpt` rejects any CP whose
+        // bitmap sizes don't match this formula exactly.
+        let log_bps = self.geom.log_blocks_per_seg;
+        let sit_ver_bitmap_bytesize = ((self.geom.segment_count_sit / 2) << log_bps) / 8;
+        let nat_ver_bitmap_bytesize = ((self.geom.segment_count_nat / 2) << log_bps) / 8;
         let cp = Checkpoint {
             version: 1,
             user_block_count,
@@ -1099,8 +1108,8 @@ impl Writer {
             cp_pack_total_block_count: 2,
             cp_payload: 0,
             head_blkaddr: self.geom.cp_blkaddr,
-            nat_ver_bitmap_bytesize: 64,
-            sit_ver_bitmap_bytesize: 64,
+            nat_ver_bitmap_bytesize,
+            sit_ver_bitmap_bytesize,
             cur_nat_pack: 0,
             cur_sit_pack: 0,
             nat_journal: Vec::new(),

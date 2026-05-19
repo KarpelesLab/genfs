@@ -153,9 +153,15 @@ pub fn plan_geometry(total_blocks: u64, opts: &FormatOpts) -> Result<Geometry> {
     // Two superblock blocks at the start.
     let sb_blocks = 2u32;
 
-    // Meta region: CP / SIT / NAT / SSA in *segments*.
+    // Meta region: CP / SIT / NAT / SSA in *segments*. The SIT and NAT
+    // regions are shadow-paired (two halves for ping-pong updates), so
+    // their segment counts must be EVEN. fsck.f2fs's
+    // `sanity_check_ckpt` derives the bitmap sizes via
+    // `((segment_count_X / 2) << log_blocks_per_seg) / 8` — anything
+    // less than 2 yields a zero-byte bitmap, mismatches the CP's
+    // recorded size, and fsck rejects with `Wrong bitmap size`.
     let segment_count_ckpt = 2u32;
-    let segment_count_sit = 1u32;
+    let segment_count_sit = 2u32;
     let segment_count_nat = 2u32;
     let segment_count_ssa = 1u32;
 

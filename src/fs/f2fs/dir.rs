@@ -85,7 +85,9 @@ pub fn decode_inline_dentries(
     let payload = inode.inline_payload(inode_block);
     let nr = INLINE_DENTRY_NR;
     let bitmap_bytes = nr.div_ceil(8);
-    let reserved = 1usize; // alignment pad
+    // fsck.f2fs's INLINE_RESERVED_SIZE = MAX_INLINE_DATA - (nr*19 + bitmap_size)
+    // = 3488 - (182*19 + 23) = 7 bytes.
+    let reserved = 7usize;
     let dentries_off = bitmap_bytes + reserved;
     let names_off = dentries_off + nr * SIZE_OF_DIR_ENTRY;
     decode_dentry_region(payload, nr, 0, dentries_off, names_off)
@@ -204,9 +206,9 @@ pub(crate) fn encode_inline_dentries_payload(entries: &[RawDentry]) -> Vec<u8> {
         entries,
         INLINE_DENTRY_NR,
         INLINE_DENTRY_NR.div_ceil(8),
-        1,
+        7,
         // size: bitmap + reserved + nr*(de + slot)
-        INLINE_DENTRY_NR.div_ceil(8) + 1 + INLINE_DENTRY_NR * (SIZE_OF_DIR_ENTRY + F2FS_SLOT_LEN),
+        INLINE_DENTRY_NR.div_ceil(8) + 7 + INLINE_DENTRY_NR * (SIZE_OF_DIR_ENTRY + F2FS_SLOT_LEN),
     )
 }
 

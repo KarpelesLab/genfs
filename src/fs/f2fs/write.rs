@@ -1480,7 +1480,12 @@ fn encode_inline_dentry_payload(dir_nid: u32, parent_nid: u32, entries: &[Dentry
     ];
     let all: Vec<&Dentry> = dot_entries.iter().chain(entries.iter()).collect();
     let bitmap_bytes = INLINE_DENTRY_NR.div_ceil(8);
-    let reserved = 1usize;
+    // INLINE_RESERVED_SIZE (per fsck.f2fs's
+    // `INLINE_RESERVED_SIZE` macro) = MAX_INLINE_DATA - (NR * (DE +
+    // SLOT) + bitmap_size) = 3488 - (182 * 19 + 23) = 7. Off-by-six
+    // here means fsck reads bitmap byte 0 and dentry byte 6 from the
+    // same address, scrambling the layout.
+    let reserved = 7usize;
     let dentries_off = bitmap_bytes + reserved;
     let names_off = dentries_off + INLINE_DENTRY_NR * SIZE_OF_DIR_ENTRY;
     let total = names_off + INLINE_DENTRY_NR * F2FS_SLOT_LEN;

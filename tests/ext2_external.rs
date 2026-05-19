@@ -410,6 +410,82 @@ fn ext2_via_filesystem_trait() {
     assert_eq!(body, b"trait-impl content\n");
 }
 
+/// ext2 sparse files: holes are represented as zero block pointers in the
+/// direct + indirect block map. A mostly-zero file occupies few blocks and
+/// the indirect block for an all-hole range isn't allocated at all.
+#[test]
+fn ext2_sparse_file_uses_holes() {
+    use fstool::block::BlockDevice;
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    // 200 KiB mostly-zero file (well past the 12 KiB direct-block range at
+    // 1 KiB blocks, so it exercises the single-indirect hole path).
+    let mut body = vec![b'X'; 1024];
+    body.extend(std::iter::repeat_n(0u8, 198 * 1024));
+    body.extend(std::iter::repeat_n(b'Y', 1024));
+
+    let srcfile = NamedTempFile::new().unwrap();
+    std::fs::write(srcfile.path(), &body).unwrap();
+
+    let opts = FormatOpts {
+        blocks_count: 8192,
+        inodes_count: 64,
+        sparse: true,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(
+        tmp.path(),
+        opts.blocks_count as u64 * opts.block_size as u64,
+    )
+    .unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    ext.add_file_to(
+        &mut dev,
+        2,
+        b"holey",
+        FileSource::HostPath(srcfile.path().to_path_buf()),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Content round-trips.
+    let ino = ext.path_to_inode(&mut dev, "/holey").unwrap();
+    let mut got = Vec::new();
+    use std::io::Read;
+    ext.open_file_reader(&mut dev, ino)
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, body);
+
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    // Only the 2 KiB of real data should be allocated (+ at most one
+    // indirect block) — nowhere near the dense 200 blocks.
+    assert!(
+        inode.blocks_512 < 32,
+        "sparse ext2 file used {} sectors",
+        inode.blocks_512
+    );
+    drop(dev);
+
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck failed on sparse ext2:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// Open an ext2 image created by an external `mke2fs`, add a file via
 /// fstool, flush, and verify the result is fsck-clean and debugfs can read
 /// the file we wrote. This is the "modify someone else's image" path —

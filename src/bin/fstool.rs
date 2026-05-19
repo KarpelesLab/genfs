@@ -47,6 +47,9 @@ enum Command {
         /// Block size in bytes (1024, 2048, or 4096).
         #[arg(long, default_value_t = 1024)]
         block_size: u32,
+        /// Write files sparsely: all-zero blocks become holes.
+        #[arg(long)]
+        sparse: bool,
     },
 
     /// List a directory inside an image. One entry per line:
@@ -150,7 +153,8 @@ fn run(cli: Cli) -> fstool::Result<()> {
             output,
             kind,
             block_size,
-        } => ext_build(&src_dir, &output, kind.into(), block_size),
+            sparse,
+        } => ext_build(&src_dir, &output, kind.into(), block_size, sparse),
         Command::Ls { image, path } => ls(&image, &path),
         Command::Cat { image, path } => cat(&image, &path),
         Command::Info { image } => info(&image),
@@ -227,20 +231,25 @@ fn ext_build(
     output: &std::path::Path,
     kind: FsKind,
     block_size: u32,
+    sparse: bool,
 ) -> fstool::Result<()> {
     use fstool::fs::ext::BuildPlan;
     let mut plan = BuildPlan::new(block_size, kind);
     plan.scan_host_path(src_dir)?;
-    let opts = plan.to_format_opts();
+    let mut opts = plan.to_format_opts();
+    opts.sparse = sparse;
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(output, size)?;
-    Ext::build_from_host_dir(&mut dev, src_dir, kind, block_size)?;
+    let mut ext = Ext::format_with(&mut dev, &opts)?;
+    ext.populate_from_host_dir(&mut dev, 2, src_dir)?;
+    ext.flush(&mut dev)?;
     dev.sync()?;
     eprintln!(
-        "wrote {} ({} bytes, {:?}, {} inodes, {} blocks)",
+        "wrote {} ({} bytes, {:?}{}, {} inodes, {} blocks)",
         output.display(),
         size,
         kind,
+        if sparse { ", sparse" } else { "" },
         opts.inodes_count,
         opts.blocks_count
     );

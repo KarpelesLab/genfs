@@ -108,6 +108,9 @@ pub struct FilesystemSpec {
     /// Modification timestamp baked into every inode (seconds since epoch).
     /// Default 0 for reproducible output.
     pub mtime: Option<u32>,
+    /// When true, regular files are written sparsely — all-zero blocks
+    /// become holes instead of consuming data blocks. Default false.
+    pub sparse: Option<bool>,
 }
 
 impl Spec {
@@ -206,6 +209,7 @@ fn ext_format_opts(
 
     let mut opts = plan.to_format_opts();
     opts.mtime = mtime;
+    opts.sparse = fs.sparse.unwrap_or(false);
     if let Some(label) = &fs.volume_label {
         let bytes = label.as_bytes();
         let n = bytes.len().min(16);

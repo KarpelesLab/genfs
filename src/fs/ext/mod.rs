@@ -83,6 +83,11 @@ pub struct FormatOpts {
     /// Journal size in FS blocks. Only used when `kind.has_journal()`.
     /// 0 → pick a sensible default (256 blocks).
     pub journal_blocks: u32,
+    /// When set, regular files are written sparsely: any block that is
+    /// entirely zero is left unallocated (a hole) instead of consuming a
+    /// data block. The file still reads back identically. Off by default
+    /// so plain ext2 output stays byte-for-byte comparable with genext2fs.
+    pub sparse: bool,
 }
 
 impl Default for FormatOpts {
@@ -98,6 +103,7 @@ impl Default for FormatOpts {
             reserved_blocks_percent: 5,
             create_lost_found: true,
             journal_blocks: 0,
+            sparse: false,
         }
     }
 }
@@ -123,6 +129,8 @@ pub struct Ext {
     /// Which ext flavour to write — controls extent-vs-indirect block
     /// pointers, FILETYPE in dirents, etc.
     pub kind: FsKind,
+    /// When set, all-zero blocks in regular files are written as holes.
+    pub sparse: bool,
     groups: Vec<GroupState>,
     /// Next free inode number to hand out (starts at first_ino).
     next_inode: u32,
@@ -223,6 +231,7 @@ impl Ext {
             sb,
             layout,
             kind: opts.kind,
+            sparse: opts.sparse,
             groups,
             next_inode: 0,
             inodes: Vec::new(),
@@ -324,6 +333,10 @@ impl Ext {
     /// Ext2 / Ext3 path: direct + single + double indirection. v1 cap.
     /// At 1 KiB blocks that's up to 12 + 256 + 256² ≈ 65 MiB; at 4 KiB
     /// it's ~4 GiB.
+    ///
+    /// A `0` in `data` is a hole (sparse file): the corresponding block
+    /// pointer stays 0, and an indirect block whose entire range is holes
+    /// is not allocated at all.
     fn fill_block_pointers_indirect(&mut self, inode: &mut Inode, data: &[u32]) -> Result<u32> {
         let bs = self.layout.block_size;
         let ptrs_per_block = (bs / 4) as usize;
@@ -334,48 +347,58 @@ impl Ext {
         let mut consumed = n_direct;
 
         if consumed < n {
-            // Single-indirect.
-            let ind = self.alloc_data_block()?;
-            allocated_meta += 1;
-            inode.block[constants::IDX_INDIRECT] = ind;
+            // Single-indirect — only allocate the indirect block if at least
+            // one block in its range is actually present.
             let take = (n - consumed).min(ptrs_per_block);
-            let mut buf = vec![0u8; bs as usize];
-            for (i, &b) in data[consumed..consumed + take].iter().enumerate() {
-                let off = i * 4;
-                buf[off..off + 4].copy_from_slice(&b.to_le_bytes());
+            let range = &data[consumed..consumed + take];
+            if range.iter().any(|&b| b != 0) {
+                let ind = self.alloc_data_block()?;
+                allocated_meta += 1;
+                inode.block[constants::IDX_INDIRECT] = ind;
+                let mut buf = vec![0u8; bs as usize];
+                for (i, &b) in range.iter().enumerate() {
+                    buf[i * 4..i * 4 + 4].copy_from_slice(&b.to_le_bytes());
+                }
+                self.data_blocks.push((ind, buf));
             }
-            self.data_blocks.push((ind, buf));
             consumed += take;
         }
 
         if consumed < n {
-            // Double-indirect.
-            let dind = self.alloc_data_block()?;
-            allocated_meta += 1;
-            inode.block[constants::IDX_DOUBLE_INDIRECT] = dind;
+            // Double-indirect. Each sub-indirect block is allocated only if
+            // its range has a non-hole block; the double-indirect block
+            // itself is allocated only if at least one sub-indirect is.
             let mut dind_buf = vec![0u8; bs as usize];
             let mut dind_slot = 0;
+            let mut any_sub = false;
             while consumed < n {
                 if dind_slot >= ptrs_per_block {
                     return Err(crate::Error::Unsupported(
                         "ext: file exceeds direct+single+double indirection capacity".into(),
                     ));
                 }
-                let ind = self.alloc_data_block()?;
-                allocated_meta += 1;
-                let off = dind_slot * 4;
-                dind_buf[off..off + 4].copy_from_slice(&ind.to_le_bytes());
                 let take = (n - consumed).min(ptrs_per_block);
-                let mut ind_buf = vec![0u8; bs as usize];
-                for (i, &b) in data[consumed..consumed + take].iter().enumerate() {
-                    let off = i * 4;
-                    ind_buf[off..off + 4].copy_from_slice(&b.to_le_bytes());
+                let range = &data[consumed..consumed + take];
+                if range.iter().any(|&b| b != 0) {
+                    let ind = self.alloc_data_block()?;
+                    allocated_meta += 1;
+                    any_sub = true;
+                    dind_buf[dind_slot * 4..dind_slot * 4 + 4].copy_from_slice(&ind.to_le_bytes());
+                    let mut ind_buf = vec![0u8; bs as usize];
+                    for (i, &b) in range.iter().enumerate() {
+                        ind_buf[i * 4..i * 4 + 4].copy_from_slice(&b.to_le_bytes());
+                    }
+                    self.data_blocks.push((ind, ind_buf));
                 }
-                self.data_blocks.push((ind, ind_buf));
                 consumed += take;
                 dind_slot += 1;
             }
-            self.data_blocks.push((dind, dind_buf));
+            if any_sub {
+                let dind = self.alloc_data_block()?;
+                allocated_meta += 1;
+                inode.block[constants::IDX_DOUBLE_INDIRECT] = dind;
+                self.data_blocks.push((dind, dind_buf));
+            }
         }
 
         Ok(allocated_meta)
@@ -797,10 +820,6 @@ impl Ext {
             ));
         }
         let n_data_blocks = len.div_ceil(bs as u64) as u32;
-        let mut data_blocks = Vec::with_capacity(n_data_blocks as usize);
-        for _ in 0..n_data_blocks {
-            data_blocks.push(self.alloc_data_block()?);
-        }
 
         let ino = self.alloc_inode()?;
         let mut inode = Inode::regular(
@@ -810,20 +829,35 @@ impl Ext {
             meta.gid,
             meta.mtime,
         );
-        let allocated_meta_blocks = self.fill_block_pointers(&mut inode, &data_blocks)?;
-        inode.blocks_512 = (n_data_blocks + allocated_meta_blocks) * (bs / 512);
 
-        // Stream data straight to device.
+        // Stream the source one block at a time. Each block is read into a
+        // fixed buffer (the file is never fully resident in memory). In
+        // sparse mode an all-zero block becomes a hole: `data_blocks[i] == 0`
+        // means logical block i is unallocated and reads back as zero.
         let (mut reader, _) = src.open()?;
         let mut buf = vec![0u8; bs as usize];
+        let mut data_blocks = Vec::with_capacity(n_data_blocks as usize);
         let mut remaining = len;
-        for &blk in &data_blocks {
+        let mut allocated_data = 0u32;
+        for _ in 0..n_data_blocks {
             let to_read = remaining.min(bs as u64) as usize;
+            // Zero the whole buffer so a short final block's tail is zero.
+            buf.fill(0);
             reader.read_exact(&mut buf[..to_read])?;
-            dev.write_at(blk as u64 * bs as u64, &buf[..to_read])?;
+            if self.sparse && buf.iter().all(|&b| b == 0) {
+                data_blocks.push(0); // hole
+            } else {
+                let blk = self.alloc_data_block()?;
+                dev.write_at(blk as u64 * bs as u64, &buf[..to_read])?;
+                data_blocks.push(blk);
+                allocated_data += 1;
+            }
             remaining -= to_read as u64;
         }
         debug_assert_eq!(remaining, 0);
+
+        let allocated_meta_blocks = self.fill_block_pointers(&mut inode, &data_blocks)?;
+        inode.blocks_512 = (allocated_data + allocated_meta_blocks) * (bs / 512);
 
         self.inodes.push((ino, inode));
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_REG)?;
@@ -1363,12 +1397,21 @@ impl Ext {
             sb,
             layout,
             kind,
+            // Default sparse off for an opened image; the caller can flip it
+            // via `set_sparse` before adding files.
+            sparse: false,
             groups,
             next_inode,
             inodes: Vec::new(),
             data_blocks: Vec::new(),
             dir_blocks: Vec::new(),
         })
+    }
+
+    /// Enable or disable sparse-file writing for subsequent `add_file_to`
+    /// calls. Useful after [`Ext::open`], which defaults it off.
+    pub fn set_sparse(&mut self, sparse: bool) {
+        self.sparse = sparse;
     }
 
     /// Read inode number `ino`. Consults the in-memory staged-write cache

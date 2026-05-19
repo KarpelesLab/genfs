@@ -75,15 +75,18 @@ pub fn encode_leaf(run: ExtentRun) -> [u8; 12] {
     out
 }
 
-/// Collapse a sorted list of `(logical, physical)` mappings into the
-/// minimum-length sequence of contiguous extents (same as how genext2fs
-/// / mke2fs / kernel would).
+/// Collapse a list of physical block numbers (indexed by logical block)
+/// into the minimum-length sequence of contiguous extents.
 ///
-/// Input must be sorted by `logical`; physical blocks are read straight
-/// through.
+/// A `0` entry is a hole (sparse file): it produces no extent, and the
+/// logical gap it leaves naturally starts a fresh extent for the next
+/// present block.
 pub fn coalesce(data_blocks: &[u32]) -> Vec<ExtentRun> {
     let mut out: Vec<ExtentRun> = Vec::new();
     for (i, &phys) in data_blocks.iter().enumerate() {
+        if phys == 0 {
+            continue; // hole — no extent covers this logical block
+        }
         let logical = i as u32;
         if let Some(last) = out.last_mut() {
             // Same run if physically contiguous AND fits within ee_len cap.

@@ -93,6 +93,81 @@ fn read_default_mke2fs_ext4_image() {
     assert_eq!(body, b"x=1\n");
 }
 
+/// A mostly-zero file written with `sparse` set should occupy far fewer
+/// blocks while still reading back identically, and stay e2fsck-clean.
+#[test]
+fn ext4_sparse_file_uses_holes() {
+    use std::io::Read;
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    // 256 KiB: 4 KiB of data, 248 KiB of zeros, 4 KiB of data.
+    let mut body = vec![b'A'; 4096];
+    body.extend(std::iter::repeat_n(0u8, 248 * 1024));
+    body.extend(std::iter::repeat_n(b'B', 4096));
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hole.bin"), &body).unwrap();
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        sparse: true,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(
+        tmp.path(),
+        opts.blocks_count as u64 * opts.block_size as u64,
+    )
+    .unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    ext.add_file_to(
+        &mut dev,
+        2,
+        b"hole.bin",
+        FileSource::HostPath(srcdir.path().join("hole.bin")),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // The file's content must round-trip through our reader exactly.
+    let ino = ext.path_to_inode(&mut dev, "/hole.bin").unwrap();
+    let mut got = Vec::new();
+    ext.open_file_reader(&mut dev, ino)
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, body, "sparse file content mismatch");
+
+    // The inode should account for only the ~8 KiB of real data, not 256.
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    // blocks_512 counts 512-byte sectors; 8 KiB = 16, full file = 512.
+    assert!(
+        inode.blocks_512 < 64,
+        "sparse file used {} sectors, expected far fewer than the dense 512",
+        inode.blocks_512
+    );
+    drop(dev);
+
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck failed on sparse ext4:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn ext4_passes_e2fsck_and_advertises_features() {
     let Some(_) = which("e2fsck") else {

@@ -212,36 +212,39 @@ pub(crate) fn write_superblocks(
     buf[0x00..0x04].copy_from_slice(&F2FS_MAGIC.to_le_bytes());
     buf[0x04..0x06].copy_from_slice(&1u16.to_le_bytes()); // major_ver
     buf[0x06..0x08].copy_from_slice(&15u16.to_le_bytes()); // minor_ver
+    // Field offsets per kernel `f2fs_fs.h`. The whole tail of the
+    // superblock used to be 4 bytes too late; fsck.f2fs / mkfs.f2fs
+    // now accept what we emit.
     buf[0x08..0x0C].copy_from_slice(&9u32.to_le_bytes()); // log_sectorsize (512)
     buf[0x0C..0x10].copy_from_slice(&3u32.to_le_bytes()); // log_sectors_per_block (8 sec / 4 KiB)
-    buf[0x14..0x18].copy_from_slice(&12u32.to_le_bytes()); // log_blocksize (4096)
-    buf[0x18..0x1C].copy_from_slice(&geom.log_blocks_per_seg.to_le_bytes());
-    buf[0x1C..0x20].copy_from_slice(&geom.segs_per_sec.to_le_bytes());
-    buf[0x20..0x24].copy_from_slice(&geom.secs_per_zone.to_le_bytes());
-    // 0x24 = checksum_offset (unused by our reader)
-    buf[0x28..0x30].copy_from_slice(&geom.total_blocks.to_le_bytes());
+    buf[0x10..0x14].copy_from_slice(&12u32.to_le_bytes()); // log_blocksize (4096)
+    buf[0x14..0x18].copy_from_slice(&geom.log_blocks_per_seg.to_le_bytes());
+    buf[0x18..0x1C].copy_from_slice(&geom.segs_per_sec.to_le_bytes());
+    buf[0x1C..0x20].copy_from_slice(&geom.secs_per_zone.to_le_bytes());
+    // 0x20 = checksum_offset (unused by our reader)
+    buf[0x24..0x2C].copy_from_slice(&geom.total_blocks.to_le_bytes());
     let section_count = geom.segment_count_main / geom.segs_per_sec.max(1);
-    buf[0x30..0x34].copy_from_slice(&section_count.to_le_bytes());
-    buf[0x34..0x38].copy_from_slice(&geom.segment_count().to_le_bytes());
-    buf[0x38..0x3C].copy_from_slice(&geom.segment_count_ckpt.to_le_bytes());
-    buf[0x3C..0x40].copy_from_slice(&geom.segment_count_sit.to_le_bytes());
-    buf[0x40..0x44].copy_from_slice(&geom.segment_count_nat.to_le_bytes());
-    buf[0x44..0x48].copy_from_slice(&geom.segment_count_ssa.to_le_bytes());
-    buf[0x48..0x4C].copy_from_slice(&geom.segment_count_main.to_le_bytes());
-    buf[0x4C..0x50].copy_from_slice(&0u32.to_le_bytes()); // segment0_blkaddr
-    buf[0x50..0x54].copy_from_slice(&geom.cp_blkaddr.to_le_bytes());
-    buf[0x54..0x58].copy_from_slice(&geom.sit_blkaddr.to_le_bytes());
-    buf[0x58..0x5C].copy_from_slice(&geom.nat_blkaddr.to_le_bytes());
-    buf[0x5C..0x60].copy_from_slice(&geom.ssa_blkaddr.to_le_bytes());
-    buf[0x60..0x64].copy_from_slice(&geom.main_blkaddr.to_le_bytes());
-    buf[0x64..0x68].copy_from_slice(&F2FS_ROOT_INO_DEFAULT.to_le_bytes());
-    buf[0x68..0x6C].copy_from_slice(&1u32.to_le_bytes()); // node_ino
-    buf[0x6C..0x70].copy_from_slice(&2u32.to_le_bytes()); // meta_ino
+    buf[0x2C..0x30].copy_from_slice(&section_count.to_le_bytes());
+    buf[0x30..0x34].copy_from_slice(&geom.segment_count().to_le_bytes());
+    buf[0x34..0x38].copy_from_slice(&geom.segment_count_ckpt.to_le_bytes());
+    buf[0x38..0x3C].copy_from_slice(&geom.segment_count_sit.to_le_bytes());
+    buf[0x3C..0x40].copy_from_slice(&geom.segment_count_nat.to_le_bytes());
+    buf[0x40..0x44].copy_from_slice(&geom.segment_count_ssa.to_le_bytes());
+    buf[0x44..0x48].copy_from_slice(&geom.segment_count_main.to_le_bytes());
+    buf[0x48..0x4C].copy_from_slice(&0u32.to_le_bytes()); // segment0_blkaddr
+    buf[0x4C..0x50].copy_from_slice(&geom.cp_blkaddr.to_le_bytes());
+    buf[0x50..0x54].copy_from_slice(&geom.sit_blkaddr.to_le_bytes());
+    buf[0x54..0x58].copy_from_slice(&geom.nat_blkaddr.to_le_bytes());
+    buf[0x58..0x5C].copy_from_slice(&geom.ssa_blkaddr.to_le_bytes());
+    buf[0x5C..0x60].copy_from_slice(&geom.main_blkaddr.to_le_bytes());
+    buf[0x60..0x64].copy_from_slice(&F2FS_ROOT_INO_DEFAULT.to_le_bytes());
+    buf[0x64..0x68].copy_from_slice(&1u32.to_le_bytes()); // node_ino
+    buf[0x68..0x6C].copy_from_slice(&2u32.to_le_bytes()); // meta_ino
 
-    // 16-byte UUID at 0x70.
-    buf[0x70..0x80].copy_from_slice(&opts.uuid);
+    // 16-byte UUID at 0x6C.
+    buf[0x6C..0x7C].copy_from_slice(&opts.uuid);
 
-    // 512-codepoint UTF-16LE volume label at 0x80.
+    // 512-codepoint UTF-16LE volume label at 0x7C.
     let mut units = opts
         .volume_label
         .encode_utf16()
@@ -249,7 +252,7 @@ pub(crate) fn write_superblocks(
         .collect::<Vec<u16>>();
     units.push(0);
     for (i, c) in units.iter().enumerate() {
-        let o = 0x80 + i * 2;
+        let o = 0x7C + i * 2;
         if o + 2 > buf.len() {
             break;
         }

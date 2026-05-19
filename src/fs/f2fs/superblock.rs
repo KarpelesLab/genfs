@@ -87,35 +87,40 @@ impl Superblock {
         }
         let major_ver = r16(0x04);
         let minor_ver = r16(0x06);
+        // Field offsets per `include/linux/f2fs_fs.h` / kernel docs.
+        // Every offset from log_blocksize onward was previously off by
+        // +4 bytes; mkfs.f2fs / fsck.f2fs reject those images even
+        // though our reader could round-trip them via the same wrong
+        // offsets. Aligned to the canonical layout now.
         let log_sectorsize = r32(0x08);
         // 0x0C log_sectors_per_block (unused — we only support 4 KiB blocks)
-        let log_blocksize = r32(0x14);
-        let log_blocks_per_seg = r32(0x18);
-        let segs_per_sec = r32(0x1C);
-        let secs_per_zone = r32(0x20);
-        // 0x24 checksum_offset
-        let block_count = r64(0x28);
-        let _section_count = r32(0x30);
-        let segment_count = r32(0x34);
-        let segment_count_ckpt = r32(0x38);
-        let segment_count_sit = r32(0x3C);
-        let segment_count_nat = r32(0x40);
-        let segment_count_ssa = r32(0x44);
-        let segment_count_main = r32(0x48);
-        let segment0_blkaddr = r32(0x4C);
-        let cp_blkaddr = r32(0x50);
-        let sit_blkaddr = r32(0x54);
-        let nat_blkaddr = r32(0x58);
-        let ssa_blkaddr = r32(0x5C);
-        let main_blkaddr = r32(0x60);
-        let root_ino = r32(0x64);
-        let node_ino = r32(0x68);
-        let meta_ino = r32(0x6C);
+        let log_blocksize = r32(0x10);
+        let log_blocks_per_seg = r32(0x14);
+        let segs_per_sec = r32(0x18);
+        let secs_per_zone = r32(0x1C);
+        // 0x20 checksum_offset
+        let block_count = r64(0x24);
+        let _section_count = r32(0x2C);
+        let segment_count = r32(0x30);
+        let segment_count_ckpt = r32(0x34);
+        let segment_count_sit = r32(0x38);
+        let segment_count_nat = r32(0x3C);
+        let segment_count_ssa = r32(0x40);
+        let segment_count_main = r32(0x44);
+        let segment0_blkaddr = r32(0x48);
+        let cp_blkaddr = r32(0x4C);
+        let sit_blkaddr = r32(0x50);
+        let nat_blkaddr = r32(0x54);
+        let ssa_blkaddr = r32(0x58);
+        let main_blkaddr = r32(0x5C);
+        let root_ino = r32(0x60);
+        let node_ino = r32(0x64);
+        let meta_ino = r32(0x68);
 
-        // The 16-byte uuid sits at 0x70..0x80; volume_name at 0x80 spans
+        // The 16-byte uuid sits at 0x6C..0x7C; volume_name at 0x7C spans
         // 512 UTF-16LE code units (1024 bytes). We read at most 64 bytes
         // for the human-readable label.
-        let name_off = 0x80;
+        let name_off = 0x7C;
         let volume_name = if buf.len() >= name_off + 64 {
             utf16_lossy_until_nul(&buf[name_off..name_off + 64])
         } else {

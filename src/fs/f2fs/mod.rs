@@ -507,35 +507,35 @@ mod tests {
         sb_buf[4..6].copy_from_slice(&1u16.to_le_bytes());
         sb_buf[6..8].copy_from_slice(&15u16.to_le_bytes());
         sb_buf[8..12].copy_from_slice(&9u32.to_le_bytes()); // log_sectorsize
-        sb_buf[0x14..0x18].copy_from_slice(&12u32.to_le_bytes()); // log_blocksize
+        sb_buf[0x10..0x14].copy_from_slice(&12u32.to_le_bytes()); // log_blocksize
         let log_bps = layout.blocks_per_seg.trailing_zeros();
-        sb_buf[0x18..0x1C].copy_from_slice(&log_bps.to_le_bytes());
-        sb_buf[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes()); // segs_per_sec
-        sb_buf[0x20..0x24].copy_from_slice(&1u32.to_le_bytes()); // secs_per_zone
-        sb_buf[0x28..0x30].copy_from_slice(&layout.blocks.to_le_bytes());
-        sb_buf[0x30..0x34].copy_from_slice(&main_segs.to_le_bytes()); // section_count
-        sb_buf[0x34..0x38].copy_from_slice(
+        sb_buf[0x14..0x18].copy_from_slice(&log_bps.to_le_bytes());
+        sb_buf[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes()); // segs_per_sec
+        sb_buf[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes()); // secs_per_zone
+        sb_buf[0x24..0x2C].copy_from_slice(&layout.blocks.to_le_bytes());
+        sb_buf[0x2C..0x30].copy_from_slice(&main_segs.to_le_bytes()); // section_count
+        sb_buf[0x30..0x34].copy_from_slice(
             &(main_segs + layout.cp_segs + layout.sit_segs + layout.nat_segs + layout.ssa_segs)
                 .to_le_bytes(),
         );
-        sb_buf[0x38..0x3C].copy_from_slice(&layout.cp_segs.to_le_bytes());
-        sb_buf[0x3C..0x40].copy_from_slice(&layout.sit_segs.to_le_bytes());
-        sb_buf[0x40..0x44].copy_from_slice(&layout.nat_segs.to_le_bytes());
-        sb_buf[0x44..0x48].copy_from_slice(&layout.ssa_segs.to_le_bytes());
-        sb_buf[0x48..0x4C].copy_from_slice(&main_segs.to_le_bytes());
-        sb_buf[0x4C..0x50].copy_from_slice(&0u32.to_le_bytes()); // segment0_blkaddr
-        sb_buf[0x50..0x54].copy_from_slice(&cp_blkaddr.to_le_bytes());
-        sb_buf[0x54..0x58].copy_from_slice(&sit_blkaddr.to_le_bytes());
-        sb_buf[0x58..0x5C].copy_from_slice(&nat_blkaddr.to_le_bytes());
-        sb_buf[0x5C..0x60].copy_from_slice(&ssa_blkaddr.to_le_bytes());
-        sb_buf[0x60..0x64].copy_from_slice(&main_blkaddr.to_le_bytes());
-        sb_buf[0x64..0x68].copy_from_slice(&3u32.to_le_bytes()); // root_ino
-        sb_buf[0x68..0x6C].copy_from_slice(&1u32.to_le_bytes()); // node_ino
-        sb_buf[0x6C..0x70].copy_from_slice(&2u32.to_le_bytes()); // meta_ino
-        // volume_name = "test" at 0x80
+        sb_buf[0x34..0x38].copy_from_slice(&layout.cp_segs.to_le_bytes());
+        sb_buf[0x38..0x3C].copy_from_slice(&layout.sit_segs.to_le_bytes());
+        sb_buf[0x3C..0x40].copy_from_slice(&layout.nat_segs.to_le_bytes());
+        sb_buf[0x40..0x44].copy_from_slice(&layout.ssa_segs.to_le_bytes());
+        sb_buf[0x44..0x48].copy_from_slice(&main_segs.to_le_bytes());
+        sb_buf[0x48..0x4C].copy_from_slice(&0u32.to_le_bytes()); // segment0_blkaddr
+        sb_buf[0x4C..0x50].copy_from_slice(&cp_blkaddr.to_le_bytes());
+        sb_buf[0x50..0x54].copy_from_slice(&sit_blkaddr.to_le_bytes());
+        sb_buf[0x54..0x58].copy_from_slice(&nat_blkaddr.to_le_bytes());
+        sb_buf[0x58..0x5C].copy_from_slice(&ssa_blkaddr.to_le_bytes());
+        sb_buf[0x5C..0x60].copy_from_slice(&main_blkaddr.to_le_bytes());
+        sb_buf[0x60..0x64].copy_from_slice(&3u32.to_le_bytes()); // root_ino
+        sb_buf[0x64..0x68].copy_from_slice(&1u32.to_le_bytes()); // node_ino
+        sb_buf[0x68..0x6C].copy_from_slice(&2u32.to_le_bytes()); // meta_ino
+        // volume_name = "test" at 0x7C
         let name = "test".encode_utf16().collect::<Vec<u16>>();
         for (i, c) in name.iter().enumerate() {
-            sb_buf[0x80 + i * 2..0x80 + i * 2 + 2].copy_from_slice(&c.to_le_bytes());
+            sb_buf[0x7C + i * 2..0x7C + i * 2 + 2].copy_from_slice(&c.to_le_bytes());
         }
         dev.write_at(SB_OFFSET_PRIMARY, &sb_buf).unwrap();
         dev.write_at(SB_OFFSET_BACKUP, &sb_buf).unwrap();
@@ -987,28 +987,28 @@ mod tests {
         sb_buf[0..4].copy_from_slice(&F2FS_MAGIC.to_le_bytes());
         sb_buf[4..6].copy_from_slice(&1u16.to_le_bytes());
         sb_buf[8..12].copy_from_slice(&9u32.to_le_bytes());
-        sb_buf[0x14..0x18].copy_from_slice(&12u32.to_le_bytes());
+        sb_buf[0x10..0x14].copy_from_slice(&12u32.to_le_bytes());
         let log_bps = blocks_per_seg.trailing_zeros();
-        sb_buf[0x18..0x1C].copy_from_slice(&log_bps.to_le_bytes());
+        sb_buf[0x14..0x18].copy_from_slice(&log_bps.to_le_bytes());
+        sb_buf[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes());
         sb_buf[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes());
-        sb_buf[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
-        sb_buf[0x28..0x30].copy_from_slice(&total_blocks.to_le_bytes());
-        sb_buf[0x34..0x38].copy_from_slice(&((total_blocks as u32) / blocks_per_seg).to_le_bytes());
-        sb_buf[0x38..0x3C].copy_from_slice(&2u32.to_le_bytes());
-        sb_buf[0x3C..0x40].copy_from_slice(&1u32.to_le_bytes());
-        sb_buf[0x40..0x44].copy_from_slice(&2u32.to_le_bytes());
-        sb_buf[0x44..0x48].copy_from_slice(&1u32.to_le_bytes());
-        sb_buf[0x48..0x4C].copy_from_slice(
+        sb_buf[0x24..0x2C].copy_from_slice(&total_blocks.to_le_bytes());
+        sb_buf[0x30..0x34].copy_from_slice(&((total_blocks as u32) / blocks_per_seg).to_le_bytes());
+        sb_buf[0x34..0x38].copy_from_slice(&2u32.to_le_bytes());
+        sb_buf[0x38..0x3C].copy_from_slice(&1u32.to_le_bytes());
+        sb_buf[0x3C..0x40].copy_from_slice(&2u32.to_le_bytes());
+        sb_buf[0x40..0x44].copy_from_slice(&1u32.to_le_bytes());
+        sb_buf[0x44..0x48].copy_from_slice(
             &((total_blocks as u32 - main_blkaddr) / blocks_per_seg).to_le_bytes(),
         );
-        sb_buf[0x50..0x54].copy_from_slice(&cp_blkaddr.to_le_bytes());
-        sb_buf[0x54..0x58].copy_from_slice(&sit_blkaddr.to_le_bytes());
-        sb_buf[0x58..0x5C].copy_from_slice(&nat_blkaddr.to_le_bytes());
-        sb_buf[0x5C..0x60].copy_from_slice(&ssa_blkaddr.to_le_bytes());
-        sb_buf[0x60..0x64].copy_from_slice(&main_blkaddr.to_le_bytes());
-        sb_buf[0x64..0x68].copy_from_slice(&3u32.to_le_bytes());
-        sb_buf[0x68..0x6C].copy_from_slice(&1u32.to_le_bytes());
-        sb_buf[0x6C..0x70].copy_from_slice(&2u32.to_le_bytes());
+        sb_buf[0x4C..0x50].copy_from_slice(&cp_blkaddr.to_le_bytes());
+        sb_buf[0x50..0x54].copy_from_slice(&sit_blkaddr.to_le_bytes());
+        sb_buf[0x54..0x58].copy_from_slice(&nat_blkaddr.to_le_bytes());
+        sb_buf[0x58..0x5C].copy_from_slice(&ssa_blkaddr.to_le_bytes());
+        sb_buf[0x5C..0x60].copy_from_slice(&main_blkaddr.to_le_bytes());
+        sb_buf[0x60..0x64].copy_from_slice(&3u32.to_le_bytes());
+        sb_buf[0x64..0x68].copy_from_slice(&1u32.to_le_bytes());
+        sb_buf[0x68..0x6C].copy_from_slice(&2u32.to_le_bytes());
         dev.write_at(SB_OFFSET_PRIMARY, &sb_buf).unwrap();
         dev.write_at(SB_OFFSET_BACKUP, &sb_buf).unwrap();
 

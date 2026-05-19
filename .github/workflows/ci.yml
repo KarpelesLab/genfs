@@ -96,14 +96,15 @@ jobs:
 
       - name: Install validators (qemu + squashfs-tools)
         run: |
-          brew install qemu squashfs ntfs-3g
-          # APFS validation uses Apple's `hdiutil` + `fsck_apfs`, which
-          # ship with macOS. `fsck_hfs` / `newfs_hfs` also built-in.
-          # No exfat / xfs / f2fs Linux validators on macOS; those tests
-          # skip themselves.
+          # ntfs-3g was removed from homebrew-core (deprecated upstream
+          # since 2022). Skip it on macOS; ntfs writer tests fall back
+          # to the skip path. APFS validation uses Apple's `hdiutil` +
+          # `fsck_apfs` which ship built-in; same for `fsck_hfs` /
+          # `newfs_hfs`. No exfat / xfs / f2fs Linux validators on
+          # macOS; those tests skip themselves.
+          brew install qemu squashfs
           for tool in hdiutil fsck_apfs fsck_hfs newfs_hfs \
-                      unsquashfs mksquashfs ntfsfix ntfsls ntfscat \
-                      qemu-img; do
+                      unsquashfs mksquashfs qemu-img; do
             if command -v "$tool" >/dev/null 2>&1; then
               echo "found: $tool ($(command -v "$tool"))"
             else

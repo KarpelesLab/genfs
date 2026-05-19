@@ -61,7 +61,7 @@ pub mod mode {
 /// HFS+ stores the length as a u16 (BE) followed by exactly that many
 /// UTF-16 code units (also BE). We decode the slice into a `Vec<u16>`
 /// for case-insensitive comparison via the simple HFS+ rules.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UniStr {
     pub code_units: Vec<u16>,
 }

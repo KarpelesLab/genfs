@@ -91,7 +91,7 @@ impl ExtentDescriptor {
 /// HFSPlusForkData — the per-fork allocation map embedded in the
 /// volume header (for the special files) and in catalog file records
 /// (for user files).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ForkData {
     /// File length in bytes.
     pub logical_size: u64,

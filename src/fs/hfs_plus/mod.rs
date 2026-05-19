@@ -30,6 +30,9 @@ pub mod btree;
 pub mod catalog;
 pub mod extents;
 pub mod volume_header;
+pub mod writer;
+
+pub use writer::FormatOpts;
 
 use std::io::Read;
 
@@ -62,6 +65,10 @@ pub struct HfsPlus {
     private_dir_resolved: std::cell::Cell<bool>,
     /// Cached volume name, taken from the root folder's thread record.
     volume_name: String,
+    /// Writer state, present only while a freshly formatted volume
+    /// (or one re-opened for mutation) is being built. `None` for
+    /// read-only opens.
+    writer: Option<writer::Writer>,
 }
 
 impl HfsPlus {
@@ -95,7 +102,200 @@ impl HfsPlus {
             private_dir_cnid: std::cell::Cell::new(None),
             private_dir_resolved: std::cell::Cell::new(false),
             volume_name,
+            writer: None,
         })
+    }
+
+    /// Format `dev` as a fresh HFS+ volume and return a handle that
+    /// accepts subsequent `create_*` calls. Call [`flush`](Self::flush)
+    /// when done to persist the catalog, bitmap, and volume header.
+    pub fn format(dev: &mut dyn BlockDevice, opts: &writer::FormatOpts) -> Result<Self> {
+        let (vh, w) = writer::format(dev, opts)?;
+        let case_sensitive = vh.is_hfsx();
+        let mut w = w;
+        let mut vh_mut = vh.clone();
+        writer::flush(&mut w, &mut vh_mut, dev)?;
+        w.flushed = false;
+
+        let cat_fork = ForkReader::from_inline(&vh_mut.catalog_file, vh_mut.block_size, "catalog")?;
+        let catalog = Catalog::open(dev, cat_fork, case_sensitive)?;
+        let overflow = if vh_mut.extents_file.total_blocks > 0 {
+            let ext_fork = ForkReader::from_inline(
+                &vh_mut.extents_file,
+                vh_mut.block_size,
+                "extents-overflow",
+            )?;
+            Some(ExtentsOverflow::open(dev, ext_fork)?)
+        } else {
+            None
+        };
+        let volume_name = w.volume_name.clone();
+        Ok(Self {
+            volume_header: vh_mut,
+            catalog,
+            overflow,
+            private_dir_cnid: std::cell::Cell::new(None),
+            private_dir_resolved: std::cell::Cell::new(false),
+            volume_name,
+            writer: Some(w),
+        })
+    }
+
+    /// Create a directory at the given absolute path.
+    pub fn create_dir(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &str,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u32> {
+        let (parent_id, name) = self.resolve_create_target(path)?;
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
+        let cnid = w.next_cnid;
+        w.next_cnid = w
+            .next_cnid
+            .checked_add(1)
+            .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+        writer::insert_folder(w, parent_id, &name, cnid, mode, uid, gid)?;
+        Ok(cnid)
+    }
+
+    /// Create a regular file at the given absolute path, streaming
+    /// `len` bytes from `src` into freshly allocated allocation blocks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_file<R: std::io::Read>(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        src: &mut R,
+        len: u64,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u32> {
+        let (parent_id, name) = self.resolve_create_target(path)?;
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
+        let cnid = w.next_cnid;
+        w.next_cnid = w
+            .next_cnid
+            .checked_add(1)
+            .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+        let fork = writer::stream_data_to_blocks(w, dev, src, len)?;
+        writer::insert_file(
+            w,
+            parent_id,
+            &name,
+            cnid,
+            mode,
+            uid,
+            gid,
+            *b"\0\0\0\0",
+            *b"\0\0\0\0",
+            &fork,
+            false,
+        )?;
+        Ok(cnid)
+    }
+
+    /// Create a symlink at `path` whose target is the UTF-8 byte string
+    /// `target`. Finder type `slnk` / creator `rhap`, mode S_IFLNK.
+    pub fn create_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        target: &str,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u32> {
+        let (parent_id, name) = self.resolve_create_target(path)?;
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
+        let cnid = w.next_cnid;
+        w.next_cnid = w
+            .next_cnid
+            .checked_add(1)
+            .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+        let fork = writer::write_inline_data(w, dev, target.as_bytes())?;
+        writer::insert_file(
+            w, parent_id, &name, cnid, mode, uid, gid, *b"slnk", *b"rhap", &fork, true,
+        )?;
+        Ok(cnid)
+    }
+
+    /// Remove a file, symlink, or empty directory at `path`.
+    pub fn remove(&mut self, _dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        let (parent_id, name) = self.resolve_create_target(path)?;
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
+        writer::remove_entry(w, parent_id, &name)
+    }
+
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub fn test_writer(&self) -> Option<&writer::Writer> {
+        self.writer.as_ref()
+    }
+
+    /// Persist in-memory writer state (bitmap, catalog tree, volume
+    /// header) to disk. Idempotent; no-op on read-only handles.
+    pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let Some(w) = self.writer.as_mut() else {
+            return Ok(());
+        };
+        writer::flush(w, &mut self.volume_header, dev)?;
+        let case_sensitive = self.volume_header.is_hfsx();
+        let cat_fork = ForkReader::from_inline(
+            &self.volume_header.catalog_file,
+            self.volume_header.block_size,
+            "catalog",
+        )?;
+        self.catalog = Catalog::open(dev, cat_fork, case_sensitive)?;
+        w.flushed = false;
+        Ok(())
+    }
+
+    /// Split `path` into its parent CNID and final name component,
+    /// resolving all intermediates against the in-memory catalog.
+    fn resolve_create_target(&self, path: &str) -> Result<(u32, UniStr)> {
+        let parts = split_path(path);
+        if parts.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "hfs+: cannot create at the root path".into(),
+            ));
+        }
+        let (last, prefix) = parts.split_last().unwrap();
+        let mut cnid = ROOT_FOLDER_ID;
+        let w = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
+        for part in prefix {
+            let name = UniStr::from_str_lossy(part);
+            let (_, child_cnid, rec_type) = w.lookup(cnid, &name).ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "hfs+: parent component {part:?} does not exist"
+                ))
+            })?;
+            if rec_type != catalog::REC_FOLDER {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "hfs+: component {part:?} is not a directory"
+                )));
+            }
+            cnid = child_cnid;
+        }
+        Ok((cnid, UniStr::from_str_lossy(last)))
     }
 
     /// Total byte capacity advertised by the volume header.

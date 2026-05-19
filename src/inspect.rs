@@ -14,6 +14,7 @@ use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::ext::Ext;
 use crate::fs::fat::Fat32;
+use crate::fs::tar::Tar;
 use crate::fs::{DirEntry, Filesystem};
 use crate::part::{Gpt, Mbr, Partition, PartitionTable, slice_partition};
 
@@ -24,6 +25,8 @@ pub enum FsKind {
     Ext,
     /// FAT32.
     Fat32,
+    /// A tar archive treated as a read-only filesystem.
+    Tar,
 }
 
 /// Probe `dev` to decide which filesystem it carries. Reads only sector 0
@@ -40,6 +43,11 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
         return Ok(FsKind::Fat32);
     }
 
+    // Tar: "ustar\0" or "ustar " magic at offset 257 of the first block.
+    if &bs[257..262] == b"ustar" {
+        return Ok(FsKind::Tar);
+    }
+
     // ext superblock starts at byte 1024; s_magic (0xEF53) is at offset 56.
     let mut sb_magic = [0u8; 2];
     dev.read_at(1024 + 56, &mut sb_magic)?;
@@ -48,19 +56,24 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     }
 
     Err(crate::Error::InvalidImage(
-        "inspect: no recognised filesystem (ext2/3/4 or FAT32) on this image".into(),
+        "inspect: no recognised filesystem (ext2/3/4, FAT32, or tar) on this image".into(),
     ))
 }
 
 /// A unified read-side handle. Hides whether the underlying filesystem
-/// is ext or FAT32 — the CLI calls `list` / `read_file` / `summary` and
-/// the right backend dispatches.
+/// is ext, FAT32, or a tar archive — the CLI calls `list` / `read_file`
+/// / `summary` and the right backend dispatches.
 ///
 /// The ext backend's state is much larger than FAT32's (group descriptors,
 /// bitmaps, inode table cache), so it's boxed to keep the enum compact.
 pub enum AnyFs {
     Ext(Box<Ext>),
     Fat32(Box<Fat32>),
+    /// Tar archive — read-only via this handle. Write-side operations
+    /// (add_file, add_dir_tree, mkdir, remove) error with
+    /// `Unsupported`; build a fresh tar via `fstool repack` or
+    /// `fstool tar-build`.
+    Tar(Box<Tar>),
 }
 
 impl AnyFs {
@@ -69,6 +82,7 @@ impl AnyFs {
         match detect_fs(dev)? {
             FsKind::Ext => Ok(Self::Ext(Box::new(Ext::open(dev)?))),
             FsKind::Fat32 => Ok(Self::Fat32(Box::new(Fat32::open(dev)?))),
+            FsKind::Tar => Ok(Self::Tar(Box::new(Tar::open(dev)?))),
         }
     }
 
@@ -77,6 +91,7 @@ impl AnyFs {
         match self {
             Self::Ext(_) => FsKind::Ext,
             Self::Fat32(_) => FsKind::Fat32,
+            Self::Tar(_) => FsKind::Tar,
         }
     }
 
@@ -88,6 +103,7 @@ impl AnyFs {
                 ext.list_inode(dev, ino)
             }
             Self::Fat32(fat) => fat.list_path(dev, path),
+            Self::Tar(tar) => tar.list_path(dev, path),
         }
     }
 
@@ -116,6 +132,17 @@ impl AnyFs {
             }
             Self::Fat32(fat) => {
                 let mut reader = fat.open_file_reader(dev, path)?;
+                loop {
+                    let n = reader.read(&mut buf).map_err(crate::Error::from)?;
+                    if n == 0 {
+                        break;
+                    }
+                    out.write_all(&buf[..n]).map_err(crate::Error::from)?;
+                    total += n as u64;
+                }
+            }
+            Self::Tar(tar) => {
+                let mut reader = tar.open_file_reader(dev, path)?;
                 loop {
                     let n = reader.read(&mut buf).map_err(crate::Error::from)?;
                     if n == 0 {
@@ -157,6 +184,7 @@ impl AnyFs {
                 )
             }
             Self::Fat32(fat) => fat.add_file(dev, dest_path, host_src),
+            Self::Tar(_) => Err(tar_readonly()),
         }
     }
 
@@ -187,6 +215,7 @@ impl AnyFs {
                 fat.add_dir(dev, dest_path)?;
                 add_host_tree_into_fat32(fat, dev, dest_path, host_src)
             }
+            Self::Tar(_) => Err(tar_readonly()),
         }
     }
 
@@ -203,6 +232,7 @@ impl AnyFs {
                 ext.create_dir(dev, std::path::Path::new(path), meta)
             }
             Self::Fat32(fat) => fat.add_dir(dev, path),
+            Self::Tar(_) => Err(tar_readonly()),
         }
     }
 
@@ -212,6 +242,7 @@ impl AnyFs {
         match self {
             Self::Ext(ext) => ext.remove_path(dev, path),
             Self::Fat32(fat) => fat.remove(dev, path),
+            Self::Tar(_) => Err(tar_readonly()),
         }
     }
 
@@ -220,6 +251,8 @@ impl AnyFs {
         match self {
             Self::Ext(ext) => ext.flush(dev),
             Self::Fat32(fat) => fat.flush(dev),
+            // Tar is read-only via AnyFs; nothing to flush.
+            Self::Tar(_) => Ok(()),
         }
     }
 
@@ -232,8 +265,15 @@ impl AnyFs {
                 crate::fs::ext::FsKind::Ext4 => "ext4",
             },
             Self::Fat32(_) => "fat32",
+            Self::Tar(_) => "tar",
         }
     }
+}
+
+fn tar_readonly() -> crate::Error {
+    crate::Error::Unsupported(
+        "tar archives are read-only via fstool; build a fresh archive with `fstool repack` or `fstool tar-build`".into(),
+    )
 }
 
 /// Recursively copy a host directory tree into a pre-existing FAT32

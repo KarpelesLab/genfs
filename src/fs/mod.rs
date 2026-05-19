@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 pub mod ext;
 pub mod fat;
 pub mod rootdevs;
+pub mod tar;
 
 pub use rootdevs::{DeviceEntry, RootDevs};
 

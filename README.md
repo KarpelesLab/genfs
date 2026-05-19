@@ -7,7 +7,8 @@
 Build disk images and filesystem images from a directory tree and a TOML
 spec — in the spirit of `genext2fs`, but going further:
 
-- **Multiple filesystems** — ext2, ext3, ext4, and FAT32.
+- **Multiple filesystems** — ext2, ext3, ext4, FAT32, and tar (as a
+  read/write filesystem-like archive format).
 - **Whole disk images** — MBR and GPT partition tables, not just bare FS images.
 - **Streaming** — file contents are never preloaded in memory regardless of
   size. Generation is a two-pass scan-then-stream.
@@ -51,7 +52,11 @@ through repack — both inline (extended-inode-body) source xattrs and
 external `file_acl`-block ones are read; the destination always writes
 to an external block with a correctly-computed CRC32C when
 `metadata_csum` is on. `debugfs ea_get` confirms identical values
-after repack. All
+after repack. tar is supported as both a source and destination FS
+(ustar + PAX, with `SCHILY.xattr.*` records for xattrs), so
+`fstool repack disk.img out.tar` and `fstool repack archive.tar
+disk.img` round-trip content + mode + uid/gid + mtime + symlinks +
+device nodes + xattrs. All
 inspection and in-place modification commands accept a `disk.img:N`
 (1-indexed) target to walk into a partition of a GPT or MBR disk
 image; `fstool info disk.img` (no suffix) prints the partition table.

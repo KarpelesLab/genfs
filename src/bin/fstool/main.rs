@@ -400,7 +400,29 @@ fn repack_cmd(
 
         // Compute the destination size + a BuildPlan-shaped sketch by
         // walking the source FS, no host I/O involved.
-        let target_fs_str = fs_type_override.unwrap_or(source_kind).to_string();
+        //
+        // Default destination FS: explicit --fs-type, else infer from
+        // the dst extension (.tar → tar), else preserve the source kind.
+        let target_fs_str = fs_type_override
+            .map(|s| s.to_string())
+            .or_else(|| {
+                dst.extension()
+                    .and_then(|s| s.to_str())
+                    .filter(|e| e.eq_ignore_ascii_case("tar"))
+                    .map(|_| "tar".to_string())
+            })
+            .unwrap_or_else(|| {
+                // Default destination FS when nothing else specifies one:
+                // preserve the source FS, unless the source is tar (in
+                // which case picking "tar" would just round-trip the
+                // archive — almost never what the user wants). Default to
+                // ext4 in that case; the user can override with --fs-type.
+                if source_kind == "tar" {
+                    "ext4".into()
+                } else {
+                    source_kind.to_string()
+                }
+            });
         let lower = target_fs_str.to_ascii_lowercase();
         let dst_size = match (size_arg, shrink) {
             (Some(s), _) => fstool::spec::parse_size(s)?,
@@ -416,13 +438,20 @@ fn repack_cmd(
                         .max(fstool::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024);
                     needed.div_ceil(512) * 512
                 }
+                "tar" => tar_size_upper_bound(src_dev, &src_fs)?,
                 other => {
                     return Err(fstool::Error::InvalidArgument(format!(
                         "repack: unknown --fs-type {other:?}"
                     )));
                 }
             },
-            (None, false) => src_total,
+            // For tar, "explicit size" doesn't really apply since the
+            // archive grows to whatever fits. Without --shrink either
+            // we still upper-bound the destination from the source.
+            (None, false) => match lower.as_str() {
+                "tar" => tar_size_upper_bound(src_dev, &src_fs)?,
+                _ => src_total,
+            },
         };
 
         // Format the destination.
@@ -467,6 +496,38 @@ fn repack_cmd(
                 copy_into_fat32(src_dev, &src_fs, dst_dev.as_mut(), &mut dst_fat)?;
                 dst_fat.flush(dst_dev.as_mut())?;
             }
+            "tar" => {
+                let written = repack_into_tar(src_dev, &src_fs, dst_dev.as_mut())?;
+                dst_dev.sync()?;
+                // For a raw output, trim the file down to the actual
+                // archive length (we over-allocated). qcow2 outputs
+                // already leave the tail as unallocated clusters.
+                drop(dst_dev);
+                if dst
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+                    != Some("qcow2".into())
+                    && dst
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                        != Some("qcow".into())
+                    && dst
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                        != Some("q2".into())
+                    && let Ok(f) = std::fs::OpenOptions::new().write(true).open(dst)
+                {
+                    let _ = f.set_len(written);
+                }
+                eprintln!(
+                    "repacked {src} → {} (fs: {source_kind} → tar, {written} bytes)",
+                    dst.display()
+                );
+                return Ok(());
+            }
             other => {
                 return Err(fstool::Error::InvalidArgument(format!(
                     "repack: unknown --fs-type {other:?}"
@@ -499,6 +560,7 @@ fn copy_into_ext(
         AnyFs::Fat32(src_fat) => {
             copy_fat_dir_into_ext(src_dev, src_fat, "/", dst_dev, dst, 2, &FileMeta::default())
         }
+        AnyFs::Tar(src_tar) => copy_tar_into_ext(src_dev, src_tar, dst_dev, dst),
     }
 }
 
@@ -516,6 +578,7 @@ fn copy_into_fat32(
     match src_fs {
         AnyFs::Ext(src_ext) => copy_ext_dir_into_fat(src_dev, src_ext, 2, "/", dst_dev, dst),
         AnyFs::Fat32(src_fat) => copy_fat_dir_into_fat(src_dev, src_fat, "/", dst_dev, dst),
+        AnyFs::Tar(src_tar) => copy_tar_into_fat(src_dev, src_tar, dst_dev, dst),
     }
 }
 
@@ -721,6 +784,226 @@ fn copy_fat_dir_into_ext(
     Ok(())
 }
 
+// ─── Tar → ext ──────────────────────────────────────────────────────────
+
+/// Replay a tar archive's entries into a fresh ext destination.
+/// Preserves mode, uid/gid, mtime, symlinks, device nodes, and xattrs.
+fn copy_tar_into_ext(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    tar: &fstool::fs::tar::Tar,
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::ext::Ext,
+) -> fstool::Result<()> {
+    use fstool::fs::tar::EntryKind;
+    use fstool::fs::{DeviceKind, FileMeta};
+    // Map every absolute path in the tar to its destination inode,
+    // creating ancestor dirs on demand so an entry can land before its
+    // parent dir appears in the archive.
+    let mut path_to_ino: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    path_to_ino.insert("/".into(), 2);
+
+    let entries: Vec<fstool::fs::tar::Entry> = tar.entries().to_vec();
+    for e in entries {
+        let parent_path = parent_of(&e.path);
+        let parent_ino = ensure_ext_dir(dst_dev, dst, &mut path_to_ino, &parent_path)?;
+        let leaf = leaf_of(&e.path);
+        let meta = FileMeta {
+            mode: e.mode & 0o7777,
+            uid: e.uid,
+            gid: e.gid,
+            mtime: e.mtime as u32,
+            atime: e.mtime as u32,
+            ctime: e.mtime as u32,
+        };
+        let new_ino = match e.kind {
+            EntryKind::Regular => {
+                let mut reader = tar.open_file_reader(src_dev, &e.path)?;
+                dst.add_file_to_streaming(
+                    dst_dev,
+                    parent_ino,
+                    leaf.as_bytes(),
+                    &mut reader,
+                    e.size,
+                    meta,
+                )?
+            }
+            EntryKind::Dir => {
+                // ensure_ext_dir already creates it if missing; we just
+                // need its inode.
+                ensure_ext_dir(dst_dev, dst, &mut path_to_ino, &e.path)?
+            }
+            EntryKind::Symlink => {
+                let target = e.link_target.as_deref().unwrap_or("");
+                dst.add_symlink_to(
+                    dst_dev,
+                    parent_ino,
+                    leaf.as_bytes(),
+                    target.as_bytes(),
+                    meta,
+                )?
+            }
+            EntryKind::HardLink => {
+                // Materialise the link target's content again. Preserves
+                // file content across the conversion at the cost of a
+                // copy; preserving the link itself across FS types is
+                // out of scope.
+                let target = e.link_target.as_deref().unwrap_or("");
+                let abs_target = if target.starts_with('/') {
+                    target.to_string()
+                } else {
+                    format!("/{target}")
+                };
+                let target_entry = tar.lookup(&abs_target).ok_or_else(|| {
+                    fstool::Error::InvalidImage(format!(
+                        "tar: hard link {:?} → {abs_target:?} (target missing)",
+                        e.path
+                    ))
+                })?;
+                let mut reader = tar.open_file_reader(src_dev, &abs_target)?;
+                dst.add_file_to_streaming(
+                    dst_dev,
+                    parent_ino,
+                    leaf.as_bytes(),
+                    &mut reader,
+                    target_entry.size,
+                    meta,
+                )?
+            }
+            EntryKind::CharDev => dst.add_device_to(
+                dst_dev,
+                parent_ino,
+                leaf.as_bytes(),
+                DeviceKind::Char,
+                e.device_major,
+                e.device_minor,
+                meta,
+            )?,
+            EntryKind::BlockDev => dst.add_device_to(
+                dst_dev,
+                parent_ino,
+                leaf.as_bytes(),
+                DeviceKind::Block,
+                e.device_major,
+                e.device_minor,
+                meta,
+            )?,
+            EntryKind::Fifo => dst.add_device_to(
+                dst_dev,
+                parent_ino,
+                leaf.as_bytes(),
+                DeviceKind::Fifo,
+                0,
+                0,
+                meta,
+            )?,
+        };
+        if matches!(e.kind, EntryKind::Dir) {
+            path_to_ino.insert(e.path.clone(), new_ino);
+        }
+        if !e.xattrs.is_empty() {
+            dst.set_xattrs(dst_dev, new_ino, &e.xattrs)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_ext_dir(
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::ext::Ext,
+    path_to_ino: &mut std::collections::HashMap<String, u32>,
+    path: &str,
+) -> fstool::Result<u32> {
+    use fstool::fs::FileMeta;
+    if let Some(&ino) = path_to_ino.get(path) {
+        return Ok(ino);
+    }
+    let parent = parent_of(path);
+    let parent_ino = ensure_ext_dir(dst_dev, dst, path_to_ino, &parent)?;
+    let leaf = leaf_of(path);
+    let meta = FileMeta {
+        mode: 0o755,
+        ..FileMeta::default()
+    };
+    let ino = dst.add_dir_to(dst_dev, parent_ino, leaf.as_bytes(), meta)?;
+    path_to_ino.insert(path.to_string(), ino);
+    Ok(ino)
+}
+
+// ─── Tar → FAT32 ────────────────────────────────────────────────────────
+
+fn copy_tar_into_fat(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    tar: &fstool::fs::tar::Tar,
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::fat::Fat32,
+) -> fstool::Result<()> {
+    use fstool::fs::tar::EntryKind;
+    let mut made_dirs: std::collections::HashSet<String> =
+        std::collections::HashSet::from(["/".into()]);
+    let entries: Vec<fstool::fs::tar::Entry> = tar.entries().to_vec();
+    for e in entries {
+        let parent = parent_of(&e.path);
+        ensure_fat_dir(dst_dev, dst, &mut made_dirs, &parent)?;
+        match e.kind {
+            EntryKind::Regular => {
+                let mut reader = tar.open_file_reader(src_dev, &e.path)?;
+                dst.add_file_from_reader(dst_dev, &e.path, &mut reader, e.size)?;
+            }
+            EntryKind::Dir => {
+                ensure_fat_dir(dst_dev, dst, &mut made_dirs, &e.path)?;
+            }
+            EntryKind::HardLink => {
+                let target = e.link_target.as_deref().unwrap_or("");
+                let abs_target = if target.starts_with('/') {
+                    target.to_string()
+                } else {
+                    format!("/{target}")
+                };
+                if let Some(target_entry) = tar.lookup(&abs_target) {
+                    let mut reader = tar.open_file_reader(src_dev, &abs_target)?;
+                    dst.add_file_from_reader(dst_dev, &e.path, &mut reader, target_entry.size)?;
+                }
+            }
+            _ => {
+                eprintln!(
+                    "repack: dropping {:?} — FAT32 can't represent {:?}",
+                    e.path, e.kind
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_fat_dir(
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::fat::Fat32,
+    made: &mut std::collections::HashSet<String>,
+    path: &str,
+) -> fstool::Result<()> {
+    if made.contains(path) {
+        return Ok(());
+    }
+    let parent = parent_of(path);
+    ensure_fat_dir(dst_dev, dst, made, &parent)?;
+    dst.add_dir(dst_dev, path)?;
+    made.insert(path.to_string());
+    Ok(())
+}
+
+fn parent_of(path: &str) -> String {
+    let p = path.trim_end_matches('/');
+    match p.rfind('/') {
+        Some(0) | None => "/".into(),
+        Some(i) => p[..i].into(),
+    }
+}
+
+fn leaf_of(path: &str) -> &str {
+    let p = path.trim_end_matches('/');
+    p.rsplit('/').next().unwrap_or(p)
+}
+
 fn join_fs_path(parent: &str, leaf: &str) -> String {
     if parent.ends_with('/') {
         format!("{parent}{leaf}")
@@ -767,6 +1050,7 @@ fn build_ext_plan(
     match src_fs {
         AnyFs::Ext(src_ext) => walk_ext_for_plan(src_dev, src_ext, 2, &mut plan)?,
         AnyFs::Fat32(src_fat) => walk_fat_for_plan(src_dev, src_fat, "/", &mut plan)?,
+        AnyFs::Tar(src_tar) => walk_tar_for_plan(src_tar, &mut plan),
     }
     Ok(plan)
 }
@@ -840,6 +1124,306 @@ fn sum_source_file_bytes(
     match src_fs {
         AnyFs::Ext(src_ext) => sum_ext_file_bytes(src_dev, src_ext, 2),
         AnyFs::Fat32(src_fat) => sum_fat_file_bytes(src_dev, src_fat, "/"),
+        AnyFs::Tar(src_tar) => Ok(src_tar
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.kind, fstool::fs::tar::EntryKind::Regular))
+            .map(|e| e.size)
+            .sum()),
+    }
+}
+
+/// Upper-bound the size of a tar archive built from `src_fs`. Walks the
+/// source once, accumulating header + content + worst-case PAX overhead
+/// for each entry, plus a 1 KiB safety pad. The actual archive almost
+/// always comes out smaller; the destination file is truncated to the
+/// real length after the write.
+fn tar_size_upper_bound(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src_fs: &fstool::inspect::AnyFs,
+) -> fstool::Result<u64> {
+    use fstool::inspect::AnyFs;
+    let mut total: u64 = 0;
+    // Conservative per-entry header allowance: 512 (ustar) + 2 * 512
+    // (one PAX header + body) + a generous xattr payload buffer.
+    let per_entry_overhead = |xattr_bytes: u64| 1536 + xattr_bytes + 512;
+    match src_fs {
+        AnyFs::Ext(src_ext) => {
+            tar_size_walk_ext(src_dev, src_ext, 2, &mut total, &per_entry_overhead)?;
+        }
+        AnyFs::Fat32(src_fat) => {
+            tar_size_walk_fat(src_dev, src_fat, "/", &mut total, &per_entry_overhead)?;
+        }
+        AnyFs::Tar(src_tar) => {
+            for e in src_tar.entries() {
+                let xb: u64 = e
+                    .xattrs
+                    .iter()
+                    .map(|x| (x.name.len() + x.value.len()) as u64)
+                    .sum();
+                let content = if matches!(e.kind, fstool::fs::tar::EntryKind::Regular) {
+                    (e.size + 511) & !511
+                } else {
+                    0
+                };
+                total += per_entry_overhead(xb) + content;
+            }
+        }
+    }
+    // Two zero blocks for EOF + 1 KiB pad.
+    Ok(total + 1024 + 1024)
+}
+
+fn tar_size_walk_ext(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::ext::Ext,
+    src_ino: u32,
+    total: &mut u64,
+    overhead: &dyn Fn(u64) -> u64,
+) -> fstool::Result<()> {
+    for e in src.list_inode(src_dev, src_ino)? {
+        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
+            continue;
+        }
+        let inode = src.read_inode(src_dev, e.inode)?;
+        let xattrs = src.read_xattrs(src_dev, e.inode)?;
+        let xb: u64 = xattrs
+            .iter()
+            .map(|x| (x.name.len() + x.value.len()) as u64)
+            .sum();
+        let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
+        let content = if mode_type == fstool::fs::ext::constants::S_IFREG {
+            ((inode.size as u64) + 511) & !511
+        } else {
+            0
+        };
+        *total += overhead(xb) + content;
+        if mode_type == fstool::fs::ext::constants::S_IFDIR {
+            tar_size_walk_ext(src_dev, src, e.inode, total, overhead)?;
+        }
+    }
+    Ok(())
+}
+
+fn tar_size_walk_fat(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::fat::Fat32,
+    src_path: &str,
+    total: &mut u64,
+    overhead: &dyn Fn(u64) -> u64,
+) -> fstool::Result<()> {
+    use fstool::fs::EntryKind;
+    for e in src.list_path(src_dev, src_path)? {
+        let child = join_fs_path(src_path, &e.name);
+        match e.kind {
+            EntryKind::Dir => {
+                *total += overhead(0);
+                tar_size_walk_fat(src_dev, src, &child, total, overhead)?;
+            }
+            EntryKind::Regular => {
+                let (entry, _) = src.resolve_entry(src_dev, &child)?;
+                *total += overhead(0) + (((entry.file_size as u64) + 511) & !511);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Walk every entry in `src_fs` and emit it as a tar archive on
+/// `dst_dev`. Returns the number of bytes written (so the caller can
+/// truncate the underlying file).
+fn repack_into_tar(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src_fs: &fstool::inspect::AnyFs,
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+) -> fstool::Result<u64> {
+    use fstool::fs::tar::TarWriter;
+    use fstool::inspect::AnyFs;
+    let mut writer = TarWriter::new(dst_dev);
+    match src_fs {
+        AnyFs::Ext(src_ext) => tar_walk_ext(src_dev, src_ext, 2, "", &mut writer)?,
+        AnyFs::Fat32(src_fat) => tar_walk_fat(src_dev, src_fat, "/", &mut writer)?,
+        AnyFs::Tar(src_tar) => tar_replay_tar(src_dev, src_tar, &mut writer)?,
+    }
+    writer.finish()?;
+    Ok(writer.cursor())
+}
+
+fn tar_walk_ext(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::ext::Ext,
+    src_ino: u32,
+    prefix: &str,
+    writer: &mut fstool::fs::tar::TarWriter<'_>,
+) -> fstool::Result<()> {
+    use fstool::fs::DeviceKind;
+    use fstool::fs::ext::constants::*;
+    use fstool::fs::ext::inode::decode_devnum;
+    use fstool::fs::tar::TarEntryMeta;
+    for e in src.list_inode(src_dev, src_ino)? {
+        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
+            continue;
+        }
+        let inode = src.read_inode(src_dev, e.inode)?;
+        let xattrs = src.read_xattrs(src_dev, e.inode)?;
+        let path = if prefix.is_empty() {
+            format!("/{}", e.name)
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
+        let meta = TarEntryMeta {
+            mode: inode.mode & 0o7777,
+            uid: inode.uid as u32,
+            gid: inode.gid as u32,
+            mtime: inode.mtime as u64,
+            uname: String::new(),
+            gname: String::new(),
+        };
+        let mode_type = inode.mode & S_IFMT;
+        match mode_type {
+            t if t == S_IFREG => {
+                let mut reader = src.open_file_reader(src_dev, e.inode)?;
+                writer.add_file(&path, &mut reader, inode.size as u64, meta, &xattrs)?;
+            }
+            t if t == S_IFDIR => {
+                writer.add_dir(&path, meta, &xattrs)?;
+                tar_walk_ext(src_dev, src, e.inode, &path, writer)?;
+            }
+            t if t == S_IFLNK => {
+                let target = src.read_symlink_target(src_dev, e.inode)?;
+                writer.add_symlink(&path, &target, meta, &xattrs)?;
+            }
+            t if t == S_IFCHR => {
+                let (maj, min) = decode_devnum(inode.block[0]);
+                writer.add_device(&path, DeviceKind::Char, maj, min, meta, &xattrs)?;
+            }
+            t if t == S_IFBLK => {
+                let (maj, min) = decode_devnum(inode.block[0]);
+                writer.add_device(&path, DeviceKind::Block, maj, min, meta, &xattrs)?;
+            }
+            t if t == S_IFIFO => {
+                writer.add_device(&path, DeviceKind::Fifo, 0, 0, meta, &xattrs)?;
+            }
+            _ => {
+                eprintln!(
+                    "repack: skipping {path:?} — unsupported mode {:#o}",
+                    inode.mode
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tar_walk_fat(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::fat::Fat32,
+    src_path: &str,
+    writer: &mut fstool::fs::tar::TarWriter<'_>,
+) -> fstool::Result<()> {
+    use fstool::fs::EntryKind;
+    use fstool::fs::tar::TarEntryMeta;
+    for e in src.list_path(src_dev, src_path)? {
+        let child = join_fs_path(src_path, &e.name);
+        let meta = TarEntryMeta::default();
+        match e.kind {
+            EntryKind::Dir => {
+                writer.add_dir(&child, meta, &[])?;
+                tar_walk_fat(src_dev, src, &child, writer)?;
+            }
+            EntryKind::Regular => {
+                let (entry, _) = src.resolve_entry(src_dev, &child)?;
+                let mut reader = src.open_file_reader(src_dev, &child)?;
+                writer.add_file(&child, &mut reader, entry.file_size as u64, meta, &[])?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn tar_replay_tar(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::tar::Tar,
+    writer: &mut fstool::fs::tar::TarWriter<'_>,
+) -> fstool::Result<()> {
+    use fstool::fs::DeviceKind;
+    use fstool::fs::tar::{EntryKind, TarEntryMeta};
+    let entries: Vec<fstool::fs::tar::Entry> = src.entries().to_vec();
+    for e in entries {
+        let meta = TarEntryMeta {
+            mode: e.mode,
+            uid: e.uid,
+            gid: e.gid,
+            mtime: e.mtime,
+            uname: String::new(),
+            gname: String::new(),
+        };
+        match e.kind {
+            EntryKind::Regular => {
+                let mut reader = src.open_file_reader(src_dev, &e.path)?;
+                writer.add_file(&e.path, &mut reader, e.size, meta, &e.xattrs)?;
+            }
+            EntryKind::Dir => writer.add_dir(&e.path, meta, &e.xattrs)?,
+            EntryKind::Symlink => {
+                let target = e.link_target.as_deref().unwrap_or("");
+                writer.add_symlink(&e.path, target, meta, &e.xattrs)?;
+            }
+            EntryKind::HardLink => {
+                // Preserve content for the link's apparent file.
+                let target = e.link_target.as_deref().unwrap_or("");
+                let abs = if target.starts_with('/') {
+                    target.to_string()
+                } else {
+                    format!("/{target}")
+                };
+                if let Some(target_entry) = src.lookup(&abs) {
+                    let mut reader = src.open_file_reader(src_dev, &abs)?;
+                    writer.add_file(&e.path, &mut reader, target_entry.size, meta, &e.xattrs)?;
+                }
+            }
+            EntryKind::CharDev => {
+                writer.add_device(
+                    &e.path,
+                    DeviceKind::Char,
+                    e.device_major,
+                    e.device_minor,
+                    meta,
+                    &e.xattrs,
+                )?;
+            }
+            EntryKind::BlockDev => {
+                writer.add_device(
+                    &e.path,
+                    DeviceKind::Block,
+                    e.device_major,
+                    e.device_minor,
+                    meta,
+                    &e.xattrs,
+                )?;
+            }
+            EntryKind::Fifo => {
+                writer.add_device(&e.path, DeviceKind::Fifo, 0, 0, meta, &e.xattrs)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fold a tar archive's entries into a BuildPlan suitable for sizing an
+/// ext destination.
+fn walk_tar_for_plan(tar: &fstool::fs::tar::Tar, plan: &mut fstool::fs::ext::BuildPlan) {
+    use fstool::fs::tar::EntryKind;
+    for e in tar.entries() {
+        match e.kind {
+            EntryKind::Regular | EntryKind::HardLink => plan.add_file(e.size),
+            EntryKind::Dir => plan.add_dir(),
+            EntryKind::Symlink => {
+                plan.add_symlink(e.link_target.as_deref().map(|s| s.len()).unwrap_or(0))
+            }
+            EntryKind::CharDev | EntryKind::BlockDev | EntryKind::Fifo => plan.add_device(),
+        }
     }
 }
 
@@ -1180,6 +1764,37 @@ fn print_partition_table(
     }
 }
 
+fn print_tar_info(tar: &fstool::fs::tar::Tar) {
+    let entries = tar.entries();
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    let mut symlinks = 0usize;
+    let mut devices = 0usize;
+    let mut content_bytes = 0u64;
+    let mut total_xattrs = 0usize;
+    for e in entries {
+        match e.kind {
+            fstool::fs::tar::EntryKind::Regular | fstool::fs::tar::EntryKind::HardLink => {
+                files += 1;
+                content_bytes += e.size;
+            }
+            fstool::fs::tar::EntryKind::Dir => dirs += 1,
+            fstool::fs::tar::EntryKind::Symlink => symlinks += 1,
+            fstool::fs::tar::EntryKind::CharDev
+            | fstool::fs::tar::EntryKind::BlockDev
+            | fstool::fs::tar::EntryKind::Fifo => devices += 1,
+        }
+        total_xattrs += e.xattrs.len();
+    }
+    println!("entries:           {}", entries.len());
+    println!("  files:           {files}");
+    println!("  directories:     {dirs}");
+    println!("  symlinks:        {symlinks}");
+    println!("  devices/fifos:   {devices}");
+    println!("file content:      {content_bytes} bytes");
+    println!("xattrs total:      {total_xattrs}");
+}
+
 fn human_size(b: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
@@ -1200,6 +1815,7 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &fstool::inspect:
     match fs {
         fstool::inspect::AnyFs::Ext(ext) => print_ext_info(ext),
         fstool::inspect::AnyFs::Fat32(fat) => print_fat_info(fat),
+        fstool::inspect::AnyFs::Tar(tar) => print_tar_info(tar),
     }
     println!();
     println!("/ listing:");

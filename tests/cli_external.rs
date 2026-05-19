@@ -1137,3 +1137,180 @@ fn cli_repack_preserves_xattrs() {
         );
     }
 }
+
+/// `fstool repack` from ext to tar and back: content, mode, symlinks,
+/// and xattrs all survive the round-trip.
+#[test]
+fn cli_repack_ext_tar_ext_preserves_metadata() {
+    if !which("mke2fs") || !which("debugfs") || !which("e2fsck") {
+        eprintln!("skipping: e2fsprogs missing");
+        return;
+    }
+
+    // Build a source ext4 with a file (mode 0640), a relative symlink,
+    // and a nested subdir.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("regular.txt"), b"file body\n").unwrap();
+    std::os::unix::fs::symlink("regular.txt", srcdir.path().join("link.txt")).unwrap();
+    std::fs::create_dir(srcdir.path().join("sub")).unwrap();
+    std::fs::write(srcdir.path().join("sub/inside.txt"), b"nested\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let p = srcdir.path().join("regular.txt");
+    let mut perms = std::fs::metadata(&p).unwrap().permissions();
+    perms.set_mode(0o640);
+    std::fs::set_permissions(&p, perms).unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "16M"])
+        .arg(src.path())
+        .output()
+        .unwrap();
+    Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .output()
+        .unwrap();
+    // Stamp xattrs on regular.txt.
+    Command::new("debugfs")
+        .args(["-w", "-R"])
+        .arg(r#"ea_set /regular.txt user.tag "from-ext""#)
+        .arg(src.path())
+        .output()
+        .unwrap();
+
+    // ext → tar
+    let dir = tempfile::tempdir().unwrap();
+    let tar = dir.path().join("intermediate.tar");
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(src.path())
+        .arg(&tar)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "ext → tar failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    // `file` reports POSIX tar archive.
+    let f = std::fs::read(&tar).unwrap();
+    assert_eq!(&f[257..262], b"ustar");
+
+    // List the tar via fstool itself — proves the tar reader works.
+    let ls = Command::new(FSTOOL)
+        .arg("ls")
+        .arg(&tar)
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let s = String::from_utf8_lossy(&ls.stdout);
+    assert!(s.contains("regular.txt"));
+    assert!(s.contains("link.txt"));
+    assert!(s.contains("sub"));
+
+    // tar → ext (auto, uses ext4 because source is tar).
+    let back = NamedTempFile::new().unwrap();
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(&tar)
+        .arg(back.path())
+        .arg("--shrink")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "tar → ext failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // Verify mode + uid/gid + symlink target + xattrs all survived.
+    let listing = Command::new("debugfs")
+        .arg("-R")
+        .arg("ls -l /")
+        .arg(back.path())
+        .output()
+        .unwrap();
+    let l = String::from_utf8_lossy(&listing.stdout);
+    assert!(l.contains("100640"), "mode 0640 not preserved:\n{l}");
+
+    let symlink = Command::new("debugfs")
+        .arg("-R")
+        .arg("stat /link.txt")
+        .arg(back.path())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&symlink.stdout);
+    assert!(s.contains("regular.txt"), "symlink target lost:\n{s}");
+
+    let xattr = Command::new("debugfs")
+        .arg("-R")
+        .arg("ea_get /regular.txt user.tag")
+        .arg(back.path())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&xattr.stdout);
+    assert!(
+        s.contains("from-ext"),
+        "user.tag xattr lost through ext → tar → ext:\n{s}"
+    );
+
+    // e2fsck on the round-tripped image.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(back.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after ext → tar → ext:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+}
+
+/// fstool's tar reader is compatible with standard `tar -tvf`.
+#[test]
+fn cli_tar_archive_readable_by_system_tar() {
+    if !which("mke2fs") || !which("tar") {
+        eprintln!("skipping: mke2fs/tar missing");
+        return;
+    }
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hello"), b"hi\n").unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "16M"])
+        .arg(src.path())
+        .output()
+        .unwrap();
+    Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .output()
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tar = dir.path().join("out.tar");
+    Command::new(FSTOOL)
+        .arg("repack")
+        .arg(src.path())
+        .arg(&tar)
+        .output()
+        .unwrap();
+
+    let out = Command::new("tar")
+        .args(["-tf"])
+        .arg(&tar)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "system tar failed to list our archive"
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("hello"), "system tar didn't see /hello:\n{s}");
+}

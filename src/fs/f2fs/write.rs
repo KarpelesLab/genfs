@@ -1031,6 +1031,45 @@ impl Writer {
             let blk = encode_indirect_node_with_crc(&ind.nids, ind.nid, ino);
             dev.write_at(ind.on_disk_block as u64 * bs, &blk)?;
         }
+        // Build parent_of: every inode's parent nid (root self-parents).
+        let mut parent_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        parent_of.insert(3, 3); // root → root
+        for (&parent, kids) in &self.children {
+            for kid in kids {
+                parent_of.insert(kid.ino, parent);
+            }
+        }
+
+        // Recompute every inode's `i_blocks`. fsck.f2fs counts:
+        //   inode block (1) + direct-node blocks owned + indirect-node
+        //   blocks owned + non-zero i_addr / dnode addr entries.
+        // Earlier writer paths set this to "data blocks streamed" which
+        // missed the inode block itself plus any node-tree overhead.
+        let mut blocks_for: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for (&nid, ino) in self.inodes.iter() {
+            let mut count: u64 = 1; // the inode block
+            for a in ino.i_addr.iter() {
+                if *a != 0 {
+                    count += 1;
+                }
+            }
+            blocks_for.insert(nid, count);
+        }
+        for (_, d) in self.direct_nodes.iter() {
+            let owner = find_owner_of_dnode(self, d.nid);
+            // The direct-node block itself.
+            *blocks_for.entry(owner).or_insert(1) += 1;
+            for a in d.addrs.iter() {
+                if *a != 0 {
+                    *blocks_for.entry(owner).or_insert(1) += 1;
+                }
+            }
+        }
+        for (_, ind) in self.indirect_nodes.iter() {
+            let owner = find_owner_of_indirect(self, ind.nid);
+            *blocks_for.entry(owner).or_insert(1) += 1;
+        }
+
         // 4) Write every inode block.
         for (_, ino) in self.inodes.iter() {
             let kids = if ino.inline_flags & F2FS_INLINE_DENTRY != 0 {
@@ -1038,7 +1077,9 @@ impl Writer {
             } else {
                 None
             };
-            let blk = encode_inode_block(ino, kids.as_deref());
+            let parent_nid = *parent_of.get(&ino.nid).unwrap_or(&ino.nid);
+            let blocks_count = *blocks_for.get(&ino.nid).unwrap_or(&1);
+            let blk = encode_inode_block(ino, kids.as_deref(), parent_nid, blocks_count);
             dev.write_at(ino.on_disk_block as u64 * bs, &blk)?;
         }
 
@@ -1418,7 +1459,26 @@ fn encode_block_dentry(entries: &[Dentry]) -> Vec<u8> {
 }
 
 /// Encode the inline-dentry payload region used inside an inode block.
-fn encode_inline_dentry_payload(entries: &[Dentry]) -> Vec<u8> {
+fn encode_inline_dentry_payload(dir_nid: u32, parent_nid: u32, entries: &[Dentry]) -> Vec<u8> {
+    // F2FS requires the first two dentries of every directory to be
+    // "." (pointing at self) and ".." (pointing at parent). Root's
+    // parent is itself. fsck.f2fs (`fsck_chk_inline_dentries`) prints
+    // `dots: 0` and refuses to proceed if either is missing.
+    let dot_entries = [
+        Dentry {
+            hash: 0,
+            ino: dir_nid,
+            file_type: F2FS_FT_DIR,
+            name: b".".to_vec(),
+        },
+        Dentry {
+            hash: 0,
+            ino: parent_nid,
+            file_type: F2FS_FT_DIR,
+            name: b"..".to_vec(),
+        },
+    ];
+    let all: Vec<&Dentry> = dot_entries.iter().chain(entries.iter()).collect();
     let bitmap_bytes = INLINE_DENTRY_NR.div_ceil(8);
     let reserved = 1usize;
     let dentries_off = bitmap_bytes + reserved;
@@ -1426,7 +1486,7 @@ fn encode_inline_dentry_payload(entries: &[Dentry]) -> Vec<u8> {
     let total = names_off + INLINE_DENTRY_NR * F2FS_SLOT_LEN;
     let mut buf = vec![0u8; total];
     let mut slot = 0usize;
-    for e in entries {
+    for e in all {
         let need = e.name.len().div_ceil(F2FS_SLOT_LEN).max(1);
         if slot + need > INLINE_DENTRY_NR {
             break;
@@ -1470,7 +1530,12 @@ fn write_node_footer(buf: &mut [u8], nid: u32, ino: u32) {
     buf[o + 20..o + 24].copy_from_slice(&0u32.to_le_bytes()); // next_blkaddr
 }
 
-fn encode_inode_block(ino: &InodeRec, inline_children: Option<&[Dentry]>) -> Vec<u8> {
+fn encode_inode_block(
+    ino: &InodeRec,
+    inline_children: Option<&[Dentry]>,
+    parent_nid: u32,
+    blocks: u64,
+) -> Vec<u8> {
     let mut buf = vec![0u8; F2FS_BLKSIZE];
     buf[0x00..0x02].copy_from_slice(&ino.mode.to_le_bytes());
     buf[0x03] = ino.inline_flags;
@@ -1478,7 +1543,7 @@ fn encode_inode_block(ino: &InodeRec, inline_children: Option<&[Dentry]>) -> Vec
     buf[0x08..0x0C].copy_from_slice(&ino.gid.to_le_bytes());
     buf[0x0C..0x10].copy_from_slice(&ino.links.to_le_bytes());
     buf[0x10..0x18].copy_from_slice(&ino.size.to_le_bytes());
-    buf[0x18..0x20].copy_from_slice(&ino.blocks.to_le_bytes());
+    buf[0x18..0x20].copy_from_slice(&blocks.to_le_bytes());
     buf[0x20..0x28].copy_from_slice(&(ino.atime as u64).to_le_bytes());
     buf[0x28..0x30].copy_from_slice(&(ino.ctime as u64).to_le_bytes());
     buf[0x30..0x38].copy_from_slice(&(ino.mtime as u64).to_le_bytes());
@@ -1486,7 +1551,7 @@ fn encode_inode_block(ino: &InodeRec, inline_children: Option<&[Dentry]>) -> Vec
 
     if ino.inline_flags & F2FS_INLINE_DENTRY != 0 {
         let kids = inline_children.unwrap_or(&[]);
-        let payload = encode_inline_dentry_payload(kids);
+        let payload = encode_inline_dentry_payload(ino.nid, parent_nid, kids);
         let n = payload.len().min(buf.len() - I_ADDR_OFFSET - 8);
         buf[I_ADDR_OFFSET..I_ADDR_OFFSET + n].copy_from_slice(&payload[..n]);
     } else if ino.inline_flags & F2FS_INLINE_DATA != 0 {

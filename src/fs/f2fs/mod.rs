@@ -336,7 +336,14 @@ impl F2fs {
             )));
         }
         let raws = self.list_inode(dev, &inode, &inode_block)?;
-        Ok(raws.into_iter().map(|d| d.into_dir_entry()).collect())
+        // Hide "." and ".." from user-visible listings — the on-disk
+        // entries are there for fsck.f2fs but applications normally
+        // expect them filtered out (matching `ls -A` behavior).
+        Ok(raws
+            .into_iter()
+            .filter(|d| d.name.as_slice() != b"." && d.name.as_slice() != b"..")
+            .map(|d| d.into_dir_entry())
+            .collect())
     }
 
     /// Open a regular file at `path` for streaming reads. Returns a

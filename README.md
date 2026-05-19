@@ -31,38 +31,48 @@ Early in development. Public API is **unstable** until v0.5.
 | 1. `BlockDevice` foundation              | ✅ done        |
 | 2. MBR + GPT partition tables            | ✅ done        |
 | 3. ext2 writer                           | ✅ done        |
-| 4. ext2 reader + ext3/4 feature matrix   | planned       |
-| 5. TOML spec + CLI                       | planned       |
+| 4. ext2/3/4 reader + writer              | ✅ done        |
+| 5. TOML spec + CLI                       | ✅ done        |
 | 6. FAT32                                 | post-v1        |
 
 What works today:
 
-- `fstool::block::{FileBackend, MemoryBackend, SlicedBackend}` — sparse
-  file-backed devices, in-memory devices for tests, bounds-checked sub-range
-  views for carving partitions.
-- `fstool::part::{Mbr, Gpt}` — write and read 4-primary MBR and 128-entry GPT
-  layouts. GPT includes the protective MBR, primary and backup headers, and
-  CRC32 on both the header and the partition entry array. Cross-checked
-  against `sgdisk -v`.
-- `fstool::fs::ext::Ext` — write ext2 images from in-memory geometry plus a
-  populate API:
-  - `Ext::format_with(dev, opts)` → an empty FS with the root directory
-    (and `/lost+found` if requested). Layout matches `genext2fs -d <dir>
-    -f -q -B 1024` structurally; verified with `e2fsck -fn` and a
-    `dumpe2fs -h` diff.
-  - `Ext::add_file_to(dev, parent, name, FileSource, meta)` — regular
-    files via direct + single-indirect blocks. File data is streamed
-    straight to the device; never fully resident in memory.
-  - `Ext::add_dir_to`, `Ext::add_symlink_to` (with fast-symlink inline
-    storage for ≤ 60-byte targets), `Ext::add_device_to` (char / block /
-    FIFO / socket).
-  - `Ext::flush(dev)` — persists metadata, primary superblock last.
-  - `Ext::populate_rootdevs(dev, kind, uid, gid, mtime)` — drops a
-    `Minimal` or `Standard` `/dev/*` tree into the image (console, null,
-    zero, ptmx, tty, fuse, random, urandom — plus tty0..15, ttyS0..3,
-    kmsg, mem, port, hda..hdd + 4 partitions, sda..sdd + 4 partitions for
-    `Standard`). Lets a non-root user build a Linux root FS without
-    needing CAP_MKNOD.
+**CLI** — `build` (from a TOML spec), `ext-build` (bare ext FS from a
+directory), `ls`, `cat`, `info`, `add` (copy a host file/tree in), `rm`
+(unlink a file / symlink / device / empty directory).
+
+**Block layer** — `fstool::block::{FileBackend, MemoryBackend,
+SlicedBackend}`: sparse file-backed devices, in-memory devices for tests,
+bounds-checked sub-range views for carving partitions.
+
+**Partition tables** — `fstool::part::{Mbr, Gpt}`: write and read
+4-primary MBR and 128-entry GPT (protective MBR, primary + backup
+headers, CRC32 on header and entry array). Cross-checked against
+`sgdisk -v` and `fdisk -l`.
+
+**ext2 / ext3 / ext4** — `fstool::fs::ext::Ext`:
+- Write all three: ext2 (no features), ext3 (+ JBD2 journal), ext4
+  (+ extent trees, FILETYPE dirents, CRC32C `metadata_csum`). Every
+  produced image is verified `e2fsck -fn` clean.
+- Read any conforming image, including a stock `mke2fs -t ext4`
+  (64-bit 64-byte group descriptors, flex_bg, metadata_csum) — `ls`,
+  `cat`, and `info` work on it.
+- Streaming populate API (`add_file_to`, `add_dir_to`, `add_symlink_to`
+  with fast-symlink inline storage, `add_device_to`); direct +
+  single/double-indirect blocks for ext2/3, extent trees for ext4.
+- Modify-in-place: open an existing image, add/remove whole files, flush
+  — metadata checksums are re-stamped so the result stays fsck-clean.
+- `BuildPlan` auto-sizes a filesystem to fit a source tree exactly
+  (genext2fs-style "size to fit").
+- `Ext::populate_rootdevs` drops a `Minimal` or `Standard` `/dev/*` tree
+  (console, null, zero, ptmx, tty, fuse, random, urandom — plus tty0..15,
+  ttyS0..3, kmsg, mem, port, hda..hdd + partitions, sda..sdd + partitions
+  for `Standard`), so a non-root user can build a Linux root FS without
+  CAP_MKNOD.
+
+**TOML spec** — `fstool::spec`: declarative image descriptions, either a
+bare filesystem (`[filesystem]`) or a partitioned disk (`[image]` +
+`[[partitions]]`, MBR or GPT, one ext FS per partition).
 
 ## Architecture
 
@@ -121,6 +131,32 @@ Run the test suite:
 cargo test                     # unit tests + external cross-checks if tools present
 ```
 
+Build a partitioned disk image from a TOML spec:
+
+```sh
+cat > disk.toml <<'EOF'
+[image]
+size = "64MiB"
+partition_table = "gpt"
+
+[[partitions]]
+name = "EFI"
+type = "esp"
+size = "16MiB"
+
+[[partitions]]
+name = "root"
+type = "linux"
+size = "remaining"
+
+[partitions.filesystem]
+type = "ext4"
+source = "./rootfs"
+EOF
+fstool build disk.toml -o disk.img
+sgdisk -v disk.img             # "No problems found."
+```
+
 ## Roadmap
 
 The streaming invariant is the project's load-bearing constraint: regardless
@@ -133,6 +169,9 @@ it" approach.
 In-place modification is restricted to whole-file granularity in v1 (add,
 remove, replace). Partial-file rewrites are explicitly out of scope until
 there's a use case that demands them.
+
+Not yet implemented: FAT32; `sparse_super` / `flex_bg` on the *write* path
+(the reader handles both); an interactive SFTP-style shell.
 
 ## Licence
 

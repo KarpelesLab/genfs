@@ -246,8 +246,12 @@ fn newfs_hfsplus_image_opens_via_fstool() {
 /// alongside ours. Always fails to surface the diff in CI logs.
 #[test]
 fn dump_mkfs_vs_fstool_extents_header() {
-    let Some(newfs) = which("newfs_hfsplus").or_else(|| which("newfs_hfs")) else {
-        eprintln!("skipping: newfs_hfsplus / newfs_hfs not installed");
+    // Linux ships the formatter as `mkfs.hfsplus`; macOS as `newfs_hfs`.
+    let Some(newfs) = which("mkfs.hfsplus")
+        .or_else(|| which("newfs_hfsplus"))
+        .or_else(|| which("newfs_hfs"))
+    else {
+        eprintln!("skipping: no native hfs+ formatter on PATH");
         return;
     };
 
@@ -264,8 +268,10 @@ fn dump_mkfs_vs_fstool_extents_header() {
         .unwrap();
     if !out.status.success() {
         eprintln!(
-            "skipping: newfs refused to format: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "skipping: {} refused to format: {}\n{}",
+            newfs.display(),
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout),
         );
         return;
     }

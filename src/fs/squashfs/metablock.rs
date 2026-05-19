@@ -68,7 +68,10 @@ pub fn read_metablock(
 pub(crate) fn compression_to_algo(c: Compression) -> Option<crate::compression::Algo> {
     use crate::compression::Algo;
     Some(match c {
-        Compression::Gzip => Algo::Gzip,
+        // SquashFS compressor id 1 is named "gzip" in the spec but
+        // uses zlib framing (no gzip header / trailer). Map it to
+        // `Algo::Zlib` so we don't pull in the gzip wrapper.
+        Compression::Gzip => Algo::Zlib,
         Compression::Lzma => Algo::Lzma,
         Compression::Lzo => Algo::Lzo,
         Compression::Xz => Algo::Xz,

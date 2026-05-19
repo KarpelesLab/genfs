@@ -408,6 +408,25 @@ impl WriteState {
         ensure_size(dev, 96)?;
         dev.write_at(0, &[0u8; 96])?;
 
+        // LZ4 needs a compressor-options metablock immediately after the
+        // superblock: 8 bytes of payload (`u32 version=1, u32 flags=0`)
+        // wrapped in a 2-byte uncompressed-metablock header. We must
+        // also set the SQUASHFS_COMP_OPT flag in the superblock (done
+        // later, when we encode `sb`).
+        if matches!(self.compression, Compression::Lz4) {
+            // 2-byte header: length=8, high bit set (uncompressed).
+            let header = ((8u16) | 0x8000).to_le_bytes();
+            let body = [
+                1u32.to_le_bytes(),
+                0u32.to_le_bytes(), // flags: 0 = standard LZ4 (no HC)
+            ]
+            .concat();
+            ensure_size(dev, 96 + 2 + body.len() as u64)?;
+            dev.write_at(96, &header)?;
+            dev.write_at(98, &body)?;
+            next_disk_offset = 96 + 2 + body.len() as u64;
+        }
+
         struct FileLayout {
             blocks_start: u64,
             block_size_words: Vec<u32>,
@@ -1164,6 +1183,13 @@ impl WriteState {
         }
         if xattr_id_table_start == u64::MAX {
             flags |= 0x0200;
+        }
+        // LZ4 requires a compressor-options metablock immediately after
+        // the superblock. It carries `u32 version=1` + `u32 flags` (we
+        // emit flags=0 — non-HC). Set bit 0x0400 (SQUASHFS_COMP_OPT) so
+        // unsquashfs reads the block.
+        if matches!(self.compression, Compression::Lz4) {
+            flags |= 0x0400;
         }
         sb[24..26].copy_from_slice(&flags.to_le_bytes());
         sb[26..28].copy_from_slice(&id_count.to_le_bytes());

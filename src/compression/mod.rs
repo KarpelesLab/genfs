@@ -37,7 +37,13 @@ use crate::Result;
 /// Which compression algorithm a stream / block is encoded with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Algo {
+    /// gzip framing: 10-byte header + deflate + 8-byte trailer (crc32 + isize).
+    /// Used by `.tar.gz`. The `gzip` feature gates the codec.
     Gzip,
+    /// zlib framing: 2-byte header + deflate + 4-byte adler32. SquashFS
+    /// labels this "gzip" on disk (compressor id 1) but uses zlib framing.
+    /// Same `gzip` feature.
+    Zlib,
     Xz,
     Lzma,
     Lz4,
@@ -51,6 +57,7 @@ impl Algo {
     pub fn name(self) -> &'static str {
         match self {
             Self::Gzip => "gzip",
+            Self::Zlib => "zlib",
             Self::Xz => "xz",
             Self::Lzma => "lzma",
             Self::Lz4 => "lz4",
@@ -64,7 +71,7 @@ impl Algo {
     /// otherwise those return [`crate::Error::Unsupported`].
     pub fn enabled(self) -> bool {
         match self {
-            Self::Gzip => cfg!(feature = "gzip"),
+            Self::Gzip | Self::Zlib => cfg!(feature = "gzip"),
             Self::Xz => cfg!(feature = "xz"),
             Self::Lzma => cfg!(feature = "lzma"),
             Self::Lz4 => cfg!(feature = "lz4"),
@@ -135,6 +142,7 @@ pub fn detect_magic(prefix: &[u8]) -> Option<Algo> {
 pub fn decompress(algo: Algo, compressed: &[u8], max_out: usize) -> Result<Vec<u8>> {
     match algo {
         Algo::Gzip => decompress_gzip(compressed, max_out),
+        Algo::Zlib => decompress_zlib(compressed, max_out),
         Algo::Xz => decompress_xz(compressed, max_out),
         Algo::Lzma => decompress_lzma(compressed, max_out),
         Algo::Lz4 => decompress_lz4(compressed, max_out),
@@ -148,6 +156,7 @@ pub fn decompress(algo: Algo, compressed: &[u8], max_out: usize) -> Result<Vec<u
 pub fn compress(algo: Algo, plain: &[u8]) -> Result<Vec<u8>> {
     match algo {
         Algo::Gzip => compress_gzip(plain),
+        Algo::Zlib => compress_zlib(plain),
         Algo::Xz => compress_xz(plain),
         Algo::Lzma => compress_lzma(plain),
         Algo::Lz4 => compress_lz4(plain),
@@ -163,6 +172,7 @@ pub fn make_reader<'a, R: std::io::Read + 'a>(
 ) -> Result<Box<dyn std::io::Read + 'a>> {
     match algo {
         Algo::Gzip => make_reader_gzip(reader),
+        Algo::Zlib => make_reader_zlib(reader),
         Algo::Xz => make_reader_xz(reader),
         Algo::Lzma => make_reader_lzma(reader),
         Algo::Lz4 => make_reader_lz4(reader),
@@ -181,6 +191,7 @@ pub fn make_writer<'a, W: std::io::Write + 'a>(
 ) -> Result<Box<dyn std::io::Write + 'a>> {
     match algo {
         Algo::Gzip => make_writer_gzip(writer),
+        Algo::Zlib => make_writer_zlib(writer),
         Algo::Xz => make_writer_xz(writer),
         Algo::Lzma => make_writer_lzma(writer),
         Algo::Lz4 => make_writer_lz4(writer),
@@ -263,6 +274,65 @@ fn make_writer_gzip<'a, W: std::io::Write + 'a>(w: W) -> Result<Box<dyn std::io:
 #[cfg(not(feature = "gzip"))]
 fn make_writer_gzip<'a, W: std::io::Write + 'a>(_w: W) -> Result<Box<dyn std::io::Write + 'a>> {
     Err(disabled(Algo::Gzip))
+}
+
+// =========================== zlib ===========================
+// Used by SquashFS (compressor id 1 is labeled "gzip" but really uses
+// zlib framing per the on-disk spec). Shares the `gzip` Cargo feature.
+
+#[cfg(feature = "gzip")]
+fn decompress_zlib(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let dec = flate2::read::ZlibDecoder::new(src);
+    let mut out = Vec::new();
+    dec.take(max_out as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| crate::Error::InvalidImage(format!("zlib decode failed: {e}")))?;
+    cap_check(&out, max_out)?;
+    Ok(out)
+}
+
+#[cfg(not(feature = "gzip"))]
+fn decompress_zlib(_src: &[u8], _max_out: usize) -> Result<Vec<u8>> {
+    Err(disabled(Algo::Zlib))
+}
+
+#[cfg(feature = "gzip")]
+fn compress_zlib(plain: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(plain)
+        .map_err(|e| crate::Error::Io(std::io::Error::other(format!("zlib encode failed: {e}"))))?;
+    enc.finish()
+        .map_err(|e| crate::Error::Io(std::io::Error::other(format!("zlib encode failed: {e}"))))
+}
+
+#[cfg(not(feature = "gzip"))]
+fn compress_zlib(_plain: &[u8]) -> Result<Vec<u8>> {
+    Err(disabled(Algo::Zlib))
+}
+
+#[cfg(feature = "gzip")]
+fn make_reader_zlib<'a, R: std::io::Read + 'a>(r: R) -> Result<Box<dyn std::io::Read + 'a>> {
+    Ok(Box::new(flate2::read::ZlibDecoder::new(r)))
+}
+
+#[cfg(not(feature = "gzip"))]
+fn make_reader_zlib<'a, R: std::io::Read + 'a>(_r: R) -> Result<Box<dyn std::io::Read + 'a>> {
+    Err(disabled(Algo::Zlib))
+}
+
+#[cfg(feature = "gzip")]
+fn make_writer_zlib<'a, W: std::io::Write + 'a>(w: W) -> Result<Box<dyn std::io::Write + 'a>> {
+    Ok(Box::new(flate2::write::ZlibEncoder::new(
+        w,
+        flate2::Compression::default(),
+    )))
+}
+
+#[cfg(not(feature = "gzip"))]
+fn make_writer_zlib<'a, W: std::io::Write + 'a>(_w: W) -> Result<Box<dyn std::io::Write + 'a>> {
+    Err(disabled(Algo::Zlib))
 }
 
 // ============================ xz ============================

@@ -906,7 +906,13 @@ mod tests {
         let res = std::io::Read::read_to_end(&mut r, &mut sink);
         let err = res.unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("gzip"), "unexpected message: {msg}");
+        // Either "gzip" (codec disabled) or "zlib" (codec enabled and
+        // tries to decode the garbage we wrote — SquashFS calls this
+        // compressor "gzip" but the on-wire framing is zlib).
+        assert!(
+            msg.contains("zlib") || msg.contains("gzip"),
+            "unexpected message: {msg}"
+        );
     }
 
     /// End-to-end writer test: format an image into a memory backend,

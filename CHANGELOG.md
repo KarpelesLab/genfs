@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/fstool/compare/v0.0.4...v0.0.5) - 2026-05-19
+
+### Added
+
+- *(fs)* fill out xfs/hfs+/apfs/ntfs/f2fs/squashfs read paths + exfat writer
+- *(fs)* xfs/exfat/hfs+/apfs read-only + ntfs/f2fs/squashfs scaffolds
+- *(tar)* tar as a read/write filesystem — ext↔tar / fat↔tar repack
+
+### Other
+
+- gate Unix-only integration tests for the Windows / macOS matrix
+- *(release-plz)* chain release-binaries via workflow_dispatch
+
 ## [0.0.4](https://github.com/KarpelesLab/fstool/compare/v0.0.3...v0.0.4) - 2026-05-19
 
 ### Added

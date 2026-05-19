@@ -24,6 +24,12 @@ pub struct Checkpoint {
     pub user_block_count: u64,
     /// `valid_block_count`.
     pub valid_block_count: u64,
+    /// `rsvd_segment_count` — segments reserved for GC. fsck.f2fs (and
+    /// the kernel) refuse a CP that reports zero on a non-RO volume.
+    pub rsvd_segment_count: u32,
+    /// `overprov_segment_count` — over-provisioned segments. Same
+    /// non-zero requirement as `rsvd_segment_count`.
+    pub overprov_segment_count: u32,
     /// Bitfield of `CP_*_FLAG` bits.
     pub flags: u32,
     /// First block within this CP pack that holds summary data (where the
@@ -182,6 +188,8 @@ fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
     let version = r64(0x00);
     let user_block_count = r64(0x08);
     let valid_block_count = r64(0x10);
+    let rsvd_segment_count = r32(0x18);
+    let overprov_segment_count = r32(0x1C);
     let ckpt_flags = r32(0x84);
     let cp_pack_total_block_count = r32(0x88);
     let cp_pack_start_sum = r32(0x8C);
@@ -193,6 +201,8 @@ fn decode_cp_head(buf: &[u8], head_blkaddr: u32) -> Result<Checkpoint> {
         version,
         user_block_count,
         valid_block_count,
+        rsvd_segment_count,
+        overprov_segment_count,
         flags: ckpt_flags,
         cp_pack_start_sum,
         cp_pack_total_block_count,
@@ -258,9 +268,11 @@ pub(crate) fn encode_cp_head_writer(cp: &Checkpoint) -> Vec<u8> {
     buf[0x00..0x08].copy_from_slice(&cp.version.to_le_bytes());
     buf[0x08..0x10].copy_from_slice(&cp.user_block_count.to_le_bytes());
     buf[0x10..0x18].copy_from_slice(&cp.valid_block_count.to_le_bytes());
-    // 0x18..0x84 — rsvd / overprov / free_segment_count + cur_*_segno[8]
-    // + cur_*_blkoff[8]. We leave them all zero for a fresh image; fsck
-    // tolerates zeros for segments that aren't yet active.
+    buf[0x18..0x1C].copy_from_slice(&cp.rsvd_segment_count.to_le_bytes());
+    buf[0x1C..0x20].copy_from_slice(&cp.overprov_segment_count.to_le_bytes());
+    // 0x20 free_segment_count, 0x24..0x84 cur_*_segno + cur_*_blkoff
+    // tables — left zero for a fresh image; fsck tolerates that as long
+    // as ckpt_flags carries `CP_UMOUNT_FLAG`.
     buf[0x84..0x88].copy_from_slice(&cp.flags.to_le_bytes());
     buf[0x88..0x8C].copy_from_slice(&cp.cp_pack_total_block_count.to_le_bytes());
     buf[0x8C..0x90].copy_from_slice(&cp.cp_pack_start_sum.to_le_bytes());

@@ -1068,10 +1068,32 @@ impl Writer {
         //    (n_nats=0 at the journal slot — the upper bytes of
         //    `checkpoint_ver` decode as zero).
         let valid_blocks = (self.next_main_blk - self.geom.main_blkaddr) as u64;
+        // fsck.f2fs (Android fork + Ubuntu 24.04 build) refuses a CP
+        // that has any of `rsvd_segment_count == 0`,
+        // `overprov_segment_count == 0`, or `fsmeta < F2FS_MIN_SEGMENT`
+        // (typically 9). Our fsmeta is
+        // `segment_count_ckpt + sit + nat + ssa + rsvd_segment_count` =
+        // 2 + 1 + 2 + 1 + rsvd. So `rsvd >= 3` lifts fsmeta to 9.
+        // Picking 5 for both leaves comfortable headroom on any image
+        // big enough to format at all (we require ≥ 64 blocks).
+        let main_segs = self.geom.segment_count_main;
+        let rsvd_segment_count = 5u32.min(main_segs.saturating_sub(2));
+        let overprov_segment_count = 5u32.min(main_segs.saturating_sub(2));
+        // `user_block_count` is the user-visible block count after
+        // reserving the GC + over-provisioned segments. fsck rejects
+        // `user_block_count == 0` and `user_block_count >=
+        // segment_count_main * blocks_per_seg`.
+        let bps_u64 = self.geom.blocks_per_seg as u64;
+        let usable_segs = main_segs
+            .saturating_sub(rsvd_segment_count)
+            .saturating_sub(overprov_segment_count);
+        let user_block_count = (usable_segs as u64) * bps_u64;
         let cp = Checkpoint {
             version: 1,
-            user_block_count: self.geom.total_blocks,
+            user_block_count,
             valid_block_count: valid_blocks,
+            rsvd_segment_count,
+            overprov_segment_count,
             flags: super::constants::CP_UMOUNT_FLAG,
             cp_pack_start_sum: 1,
             cp_pack_total_block_count: 2,

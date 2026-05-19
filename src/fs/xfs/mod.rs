@@ -38,9 +38,11 @@ pub mod bmbt;
 pub mod dir;
 pub mod format;
 pub mod inode;
+pub mod journal;
 pub mod superblock;
 pub mod symlink;
 pub mod write;
+pub mod xattr;
 
 pub use format::{FormatOpts, format};
 pub use write::{DeviceKind, EntryMeta, WriteState};

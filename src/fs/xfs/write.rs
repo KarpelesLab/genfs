@@ -1,46 +1,50 @@
-//! XFS write path — bump-pointer allocator + inode-creation helpers.
+//! XFS write path — per-AG bump-pointer allocator + inode helpers.
 //!
-//! After [`super::format::format`] returns, the on-disk image is a valid
-//! single-AG v5 filesystem with one inode allocated (the root). This
-//! module adds methods on [`Xfs`] for populating the volume with files,
-//! directories, symlinks, and special files. The strategy is the
-//! simplest thing that produces a `xfs_repair -n clean` output:
+//! After [`super::format::format`] returns, the on-disk image is a
+//! valid v5 filesystem with the root inode chunk allocated in AG 0
+//! (root + rbmino + rsumino) and the kernel journal stub already
+//! written. This module adds methods on [`Xfs`] for populating the
+//! volume with files, directories, symlinks, special files, and
+//! extended attributes — plus the `remove` companion for tearing
+//! entries down.
 //!
-//! - **Allocator.** A single bump-pointer over the AG's free-space
-//!   region (AG block `ROOT_CHUNK_AGBLOCK + 8` onward) hands out
-//!   contiguous extents for both data blocks and new inode chunks. We
-//!   never reuse freed space and never re-shuffle free-space records.
-//!   At [`Xfs::flush_writes`] time we rewrite the BNO / CNT / INOBT
-//!   roots to reflect the new state.
+//! - **Allocator.** Per-AG bump pointer + per-AG freed-extent list.
+//!   `alloc_blocks_in_any_ag` round-robins across AGs, preferring a
+//!   freed extent of exact size before bumping the pointer. Freed
+//!   space comes from [`Xfs::remove`]. The BNO / CNT trees are
+//!   re-emitted with all the AG's current extents at
+//!   [`Xfs::flush_writes`] time, coalescing adjacent ranges.
 //!
-//! - **Inodes.** Once the root chunk is exhausted, we allocate a fresh
-//!   64-inode chunk by advancing the bump-pointer by 8 blocks
-//!   (32 KiB / 4 KiB) and append a new INOBT leaf record. We track
-//!   chunks as `(startino_ag, ir_free_bitmap)` pairs.
+//! - **Inodes.** Multi-chunk INOBT, multi-AG hopping. Allocation tries
+//!   every existing chunk across AGs in round-robin order; if every
+//!   chunk is full, it allocates a fresh 64-inode chunk in the next AG
+//!   with space. [`Xfs::remove`] frees its inode back to the chunk
+//!   bitmap and zeroes the on-disk slot.
 //!
 //! - **Directories.** Every directory is initialised as block-format
-//!   (`encode_v5_block_dir`); when a directory grows past one
-//!   directory block, [`Xfs::add_dir`] returns `Error::Unsupported`.
-//!   The root directory is always block-format. (Promotion to leaf or
-//!   node format is a v2 feature.)
+//!   (`encode_v5_block_dir`); growing past one directory block
+//!   returns `Error::Unsupported`. The root directory is always
+//!   block-format. (Promotion to leaf or node format is future work.)
 //!
 //! - **Symlinks.** ≤ 336 bytes → local (inline). 337 .. 4096 → remote,
 //!   one v5 XSLM-headered block. Longer is `Error::Unsupported`.
 //!
-//! - **Files.** Streamed through a 64 KiB scratch buffer, allocated as
-//!   one contiguous extent (the bump-pointer guarantees contiguity).
-//!   If the file size exceeds the remaining free pool the call fails.
+//! - **Files.** Streamed through a 64 KiB scratch buffer; allocated as
+//!   one contiguous extent in whichever AG the round-robin picks.
+//!
+//! - **Xattrs.** [`Xfs::add_xattr`] / [`Xfs::read_xattrs`] use the
+//!   shortform (LOCAL) attribute fork; spill to leaf/node attr blocks
+//!   surfaces `Error::Unsupported`.
 //!
 //! ## What's not done
 //!
-//! - Extended attributes — every inode has `forkoff=0`. TODO.
 //! - Reverse-mapping B+tree, reference-count B+tree, FINOBT — disabled.
 //! - Sparse inodes — disabled.
-//! - Journal — `sb_logblocks = 0`; mounts must use `-o ro,norecovery`.
+//! - Journal — only the empty-unmount-record stub is written; the
+//!   kernel may emit a `dirty log` warning on first mount because we
+//!   don't stamp `h_crc` in the record header. Mounts still succeed.
 //! - Mixed-format directories (leaf, node, B+tree on the write side) —
 //!   only block-format is emitted.
-//! - Free-space defragmentation. The longest-extent count stays equal
-//!   to the entire remaining free pool because we never split it.
 //! - Hard links — every directory entry points at a freshly allocated
 //!   inode; calling `add_file` twice with the same target creates two
 //!   independent inodes.
@@ -58,14 +62,15 @@ use super::dir::{
     stamp_v5_dir_block_crc,
 };
 use super::format::{
-    AG0_METADATA_BLOCKS, ROOT_CHUNK_AGBLOCK, XFS_ABTB_CRC_MAGIC, XFS_ABTC_CRC_MAGIC, XFS_BLOCKSIZE,
-    XFS_BTREE_SBLOCK_V5_SIZE, XFS_IBT_CRC_MAGIC, XFS_INODES_PER_CHUNK, XFS_INODESIZE,
-    XFS_INOPBLOCK, stamp_v5_btree_block_crc,
+    AG0_METADATA_BLOCKS, LOG_AGBLOCK, ROOT_CHUNK_AGBLOCK, XFS_ABTB_CRC_MAGIC, XFS_ABTC_CRC_MAGIC,
+    XFS_BLOCKSIZE, XFS_BTREE_SBLOCK_V5_SIZE, XFS_IBT_CRC_MAGIC, XFS_INODES_PER_CHUNK,
+    XFS_INODESIZE, XFS_INOPBLOCK, stamp_v5_btree_block_crc,
 };
 use super::inode::{
     S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK, V3DinodeBuilder, XfsTimestamp,
     stamp_v3_inode_crc,
 };
+use super::journal::DEFAULT_LOG_BLOCKS;
 use super::symlink::XFS_SYMLINK_HDR_SIZE;
 
 /// Streaming-write scratch buffer size — never grow this above 64 KiB.
@@ -144,7 +149,7 @@ impl EntryMeta {
     }
 }
 
-/// In-memory state of an active inode chunk in AG 0.
+/// In-memory state of an active inode chunk within a single AG.
 #[derive(Debug, Clone)]
 struct InodeChunk {
     /// AG-relative inode number of slot 0.
@@ -173,44 +178,115 @@ impl InodeChunk {
     fn freecount(&self) -> u32 {
         self.ir_free.count_ones()
     }
+
+    fn free_slot(&mut self, slot: u32) -> bool {
+        if slot >= 64 {
+            return false;
+        }
+        let mask = 1u64 << slot;
+        if self.ir_free & mask != 0 {
+            return false; // already free
+        }
+        self.ir_free |= mask;
+        true
+    }
+}
+
+/// Per-AG slice of the write state. Each AG has its own bump pointer,
+/// inode-chunk list, and freed-extent list (returned to BNO/CNT on
+/// flush).
+#[derive(Debug, Clone)]
+struct AgState {
+    /// Bump pointer (AG-relative block); points at the next FS block
+    /// the linear allocator hasn't handed out yet.
+    next_agblock: u32,
+    /// All inode chunks ever allocated in this AG.
+    chunks: Vec<InodeChunk>,
+    /// `(startblock, blockcount)` pairs of extents that were released
+    /// by [`Xfs::remove`] and are available for reuse by future
+    /// allocations in the same AG. Reclaim order is "newest first" —
+    /// a fresh allocation tries the most recently freed extent before
+    /// bumping the pointer.
+    freed_extents: Vec<(u32, u32)>,
+}
+
+impl AgState {
+    fn freecount_inodes(&self) -> u32 {
+        self.chunks.iter().map(|c| c.freecount()).sum()
+    }
+    fn usedcount_inodes(&self) -> u32 {
+        self.chunks.iter().map(|c| 64 - c.freecount()).sum()
+    }
 }
 
 /// Side-table of write-only state. Lives in [`Xfs`] behind an `Option`
 /// because read-only opens don't need it.
 #[derive(Debug, Clone)]
 pub struct WriteState {
-    /// AG 0 next free block (bump pointer).
-    next_agblock: u32,
-    /// All inode chunks ever allocated (we never deallocate).
-    chunks: Vec<InodeChunk>,
+    /// One [`AgState`] per allocation group.
+    ags: Vec<AgState>,
+    /// AG index to try first on the next inode allocation
+    /// (round-robin).
+    next_inode_ag: u32,
+    /// AG index to try first on the next block allocation
+    /// (round-robin).
+    next_block_ag: u32,
     /// Default 16-byte UUID stamped into new metadata blocks. We pull
     /// the canonical UUID from the superblock at write-time instead,
     /// so this field is informational. Kept for future per-AG UUIDs.
     #[allow(dead_code)]
     uuid: [u8; 16],
-    /// Total inodes allocated so far (== sum of `64 - chunk.freecount()`).
+    /// Total inodes allocated so far across all AGs.
     inodes_used: u64,
-    /// Outstanding inodes free across all chunks.
+    /// Outstanding inodes free across all chunks across all AGs.
     inodes_free: u64,
 }
 
 impl WriteState {
-    /// Build the write state corresponding to a freshly-formatted image:
-    /// one chunk (the root chunk) with only inode 0 (the root) used.
-    pub fn initial(uuid: [u8; 16]) -> Self {
-        Self {
-            // First bump-pointer hand-out = post-chunk + 1 (the first
-            // dir block has already been written by the formatter).
-            next_agblock: ROOT_CHUNK_AGBLOCK + 8 + 1,
-            chunks: vec![InodeChunk {
-                startino_ag: ROOT_CHUNK_AGBLOCK * (XFS_INOPBLOCK as u32),
-                ir_free: !1u64, // bit 0 used, rest free
-                agblock: ROOT_CHUNK_AGBLOCK,
-            }],
-            uuid,
-            inodes_used: 1,
-            inodes_free: 63,
+    /// Build the write state corresponding to a freshly-formatted
+    /// `agcount`-AG image. AG 0 starts with the root inode chunk and
+    /// the bump pointer right after the log + first dir block; every
+    /// other AG starts with no inode chunks and the bump pointer at
+    /// the end of static metadata.
+    pub fn initial(uuid: [u8; 16], agcount: u32) -> Self {
+        let log_blocks = DEFAULT_LOG_BLOCKS;
+        let mut ags = Vec::with_capacity(agcount as usize);
+        for ag in 0..agcount {
+            let (next_agblock, chunks) = if ag == 0 {
+                (
+                    // Free pool starts right after the log.
+                    LOG_AGBLOCK + log_blocks,
+                    vec![InodeChunk {
+                        startino_ag: ROOT_CHUNK_AGBLOCK * (XFS_INOPBLOCK as u32),
+                        // Slots 0 (root), 1 (rbmino), 2 (rsumino) are
+                        // pre-allocated by the formatter; the rest are
+                        // free.
+                        ir_free: !0b111u64,
+                        agblock: ROOT_CHUNK_AGBLOCK,
+                    }],
+                )
+            } else {
+                (AG0_METADATA_BLOCKS, Vec::new())
+            };
+            ags.push(AgState {
+                next_agblock,
+                chunks,
+                freed_extents: Vec::new(),
+            });
         }
+        Self {
+            ags,
+            next_inode_ag: 0,
+            next_block_ag: 0,
+            uuid,
+            inodes_used: 3,
+            inodes_free: 61,
+        }
+    }
+
+    /// Single-AG convenience wrapper (back-compat with previous API).
+    pub fn initial_single_ag(uuid: [u8; 16]) -> Self {
+        Self::initial(uuid, 1)
     }
 }
 
@@ -219,7 +295,8 @@ impl Xfs {
     /// than once replaces the existing state, which is fine because all
     /// allocator state is recoverable from the on-disk image.
     pub fn begin_writes(&mut self, uuid: [u8; 16]) {
-        self.write_state = Some(WriteState::initial(uuid));
+        let agcount = self.sb.agcount.max(1);
+        self.write_state = Some(WriteState::initial(uuid, agcount));
     }
 
     fn ws_mut(&mut self) -> Result<&mut WriteState> {
@@ -230,73 +307,154 @@ impl Xfs {
         })
     }
 
-    /// Bump-pointer-allocate `n` contiguous AG blocks. Returns the AG
-    /// block number of the first one.
-    fn alloc_blocks(&mut self, n: u32) -> Result<u32> {
+    /// Allocate `n` contiguous AG blocks. Picks the next AG in
+    /// round-robin order; falls back to other AGs if the current one
+    /// is full. Reuses a recently-freed extent of the exact size if
+    /// available. Returns `(ag, agblock_start)` — the caller is
+    /// responsible for translating to FSB / device byte.
+    fn alloc_blocks_in_any_ag(&mut self, n: u32) -> Result<(u32, u32)> {
         let agblocks = self.sb.agblocks;
         let ws = self.ws_mut()?;
-        if ws
-            .next_agblock
-            .checked_add(n)
-            .is_none_or(|end| end > agblocks)
-        {
-            return Err(crate::Error::InvalidArgument(format!(
-                "xfs: out of space (requested {n} blocks at {}, AG capacity {agblocks})",
-                ws.next_agblock,
-            )));
-        }
-        let start = ws.next_agblock;
-        ws.next_agblock += n;
-        Ok(start)
-    }
-
-    /// Allocate one inode. May allocate a fresh inode chunk if every
-    /// existing chunk is full. Returns the **absolute** inode number.
-    fn alloc_inode(&mut self) -> Result<u64> {
-        // Try existing chunks first.
-        let inopblog = self.sb.inopblog;
-        let agblklog = self.sb.agblklog;
-        let agblocks = self.sb.agblocks;
-        // Take a mutable borrow split so we can advance the bump-pointer
-        // and the chunk list in one pass.
-        {
-            let ws = self.ws_mut()?;
-            for chunk in &mut ws.chunks {
-                if let Some(rel) = chunk.alloc() {
-                    let ag = 0u64;
-                    let ino = (ag << (inopblog + agblklog)) | (rel as u64);
-                    ws.inodes_used += 1;
-                    ws.inodes_free -= 1;
-                    return Ok(ino);
-                }
+        let agcount = ws.ags.len() as u32;
+        // Try each AG starting at `next_block_ag`, round-robin.
+        for offset in 0..agcount {
+            let ag = (ws.next_block_ag + offset) % agcount;
+            let ag_state = &mut ws.ags[ag as usize];
+            // Prefer a freed extent of exact size.
+            if let Some(idx) = ag_state.freed_extents.iter().position(|(_s, c)| *c == n) {
+                let (start, _) = ag_state.freed_extents.swap_remove(idx);
+                ws.next_block_ag = (ag + 1) % agcount;
+                return Ok((ag, start));
+            }
+            // Otherwise bump-allocate.
+            let next = ag_state.next_agblock;
+            if next.checked_add(n).is_some_and(|end| end <= agblocks) {
+                let start = next;
+                ag_state.next_agblock = next + n;
+                ws.next_block_ag = (ag + 1) % agcount;
+                return Ok((ag, start));
             }
         }
-        // No room — allocate a new 64-inode chunk.
+        Err(crate::Error::InvalidArgument(format!(
+            "xfs: out of space across all {agcount} AGs (requested {n} blocks)"
+        )))
+    }
+
+    /// Allocate `n` contiguous AG blocks and return the **FSB** of the
+    /// first allocated block (encodes the AG in the high bits via
+    /// `agblklog`). All write-path callers funnel through this so
+    /// `fsb_to_byte` yields the right device offset regardless of
+    /// which AG was picked.
+    fn alloc_blocks_fsb(&mut self, n: u32) -> Result<u64> {
+        let (ag, agblk) = self.alloc_blocks_in_any_ag(n)?;
+        Ok(((ag as u64) << self.sb.agblklog as u32) | (agblk as u64))
+    }
+
+    /// Allocate one inode. Tries existing chunks across AGs in
+    /// round-robin order; falls back to allocating a fresh 64-inode
+    /// chunk when every existing chunk is full. Returns the absolute
+    /// inode number.
+    fn alloc_inode(&mut self) -> Result<u64> {
+        let inopblog = self.sb.inopblog as u32;
+        let agblklog = self.sb.agblklog as u32;
+        // Round-robin across AGs, trying existing chunks first.
+        let agcount = {
+            let ws = self.ws_mut()?;
+            ws.ags.len() as u32
+        };
+        for offset in 0..agcount {
+            let try_result = {
+                let ws = self.ws_mut()?;
+                let ag = (ws.next_inode_ag + offset) % agcount;
+                let ag_state = &mut ws.ags[ag as usize];
+                let mut found = None;
+                for chunk in &mut ag_state.chunks {
+                    if let Some(rel) = chunk.alloc() {
+                        found = Some(rel);
+                        break;
+                    }
+                }
+                found.map(|rel| (ag, rel))
+            };
+            if let Some((ag, rel)) = try_result {
+                let ws = self.ws_mut()?;
+                ws.inodes_used += 1;
+                ws.inodes_free -= 1;
+                ws.next_inode_ag = (ag + 1) % agcount;
+                return Ok(((ag as u64) << (inopblog + agblklog)) | (rel as u64));
+            }
+        }
+        // No existing chunk had room. Allocate a new chunk in the next
+        // AG with space.
         let chunk_blocks = XFS_INODES_PER_CHUNK / (XFS_INOPBLOCK as u32);
-        let start = self.alloc_blocks(chunk_blocks)?;
-        let _ = agblocks;
-        let startino_ag = start * (XFS_INOPBLOCK as u32);
-        // Zero the chunk and write a "free" inode pattern into each slot.
-        let chunk_byte = (start as u64) * (XFS_BLOCKSIZE as u64);
-        // No dev access here; we'll have the caller flush. We can't
-        // physically zero through the unavailable `dev` reference. So
-        // we just record the chunk; physical zeroing happens lazily
-        // when an inode is actually written into the slot.
+        let (ag, agblk) = self.alloc_blocks_in_any_ag(chunk_blocks)?;
+        let startino_ag = agblk * (XFS_INOPBLOCK as u32);
         let mut chunk = InodeChunk {
             startino_ag,
             ir_free: !1u64,
-            agblock: start,
+            agblock: agblk,
         };
-        let _ = chunk_byte;
         let rel = chunk.alloc().expect("fresh chunk has 64 free inodes");
         let ws = self.ws_mut()?;
-        ws.chunks.push(chunk);
-        let ag = 0u64;
+        ws.ags[ag as usize].chunks.push(chunk);
         ws.inodes_used += 1;
         ws.inodes_free += 63;
-        let inopblog2 = inopblog as u32;
-        let agblklog2 = agblklog as u32;
-        Ok((ag << (inopblog2 + agblklog2)) | (rel as u64))
+        ws.next_inode_ag = (ag + 1) % (ws.ags.len() as u32);
+        Ok(((ag as u64) << (inopblog + agblklog)) | (rel as u64))
+    }
+
+    /// Free `n` blocks starting at FSB `start_fsb` back to its AG's
+    /// freed-extent list. The next allocator pass may reuse them.
+    fn free_blocks_fsb(&mut self, start_fsb: u64, n: u32) -> Result<()> {
+        let agblklog = self.sb.agblklog as u32;
+        let ag = (start_fsb >> agblklog) as u32;
+        let agblk = (start_fsb & ((1u64 << agblklog) - 1)) as u32;
+        let ws = self.ws_mut()?;
+        if (ag as usize) >= ws.ags.len() {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: free_blocks_fsb: ag {ag} out of range"
+            )));
+        }
+        ws.ags[ag as usize].freed_extents.push((agblk, n));
+        Ok(())
+    }
+
+    /// Free a previously allocated inode. Returns its (ag, slot)
+    /// position for the caller's convenience.
+    fn free_inode(&mut self, ino: u64) -> Result<(u32, u32)> {
+        let inopblog = self.sb.inopblog as u32;
+        let agblklog = self.sb.agblklog as u32;
+        let slot_mask = (1u64 << inopblog) - 1;
+        let agblk_mask = (1u64 << agblklog) - 1;
+        let slot = (ino & slot_mask) as u32;
+        let agrel_ino = ino & ((1u64 << (inopblog + agblklog)) - 1);
+        let agrel_ino = agrel_ino as u32;
+        let ag = (ino >> (inopblog + agblklog)) as u32;
+        let _ = agblk_mask;
+        let ws = self.ws_mut()?;
+        if (ag as usize) >= ws.ags.len() {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: free_inode: ag {ag} out of range"
+            )));
+        }
+        // Find the chunk that owns this ino (relative to AG).
+        let ag_state = &mut ws.ags[ag as usize];
+        for chunk in &mut ag_state.chunks {
+            if agrel_ino >= chunk.startino_ag && agrel_ino < chunk.startino_ag + 64 {
+                let slot_in_chunk = agrel_ino - chunk.startino_ag;
+                if chunk.free_slot(slot_in_chunk) {
+                    ws.inodes_used -= 1;
+                    ws.inodes_free += 1;
+                    return Ok((ag, slot));
+                }
+                return Err(crate::Error::InvalidArgument(format!(
+                    "xfs: free_inode {ino}: slot already free"
+                )));
+            }
+        }
+        Err(crate::Error::InvalidImage(format!(
+            "xfs: free_inode {ino}: no chunk owns this inode"
+        )))
     }
 
     /// Write a v3 inode at `ino`'s slot, stamping the CRC. `literal` is
@@ -448,7 +606,7 @@ impl Xfs {
 
         // Allocate the file data extent first.
         let startblock = if nblocks > 0 {
-            self.alloc_blocks(nblocks)?
+            self.alloc_blocks_fsb(nblocks)?
         } else {
             0
         };
@@ -456,7 +614,7 @@ impl Xfs {
         if nblocks > 0 {
             let mut scratch = [0u8; SCRATCH_SIZE];
             let mut remaining = size;
-            let mut dev_offset = (startblock as u64) * bs;
+            let mut dev_offset = self.fsb_to_byte(startblock);
             while remaining > 0 {
                 let want = (remaining.min(SCRATCH_SIZE as u64)) as usize;
                 let n = read_exact_or_eof(src, &mut scratch[..want])?;
@@ -511,7 +669,7 @@ impl Xfs {
         let lit = if nblocks > 0 {
             let ext = Extent {
                 offset: 0,
-                startblock: startblock as u64,
+                startblock,
                 blockcount: nblocks,
                 unwritten: false,
             };
@@ -535,12 +693,12 @@ impl Xfs {
         meta: EntryMeta,
     ) -> Result<u64> {
         let dir_block_size = self.sb.dir_block_size() as usize;
-        let dir_block_agblk = self.alloc_blocks(1)?;
+        let dir_block_fsb = self.alloc_blocks_fsb(1)?;
         let ino = self.alloc_inode()?;
         let uuid = self.uuid_for_writes();
-        let basic_blkno = ((dir_block_agblk as u64) * (XFS_BLOCKSIZE as u64)) / 512;
+        let phys_byte = self.fsb_to_byte(dir_block_fsb);
+        let basic_blkno = phys_byte / 512;
         let block = encode_v5_block_dir(dir_block_size, ino, parent_ino, &[], &uuid, basic_blkno)?;
-        let phys_byte = (dir_block_agblk as u64) * (XFS_BLOCKSIZE as u64);
         dev.write_at(phys_byte, &block)?;
 
         let (atime, mtime, ctime) = meta.ts();
@@ -568,7 +726,7 @@ impl Xfs {
         };
         let ext = Extent {
             offset: 0,
-            startblock: dir_block_agblk as u64,
+            startblock: dir_block_fsb,
             blockcount: 1,
             unwritten: false,
         };
@@ -621,7 +779,8 @@ impl Xfs {
             self.write_inode(dev, ino, builder, target_bytes)?;
         } else if target_bytes.len() <= max_remote {
             // One remote block.
-            let blk = self.alloc_blocks(1)?;
+            let blk_fsb = self.alloc_blocks_fsb(1)?;
+            let blk_byte = self.fsb_to_byte(blk_fsb);
             let mut blkbuf = vec![0u8; bs];
             blkbuf[0..4].copy_from_slice(&super::symlink::XFS_SYMLINK_MAGIC.to_be_bytes());
             // crc at 4..8 — zero for now (we'll stamp below)
@@ -629,7 +788,7 @@ impl Xfs {
             // ino at 16..24 = owner inode
             blkbuf[16..24].copy_from_slice(&ino.to_be_bytes());
             // blkno at 24..32 — basic block (FSB << 3)
-            let basic_blkno = ((blk as u64) * (XFS_BLOCKSIZE as u64)) / 512;
+            let basic_blkno = blk_byte / 512;
             blkbuf[24..32].copy_from_slice(&basic_blkno.to_be_bytes());
             // lsn at 32..40 zero
             blkbuf[40..56].copy_from_slice(&uuid);
@@ -639,7 +798,7 @@ impl Xfs {
             // CRC at byte 4 (le32) of the v5 symlink header (same as
             // dir blocks).
             stamp_v5_dir_block_crc(&mut blkbuf);
-            dev.write_at((blk as u64) * (XFS_BLOCKSIZE as u64), &blkbuf)?;
+            dev.write_at(blk_byte, &blkbuf)?;
 
             let builder = V3DinodeBuilder {
                 inodesize: XFS_INODESIZE as usize,
@@ -665,7 +824,7 @@ impl Xfs {
             };
             let ext = Extent {
                 offset: 0,
-                startblock: blk as u64,
+                startblock: blk_fsb,
                 blockcount: 1,
                 unwritten: false,
             };
@@ -728,12 +887,337 @@ impl Xfs {
         Ok(ino)
     }
 
+    /// Remove `name` from directory `parent_ino`. Frees the target
+    /// inode's data extents back to the BNO/CNT free pool, marks the
+    /// inode as unallocated in INOBT, zeroes its on-disk slot, and
+    /// rewrites the parent dir block sans the removed entry. Returns
+    /// the removed inode number.
+    ///
+    /// Rejects non-empty directories with [`crate::Error::InvalidArgument`].
+    /// Counters are batched into the next `flush_writes` call.
+    pub fn remove(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_ino: u64,
+        name: &str,
+    ) -> Result<u64> {
+        if name == "." || name == ".." || name.is_empty() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: cannot remove {name:?}"
+            )));
+        }
+        let (parent_buf, parent_core) = self.read_inode(dev, parent_ino)?;
+        if !parent_core.is_dir() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: parent inode {parent_ino} is not a directory"
+            )));
+        }
+        // Block-format only: one extent, one FS block.
+        let extents = self.read_extent_list(dev, &parent_buf, &parent_core)?;
+        if extents.len() != 1 || extents[0].blockcount != 1 {
+            return Err(crate::Error::Unsupported(
+                "xfs: remove only supports block-format (single-extent) parents".into(),
+            ));
+        }
+        let parent_self_extent = extents[0];
+        let dir_block_size = self.sb.dir_block_size() as usize;
+        let phys_byte = self.fsb_to_byte(parent_self_extent.startblock);
+        let mut block = vec![0u8; dir_block_size];
+        dev.read_at(phys_byte, &mut block)?;
+        let existing = super::dir::decode_block_dir(&block, self.sb.is_v5())?;
+        // Locate the entry by name.
+        let target = existing.iter().find(|e| e.name == name).ok_or_else(|| {
+            crate::Error::InvalidArgument(format!(
+                "xfs: {name:?} not present in directory inode {parent_ino}"
+            ))
+        })?;
+        let target_ino = target.inumber;
+        let target_ftype = target.ftype;
+
+        // Read the target inode; reject non-empty directories.
+        let (target_buf, target_core) = self.read_inode(dev, target_ino)?;
+        if target_core.is_dir() {
+            let child_entries = self.read_dir_entries(dev, &target_buf, &target_core)?;
+            let user_entries: Vec<_> = child_entries
+                .iter()
+                .filter(|e| e.name != "." && e.name != "..")
+                .collect();
+            if !user_entries.is_empty() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "xfs: directory {name:?} not empty (contains {} entries)",
+                    user_entries.len()
+                )));
+            }
+        }
+
+        // Free the target inode's data extents (regular files /
+        // remote-format symlinks / sub-dir blocks).
+        if matches!(
+            target_core.format,
+            super::inode::DiFormat::Extents | super::inode::DiFormat::Btree
+        ) {
+            let target_extents = self.read_extent_list(dev, &target_buf, &target_core)?;
+            for ext in &target_extents {
+                self.free_blocks_fsb(ext.startblock, ext.blockcount)?;
+            }
+        }
+
+        // Mark the inode unallocated.
+        self.free_inode(target_ino)?;
+        // Zero its on-disk slot so xfs_repair sees "di_magic = 0".
+        let ino_off = self.ino_byte_offset(target_ino)?;
+        let zero = vec![0u8; XFS_INODESIZE as usize];
+        dev.write_at(ino_off, &zero)?;
+
+        // Re-encode the parent dir block without the entry.
+        let new_entries: Vec<(String, u64, u8)> = existing
+            .into_iter()
+            .filter(|e| e.name != "." && e.name != ".." && e.name != name)
+            .map(|e| (e.name, e.inumber, e.ftype))
+            .collect();
+        let parent_parent = existing_parent(&block, self.sb.is_v5())?;
+        let uuid = self.uuid_for_writes();
+        let basic_blkno = phys_byte / 512;
+        let new_block = encode_v5_block_dir(
+            dir_block_size,
+            parent_ino,
+            parent_parent,
+            &new_entries,
+            &uuid,
+            basic_blkno,
+        )?;
+        dev.write_at(phys_byte, &new_block)?;
+
+        // Adjust parent nlink if we removed a subdirectory.
+        let new_nlink = if target_ftype == XFS_DIR3_FT_DIR {
+            parent_core.nlink.saturating_sub(1)
+        } else {
+            parent_core.nlink
+        };
+        let (atime, mtime, ctime) = (parent_core.atime, parent_core.mtime, parent_core.ctime);
+        let builder = V3DinodeBuilder {
+            inodesize: XFS_INODESIZE as usize,
+            mode: parent_core.mode,
+            format: 2, // EXTENTS
+            uid: parent_core.uid,
+            gid: parent_core.gid,
+            nlink: new_nlink,
+            atime,
+            mtime,
+            ctime,
+            crtime: mtime,
+            size: dir_block_size as u64,
+            nblocks: 1,
+            extsize: 0,
+            nextents: 1,
+            forkoff: 0,
+            aformat: 2,
+            flags: parent_core.flags,
+            generation: parent_core.generation,
+            di_ino: parent_ino,
+            uuid,
+        };
+        let mut lit = Vec::with_capacity(16);
+        lit.extend_from_slice(&parent_self_extent.encode());
+        self.write_inode(dev, parent_ino, builder, &lit)?;
+
+        Ok(target_ino)
+    }
+
+    /// Attach a single extended attribute `(name, value)` to the inode.
+    /// Stored in the shortform (LOCAL) attribute fork inside the
+    /// inode's literal area. The total size of all attributes on the
+    /// inode (header + entries) must fit in the attribute-fork half of
+    /// the literal area — if it doesn't, an `Error::Unsupported` is
+    /// returned (leaf-/node-format spill is future work).
+    ///
+    /// The first xattr added to a freshly-allocated inode pulls bytes
+    /// away from the data fork via `di_forkoff`; we pick the minimum
+    /// `forkoff` that just covers the encoded shortform area, rounded
+    /// up to the nearest 8-byte boundary, leaving the remaining
+    /// literal-area bytes available for the data fork.
+    pub fn add_xattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u64,
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        if name.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "xfs: empty xattr name".into(),
+            ));
+        }
+        let (ino_buf, core) = self.read_inode(dev, ino)?;
+        // Decode any existing xattrs from the inode's attr fork.
+        let mut current: Vec<(String, Vec<u8>)> = self
+            .read_xattrs_from_core(&ino_buf, &core)?
+            .into_iter()
+            .collect();
+        // Replace or append.
+        if let Some(slot) = current.iter_mut().find(|(n, _)| n == name) {
+            slot.1 = value.to_vec();
+        } else {
+            current.push((name.to_string(), value.to_vec()));
+        }
+        // Encode the new shortform area.
+        let encoded = super::xattr::encode_shortform(&current)?;
+        // Determine the attr-fork allocation.
+        //
+        // Inode literal area starts at offset 176 (v3 / 512-B inode)
+        // and is 336 bytes long. The data fork must keep its current
+        // bytes intact — so we must NOT overwrite the bytes the data
+        // fork already uses. The data fork's actual occupancy depends
+        // on di_format:
+        //
+        //   - LOCAL (1)    → core.size bytes
+        //   - DEV (0)      → 8 bytes
+        //   - EXTENTS (2)  → core.nextents * 16 bytes
+        //   - BTREE (3)    → variable; we conservatively refuse.
+        //
+        // di_forkoff is in 8-byte words measured from the literal
+        // area's start; the attribute fork lives at lit[forkoff*8 ..].
+        let lit_size = (XFS_INODESIZE as usize) - 176;
+        let data_fork_bytes = match core.format {
+            super::inode::DiFormat::Local => core.size as usize,
+            super::inode::DiFormat::Dev => 8,
+            super::inode::DiFormat::Extents => (core.nextents as usize) * 16,
+            super::inode::DiFormat::Btree => {
+                return Err(crate::Error::Unsupported(
+                    "xfs: add_xattr to BTREE-format inode not supported".into(),
+                ));
+            }
+            super::inode::DiFormat::Unknown(b) => {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: add_xattr to inode with unknown di_format {b}"
+                )));
+            }
+        };
+        let data_fork_words = data_fork_bytes.div_ceil(8);
+        // attr-fork bytes needed (round up to multiple of 8).
+        let attr_words = encoded.len().div_ceil(8);
+        // forkoff is the BOUNDARY between forks — i.e., data fork
+        // length in 8-byte words. We need `forkoff*8 + attr_size <=
+        // lit_size`. Pick the smallest forkoff that fits the data
+        // fork.
+        let min_forkoff = data_fork_words.max(1);
+        let max_forkoff = (lit_size / 8).saturating_sub(attr_words);
+        if min_forkoff > max_forkoff {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: shortform xattrs ({} bytes) don't fit in inode literal area",
+                encoded.len()
+            )));
+        }
+        let forkoff = min_forkoff as u8;
+        let attr_off = (forkoff as usize) * 8;
+        if attr_off + encoded.len() > lit_size {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: shortform xattrs at forkoff={forkoff} overrun literal area"
+            )));
+        }
+
+        // Rebuild the inode in place. We keep the data fork bytes as-is.
+        let data_fork_slice = &ino_buf[176..176 + data_fork_bytes];
+
+        let builder = V3DinodeBuilder {
+            inodesize: XFS_INODESIZE as usize,
+            mode: core.mode,
+            format: match core.format {
+                super::inode::DiFormat::Local => 1,
+                super::inode::DiFormat::Dev => 0,
+                super::inode::DiFormat::Extents => 2,
+                super::inode::DiFormat::Btree => 3,
+                super::inode::DiFormat::Unknown(b) => b,
+            },
+            uid: core.uid,
+            gid: core.gid,
+            nlink: core.nlink,
+            atime: core.atime,
+            mtime: core.mtime,
+            ctime: core.ctime,
+            crtime: core.mtime,
+            size: core.size,
+            nblocks: core.nblocks,
+            extsize: 0,
+            nextents: core.nextents,
+            forkoff,
+            aformat: 1, // LOCAL
+            flags: core.flags,
+            generation: core.generation,
+            di_ino: ino,
+            uuid: self.uuid_for_writes(),
+        };
+        let mut buf = builder.build();
+        // Restore the data fork.
+        buf[176..176 + data_fork_bytes].copy_from_slice(data_fork_slice);
+        // Lay down the attribute fork at the forkoff boundary.
+        buf[176 + attr_off..176 + attr_off + encoded.len()].copy_from_slice(&encoded);
+        stamp_v3_inode_crc(&mut buf);
+        let ino_off = self.ino_byte_offset(ino)?;
+        dev.write_at(ino_off, &buf)?;
+        Ok(())
+    }
+
+    /// Read all extended attributes from an inode's attribute fork.
+    /// Returns an empty map when `core.forkoff == 0` (no attr fork) or
+    /// when the attr fork is empty. Supports shortform (LOCAL) attr
+    /// forks only — extents and B-tree spills surface `Error::Unsupported`.
+    pub fn read_xattrs(
+        &self,
+        dev: &mut dyn BlockDevice,
+        ino: u64,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>> {
+        let (buf, core) = self.read_inode(dev, ino)?;
+        self.read_xattrs_from_core(&buf, &core)
+    }
+
+    /// Decode this inode's attr fork from its already-read on-disk
+    /// bytes + core. Used by both [`read_xattrs`] and the read side of
+    /// [`add_xattr`] (so updates round-trip without re-reading the
+    /// inode).
+    fn read_xattrs_from_core(
+        &self,
+        ino_buf: &[u8],
+        core: &super::inode::DinodeCore,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>> {
+        if core.forkoff == 0 {
+            return Ok(std::collections::HashMap::new());
+        }
+        let attr_off = (core.forkoff as usize) * 8;
+        let lit_start = core.literal_offset;
+        let attr_start = lit_start + attr_off;
+        let inodesize = self.sb.inodesize as usize;
+        if attr_start >= inodesize {
+            return Ok(std::collections::HashMap::new());
+        }
+        let attr_buf = &ino_buf[attr_start..inodesize.min(ino_buf.len())];
+        // di_aformat=1 ⇒ shortform / LOCAL. The on-disk byte sits at
+        // dinode offset 83 (di_aformat).
+        let aformat = if ino_buf.len() >= 84 { ino_buf[83] } else { 0 };
+        match aformat {
+            1 => super::xattr::decode_shortform(attr_buf),
+            0 => Ok(std::collections::HashMap::new()),
+            2 => Err(crate::Error::Unsupported(
+                "xfs: extents-format attribute fork not supported on read".into(),
+            )),
+            3 => Err(crate::Error::Unsupported(
+                "xfs: btree-format attribute fork not supported on read".into(),
+            )),
+            other => Err(crate::Error::Unsupported(format!(
+                "xfs: unknown attribute-fork format {other}"
+            ))),
+        }
+    }
+
     /// Flush in-memory allocator state to disk: rewrite the AGF / AGI /
     /// BNO / CNT / INOBT roots + the superblock counters to reflect the
-    /// current `WriteState`. This must be called once after all `add_*`
-    /// calls so the image is `xfs_repair -n` clean.
+    /// current `WriteState`. Multi-AG safe: every AG's headers and
+    /// per-AG B+trees are rewritten from `WriteState.ags[ag]`. Must be
+    /// called once after all `add_*` / `remove` calls so the image is
+    /// `xfs_repair -n` clean.
     pub fn flush_writes(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         let agblocks = self.sb.agblocks;
+        let total_blocks = self.sb.dblocks as u32;
         let uuid = self.uuid_for_writes();
         let ws = self
             .write_state
@@ -744,117 +1228,180 @@ impl Xfs {
                 )
             })?
             .clone();
-        let free_start = ws.next_agblock;
-        let free_blocks = agblocks.saturating_sub(free_start);
         let bs = XFS_BLOCKSIZE as u64;
+        let agcount = ws.ags.len() as u32;
 
-        // -- Re-stamp BNO (block 4) and CNT (block 5) ---------------
-        let mut bno = make_alloc_btree(XFS_ABTB_CRC_MAGIC, &uuid, 4, free_start, free_blocks);
-        stamp_v5_btree_block_crc(&mut bno);
-        dev.write_at(4 * bs, &bno)?;
-        let mut cnt = make_alloc_btree(XFS_ABTC_CRC_MAGIC, &uuid, 5, free_start, free_blocks);
-        stamp_v5_btree_block_crc(&mut cnt);
-        dev.write_at(5 * bs, &cnt)?;
+        let mut total_free_blocks_u64: u64 = 0;
 
-        // -- Re-stamp INOBT root at block 6. If only one chunk, a
-        //    single leaf record fits; otherwise we'd need to grow the
-        //    tree, which we don't (TODO: multi-chunk INOBT).
-        if ws.chunks.len() > 1 {
-            // We do still write ALL records into a level-0 leaf as
-            // long as they fit. A 4 KiB block fits ~250 records, so
-            // this covers most realistic populations.
+        for (ag_idx, ag_state) in ws.ags.iter().enumerate() {
+            let ag = ag_idx as u32;
+            let ag_byte = (ag as u64) * (agblocks as u64) * bs;
+            // The last AG can be short; quote the real block count.
+            let this_ag_blocks = if ag == agcount - 1 {
+                total_blocks.saturating_sub(ag * agblocks).max(1)
+            } else {
+                agblocks
+            };
+            // Collect this AG's free-space extents: the trailing
+            // bump-pointer region plus any explicitly freed extents.
+            let mut extents: Vec<(u32, u32)> = ag_state.freed_extents.clone();
+            let tail_free = this_ag_blocks.saturating_sub(ag_state.next_agblock);
+            if tail_free > 0 {
+                extents.push((ag_state.next_agblock, tail_free));
+            }
+            // Sort by start-block, then coalesce adjacent extents.
+            extents.sort_by_key(|(s, _)| *s);
+            let mut coalesced: Vec<(u32, u32)> = Vec::with_capacity(extents.len());
+            for (s, c) in extents {
+                if let Some((ls, lc)) = coalesced.last_mut() {
+                    if *ls + *lc == s {
+                        *lc += c;
+                        continue;
+                    }
+                }
+                coalesced.push((s, c));
+            }
+            let total_free_in_ag: u32 = coalesced.iter().map(|(_, c)| *c).sum();
+            let longest = coalesced.iter().map(|(_, c)| *c).max().unwrap_or(0);
+            total_free_blocks_u64 += total_free_in_ag as u64;
+
+            // -- BNO (block 4) — start-block order --------------------
+            let mut bno = vec![0u8; XFS_BLOCKSIZE as usize];
+            write_btree_header_for_ag(
+                &mut bno,
+                XFS_ABTB_CRC_MAGIC,
+                0,
+                coalesced.len() as u16,
+                &uuid,
+                ag,
+                agblocks,
+                4,
+            );
+            for (i, (s, c)) in coalesced.iter().enumerate() {
+                let off = XFS_BTREE_SBLOCK_V5_SIZE + i * 8;
+                if off + 8 > bno.len() {
+                    return Err(crate::Error::Unsupported(
+                        "xfs: too many free-space extents for a single-leaf BNO/CNT".into(),
+                    ));
+                }
+                bno[off..off + 4].copy_from_slice(&s.to_be_bytes());
+                bno[off + 4..off + 8].copy_from_slice(&c.to_be_bytes());
+            }
+            stamp_v5_btree_block_crc(&mut bno);
+            dev.write_at(ag_byte + 4 * bs, &bno)?;
+
+            // -- CNT (block 5) — blockcount order ---------------------
+            let mut cnt_sorted = coalesced.clone();
+            cnt_sorted.sort_by_key(|(_, c)| *c);
+            let mut cnt = vec![0u8; XFS_BLOCKSIZE as usize];
+            write_btree_header_for_ag(
+                &mut cnt,
+                XFS_ABTC_CRC_MAGIC,
+                0,
+                cnt_sorted.len() as u16,
+                &uuid,
+                ag,
+                agblocks,
+                5,
+            );
+            for (i, (s, c)) in cnt_sorted.iter().enumerate() {
+                let off = XFS_BTREE_SBLOCK_V5_SIZE + i * 8;
+                cnt[off..off + 4].copy_from_slice(&s.to_be_bytes());
+                cnt[off + 4..off + 8].copy_from_slice(&c.to_be_bytes());
+            }
+            stamp_v5_btree_block_crc(&mut cnt);
+            dev.write_at(ag_byte + 5 * bs, &cnt)?;
+
+            // -- INOBT (block 6) — leaf with this AG's chunks ---------
             let mut inobt = vec![0u8; XFS_BLOCKSIZE as usize];
-            write_btree_header(
+            write_btree_header_for_ag(
                 &mut inobt,
                 XFS_IBT_CRC_MAGIC,
                 0,
-                ws.chunks.len() as u16,
+                ag_state.chunks.len() as u16,
                 &uuid,
+                ag,
+                agblocks,
                 6,
             );
-            let mut off = XFS_BTREE_SBLOCK_V5_SIZE;
-            for chunk in &ws.chunks {
-                inobt[off..off + 4].copy_from_slice(&chunk.startino_ag.to_be_bytes());
-                inobt[off + 4..off + 8].copy_from_slice(&chunk.freecount().to_be_bytes());
-                inobt[off + 8..off + 16].copy_from_slice(&chunk.ir_free.to_be_bytes());
-                off += 16;
+            for (i, chunk) in ag_state.chunks.iter().enumerate() {
+                let off = XFS_BTREE_SBLOCK_V5_SIZE + i * 16;
                 if off + 16 > inobt.len() {
                     return Err(crate::Error::Unsupported(
                         "xfs: too many inode chunks for a single-leaf INOBT".into(),
                     ));
                 }
+                inobt[off..off + 4].copy_from_slice(&chunk.startino_ag.to_be_bytes());
+                inobt[off + 4..off + 8].copy_from_slice(&chunk.freecount().to_be_bytes());
+                inobt[off + 8..off + 16].copy_from_slice(&chunk.ir_free.to_be_bytes());
             }
             stamp_v5_btree_block_crc(&mut inobt);
-            dev.write_at(6 * bs, &inobt)?;
-        } else {
-            let chunk = &ws.chunks[0];
-            let mut inobt = make_inobt_leaf(
-                &uuid,
-                6,
-                chunk.startino_ag,
-                chunk.freecount(),
-                chunk.ir_free,
-            );
-            stamp_v5_btree_block_crc(&mut inobt);
-            dev.write_at(6 * bs, &inobt)?;
+            dev.write_at(ag_byte + 6 * bs, &inobt)?;
+
+            // -- AGF (sector 1, byte 512 of AG) ----------------------
+            // AG headers are sector-aligned: the formatter laid them
+            // down at offsets {0,512,1024,1536} of every AG, so we
+            // overwrite at those same positions here.
+            let sect = super::format::XFS_SECTSIZE as u64;
+            let mut agf = vec![0u8; sect as usize];
+            agf[0..4].copy_from_slice(&super::format::XFS_AGF_MAGIC.to_be_bytes());
+            agf[4..8].copy_from_slice(&super::format::XFS_AGF_VERSION.to_be_bytes());
+            agf[8..12].copy_from_slice(&ag.to_be_bytes());
+            agf[12..16].copy_from_slice(&this_ag_blocks.to_be_bytes());
+            agf[16..20].copy_from_slice(&4u32.to_be_bytes()); // bno root
+            agf[20..24].copy_from_slice(&5u32.to_be_bytes()); // cnt root
+            agf[24..28].copy_from_slice(&0u32.to_be_bytes()); // rmap root
+            agf[28..32].copy_from_slice(&1u32.to_be_bytes());
+            agf[32..36].copy_from_slice(&1u32.to_be_bytes());
+            agf[36..40].copy_from_slice(&0u32.to_be_bytes()); // rmap level
+            agf[40..44].copy_from_slice(&0u32.to_be_bytes());
+            agf[44..48].copy_from_slice(&0u32.to_be_bytes());
+            agf[48..52].copy_from_slice(&0u32.to_be_bytes());
+            agf[52..56].copy_from_slice(&total_free_in_ag.to_be_bytes());
+            agf[56..60].copy_from_slice(&longest.to_be_bytes());
+            agf[60..64].copy_from_slice(&0u32.to_be_bytes());
+            agf[64..80].copy_from_slice(&uuid);
+            super::format::stamp_v5_agf_crc(&mut agf);
+            dev.write_at(ag_byte + sect, &agf)?;
+
+            // -- AGI (sector 2, byte 1024 of AG) ---------------------
+            let mut agi = vec![0u8; sect as usize];
+            agi[0..4].copy_from_slice(&super::format::XFS_AGI_MAGIC.to_be_bytes());
+            agi[4..8].copy_from_slice(&super::format::XFS_AGI_VERSION.to_be_bytes());
+            agi[8..12].copy_from_slice(&ag.to_be_bytes());
+            agi[12..16].copy_from_slice(&this_ag_blocks.to_be_bytes());
+            let agi_count = ag_state.usedcount_inodes() + ag_state.freecount_inodes();
+            agi[16..20].copy_from_slice(&agi_count.to_be_bytes());
+            agi[20..24].copy_from_slice(&6u32.to_be_bytes()); // inobt root
+            agi[24..28].copy_from_slice(&1u32.to_be_bytes()); // level
+            agi[28..32].copy_from_slice(&ag_state.freecount_inodes().to_be_bytes());
+            if let Some(last) = ag_state.chunks.last() {
+                agi[32..36].copy_from_slice(&last.startino_ag.to_be_bytes());
+            } else {
+                agi[32..36].copy_from_slice(&u32::MAX.to_be_bytes());
+            }
+            agi[36..40].copy_from_slice(&u32::MAX.to_be_bytes()); // dirino (deprecated)
+            for i in 0..64 {
+                let off = 40 + i * 4;
+                agi[off..off + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+            }
+            agi[296..312].copy_from_slice(&uuid);
+            agi[328..332].copy_from_slice(&0u32.to_be_bytes());
+            agi[332..336].copy_from_slice(&0u32.to_be_bytes());
+            super::format::stamp_v5_agi_crc(&mut agi);
+            dev.write_at(ag_byte + 2 * sect, &agi)?;
         }
-
-        // Also write per-inode-chunk inode blocks for any chunks we
-        // allocated but never wrote into beyond what `write_inode`
-        // already did. The chunk's storage region is zeroed when
-        // first claimed by `alloc_blocks`, so unused slots read as
-        // "di_magic = 0" which the kernel treats as free; xfs_repair
-        // accepts this.
-
-        // -- Re-stamp AGF + AGI (sectors 1 + 2) ---------------------
-        let mut agf = vec![0u8; XFS_BLOCKSIZE as usize];
-        agf[0..4].copy_from_slice(&super::format::XFS_AGF_MAGIC.to_be_bytes());
-        agf[4..8].copy_from_slice(&super::format::XFS_AGF_VERSION.to_be_bytes());
-        agf[8..12].copy_from_slice(&0u32.to_be_bytes());
-        agf[12..16].copy_from_slice(&agblocks.to_be_bytes());
-        agf[16..20].copy_from_slice(&4u32.to_be_bytes()); // bno root
-        agf[20..24].copy_from_slice(&5u32.to_be_bytes()); // cnt root
-        agf[24..28].copy_from_slice(&0u32.to_be_bytes()); // rmap root
-        agf[28..32].copy_from_slice(&1u32.to_be_bytes());
-        agf[32..36].copy_from_slice(&1u32.to_be_bytes());
-        agf[36..40].copy_from_slice(&0u32.to_be_bytes()); // rmap level
-        agf[40..44].copy_from_slice(&0u32.to_be_bytes());
-        agf[44..48].copy_from_slice(&0u32.to_be_bytes());
-        agf[48..52].copy_from_slice(&0u32.to_be_bytes());
-        agf[52..56].copy_from_slice(&free_blocks.to_be_bytes());
-        agf[56..60].copy_from_slice(&free_blocks.to_be_bytes());
-        agf[60..64].copy_from_slice(&0u32.to_be_bytes());
-        agf[64..80].copy_from_slice(&uuid);
-        super::format::stamp_v5_agf_crc(&mut agf);
-        dev.write_at(bs, &agf)?;
-
-        let mut agi = vec![0u8; XFS_BLOCKSIZE as usize];
-        agi[0..4].copy_from_slice(&super::format::XFS_AGI_MAGIC.to_be_bytes());
-        agi[4..8].copy_from_slice(&super::format::XFS_AGI_VERSION.to_be_bytes());
-        agi[8..12].copy_from_slice(&0u32.to_be_bytes());
-        agi[12..16].copy_from_slice(&agblocks.to_be_bytes());
-        agi[16..20].copy_from_slice(&((ws.inodes_used + ws.inodes_free) as u32).to_be_bytes());
-        agi[20..24].copy_from_slice(&6u32.to_be_bytes()); // inobt root
-        agi[24..28].copy_from_slice(&1u32.to_be_bytes()); // level
-        agi[28..32].copy_from_slice(&(ws.inodes_free as u32).to_be_bytes());
-        agi[32..36].copy_from_slice(&ws.chunks.last().unwrap().startino_ag.to_be_bytes());
-        agi[36..40].copy_from_slice(&u32::MAX.to_be_bytes());
-        for i in 0..64 {
-            let off = 40 + i * 4;
-            agi[off..off + 4].copy_from_slice(&u32::MAX.to_be_bytes());
-        }
-        agi[296..312].copy_from_slice(&uuid);
-        agi[328..332].copy_from_slice(&0u32.to_be_bytes());
-        agi[332..336].copy_from_slice(&0u32.to_be_bytes());
-        super::format::stamp_v5_agi_crc(&mut agi);
-        dev.write_at(2 * bs, &agi)?;
 
         // -- Re-stamp the primary superblock counters ---------------
         let mut sb = vec![0u8; XFS_BLOCKSIZE as usize];
         dev.read_at(0, &mut sb)?;
-        sb[128..136].copy_from_slice(&ws.inodes_used.to_be_bytes());
+        // sb_icount = total inodes provisioned across all chunks (=
+        // chunks × 64). xfs_repair compares this to the count it
+        // derives from the INOBT and flags a mismatch otherwise.
+        let chunk_total: u64 = ws.ags.iter().map(|a| (a.chunks.len() as u64) * 64).sum();
+        sb[128..136].copy_from_slice(&chunk_total.to_be_bytes());
         sb[136..144].copy_from_slice(&ws.inodes_free.to_be_bytes());
-        sb[144..152].copy_from_slice(&(free_blocks as u64).to_be_bytes());
+        sb[144..152].copy_from_slice(&total_free_blocks_u64.to_be_bytes());
         super::format::stamp_v5_superblock_crc(&mut sb);
         dev.write_at(0, &sb)?;
 
@@ -863,46 +1410,7 @@ impl Xfs {
     }
 }
 
-fn make_alloc_btree(
-    magic: u32,
-    uuid: &[u8; 16],
-    blkno_ag: u32,
-    free_startblock: u32,
-    free_blockcount: u32,
-) -> Vec<u8> {
-    let mut buf = vec![0u8; XFS_BLOCKSIZE as usize];
-    write_btree_header(
-        &mut buf,
-        magic,
-        0,
-        if free_blockcount > 0 { 1 } else { 0 },
-        uuid,
-        blkno_ag,
-    );
-    if free_blockcount > 0 {
-        let off = XFS_BTREE_SBLOCK_V5_SIZE;
-        buf[off..off + 4].copy_from_slice(&free_startblock.to_be_bytes());
-        buf[off + 4..off + 8].copy_from_slice(&free_blockcount.to_be_bytes());
-    }
-    buf
-}
-
-fn make_inobt_leaf(
-    uuid: &[u8; 16],
-    blkno_ag: u32,
-    startino_ag: u32,
-    freecount: u32,
-    ir_free: u64,
-) -> Vec<u8> {
-    let mut buf = vec![0u8; XFS_BLOCKSIZE as usize];
-    write_btree_header(&mut buf, XFS_IBT_CRC_MAGIC, 0, 1, uuid, blkno_ag);
-    let off = XFS_BTREE_SBLOCK_V5_SIZE;
-    buf[off..off + 4].copy_from_slice(&startino_ag.to_be_bytes());
-    buf[off + 4..off + 8].copy_from_slice(&freecount.to_be_bytes());
-    buf[off + 8..off + 16].copy_from_slice(&ir_free.to_be_bytes());
-    buf
-}
-
+#[allow(dead_code)]
 fn write_btree_header(
     buf: &mut [u8],
     magic: u32,
@@ -911,16 +1419,36 @@ fn write_btree_header(
     uuid: &[u8; 16],
     blkno_ag: u32,
 ) {
+    write_btree_header_for_ag(buf, magic, level, numrecs, uuid, 0, 0, blkno_ag)
+}
+
+/// AG-aware variant of [`write_btree_header`]: stamps the AG number
+/// into `bb_owner` and computes `bb_blkno` as the absolute basic-block
+/// (= device byte / 512) so v5 BNO/CNT/INOBT roots checksum correctly.
+#[allow(clippy::too_many_arguments)]
+fn write_btree_header_for_ag(
+    buf: &mut [u8],
+    magic: u32,
+    level: u16,
+    numrecs: u16,
+    uuid: &[u8; 16],
+    ag: u32,
+    agblocks: u32,
+    blkno_ag: u32,
+) {
     buf[0..4].copy_from_slice(&magic.to_be_bytes());
     buf[4..6].copy_from_slice(&level.to_be_bytes());
     buf[6..8].copy_from_slice(&numrecs.to_be_bytes());
     buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
     buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
-    let basic = (blkno_ag as u64) * (XFS_BLOCKSIZE as u64 / 512);
+    // bb_blkno = absolute basic-block number (device byte offset / 512)
+    // = `(ag * agblocks + blkno_ag) * (blocksize / 512)`. xfs_repair
+    // flags a btree block as "suspect" whenever this is wrong.
+    let basic = ((ag as u64) * (agblocks as u64) + blkno_ag as u64) * (XFS_BLOCKSIZE as u64 / 512);
     buf[16..24].copy_from_slice(&basic.to_be_bytes());
     // lsn at 24..32 zero
     buf[32..48].copy_from_slice(uuid);
-    buf[48..52].copy_from_slice(&0u32.to_be_bytes()); // owner = AG 0
+    buf[48..52].copy_from_slice(&ag.to_be_bytes()); // bb_owner = this AG
     // crc at 52..56 zero (caller stamps)
 }
 
@@ -964,10 +1492,13 @@ mod tests {
 
     #[test]
     fn write_state_initial_has_root_only() {
-        let ws = WriteState::initial([0u8; 16]);
-        assert_eq!(ws.chunks.len(), 1);
-        assert_eq!(ws.inodes_used, 1);
-        assert_eq!(ws.inodes_free, 63);
+        let ws = WriteState::initial_single_ag([0u8; 16]);
+        assert_eq!(ws.ags.len(), 1);
+        assert_eq!(ws.ags[0].chunks.len(), 1);
+        // The formatter pre-allocates root + rbmino + rsumino, leaving
+        // 61 inodes free in the root chunk.
+        assert_eq!(ws.inodes_used, 3);
+        assert_eq!(ws.inodes_free, 61);
     }
 
     #[test]
@@ -1046,5 +1577,182 @@ mod tests {
         xfs.flush_writes(&mut dev).unwrap();
         let target = xfs.read_symlink(&mut dev, "/lnk").unwrap();
         assert_eq!(target, "/etc/hostname");
+    }
+
+    #[test]
+    fn remove_regular_file() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        let mut src = std::io::Cursor::new(b"some data".to_vec());
+        let ino = xfs
+            .add_file(&mut dev, rootino, "tmp", EntryMeta::default(), 9, &mut src)
+            .unwrap();
+        // remove it
+        let removed = xfs.remove(&mut dev, rootino, "tmp").unwrap();
+        assert_eq!(removed, ino);
+        xfs.flush_writes(&mut dev).unwrap();
+        let entries = xfs.list_path(&mut dev, "/").unwrap();
+        let user: Vec<&crate::fs::DirEntry> = entries
+            .iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .collect();
+        assert!(user.is_empty(), "expected dir to be empty, got {user:?}");
+    }
+
+    #[test]
+    fn remove_empty_dir() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        xfs.add_dir(&mut dev, rootino, "sub", EntryMeta::default())
+            .unwrap();
+        xfs.remove(&mut dev, rootino, "sub").unwrap();
+        xfs.flush_writes(&mut dev).unwrap();
+        let entries = xfs.list_path(&mut dev, "/").unwrap();
+        let user: Vec<&crate::fs::DirEntry> = entries
+            .iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .collect();
+        assert!(user.is_empty());
+    }
+
+    #[test]
+    fn remove_nonempty_dir_fails() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        let sub = xfs
+            .add_dir(&mut dev, rootino, "sub", EntryMeta::default())
+            .unwrap();
+        let mut src = std::io::Cursor::new(b"x".to_vec());
+        xfs.add_file(&mut dev, sub, "f", EntryMeta::default(), 1, &mut src)
+            .unwrap();
+        let r = xfs.remove(&mut dev, rootino, "sub");
+        assert!(matches!(r, Err(crate::Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn add_xattr_round_trip() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        let mut src = std::io::Cursor::new(b"hello".to_vec());
+        let ino = xfs
+            .add_file(&mut dev, rootino, "f", EntryMeta::default(), 5, &mut src)
+            .unwrap();
+        xfs.add_xattr(&mut dev, ino, "user.mime_type", b"text/plain")
+            .unwrap();
+        xfs.add_xattr(&mut dev, ino, "trusted.foo", b"bar").unwrap();
+        let attrs = xfs.read_xattrs(&mut dev, ino).unwrap();
+        assert_eq!(attrs.get("user.mime_type"), Some(&b"text/plain".to_vec()));
+        assert_eq!(attrs.get("trusted.foo"), Some(&b"bar".to_vec()));
+        // File contents still intact.
+        let mut reader = xfs.open_file_reader(&mut dev, "/f").unwrap();
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut out).unwrap();
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn xattr_overwrite_replaces() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        let mut src = std::io::Cursor::new(b"x".to_vec());
+        let ino = xfs
+            .add_file(&mut dev, rootino, "g", EntryMeta::default(), 1, &mut src)
+            .unwrap();
+        xfs.add_xattr(&mut dev, ino, "user.k", b"v1").unwrap();
+        xfs.add_xattr(&mut dev, ino, "user.k", b"v2").unwrap();
+        let attrs = xfs.read_xattrs(&mut dev, ino).unwrap();
+        assert_eq!(attrs.get("user.k"), Some(&b"v2".to_vec()));
+        assert_eq!(attrs.len(), 1);
+    }
+
+    /// Manual smoke test: write a fresh XFS image to `/tmp/xfs_test.img`
+    /// so the operator can run `xfs_db -r -c 'sb 0' -c 'p' /tmp/xfs_test.img`
+    /// against it. Ignored by default; run with `cargo test --lib --
+    /// --ignored xfs_writes_image_for_external_tools`.
+    #[test]
+    #[ignore]
+    fn xfs_writes_image_for_external_tools() {
+        use crate::block::FileBackend;
+        let path = "/tmp/xfs_test.img";
+        let _ = std::fs::remove_file(path);
+        let f = std::fs::File::create(path).unwrap();
+        // 768 MiB ⇒ 3 AGs of 256 MiB each so the multi-AG path is
+        // exercised; mkfs.xfs's minimum is 300 MiB.
+        f.set_len(768 * 1024 * 1024).unwrap();
+        drop(f);
+        let mut dev = FileBackend::open(std::path::Path::new(path)).unwrap();
+        let opts = super::super::FormatOpts {
+            uuid: [0x11u8; 16],
+            ..Default::default()
+        };
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0x11u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        let mut src = std::io::Cursor::new(b"hello world".to_vec());
+        xfs.add_file(
+            &mut dev,
+            rootino,
+            "greet",
+            EntryMeta::default(),
+            11,
+            &mut src,
+        )
+        .unwrap();
+        let sub = xfs
+            .add_dir(&mut dev, rootino, "sub", EntryMeta::default())
+            .unwrap();
+        let mut src2 = std::io::Cursor::new(b"hi".to_vec());
+        let fino = xfs
+            .add_file(&mut dev, sub, "leaf", EntryMeta::default(), 2, &mut src2)
+            .unwrap();
+        xfs.add_xattr(&mut dev, fino, "user.k", b"v").unwrap();
+        xfs.flush_writes(&mut dev).unwrap();
+    }
+
+    #[test]
+    fn multi_ag_format_works() {
+        // 512 MiB device → 2 AGs (256 MiB each at 65 536 blocks).
+        let size = 512 * 1024 * 1024;
+        let mut dev = MemoryBackend::new(size);
+        let opts = super::super::FormatOpts::default();
+        let xfs = super::super::format(&mut dev, &opts).unwrap();
+        assert!(
+            xfs.ag_count() >= 2,
+            "expected ≥2 AGs, got {}",
+            xfs.ag_count()
+        );
+        // Re-open via the read path and list root.
+        let mut xfs2 = super::super::Xfs::open(&mut dev).unwrap();
+        let entries = xfs2.list_path(&mut dev, "/").unwrap();
+        // Empty dir = "." + "..".
+        let user: Vec<_> = entries
+            .iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .collect();
+        assert!(user.is_empty());
+        // Verify we can write a file and list it.
+        xfs2.begin_writes([0u8; 16]);
+        let rootino = xfs2.superblock().rootino;
+        let mut src = std::io::Cursor::new(b"hi".to_vec());
+        xfs2.add_file(&mut dev, rootino, "ma", EntryMeta::default(), 2, &mut src)
+            .unwrap();
+        xfs2.flush_writes(&mut dev).unwrap();
+        let entries = xfs2.list_path(&mut dev, "/").unwrap();
+        assert!(entries.iter().any(|e| e.name == "ma"));
     }
 }

@@ -1192,9 +1192,12 @@ impl Writer {
             let page = &mut sit_pages[page_idx];
             let vblocks = (curseg_type << 10) | ((*valid_bits as u16) & 0x03FF);
             page[off..off + 2].copy_from_slice(&vblocks.to_le_bytes());
+            // SIT valid_map uses MSB-first bit ordering: `f2fs_test_bit`
+            // computes `mask = 1 << (7 - (nr & 7))`, so bit 0 of the
+            // segment is 0x80 of byte 0, not 0x01 (`test_bit_le`).
             for bit in 0..*valid_bits {
                 let byte_idx = off + 2 + (bit / 8);
-                let mask = 1u8 << (bit % 8);
+                let mask = 1u8 << (7 - (bit % 8));
                 page[byte_idx] |= mask;
             }
         }

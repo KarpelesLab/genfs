@@ -957,6 +957,177 @@ impl Ext {
         Ok(ino)
     }
 
+    /// Remove the file / empty directory / symlink / device node at the
+    /// absolute path `path`. Frees its inode and data blocks and unlinks it
+    /// from its parent directory. A non-empty directory is rejected.
+    pub fn remove_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        let (parent, name) = split_path(std::path::Path::new(path))?;
+        let parent_str = parent
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        let parent_ino = self.path_to_inode(dev, parent_str)?;
+
+        // Locate the target entry in the parent directory.
+        let entries = self.list_inode(dev, parent_ino)?;
+        let target_ino = entries
+            .iter()
+            .find(|e| e.name.as_bytes() == name.as_bytes())
+            .map(|e| e.inode)
+            .ok_or_else(|| crate::Error::InvalidArgument(format!("ext: no such entry {name:?}")))?;
+        let target = self.read_inode(dev, target_ino)?;
+        let is_dir = target.mode & constants::S_IFMT == constants::S_IFDIR;
+        if is_dir {
+            let children = self.list_inode(dev, target_ino)?;
+            let non_self = children
+                .iter()
+                .filter(|e| e.name != "." && e.name != "..")
+                .count();
+            if non_self != 0 {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "ext: directory {name:?} is not empty ({non_self} entries)"
+                )));
+            }
+        }
+
+        // Free the target's data + indirection blocks, then its inode.
+        self.free_inode_blocks(dev, &target)?;
+        self.free_inode(target_ino);
+        // Stage a zeroed inode so flush writes a clean (links=0) slot.
+        self.inodes.retain(|(i, _)| *i != target_ino);
+        self.inodes.push((target_ino, Inode::default()));
+
+        // Unlink from the parent directory.
+        self.unlink_dir_entry(dev, parent_ino, name.as_bytes())?;
+
+        if is_dir {
+            // The removed dir's ".." was a link to the parent.
+            self.patch_inode(dev, parent_ino, |i| {
+                i.links_count = i.links_count.saturating_sub(1);
+            })?;
+            self.groups[0].desc.used_dirs_count =
+                self.groups[0].desc.used_dirs_count.saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    /// Free every data block (and classic indirection metadata block) an
+    /// inode references. No-op for inodes with no allocated blocks (fast
+    /// symlinks, device nodes).
+    fn free_inode_blocks(&mut self, dev: &mut dyn BlockDevice, inode: &Inode) -> Result<()> {
+        if inode.blocks_512 == 0 {
+            return Ok(());
+        }
+        let bs = self.layout.block_size;
+        let n_blocks = (inode.size as u64).div_ceil(bs as u64) as u32;
+        for n in 0..n_blocks {
+            let phys = self.file_block(dev, inode, n)?;
+            if phys != 0 {
+                self.free_block(phys);
+            }
+        }
+        // Classic indirection metadata blocks (extent inodes keep their tree
+        // inline in i_block, so they have no external metadata blocks).
+        if inode.flags & constants::EXT4_EXTENTS_FL == 0 {
+            let ind = inode.block[constants::IDX_INDIRECT];
+            if ind != 0 {
+                self.free_block(ind);
+            }
+            let dind = inode.block[constants::IDX_DOUBLE_INDIRECT];
+            if dind != 0 {
+                let mut buf = vec![0u8; bs as usize];
+                self.read_block(dev, dind, &mut buf)?;
+                for i in 0..(bs as usize / 4) {
+                    let sub = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+                    if sub != 0 {
+                        self.free_block(sub);
+                    }
+                }
+                self.free_block(dind);
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear the block-bitmap bit for an absolute block number.
+    fn free_block(&mut self, blk: u32) {
+        for (gi, g) in self.layout.groups.iter().enumerate() {
+            if blk >= g.start_block && blk <= g.end_block {
+                group::clear_bit(&mut self.groups[gi].block_bitmap, blk - g.start_block);
+                return;
+            }
+        }
+    }
+
+    /// Clear the inode-bitmap bit for an inode number.
+    fn free_inode(&mut self, ino: u32) {
+        let (g, idx) = self.inode_location(ino);
+        group::clear_bit(&mut self.groups[g as usize].inode_bitmap, idx);
+    }
+
+    /// Remove the named entry from a directory's first data block by
+    /// merging its `rec_len` into the preceding entry.
+    fn unlink_dir_entry(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_inode: u32,
+        name: &[u8],
+    ) -> Result<()> {
+        self.ensure_inode_staged(dev, dir_inode)?;
+        let inode_copy = self
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == dir_inode)
+            .map(|(_, i)| *i)
+            .unwrap();
+        let dir_block_num = self.file_block(dev, &inode_copy, 0)?;
+        self.ensure_block_staged(dev, dir_block_num)?;
+        if !self.dir_blocks.iter().any(|(b, _)| *b == dir_block_num) {
+            self.dir_blocks.push((dir_block_num, dir_inode));
+        }
+        let with_filetype = self.has_filetype();
+        let usable = dir::usable_dir_len(self.layout.block_size, self.has_metadata_csum());
+        let block = self
+            .data_blocks
+            .iter_mut()
+            .find(|(b, _)| *b == dir_block_num)
+            .map(|(_, bytes)| bytes)
+            .unwrap();
+
+        let mut off = 0usize;
+        let mut prev_off: Option<usize> = None;
+        loop {
+            let entry = dir::decode_entry(&block[off..], with_filetype).ok_or_else(|| {
+                crate::Error::InvalidImage("corrupt dir entry while unlinking".into())
+            })?;
+            let rec_len = entry.rec_len;
+            if entry.inode != 0 && entry.name == name {
+                match prev_off {
+                    Some(p) => {
+                        // Absorb this entry's rec_len into the previous one.
+                        let prev = dir::decode_entry(&block[p..], with_filetype)
+                            .expect("prev entry decodes");
+                        let merged = (prev.rec_len + rec_len) as u16;
+                        block[p + 4..p + 6].copy_from_slice(&merged.to_le_bytes());
+                    }
+                    None => {
+                        // First entry (normally "."): just void the inode.
+                        block[off..off + 4].fill(0);
+                    }
+                }
+                return Ok(());
+            }
+            let next = off + rec_len;
+            if next >= usable {
+                break;
+            }
+            prev_off = Some(off);
+            off = next;
+        }
+        Err(crate::Error::InvalidArgument(format!(
+            "ext: entry {name:?} not found in directory"
+        )))
+    }
+
     /// Persist all staged metadata (bitmaps, inode table, dir blocks,
     /// superblock) to the device. The primary superblock is written last.
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
@@ -1579,10 +1750,11 @@ impl crate::fs::Filesystem for Ext {
         Ok(())
     }
 
-    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "ext: remove() not yet implemented".into(),
-        ))
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        self.remove_path(dev, s)
     }
 
     fn list(

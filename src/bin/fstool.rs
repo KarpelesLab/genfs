@@ -102,6 +102,17 @@ enum Command {
         #[arg(value_name = "FS_DEST")]
         fs_dest: String,
     },
+
+    /// Remove a file, symlink, device node, or empty directory from an
+    /// existing image.
+    Rm {
+        /// Path to the image file (modified in place).
+        #[arg(value_name = "IMAGE")]
+        image: PathBuf,
+        /// Absolute path inside the image to remove.
+        #[arg(value_name = "FS_PATH")]
+        fs_path: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -149,7 +160,18 @@ fn run(cli: Cli) -> fstool::Result<()> {
             host_src,
             fs_dest,
         } => add(&image, &host_src, &fs_dest),
+        Command::Rm { image, fs_path } => rm(&image, &fs_path),
     }
+}
+
+fn rm(image: &std::path::Path, fs_path: &str) -> fstool::Result<()> {
+    let mut dev = FileBackend::open(image)?;
+    let mut ext = Ext::open(&mut dev)?;
+    ext.remove_path(&mut dev, fs_path)?;
+    ext.flush(&mut dev)?;
+    dev.sync()?;
+    eprintln!("removed {fs_path}");
+    Ok(())
 }
 
 fn add(image: &std::path::Path, host_src: &std::path::Path, fs_dest: &str) -> fstool::Result<()> {

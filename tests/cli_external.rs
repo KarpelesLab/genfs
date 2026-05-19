@@ -120,6 +120,92 @@ fn cli_build_ls_cat_add_roundtrip() {
     assert_eq!(out.stdout, b"added via cli\n");
 }
 
+/// build → rm a file → rm an empty dir → e2fsck clean → non-empty dir
+/// rejected.
+#[test]
+fn cli_rm_file_and_empty_dir() {
+    if !which("e2fsck") {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    }
+
+    // Source tree: a file, an empty dir, and a non-empty dir.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("doomed.txt"), b"bye\n").unwrap();
+    std::fs::create_dir(srcdir.path().join("emptydir")).unwrap();
+    std::fs::create_dir(srcdir.path().join("fulldir")).unwrap();
+    std::fs::write(srcdir.path().join("fulldir/keep"), b"k\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args(["ext-build", "--kind", "ext4"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // rm a regular file.
+    let out = Command::new(FSTOOL)
+        .arg("rm")
+        .arg(img.path())
+        .arg("/doomed.txt")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rm file failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // rm an empty directory.
+    let out = Command::new(FSTOOL)
+        .arg("rm")
+        .arg(img.path())
+        .arg("/emptydir")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rm empty dir failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // rm a non-empty directory must fail.
+    let out = Command::new(FSTOOL)
+        .arg("rm")
+        .arg(img.path())
+        .arg("/fulldir")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "rm non-empty dir should have failed");
+
+    // e2fsck clean after the removals.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after rm:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+
+    // The removed entries are gone; the kept ones remain.
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(!listing.contains("doomed.txt"), "doomed.txt still present");
+    assert!(!listing.contains("emptydir"), "emptydir still present");
+    assert!(listing.contains("fulldir"), "fulldir wrongly removed");
+}
+
 /// `fstool info` reports the expected filesystem summary.
 #[test]
 fn cli_info_reports_ext4() {

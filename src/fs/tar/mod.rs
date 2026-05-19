@@ -30,6 +30,9 @@
 
 pub mod header;
 pub mod pax;
+pub mod stream;
+
+pub use stream::{StreamEntry, TarStreamReader, TarStreamWriter};
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -39,6 +42,38 @@ use header::{BLOCK_SIZE, Header};
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::ext::xattr::Xattr;
+
+/// Common write-side surface shared by [`TarWriter`] (BlockDevice-backed)
+/// and [`TarStreamWriter`] (Write-backed). Callers that walk a source
+/// filesystem and emit tar entries can be parametrised on this trait so
+/// the same walker drives both back-ends.
+pub trait TarSink {
+    fn add_file(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
+        size: u64,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()>;
+    fn add_dir(&mut self, path: &str, meta: TarEntryMeta, xattrs: &[Xattr]) -> Result<()>;
+    fn add_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()>;
+    fn add_device(
+        &mut self,
+        path: &str,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()>;
+}
 
 /// What a single tar entry represents on the destination side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,6 +772,80 @@ fn split_path_for_ustar(path: &str) -> (String, String) {
     }
     // Shouldn't reach here if path_fits_ustar was true.
     (path.to_string(), String::new())
+}
+
+// ── TarSink trait impls so the same walker drives both back-ends ───
+
+impl<'a> TarSink for TarWriter<'a> {
+    fn add_file(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
+        size: u64,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarWriter::add_file(self, path, reader, size, meta, xattrs)
+    }
+    fn add_dir(&mut self, path: &str, meta: TarEntryMeta, xattrs: &[Xattr]) -> Result<()> {
+        TarWriter::add_dir(self, path, meta, xattrs)
+    }
+    fn add_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarWriter::add_symlink(self, path, target, meta, xattrs)
+    }
+    fn add_device(
+        &mut self,
+        path: &str,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarWriter::add_device(self, path, kind, major, minor, meta, xattrs)
+    }
+}
+
+impl<W: std::io::Write> TarSink for TarStreamWriter<W> {
+    fn add_file(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
+        size: u64,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarStreamWriter::add_file(self, path, reader, size, meta, xattrs)
+    }
+    fn add_dir(&mut self, path: &str, meta: TarEntryMeta, xattrs: &[Xattr]) -> Result<()> {
+        TarStreamWriter::add_dir(self, path, meta, xattrs)
+    }
+    fn add_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarStreamWriter::add_symlink(self, path, target, meta, xattrs)
+    }
+    fn add_device(
+        &mut self,
+        path: &str,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarStreamWriter::add_device(self, path, kind, major, minor, meta, xattrs)
+    }
 }
 
 #[cfg(test)]

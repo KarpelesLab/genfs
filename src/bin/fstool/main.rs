@@ -390,6 +390,14 @@ fn repack_cmd(
     let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
     let src_target = fstool::inspect::Target::parse(src);
 
+    // Compressed-tar source: stream the archive directly into the
+    // destination without spooling through a tempfile. Only the
+    // tar → tar combination is fully wired here; for other targets
+    // the function returns an actionable error.
+    if let Some(algo) = tar_input_codec(src) {
+        return repack_from_tar_stream(src, algo, dst, fs_type_override);
+    }
+
     // Open the source once and walk it; the source FS stays open across
     // the destination build so we stream each file straight through
     // without ever touching the host filesystem.
@@ -459,18 +467,29 @@ fn repack_cmd(
             },
         };
 
-        // Format the destination. When the output is a compressed tar
-        // (`.tar.gz`, `.tar.zst`, …) write the plain tar bytes to a
-        // tempfile first and stream-compress to `dst` at the end of the
-        // tar branch.
-        let (real_dst, _dst_tmp) = if dst_tar_codec.is_some() && lower == "tar" {
-            let tmp = tempfile::NamedTempFile::new()?;
-            (tmp.path().to_path_buf(), Some(tmp))
-        } else {
-            (dst.to_path_buf(), None)
-        };
+        // Tar output is special: a tar archive is sequential, not a
+        // pre-sized block device. We open `dst` directly as a `Write`
+        // (optionally codec-wrapped for `.tar.gz` / `.tar.zst` / etc.)
+        // and stream every entry through a `TarStreamWriter`. No
+        // tempfile, no `set_len`, no `create_image`.
+        if lower == "tar" {
+            let written = repack_into_tar_streaming(src_dev, &src_fs, dst, dst_tar_codec)?;
+            if let Some(algo) = dst_tar_codec {
+                eprintln!(
+                    "repacked {src} → {} (fs: {source_kind} → tar.{}, {written} bytes plain)",
+                    dst.display(),
+                    algo.name()
+                );
+            } else {
+                eprintln!(
+                    "repacked {src} → {} (fs: {source_kind} → tar, {written} bytes)",
+                    dst.display()
+                );
+            }
+            return Ok(());
+        }
         let mut dst_dev = fstool::block::create_image(
-            &real_dst,
+            dst,
             dst_size,
             &fstool::block::CreateOpts {
                 cluster_size: qcow2_cluster_size,
@@ -509,36 +528,6 @@ fn repack_cmd(
                 let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
                 copy_into_fat32(src_dev, &src_fs, dst_dev.as_mut(), &mut dst_fat)?;
                 dst_fat.flush(dst_dev.as_mut())?;
-            }
-            "tar" => {
-                let written = repack_into_tar(src_dev, &src_fs, dst_dev.as_mut())?;
-                dst_dev.sync()?;
-                // Trim the tar file down to the actual archive length;
-                // we over-allocated above. qcow2 wrappers and the
-                // compressed-output codepath both skip this.
-                drop(dst_dev);
-                let real_ext = real_dst
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_ascii_lowercase());
-                let is_qcow = matches!(real_ext.as_deref(), Some("qcow2" | "qcow" | "q2"));
-                if !is_qcow && let Ok(f) = std::fs::OpenOptions::new().write(true).open(&real_dst) {
-                    let _ = f.set_len(written);
-                }
-                if let Some(algo) = dst_tar_codec {
-                    fstool::compression::compress_file_to_file(&real_dst, dst, algo)?;
-                    eprintln!(
-                        "repacked {src} → {} (fs: {source_kind} → tar.{}, {written} bytes plain)",
-                        dst.display(),
-                        algo.name()
-                    );
-                } else {
-                    eprintln!(
-                        "repacked {src} → {} (fs: {source_kind} → tar, {written} bytes)",
-                        dst.display()
-                    );
-                }
-                return Ok(());
             }
             other => {
                 return Err(fstool::Error::InvalidArgument(format!(
@@ -616,6 +605,325 @@ fn tar_output_codec(path: &std::path::Path) -> Option<fstool::compression::Algo>
         return None;
     }
     fstool::compression::Algo::from_extension(path)
+}
+
+/// `Some(algo)` when `path` points at a compressed tar archive that
+/// should be stream-walked rather than decompressed-to-tempfile.
+/// `None` for plain `.tar` (the regular BlockDevice path handles it
+/// fine) and for non-tar files.
+fn tar_input_codec(path: &str) -> Option<fstool::compression::Algo> {
+    // Strip any `:N` partition selector — tar archives don't have
+    // partitions, but the parsing helper allows the form.
+    let p = std::path::Path::new(path.split(':').next().unwrap_or(path));
+    tar_output_codec(p)
+}
+
+/// Repack from a streaming compressed-tar source. Only the tar → tar
+/// (raw or compressed) destination is wired here — piping into ext or
+/// fat would need either a second walk for sizing or an explicit
+/// user-supplied size; both are out of scope for the streaming path.
+fn repack_from_tar_stream(
+    src: &str,
+    algo: fstool::compression::Algo,
+    dst: &std::path::Path,
+    fs_type_override: Option<&str>,
+) -> fstool::Result<()> {
+    use fstool::fs::tar::{EntryKind as TarKind, TarEntryMeta, TarStreamWriter};
+    let dst_codec = tar_output_codec(dst);
+    let target_fs_str = fs_type_override
+        .map(|s| s.to_ascii_lowercase())
+        .or_else(|| {
+            dst.extension()
+                .and_then(|s| s.to_str())
+                .filter(|e| e.eq_ignore_ascii_case("tar"))
+                .map(|_| "tar".to_string())
+        })
+        .or_else(|| dst_codec.map(|_| "tar".to_string()))
+        .unwrap_or_else(|| "tar".to_string());
+    if target_fs_str != "tar" {
+        return Err(fstool::Error::Unsupported(format!(
+            "repack: streaming a `.tar.{}` source into a {target_fs_str} destination needs a sizing pre-pass that isn't streaming-safe; decompress externally first, or pick a tar destination",
+            algo.name()
+        )));
+    }
+
+    let mut reader = open_tar_stream_reader(src, Some(algo))?;
+    let file = std::fs::File::create(dst)?;
+    let buffered: Box<dyn std::io::Write> =
+        Box::new(std::io::BufWriter::with_capacity(64 * 1024, file));
+    let inner: Box<dyn std::io::Write> = match dst_codec {
+        Some(a) => fstool::compression::make_writer(a, buffered)?,
+        None => buffered,
+    };
+    let mut writer = TarStreamWriter::new(inner);
+
+    while let Some(mut ent) = reader.next_entry()? {
+        let entry = ent.entry.clone();
+        let meta = TarEntryMeta {
+            mode: entry.mode,
+            uid: entry.uid,
+            gid: entry.gid,
+            mtime: entry.mtime,
+            uname: String::new(),
+            gname: String::new(),
+        };
+        match entry.kind {
+            TarKind::Regular => {
+                writer.add_file(&entry.path, &mut ent, entry.size, meta, &entry.xattrs)?;
+            }
+            TarKind::Dir => writer.add_dir(&entry.path, meta, &entry.xattrs)?,
+            TarKind::Symlink => {
+                let target = entry.link_target.as_deref().unwrap_or("");
+                writer.add_symlink(&entry.path, target, meta, &entry.xattrs)?;
+            }
+            TarKind::HardLink => {
+                // Without a backing random-access index we can't
+                // re-materialise the link target's content; preserve
+                // the link itself as a symlink (best-effort).
+                let target = entry.link_target.as_deref().unwrap_or("");
+                writer.add_symlink(&entry.path, target, meta, &entry.xattrs)?;
+            }
+            TarKind::CharDev => {
+                writer.add_device(
+                    &entry.path,
+                    fstool::fs::DeviceKind::Char,
+                    entry.device_major,
+                    entry.device_minor,
+                    meta,
+                    &entry.xattrs,
+                )?;
+            }
+            TarKind::BlockDev => {
+                writer.add_device(
+                    &entry.path,
+                    fstool::fs::DeviceKind::Block,
+                    entry.device_major,
+                    entry.device_minor,
+                    meta,
+                    &entry.xattrs,
+                )?;
+            }
+            TarKind::Fifo => {
+                writer.add_device(
+                    &entry.path,
+                    fstool::fs::DeviceKind::Fifo,
+                    0,
+                    0,
+                    meta,
+                    &entry.xattrs,
+                )?;
+            }
+        }
+    }
+    writer.finish()?;
+    let written = writer.bytes_written();
+    drop(writer);
+    if let Some(a) = dst_codec {
+        eprintln!(
+            "repacked {src} → {} (fs: tar.{} → tar.{}, {written} bytes plain)",
+            dst.display(),
+            algo.name(),
+            a.name()
+        );
+    } else {
+        eprintln!(
+            "repacked {src} → {} (fs: tar.{} → tar, {written} bytes)",
+            dst.display(),
+            algo.name()
+        );
+    }
+    Ok(())
+}
+
+/// Open a (possibly codec-wrapped) tar archive as a streaming reader.
+fn open_tar_stream_reader(
+    path: &str,
+    algo: Option<fstool::compression::Algo>,
+) -> fstool::Result<fstool::fs::tar::TarStreamReader<Box<dyn std::io::Read>>> {
+    let p = std::path::Path::new(path.split(':').next().unwrap_or(path));
+    let file = std::fs::File::open(p)?;
+    let buffered: Box<dyn std::io::Read> =
+        Box::new(std::io::BufReader::with_capacity(64 * 1024, file));
+    let inner: Box<dyn std::io::Read> = match algo {
+        Some(a) => fstool::compression::make_reader(a, buffered)?,
+        None => buffered,
+    };
+    Ok(fstool::fs::tar::TarStreamReader::new(inner))
+}
+
+/// Normalise an absolute tar path: starts with '/', no trailing '/'
+/// (root is '/'). Matches `Tar::normalise_path`'s output.
+fn normalise_tar_path(p: &str) -> String {
+    let trimmed = p.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".into();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn parent_of_tar_path(p: &str) -> String {
+    match p.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(i) => p[..i].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+fn leaf_of_tar_path(p: &str) -> &str {
+    match p.rfind('/') {
+        Some(i) => &p[i + 1..],
+        None => p,
+    }
+}
+
+/// `ls` for a `.tar.<algo>` (or `.tar`): walks the archive once,
+/// collects every entry's path/kind, then prints the entries that live
+/// directly under `path`. Streaming-walk on every invocation; random
+/// access on a one-pass stream needs the whole index up front.
+fn ls_tar_stream(
+    image: &str,
+    path: &str,
+    algo: Option<fstool::compression::Algo>,
+) -> fstool::Result<()> {
+    use fstool::fs::tar::EntryKind as TarKind;
+    let mut reader = open_tar_stream_reader(image, algo)?;
+    let want = normalise_tar_path(path);
+    let mut entries: Vec<(String, TarKind)> = Vec::new();
+    while let Some(ent) = reader.next_entry()? {
+        entries.push((ent.entry.path.clone(), ent.entry.kind));
+    }
+    let mut children: Vec<fstool::fs::DirEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (idx, (p, kind)) in entries.iter().enumerate() {
+        let parent = parent_of_tar_path(p);
+        if parent != want {
+            continue;
+        }
+        let leaf = leaf_of_tar_path(p);
+        if !seen.insert(leaf.to_string()) {
+            continue;
+        }
+        let dirent_kind = match kind {
+            TarKind::Dir => fstool::fs::EntryKind::Dir,
+            TarKind::Regular | TarKind::HardLink => fstool::fs::EntryKind::Regular,
+            TarKind::Symlink => fstool::fs::EntryKind::Symlink,
+            TarKind::CharDev => fstool::fs::EntryKind::Char,
+            TarKind::BlockDev => fstool::fs::EntryKind::Block,
+            TarKind::Fifo => fstool::fs::EntryKind::Fifo,
+        };
+        children.push(fstool::fs::DirEntry {
+            name: leaf.to_string(),
+            inode: idx as u32 + 1,
+            kind: dirent_kind,
+        });
+    }
+    if children.is_empty() && want != "/" {
+        let exists_as_dir = entries.iter().any(|(p, _)| p == &want);
+        let has_descendants = entries.iter().any(|(p, _)| {
+            p.starts_with(&want) && p.len() > want.len() && p.as_bytes()[want.len()] == b'/'
+        });
+        if !exists_as_dir && !has_descendants {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "tar: no such directory {want:?}"
+            )));
+        }
+    }
+    let mut out = std::io::stdout().lock();
+    for e in &children {
+        let _ = writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name);
+    }
+    Ok(())
+}
+
+fn cat_tar_stream(
+    image: &str,
+    path: &str,
+    algo: Option<fstool::compression::Algo>,
+) -> fstool::Result<()> {
+    use fstool::fs::tar::EntryKind as TarKind;
+    let want = normalise_tar_path(path);
+    let mut reader = open_tar_stream_reader(image, algo)?;
+    let mut out = std::io::stdout().lock();
+    while let Some(mut ent) = reader.next_entry()? {
+        if ent.entry.path == want {
+            match ent.entry.kind {
+                TarKind::Regular | TarKind::HardLink => {
+                    std::io::copy(&mut ent, &mut out)?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(fstool::Error::InvalidArgument(format!(
+                        "tar: {want:?} is not a regular file"
+                    )));
+                }
+            }
+        }
+    }
+    Err(fstool::Error::InvalidArgument(format!(
+        "tar: no such entry {want:?}"
+    )))
+}
+
+fn info_tar_stream(image: &str, algo: Option<fstool::compression::Algo>) -> fstool::Result<()> {
+    use fstool::fs::tar::EntryKind as TarKind;
+    let mut reader = open_tar_stream_reader(image, algo)?;
+    let mut total = 0usize;
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    let mut symlinks = 0usize;
+    let mut devices = 0usize;
+    let mut content_bytes = 0u64;
+    let mut total_xattrs = 0usize;
+    let mut top_entries: Vec<(String, fstool::fs::EntryKind, u32)> = Vec::new();
+    let mut seen_top: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut idx = 0u32;
+    while let Some(ent) = reader.next_entry()? {
+        total += 1;
+        idx += 1;
+        match ent.entry.kind {
+            TarKind::Regular | TarKind::HardLink => {
+                files += 1;
+                content_bytes += ent.entry.size;
+            }
+            TarKind::Dir => dirs += 1,
+            TarKind::Symlink => symlinks += 1,
+            TarKind::CharDev | TarKind::BlockDev | TarKind::Fifo => devices += 1,
+        }
+        total_xattrs += ent.entry.xattrs.len();
+        let parent = parent_of_tar_path(&ent.entry.path);
+        if parent == "/" {
+            let leaf = leaf_of_tar_path(&ent.entry.path).to_string();
+            if seen_top.insert(leaf.clone()) {
+                let dk = match ent.entry.kind {
+                    TarKind::Dir => fstool::fs::EntryKind::Dir,
+                    TarKind::Regular | TarKind::HardLink => fstool::fs::EntryKind::Regular,
+                    TarKind::Symlink => fstool::fs::EntryKind::Symlink,
+                    TarKind::CharDev => fstool::fs::EntryKind::Char,
+                    TarKind::BlockDev => fstool::fs::EntryKind::Block,
+                    TarKind::Fifo => fstool::fs::EntryKind::Fifo,
+                };
+                top_entries.push((leaf, dk, idx));
+            }
+        }
+    }
+    println!("fs kind:           tar (streaming)");
+    println!("entries:           {total}");
+    println!("  files:           {files}");
+    println!("  directories:     {dirs}");
+    println!("  symlinks:        {symlinks}");
+    println!("  devices/fifos:   {devices}");
+    println!("file content:      {content_bytes} bytes");
+    println!("xattrs total:      {total_xattrs}");
+    println!();
+    println!("/ listing:");
+    for (name, kind, ino) in &top_entries {
+        println!("  {:>10}  {:?}  {}", ino, kind, name);
+    }
+    Ok(())
 }
 
 fn unsupported_repack_src(src_fs: &fstool::inspect::AnyFs) -> fstool::Error {
@@ -1276,25 +1584,50 @@ fn tar_size_walk_fat(
     Ok(())
 }
 
-/// Walk every entry in `src_fs` and emit it as a tar archive on
-/// `dst_dev`. Returns the number of bytes written (so the caller can
-/// truncate the underlying file).
-fn repack_into_tar(
+/// Walk every entry in `src_fs` and emit it as a tar archive directly
+/// to `dst` (optionally codec-wrapped). Returns the number of plain
+/// (uncompressed) bytes written through the writer; the on-disk file
+/// is whatever the codec produces.
+///
+/// Streaming output path: the destination file is opened once, wrapped
+/// in a compressing writer if needed, and never seeked. No tempfile.
+fn repack_into_tar_streaming(
     src_dev: &mut dyn fstool::block::BlockDevice,
     src_fs: &fstool::inspect::AnyFs,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &std::path::Path,
+    codec: Option<fstool::compression::Algo>,
 ) -> fstool::Result<u64> {
-    use fstool::fs::tar::TarWriter;
-    use fstool::inspect::AnyFs;
-    let mut writer = TarWriter::new(dst_dev);
-    match src_fs {
-        AnyFs::Ext(src_ext) => tar_walk_ext(src_dev, src_ext, 2, "", &mut writer)?,
-        AnyFs::Fat32(src_fat) => tar_walk_fat(src_dev, src_fat, "/", &mut writer)?,
-        AnyFs::Tar(src_tar) => tar_replay_tar(src_dev, src_tar, &mut writer)?,
-        _ => return Err(unsupported_repack_src(src_fs)),
-    }
+    use fstool::fs::tar::TarStreamWriter;
+    let file = std::fs::File::create(dst)?;
+    let buffered: Box<dyn std::io::Write> =
+        Box::new(std::io::BufWriter::with_capacity(64 * 1024, file));
+    let inner: Box<dyn std::io::Write> = match codec {
+        Some(algo) => fstool::compression::make_writer(algo, buffered)?,
+        None => buffered,
+    };
+    let mut writer = TarStreamWriter::new(inner);
+    repack_walk_into_sink(src_dev, src_fs, &mut writer)?;
     writer.finish()?;
-    Ok(writer.cursor())
+    let written = writer.bytes_written();
+    drop(writer);
+    Ok(written)
+}
+
+/// Walk every entry in `src_fs` and emit it through the given
+/// [`TarSink`]. Used by the streaming output path; the BlockDevice-
+/// backed `TarWriter` is no longer wired into the CLI for tar output.
+fn repack_walk_into_sink(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src_fs: &fstool::inspect::AnyFs,
+    sink: &mut dyn fstool::fs::tar::TarSink,
+) -> fstool::Result<()> {
+    use fstool::inspect::AnyFs;
+    match src_fs {
+        AnyFs::Ext(src_ext) => tar_walk_ext(src_dev, src_ext, 2, "", sink),
+        AnyFs::Fat32(src_fat) => tar_walk_fat(src_dev, src_fat, "/", sink),
+        AnyFs::Tar(src_tar) => tar_replay_tar(src_dev, src_tar, sink),
+        _ => Err(unsupported_repack_src(src_fs)),
+    }
 }
 
 fn tar_walk_ext(
@@ -1302,7 +1635,7 @@ fn tar_walk_ext(
     src: &fstool::fs::ext::Ext,
     src_ino: u32,
     prefix: &str,
-    writer: &mut fstool::fs::tar::TarWriter<'_>,
+    writer: &mut dyn fstool::fs::tar::TarSink,
 ) -> fstool::Result<()> {
     use fstool::fs::DeviceKind;
     use fstool::fs::ext::constants::*;
@@ -1367,7 +1700,7 @@ fn tar_walk_fat(
     src_dev: &mut dyn fstool::block::BlockDevice,
     src: &fstool::fs::fat::Fat32,
     src_path: &str,
-    writer: &mut fstool::fs::tar::TarWriter<'_>,
+    writer: &mut dyn fstool::fs::tar::TarSink,
 ) -> fstool::Result<()> {
     use fstool::fs::EntryKind;
     use fstool::fs::tar::TarEntryMeta;
@@ -1393,7 +1726,7 @@ fn tar_walk_fat(
 fn tar_replay_tar(
     src_dev: &mut dyn fstool::block::BlockDevice,
     src: &fstool::fs::tar::Tar,
-    writer: &mut fstool::fs::tar::TarWriter<'_>,
+    writer: &mut dyn fstool::fs::tar::TarSink,
 ) -> fstool::Result<()> {
     use fstool::fs::DeviceKind;
     use fstool::fs::tar::{EntryKind, TarEntryMeta};
@@ -1734,6 +2067,11 @@ fn require_force_for_device(
 }
 
 fn ls(image: &str, path: &str) -> fstool::Result<()> {
+    // Compressed-tar archives stream-walk per invocation; bypass the
+    // tempfile-spooling BlockDevice path entirely.
+    if let Some(algo) = tar_input_codec(image) {
+        return ls_tar_stream(image, path, Some(algo));
+    }
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
@@ -1747,6 +2085,9 @@ fn ls(image: &str, path: &str) -> fstool::Result<()> {
 }
 
 fn cat(image: &str, path: &str) -> fstool::Result<()> {
+    if let Some(algo) = tar_input_codec(image) {
+        return cat_tar_stream(image, path, Some(algo));
+    }
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
@@ -1757,6 +2098,9 @@ fn cat(image: &str, path: &str) -> fstool::Result<()> {
 }
 
 fn info(image: &str) -> fstool::Result<()> {
+    if let Some(algo) = tar_input_codec(image) {
+        return info_tar_stream(image, Some(algo));
+    }
     let target = fstool::inspect::Target::parse(image);
     // If the user gave a bare `disk.img` and it carries a partition
     // table, print the table instead of trying to open it as a single

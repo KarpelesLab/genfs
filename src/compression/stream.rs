@@ -142,17 +142,15 @@ impl<W: Write> EncoderAdapter<W> {
         match self.flavour {
             LzmaFlavour::Xz => {
                 #[cfg(feature = "xz")]
-                lzma_rs::xz_compress(&mut input, &mut out).map_err(|e| {
-                    io::Error::other(format!("xz encode failed: {e}"))
-                })?;
+                lzma_rs::xz_compress(&mut input, &mut out)
+                    .map_err(|e| io::Error::other(format!("xz encode failed: {e}")))?;
                 #[cfg(not(feature = "xz"))]
                 unreachable!("xz encoder built without `xz` feature");
             }
             LzmaFlavour::Lzma => {
                 #[cfg(feature = "lzma")]
-                lzma_rs::lzma_compress(&mut input, &mut out).map_err(|e| {
-                    io::Error::other(format!("lzma encode failed: {e}"))
-                })?;
+                lzma_rs::lzma_compress(&mut input, &mut out)
+                    .map_err(|e| io::Error::other(format!("lzma encode failed: {e}")))?;
                 #[cfg(not(feature = "lzma"))]
                 unreachable!("lzma encoder built without `lzma` feature");
             }
@@ -217,11 +215,11 @@ impl<W: Write> LzoFrameWriter<W> {
         if self.pending.is_empty() || self.inner.is_none() {
             return Ok(());
         }
-        let mut lzo = minilzo_rs::LZO::init()
-            .map_err(|e| io::Error::other(format!("lzo init: {e:?}")))?;
-        let compressed = lzo.compress(&self.pending).map_err(|e| {
-            io::Error::other(format!("lzo encode failed: {e:?}"))
-        })?;
+        let mut lzo =
+            minilzo_rs::LZO::init().map_err(|e| io::Error::other(format!("lzo init: {e:?}")))?;
+        let compressed = lzo
+            .compress(&self.pending)
+            .map_err(|e| io::Error::other(format!("lzo encode failed: {e:?}")))?;
         let w = self.inner.as_mut().unwrap();
         w.write_all(&(compressed.len() as u32).to_le_bytes())?;
         w.write_all(&(self.pending.len() as u32).to_le_bytes())?;
@@ -293,8 +291,8 @@ impl<R: Read> LzoFrameReader<R> {
         }
         let mut compressed = vec![0u8; clen];
         self.inner.read_exact(&mut compressed)?;
-        let lzo = minilzo_rs::LZO::init()
-            .map_err(|e| io::Error::other(format!("lzo init: {e:?}")))?;
+        let lzo =
+            minilzo_rs::LZO::init().map_err(|e| io::Error::other(format!("lzo init: {e:?}")))?;
         let out = lzo.decompress(&compressed, ulen).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

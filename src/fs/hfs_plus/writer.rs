@@ -1679,7 +1679,13 @@ pub(crate) fn encode_hardlink_body(
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(248);
     out.extend_from_slice(&REC_FILE.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes()); // flags
+    // kHFSHasLinkChainMask = 0x0020 — marks this record as part of
+    // a hardlink chain. Apple's HFS+ driver and fsck.hfsplus walk the
+    // chain only when this bit is set; without it the entry is
+    // treated as a regular file with bogus FileInfo, and the implicit
+    // child→parent verification ("HFS+ Private Data directory is out
+    // of order") fires.
+    out.extend_from_slice(&0x0020u16.to_be_bytes()); // flags
     out.extend_from_slice(&0u32.to_be_bytes()); // reserved1
     out.extend_from_slice(&file_id.to_be_bytes());
     for _ in 0..5 {
@@ -1818,6 +1824,10 @@ pub(crate) fn promote_to_hardlink(
         *b"hfs+",
         &src_fork,
     );
+    // Patch flags = kHFSHasLinkChainMask (0x0020). The iNode storage
+    // file participates in the same hardlink chain as the hlnk records
+    // referencing it. Flags live at byte 2..4 of the 248-byte file body.
+    inode_body[2..4].copy_from_slice(&0x0020u16.to_be_bytes());
     // Patch BSDInfo.special = link_count (2 = src + dst). BSDInfo
     // starts at byte 32 of the 248-byte file body; `special` is the
     // last u32 of the 16-byte BSDInfo struct, so byte 32+12 = 44.
@@ -1880,7 +1890,47 @@ pub(crate) fn promote_to_hardlink(
         writer, dst_parent, dst_name, dst_cnid, mode_full, uid, gid, link_inode,
     )?;
 
+    // Mark every directory that now contains a hardlink-chain entry
+    // with kHFSHasChildLinkMask (0x0040). Apple's HFS+ driver and
+    // fsck propagate this up: Private Data holds the iNode (which has
+    // HasLinkChain), and src_parent / dst_parent each hold an hlnk
+    // (which has HasLinkChain). Without these bits the structural
+    // walk reports "out of order" on the Private Data directory.
+    set_folder_flag(writer, private_dir, 0x0040)?;
+    set_folder_flag(writer, src_parent, 0x0040)?;
+    if dst_parent != src_parent {
+        set_folder_flag(writer, dst_parent, 0x0040)?;
+    }
+
     Ok(link_inode)
+}
+
+/// Set bits in the flags field of the folder record for `cnid`. Used to
+/// propagate `kHFSHasChildLinkMask` after a hardlink is created.
+pub(crate) fn set_folder_flag(writer: &mut Writer, cnid: u32, mask: u16) -> Result<()> {
+    // Find the folder record by walking via the thread (cnid → parent + name).
+    let thread_key = OwnedKey::thread(cnid);
+    let Some(thread_body) = writer.catalog.get(&thread_key).cloned() else {
+        return Ok(()); // root sometimes has its own thread layout; skip.
+    };
+    if thread_body.len() < 8 {
+        return Ok(());
+    }
+    let parent_parent = u32::from_be_bytes(thread_body[4..8].try_into().unwrap());
+    let (name, _) = UniStr::decode(&thread_body[8..])?;
+    let folder_key = OwnedKey {
+        parent_id: parent_parent,
+        name,
+    };
+    let Some(body) = writer.catalog.get_mut(&folder_key) else {
+        return Ok(());
+    };
+    if body.len() < 4 || i16::from_be_bytes([body[0], body[1]]) != REC_FOLDER {
+        return Ok(());
+    }
+    let cur = u16::from_be_bytes([body[2], body[3]]);
+    body[2..4].copy_from_slice(&(cur | mask).to_be_bytes());
+    Ok(())
 }
 
 /// Remove an entry and (for files) free its data fork.

@@ -31,10 +31,19 @@
 //! ## Limitations (returned as [`crate::Error::Unsupported`] when hit)
 //!
 //! - Compression, encryption, project quotas — no writer support.
-//! - Hard links — `add_*` always allocates a fresh nid.
 //! - Inline xattr — not synthesised.
-//! - Triple-indirect node trees — files up to ~4 GiB (direct in-inode +
-//!   2× direct-node + 2× indirect-node) work; beyond that we reject.
+//!
+//! ## Recently added
+//!
+//! - Hard links — [`Writer::add_hardlink`] points a new dentry at an existing
+//!   nid and bumps `i_links`. Only nids tracked by the writer in the current
+//!   session can be hard-linked (fresh-image lifetime).
+//! - Triple-indirect node trees — [`Writer::add_file`] now grows through
+//!   `i_nid[NID_TRIPLE_INDIRECT]` for files beyond the double-indirect
+//!   threshold (~8 GiB).
+//! - Multi-block spilled dentries — once a directory's child list overflows
+//!   the first 4 KiB dentry block, additional blocks are allocated through
+//!   the same direct/indirect-node chain a file uses.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -48,9 +57,9 @@ use super::constants::{
     ADDRS_PER_BLOCK, ADDRS_PER_INODE, F2FS_BLK_CSUM_OFFSET, F2FS_BLKSIZE, F2FS_DATA_EXIST,
     F2FS_FT_BLKDEV, F2FS_FT_CHRDEV, F2FS_FT_DIR, F2FS_FT_FIFO, F2FS_FT_REG_FILE, F2FS_FT_SOCK,
     F2FS_FT_SYMLINK, F2FS_INLINE_DATA, F2FS_INLINE_DENTRY, F2FS_SLOT_LEN, NID_DIRECT_1,
-    NID_DIRECT_2, NID_INDIRECT_1, NID_INDIRECT_2, NIDS_PER_BLOCK, NIDS_PER_INODE,
-    NR_DENTRY_IN_BLOCK, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK,
-    SIZE_OF_DENTRY_BITMAP, SIZE_OF_DIR_ENTRY, SIZE_OF_RESERVED,
+    NID_DIRECT_2, NID_INDIRECT_1, NID_INDIRECT_2, NID_TRIPLE_INDIRECT, NIDS_PER_BLOCK,
+    NIDS_PER_INODE, NR_DENTRY_IN_BLOCK, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG,
+    S_IFSOCK, SIZE_OF_DENTRY_BITMAP, SIZE_OF_DIR_ENTRY, SIZE_OF_RESERVED,
 };
 use super::dir::INLINE_DENTRY_NR;
 use super::format::Geometry;
@@ -390,11 +399,62 @@ impl Writer {
             rel -= span;
         }
 
-        // Triple-indirect: not implemented in v1. We hit ~4 GiB before
-        // we get here, which is enough for a fresh-image use case.
-        Err(crate::Error::Unsupported(
-            "f2fs: file exceeds the ~4 GiB direct + 2-level indirect limit (triple-indirect not implemented)".into(),
-        ))
+        // Triple-indirect region: i_nid[4] → top-indirect (1018 nids of
+        // indirect nodes) → each indirect (1018 nids of direct nodes) →
+        // each direct (1018 data ptrs). Span = 1018^3 blocks ≈ 4 TiB.
+        let triple_span = (NIDS_PER_BLOCK as u64).pow(2) * (ADDRS_PER_BLOCK as u64);
+        if rel < triple_span {
+            let outer = (rel / ((NIDS_PER_BLOCK as u64) * (ADDRS_PER_BLOCK as u64))) as usize;
+            let mid = ((rel / (ADDRS_PER_BLOCK as u64)) % (NIDS_PER_BLOCK as u64)) as usize;
+            let inner = (rel % (ADDRS_PER_BLOCK as u64)) as usize;
+            let top_nid = self.ensure_indirect_node(nid, NID_TRIPLE_INDIRECT)?;
+            let mid_nid = self.ensure_indirect_under_indirect(top_nid, outer)?;
+            let dnode_nid = self.ensure_dnode_under_indirect(mid_nid, mid)?;
+            let d = self
+                .direct_nodes
+                .get_mut(&dnode_nid)
+                .expect("just inserted");
+            d.addrs[inner] = phys;
+            return Ok(());
+        }
+
+        Err(crate::Error::Unsupported(format!(
+            "f2fs: file exceeds the triple-indirect addressable limit (idx={idx})"
+        )))
+    }
+
+    /// Ensure an indirect-node block exists at top-indirect `parent`'s
+    /// `outer` slot. Symmetric to [`Self::ensure_dnode_under_indirect`] but
+    /// for the top tier of the triple-indirect tree (where the child is an
+    /// indirect node, not a direct node).
+    fn ensure_indirect_under_indirect(&mut self, parent: u32, outer: usize) -> Result<u32> {
+        let ind = self
+            .indirect_nodes
+            .get_mut(&parent)
+            .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost triple-top nid".into()))?;
+        if ind.nids[outer] != 0 {
+            return Ok(ind.nids[outer]);
+        }
+        let inid = {
+            let n = self.next_nid;
+            self.next_nid += 1;
+            n
+        };
+        let phys = {
+            let blk = self.next_main_blk;
+            self.next_main_blk += 1;
+            blk
+        };
+        self.indirect_nodes.get_mut(&parent).unwrap().nids[outer] = inid;
+        self.indirect_nodes.insert(
+            inid,
+            IndirectNode {
+                nid: inid,
+                on_disk_block: phys,
+                nids: [0; NIDS_PER_BLOCK],
+            },
+        );
+        Ok(inid)
     }
 
     /// Ensure a direct-node block exists under `inode.i_nid[slot]`,
@@ -698,6 +758,88 @@ impl Writer {
         Ok(nid)
     }
 
+    /// Create a hard link from `dst_path` to the inode at `src_path`.
+    /// The source must be a path the writer already created in the current
+    /// session — fresh-image writers don't re-decode on-disk inodes from
+    /// the device, so previously-flushed nids that aren't tracked here
+    /// can't be hard-linked. Symlinks and directories are rejected (Unix
+    /// only permits hard links to non-directory files; we additionally
+    /// disallow symlinks for cross-FS portability).
+    pub fn add_hardlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        src_path: &std::path::Path,
+        dst_path: &std::path::Path,
+    ) -> Result<u32> {
+        let src_nid = self.resolve_existing(src_path)?;
+        let src = self
+            .inodes
+            .get(&src_nid)
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "f2fs: hardlink source {src_path:?} not tracked by this writer"
+                ))
+            })?
+            .clone();
+        if src.mode & super::constants::S_IFMT == S_IFDIR {
+            return Err(crate::Error::InvalidArgument(
+                "f2fs: cannot hard-link a directory".into(),
+            ));
+        }
+        if src.mode & super::constants::S_IFMT == S_IFLNK {
+            return Err(crate::Error::InvalidArgument(
+                "f2fs: cannot hard-link a symbolic link".into(),
+            ));
+        }
+        let (parent_nid, leaf, existing) = self.resolve_for_create(dst_path)?;
+        if existing.is_some() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "f2fs: path exists: {dst_path:?}"
+            )));
+        }
+        // Re-borrow mutably to bump link count now that the dst slot is free.
+        let src_mut = self
+            .inodes
+            .get_mut(&src_nid)
+            .expect("source inode disappeared between lookup and update");
+        src_mut.links = src_mut.links.saturating_add(1);
+        // Recompute file_type from the existing mode so we never lie in
+        // the dentry table.
+        let ft = super::dir::file_type_from_mode(src.mode);
+        self.attach_to_parent(parent_nid, &leaf, src_nid, ft)?;
+        Ok(src_nid)
+    }
+
+    /// Resolve a posix-style path to an existing inode this writer tracks.
+    /// Unlike [`Self::resolve_for_create`], the leaf must exist.
+    fn resolve_existing(&self, path: &std::path::Path) -> Result<u32> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("f2fs: non-UTF-8 path".into()))?;
+        if s == "/" || s.is_empty() {
+            return Ok(3);
+        }
+        let parts: Vec<&str> = s
+            .trim_matches('/')
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .collect();
+        let mut cur = 3u32;
+        for comp in &parts {
+            let kids = self.children.get(&cur).ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("f2fs: parent of {s:?} not a known dir"))
+            })?;
+            let found = kids
+                .iter()
+                .find(|d| d.name == comp.as_bytes())
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!("f2fs: no such entry {comp:?} in {s:?}"))
+                })?;
+            cur = found.ino;
+        }
+        Ok(cur)
+    }
+
     /// Add a dentry to the parent. Spills inline → block when needed.
     fn attach_to_parent(
         &mut self,
@@ -778,24 +920,52 @@ impl Writer {
         let bs = F2FS_BLKSIZE as u64;
 
         // 1) Write any dentry block(s) for directories that have spilled.
+        //
+        // For every spilled directory we greedily pack its child list into
+        // 4 KiB dentry blocks (NR_DENTRY_IN_BLOCK slots per block). The
+        // first block reuses the pre-allocated `i_addr[0]`; subsequent
+        // blocks are routed through `place_data_block`, which transparently
+        // handles direct-in-inode / direct-node / indirect-node / triple
+        // indirect placement — exactly like a regular file.
         for (&dir_nid, _) in self.spilled_dirs.clone().iter() {
             let kids = self.children.get(&dir_nid).cloned().unwrap_or_default();
-            // Single-block fast path. Multi-block dentry handling falls
-            // back to "first NR_DENTRY_IN_BLOCK entries"; further entries
-            // are dropped — the writer rejects oversized dirs up front in
-            // `attach_to_parent` (it allocs one block only).
-            let phys = {
+            let chunks = split_dentries_per_block(&kids);
+            if chunks.is_empty() {
+                continue;
+            }
+            // Block 0 — already pre-allocated when the directory first
+            // spilled (see `attach_to_parent`). If somehow not (paranoid
+            // path) allocate now.
+            let mut block_addrs: Vec<u32> = Vec::with_capacity(chunks.len());
+            let first_phys = {
                 let ino = self
                     .inodes
                     .get(&dir_nid)
                     .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost dir".into()))?;
                 ino.i_addr[0]
             };
-            if phys == 0 {
-                continue;
+            if first_phys == 0 {
+                let phys = self.alloc_block()?;
+                self.inodes.get_mut(&dir_nid).unwrap().i_addr[0] = phys;
+                block_addrs.push(phys);
+            } else {
+                block_addrs.push(first_phys);
             }
-            let blk = encode_block_dentry(&kids);
-            dev.write_at(phys as u64 * bs, &blk)?;
+            // Blocks 1..N — allocate + register.
+            for idx in 1..chunks.len() {
+                let phys = self.alloc_block()?;
+                self.place_data_block(dir_nid, idx as u64, phys)?;
+                block_addrs.push(phys);
+            }
+            // Stamp dentry blocks to disk.
+            for (idx, chunk) in chunks.iter().enumerate() {
+                let blk = encode_block_dentry(chunk);
+                dev.write_at(block_addrs[idx] as u64 * bs, &blk)?;
+            }
+            // Update inode size / blocks to reflect the dentry block(s).
+            let ino = self.inodes.get_mut(&dir_nid).unwrap();
+            ino.size = (chunks.len() as u64) * F2FS_BLKSIZE as u64;
+            ino.blocks = chunks.len() as u64;
         }
 
         // 2) Write every direct-node block.
@@ -938,6 +1108,7 @@ fn find_owner_of_dnode(w: &Writer, dnid: u32) -> u32 {
 }
 
 fn find_owner_of_indirect(w: &Writer, inid: u32) -> u32 {
+    // First check inodes — direct/indirect/triple slots.
     for (_, ino) in w.inodes.iter() {
         for s in ino.i_nid.iter() {
             if *s == inid {
@@ -945,7 +1116,43 @@ fn find_owner_of_indirect(w: &Writer, inid: u32) -> u32 {
             }
         }
     }
+    // Triple-indirect: the indirect node may itself live under another
+    // (top-level) indirect node. Walk up the chain.
+    for (_, parent) in w.indirect_nodes.iter() {
+        if parent.nid == inid {
+            continue;
+        }
+        if parent.nids.contains(&inid) {
+            return find_owner_of_indirect(w, parent.nid);
+        }
+    }
     inid
+}
+
+/// Greedy-pack a child list into 4 KiB dentry blocks. Each block holds at
+/// most `NR_DENTRY_IN_BLOCK` slots; a single dentry consumes
+/// `ceil(name_len / F2FS_SLOT_LEN)` slots (or 1 slot for an empty name).
+/// Returns the per-block child slices in the order they should be written.
+fn split_dentries_per_block(entries: &[Dentry]) -> Vec<Vec<Dentry>> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Vec<Dentry>> = Vec::new();
+    let mut cur: Vec<Dentry> = Vec::new();
+    let mut cur_slots = 0usize;
+    for e in entries {
+        let need = e.name.len().div_ceil(F2FS_SLOT_LEN).max(1);
+        if cur_slots + need > NR_DENTRY_IN_BLOCK {
+            out.push(std::mem::take(&mut cur));
+            cur_slots = 0;
+        }
+        cur.push(e.clone());
+        cur_slots += need;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// True if a list of dentries still fits in the inline-dentry layout.
@@ -1110,6 +1317,7 @@ fn _dummy_use_of_reader_type(_: Box<dyn crate::fs::ReadSeek + Send>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::MemoryBackend;
 
     #[test]
     fn fits_in_inline_handles_long_names() {
@@ -1137,5 +1345,266 @@ mod tests {
             });
         }
         assert!(!fits_in_inline(&overflow));
+    }
+
+    /// Greedy chunker emits no chunks for an empty list, one chunk for
+    /// trivially-small lists, and exactly the right number of chunks when
+    /// the slot budget overflows.
+    #[test]
+    fn split_dentries_per_block_packs_greedily() {
+        // Empty.
+        assert!(split_dentries_per_block(&[]).is_empty());
+
+        // One entry — fits in one block.
+        let one = vec![Dentry {
+            hash: 0,
+            ino: 7,
+            file_type: F2FS_FT_REG_FILE,
+            name: b"a".to_vec(),
+        }];
+        assert_eq!(split_dentries_per_block(&one).len(), 1);
+
+        // 300 entries with 1-slot names → ceil(300 / 214) = 2 blocks.
+        let mut many: Vec<Dentry> = Vec::new();
+        for i in 0..300 {
+            many.push(Dentry {
+                hash: 0,
+                ino: i,
+                file_type: F2FS_FT_REG_FILE,
+                name: b"x".to_vec(),
+            });
+        }
+        let chunks = split_dentries_per_block(&many);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 214);
+        assert_eq!(chunks[1].len(), 86);
+    }
+
+    /// Synthesize a tracked file inode at a block index that falls into
+    /// the triple-indirect region, then verify the writer plumbed all
+    /// three tiers correctly (top-indirect, mid-indirect, direct).
+    #[test]
+    fn place_data_block_builds_triple_indirect_tree() {
+        // Build a minimal Writer state from a formatted device. We use
+        // `super::super::F2fs::format` so the geometry + root inode are
+        // wired up correctly; then we reach into the writer to invoke
+        // `place_data_block` directly.
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = super::super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::super::FormatOpts::default()
+        };
+        let mut fs = super::super::F2fs::format(&mut dev, &opts).unwrap();
+        let writer = fs.writer.as_mut().expect("formatted handle has a writer");
+
+        // Allocate an inode record by hand at nid 4 (next_nid).
+        let inode_nid = writer.next_nid;
+        writer.next_nid += 1;
+        let inode_blk = writer.alloc_block().unwrap();
+        writer.inodes.insert(
+            inode_nid,
+            InodeRec {
+                nid: inode_nid,
+                mode: S_IFREG | 0o644,
+                uid: 0,
+                gid: 0,
+                links: 1,
+                size: 0,
+                blocks: 0,
+                atime: 0,
+                ctime: 0,
+                mtime: 0,
+                flags: 0,
+                inline_flags: 0,
+                i_addr: [0; ADDRS_PER_INODE],
+                i_nid: [0; NIDS_PER_INODE],
+                inline_payload: Vec::new(),
+                on_disk_block: inode_blk,
+            },
+        );
+
+        // Threshold of the triple region. Anything just past it lands in
+        // the triple branch.
+        let double_span = (NIDS_PER_BLOCK as u64) * (ADDRS_PER_BLOCK as u64) * 2;
+        let triple_base = ADDRS_PER_INODE as u64 + (ADDRS_PER_BLOCK as u64) * 2 + double_span;
+        let idx = triple_base + 7;
+
+        let phys = writer.alloc_block().unwrap();
+        writer.place_data_block(inode_nid, idx, phys).unwrap();
+
+        // Now we expect: i_nid[NID_TRIPLE_INDIRECT] points at a top
+        // indirect block, that top block's slot 0 points at a mid indirect
+        // block, that mid block's slot 0 points at a direct block, and
+        // that direct block's slot 7 holds `phys`.
+        let ino = writer.inodes.get(&inode_nid).unwrap();
+        let top_nid = ino.i_nid[NID_TRIPLE_INDIRECT];
+        assert!(top_nid != 0, "triple top nid was never assigned");
+        let top = writer.indirect_nodes.get(&top_nid).unwrap();
+        let mid_nid = top.nids[0];
+        assert!(mid_nid != 0, "triple mid nid was never assigned");
+        let mid = writer.indirect_nodes.get(&mid_nid).unwrap();
+        let dnode_nid = mid.nids[0];
+        assert!(dnode_nid != 0, "direct node under triple-mid missing");
+        let dnode = writer.direct_nodes.get(&dnode_nid).unwrap();
+        assert_eq!(dnode.addrs[7], phys);
+        // And the inode hasn't accidentally clobbered its in-inode array.
+        assert_eq!(ino.i_addr[0], 0);
+    }
+
+    /// End-to-end triple-indirect: create a real file whose final block
+    /// sits past the double-indirect span. The body is a sparse-zero
+    /// `FileSource::Zero`, so we don't pay for 8 GiB of memory backing —
+    /// the writer streams pump-buffer-sized zero blocks straight onto a
+    /// fake-large device.
+    ///
+    /// Streaming the whole file is *still* expensive (each block is a
+    /// 4 KiB write); to keep the test under a second we shrink the run by
+    /// writing only the *last* block of the file via a manual placement —
+    /// reusing the placement path already exercised by
+    /// `place_data_block_builds_triple_indirect_tree` — then patching the
+    /// inode size by hand so the reader knows where the file ends.
+    ///
+    /// Reader walks the same logical_to_physical chain and recovers the
+    /// single non-zero block byte, validating triple-indirect end-to-end.
+    #[test]
+    fn triple_indirect_round_trip_synthetic() {
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = super::super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::super::FormatOpts::default()
+        };
+        let mut fs = super::super::F2fs::format(&mut dev, &opts).unwrap();
+
+        // Attach a fresh file to the root so the dentry path resolves.
+        let inode_nid = {
+            let writer = fs.writer.as_mut().unwrap();
+            let nid = writer.next_nid;
+            writer.next_nid += 1;
+            let inode_blk = writer.alloc_block().unwrap();
+            writer.inodes.insert(
+                nid,
+                InodeRec {
+                    nid,
+                    mode: S_IFREG | 0o644,
+                    uid: 0,
+                    gid: 0,
+                    links: 1,
+                    size: 0,
+                    blocks: 0,
+                    atime: 0,
+                    ctime: 0,
+                    mtime: 0,
+                    flags: 0,
+                    inline_flags: 0,
+                    i_addr: [0; ADDRS_PER_INODE],
+                    i_nid: [0; NIDS_PER_INODE],
+                    inline_payload: Vec::new(),
+                    on_disk_block: inode_blk,
+                },
+            );
+            writer
+                .attach_to_parent(3, b"sparse.bin", nid, F2FS_FT_REG_FILE)
+                .unwrap();
+            nid
+        };
+
+        // Plant a single data block deep in the triple-indirect span. We
+        // sit one block past the boundary so the math is unambiguous.
+        let double_span = (NIDS_PER_BLOCK as u64) * (ADDRS_PER_BLOCK as u64) * 2;
+        let triple_base = ADDRS_PER_INODE as u64 + (ADDRS_PER_BLOCK as u64) * 2 + double_span;
+        let idx = triple_base; // first block of the triple region
+
+        let phys = {
+            let writer = fs.writer.as_mut().unwrap();
+            let p = writer.alloc_block().unwrap();
+            writer.place_data_block(inode_nid, idx, p).unwrap();
+            // Mark inode size so the reader serves exactly one byte from
+            // the planted block.
+            let ino = writer.inodes.get_mut(&inode_nid).unwrap();
+            ino.size = idx * F2FS_BLKSIZE as u64 + 1;
+            ino.blocks = 1;
+            p
+        };
+
+        // Stamp a sentinel byte into the planted block.
+        dev.write_at(phys as u64 * F2FS_BLKSIZE as u64, &{
+            let mut b = vec![0u8; F2FS_BLKSIZE];
+            b[0] = 0xAB;
+            b
+        })
+        .unwrap();
+
+        fs.flush(&mut dev).unwrap();
+
+        // Re-open with the read driver and confirm the reader walked the
+        // triple-indirect tree all the way to our planted block. We seek
+        // to the last logical block by reading the full file (just the
+        // last byte is meaningful — everything else is hole-zero).
+        let mut fs2 = super::super::F2fs::open(&mut dev).unwrap();
+        let mut r = fs2.open_file_reader(&mut dev, "/sparse.bin").unwrap();
+        // The file is enormous; stream and only inspect the last byte.
+        let total_bytes = idx * F2FS_BLKSIZE as u64 + 1;
+        let mut last = 0u8;
+        let mut left = total_bytes;
+        let mut buf = vec![0u8; 64 * 1024];
+        while left > 0 {
+            let want = (left as usize).min(buf.len());
+            let n = r.read(&mut buf[..want]).unwrap();
+            assert!(n > 0, "reader ran dry before EOF");
+            last = buf[n - 1];
+            left -= n as u64;
+        }
+        assert_eq!(last, 0xAB);
+    }
+
+    /// Sanity: `find_owner_of_indirect` now chains up through a parent
+    /// triple-top indirect node back to the inode.
+    #[test]
+    fn owner_chain_climbs_triple_tree() {
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = super::super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::super::FormatOpts::default()
+        };
+        let mut fs = super::super::F2fs::format(&mut dev, &opts).unwrap();
+        let writer = fs.writer.as_mut().unwrap();
+        let inode_nid = writer.next_nid;
+        writer.next_nid += 1;
+        let inode_blk = writer.alloc_block().unwrap();
+        writer.inodes.insert(
+            inode_nid,
+            InodeRec {
+                nid: inode_nid,
+                mode: S_IFREG | 0o644,
+                uid: 0,
+                gid: 0,
+                links: 1,
+                size: 0,
+                blocks: 0,
+                atime: 0,
+                ctime: 0,
+                mtime: 0,
+                flags: 0,
+                inline_flags: 0,
+                i_addr: [0; ADDRS_PER_INODE],
+                i_nid: [0; NIDS_PER_INODE],
+                inline_payload: Vec::new(),
+                on_disk_block: inode_blk,
+            },
+        );
+        let double_span = (NIDS_PER_BLOCK as u64) * (ADDRS_PER_BLOCK as u64) * 2;
+        let triple_base = ADDRS_PER_INODE as u64 + (ADDRS_PER_BLOCK as u64) * 2 + double_span;
+        let phys = writer.alloc_block().unwrap();
+        writer
+            .place_data_block(inode_nid, triple_base, phys)
+            .unwrap();
+
+        // The mid-indirect (a child of the top-indirect) should report
+        // the inode as its owner, since the chain crosses the top.
+        let ino = writer.inodes.get(&inode_nid).unwrap();
+        let top_nid = ino.i_nid[NID_TRIPLE_INDIRECT];
+        let top = writer.indirect_nodes.get(&top_nid).unwrap();
+        let mid_nid = top.nids[0];
+        assert_eq!(super::find_owner_of_indirect(writer, mid_nid), inode_nid);
     }
 }

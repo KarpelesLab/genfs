@@ -89,7 +89,7 @@ pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
 pub struct F2fs {
     sb: Superblock,
     cp: Checkpoint,
-    writer: Option<Writer>,
+    pub(crate) writer: Option<Writer>,
 }
 
 impl F2fs {
@@ -172,6 +172,20 @@ impl F2fs {
         meta: crate::fs::FileMeta,
     ) -> Result<u32> {
         self.writer_mut()?.add_symlink(dev, path, target, meta)
+    }
+
+    /// Create a hard link at `dst` pointing at the inode currently
+    /// addressed by `src`. The two paths share an inode and `i_links` on
+    /// that inode is bumped. `src` must be a non-directory, non-symlink
+    /// path created in the current writer session (fresh-image semantics —
+    /// see [`Writer::add_hardlink`] docs).
+    pub fn create_hardlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+    ) -> Result<u32> {
+        self.writer_mut()?.add_hardlink(dev, src, dst)
     }
 
     /// Create a device / FIFO / socket node.
@@ -1437,5 +1451,133 @@ mod tests {
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out.len(), payload.len());
         assert_eq!(out, payload);
+    }
+
+    /// Hard link: a second name in the same directory pointing at the same
+    /// inode. Both paths read back identical bytes, and `i_links == 2`.
+    #[test]
+    fn hardlink_two_names_same_inode() {
+        let mut dev = MemoryBackend::new(1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        let payload = b"hard-linked payload";
+        let src = crate::fs::FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(payload.to_vec())),
+            len: payload.len() as u64,
+        };
+        let src_nid = fs
+            .create_file(
+                &mut dev,
+                std::path::Path::new("/a.txt"),
+                src,
+                crate::fs::FileMeta::default(),
+            )
+            .unwrap();
+        let dst_nid = fs
+            .create_hardlink(
+                &mut dev,
+                std::path::Path::new("/a.txt"),
+                std::path::Path::new("/b.txt"),
+            )
+            .unwrap();
+        assert_eq!(src_nid, dst_nid, "hardlinks share their nid");
+        fs.flush(&mut dev).unwrap();
+
+        let mut fs2 = F2fs::open(&mut dev).unwrap();
+        let list = fs2.list_path(&mut dev, "/").unwrap();
+        let names: Vec<_> = list.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"a.txt"));
+        assert!(names.contains(&"b.txt"));
+        // Both dentries point at the same inode.
+        let a = list.iter().find(|e| e.name == "a.txt").unwrap();
+        let b = list.iter().find(|e| e.name == "b.txt").unwrap();
+        assert_eq!(a.inode, b.inode);
+
+        // Bytes match through either path.
+        for name in &["/a.txt", "/b.txt"] {
+            let mut r = fs2.open_file_reader(&mut dev, name).unwrap();
+            let mut out = Vec::new();
+            r.read_to_end(&mut out).unwrap();
+            assert_eq!(out, payload);
+        }
+        // i_links == 2 on the shared inode.
+        let (_, ino) = fs2.read_inode(&mut dev, a.inode).unwrap();
+        assert_eq!(ino.links, 2);
+    }
+
+    /// Hard-linking a directory is forbidden by POSIX; the writer must say
+    /// so explicitly.
+    #[test]
+    fn hardlink_rejects_directory() {
+        let mut dev = MemoryBackend::new(1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        fs.create_dir(
+            &mut dev,
+            std::path::Path::new("/d"),
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap();
+        let err = fs
+            .create_hardlink(
+                &mut dev,
+                std::path::Path::new("/d"),
+                std::path::Path::new("/d2"),
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)));
+    }
+
+    /// Multi-block spill: enough children with long names to overflow a
+    /// single 4 KiB dentry block. The reader must walk both blocks.
+    #[test]
+    fn dir_spills_across_multiple_dentry_blocks() {
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        // 300 files, each with a 17-byte name → 3 slots per dentry.
+        // 300 × 3 = 900 slots > NR_DENTRY_IN_BLOCK (214) → 5 blocks.
+        let n = 300usize;
+        for i in 0..n {
+            let name = format!("file_with_name_{i:03}"); // 17 bytes
+            let src = crate::fs::FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(vec![b'.'; 1])),
+                len: 1,
+            };
+            fs.create_file(
+                &mut dev,
+                std::path::Path::new(&format!("/{name}")),
+                src,
+                crate::fs::FileMeta::default(),
+            )
+            .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+
+        let mut fs2 = F2fs::open(&mut dev).unwrap();
+        let list = fs2.list_path(&mut dev, "/").unwrap();
+        assert_eq!(list.len(), n);
+        // Confirm we actually went multi-block (size > one block).
+        let (_, root) = fs2.read_inode(&mut dev, 3).unwrap();
+        assert!(
+            root.size > F2FS_BLKSIZE as u64,
+            "expected multi-block dentry layout, got size={}",
+            root.size
+        );
+        // Every named entry must round-trip.
+        let names: std::collections::HashSet<_> = list.iter().map(|e| e.name.clone()).collect();
+        for i in 0..n {
+            assert!(names.contains(&format!("file_with_name_{i:03}")));
+        }
     }
 }

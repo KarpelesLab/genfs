@@ -1,10 +1,10 @@
-//! APFS — Apple's modern macOS / iOS filesystem. Read-only support.
+//! APFS — Apple's modern macOS / iOS filesystem. Read + best-effort
+//! single-volume write support.
 //!
 //! ## Scope
 //!
 //! APFS is large. This module implements the on-disk parsers and a
-//! best-effort read-only walker covering the *common single-volume,
-//! single-checkpoint* case:
+//! best-effort walker plus a single-volume writer:
 //!
 //! 1. The **container superblock** (`nx_superblock_t`) at block 0 is
 //!    decoded. The checkpoint descriptor area is then scanned for the
@@ -13,14 +13,20 @@
 //!    root B-tree node is read. The omap walker descends multi-level
 //!    trees by binary-searching internal nodes; a small LRU node cache
 //!    keeps memory bounded while honouring the streaming invariant.
-//! 3. The first volume slot (`nx_fs_oid[0]`) is resolved through the
-//!    container omap to a physical block, and the **APFS volume
-//!    superblock** (`apfs_superblock_t`) is decoded.
+//! 3. Every populated `nx_fs_oid[]` slot is resolved through the
+//!    container omap to a physical block; the **APFS volume
+//!    superblock** (`apfs_superblock_t`) is decoded per volume.
 //! 4. The volume's own omap is loaded; the volume root tree (`fsroot`,
 //!    `OBJECT_TYPE_FSTREE`) is located.
 //! 5. The fsroot is walked top-down using a virtual-oid-aware
 //!    multi-level B-tree walker. Directory listings and file extents
 //!    are gathered via prefix range scans over the fs-tree.
+//! 6. The volume's **snapshot-metadata tree** (`apfs_snap_meta_tree_oid`)
+//!    is read as a physical leaf-only tree and yields a list of
+//!    `(xid, name, sblock_paddr, create_time)` tuples. Snapshots can be
+//!    opened via [`Apfs::open_snapshot`] / [`Apfs::open_snapshot_by_name`].
+//! 7. The [`mod@write`] submodule produces minimal APFS images from
+//!    scratch — see [`write::ApfsWriter`] for the API.
 //!
 //! ## Honest limitations
 //!
@@ -30,12 +36,14 @@
 //!   hash function isn't implemented here; range scans iterate by
 //!   `(parent_oid, DIR_REC)` prefix and filter by name in the caller, so
 //!   correctness doesn't depend on the hash.
-//! - **No snapshots.** Anything that involves snapshot lookups
-//!   (`om_snapshot_tree`, sealed volumes, snapshot rollback) returns
-//!   `Unsupported`.
+//! - **Snapshots** are read-only, single-leaf-tree only — multi-level
+//!   snap-meta trees return `Unsupported`. Snapshot lookups use the
+//!   snap-meta tree's `sblock_oid` directly and re-bind the volume's
+//!   omap to the snapshot's xid.
 //! - **No encryption.** Encrypted volumes are detected via `apfs_fs_flags`
 //!   and refused with `Unsupported`.
-//! - **No sealed-volume hashes / integrity tree.**
+//! - **No sealed-volume hashes / integrity tree.** Sealed volumes are
+//!   detected via `APFS_INCOMPAT_SEALED_VOLUME` and refused.
 //! - **No FusionDrive tiering** (the secondary `nx_efi_jumpstart`
 //!   structures, tier-2 omap, etc.).
 //! - **No xattrs, no resource forks, no clones, no compressed files**
@@ -45,6 +53,8 @@
 //!   real images often disagree with the spec in subtle ways and we'd
 //!   rather return data than refuse it. The checksum helper is still
 //!   exposed for callers that want to enforce it.
+//! - **Writer is single-leaf-only.** See [`mod@write`] for the per-feature
+//!   limits.
 //!
 //! ## References
 //!
@@ -58,7 +68,9 @@ pub mod fstree;
 pub mod jrec;
 pub mod obj;
 pub mod omap;
+pub mod snap;
 pub mod superblock;
+pub mod write;
 
 use crate::Result;
 use crate::block::BlockDevice;
@@ -70,6 +82,7 @@ use jrec::{
 };
 use obj::{OBJECT_TYPE_MASK, ObjPhys};
 use omap::{OmapPhys, lookup as omap_lookup};
+use snap::{SnapMetaVal, decode_snap_meta_key};
 use superblock::{ApfsSuperblock, NX_MAGIC, NxSuperblock};
 
 /// Root inode object id in every APFS volume.
@@ -89,6 +102,12 @@ pub struct Apfs {
     total_bytes: u64,
     /// Volume name (UTF-8, trimmed of trailing NUL).
     volume_name: String,
+    /// `apfs_snap_meta_tree_oid` — physical block of the snapshot
+    /// metadata B-tree root, or zero when the volume has no snapshots.
+    snap_meta_tree_oid: u64,
+    /// Which slot in `nx_fs_oid[]` produced this volume. A snapshot
+    /// view inherits the parent volume's slot.
+    volume_index: usize,
     /// Fs-tree root block — kept around because every fs-tree walk
     /// starts here. Internal-node children are virtual oids resolved
     /// through the volume omap in `fs_ctx`.
@@ -109,6 +128,7 @@ impl std::fmt::Debug for Apfs {
             .field("total_bytes", &self.total_bytes)
             .field("volume_name", &self.volume_name)
             .field("drec_layout", &self.drec_layout)
+            .field("volume_index", &self.volume_index)
             .finish_non_exhaustive()
     }
 }
@@ -118,74 +138,165 @@ impl std::fmt::Debug for Apfs {
 /// layout (`j_drec_key_t`) is in use.
 const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x0000_0008;
 
+/// Bundle of container-level state used by every volume opener so we
+/// don't have to re-scan the checkpoint descriptor area on each call.
+#[derive(Debug, Clone)]
+struct ContainerCtx {
+    live_sb: NxSuperblock,
+    omap_root: Vec<u8>,
+    block_size: u32,
+    total_bytes: u64,
+}
+
+/// Public summary of one populated `nx_fs_oid[]` slot, returned by
+/// [`Apfs::list_volumes`].
+#[derive(Debug, Clone)]
+pub struct VolumeInfo {
+    /// Index into `nx_fs_oid[]` (0-based). Pass this to
+    /// [`Apfs::open_volume`].
+    pub index: usize,
+    /// Virtual oid recorded in `nx_fs_oid[index]`.
+    pub vol_oid: u64,
+    /// Volume name from the volume's APSB (`apfs_volname`).
+    pub name: String,
+    /// `apfs_role` — the volume's role byte (0 = no role).
+    pub role: u16,
+    /// True when the volume's `APFS_FS_UNENCRYPTED` flag is clear — i.e.
+    /// the volume is encrypted and won't open.
+    pub encrypted: bool,
+    /// Volume UUID.
+    pub uuid: [u8; 16],
+}
+
+/// Public summary of one snapshot, returned by [`Apfs::list_snapshots`].
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+    /// Transaction id at which the snapshot was taken.
+    pub xid: u64,
+    /// Snapshot name (UTF-8, trimmed of trailing NUL).
+    pub name: String,
+    /// Per-snapshot APSB physical block address (`sblock_oid`).
+    pub sblock_paddr: u64,
+    /// `j_snap_metadata_val_t.create_time` (nanoseconds since 1970-01-01).
+    pub create_time: u64,
+}
+
 impl Apfs {
     /// Decode the container, find the active checkpoint, locate the
-    /// first volume, and cache its fs-tree root block. Errors out with
-    /// `Unsupported` when the image trips one of the explicit
-    /// limitations listed at module level.
+    /// first populated volume slot, and cache its fs-tree root block.
+    /// Errors out with `Unsupported` when the image trips one of the
+    /// explicit limitations listed at module level.
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
-        // ---- Container superblock at block 0 ----
-        let mut block0 = vec![0u8; 4096];
-        dev.read_at(0, &mut block0)?;
-        let label_sb = NxSuperblock::decode(&block0)?;
-        let block_size = label_sb.block_size;
-        if block_size == 0 || block_size > 65_536 || !block_size.is_power_of_two() {
-            return Err(crate::Error::InvalidImage(format!(
-                "apfs: nx_block_size {block_size} is not a sensible power of two"
-            )));
-        }
-
-        // Re-read block 0 at the real block size in case it differs.
-        let mut block0 = vec![0u8; block_size as usize];
-        dev.read_at(0, &mut block0)?;
-        let label_sb = NxSuperblock::decode(&block0)?;
-
-        // ---- Walk the checkpoint descriptor area for the live NXSB ----
-        // The on-disk label NXSB (block 0) may or may not be current.
-        // Each checkpoint produces a fresh NXSB written into one of the
-        // xp_desc_blocks at xp_desc_base. We pick the one with the
-        // highest xid carrying a valid NXSB magic.
-        let live_sb = find_live_nxsb(dev, &label_sb, block_size)?.unwrap_or(label_sb.clone());
-
-        let total_bytes = live_sb.block_count.saturating_mul(block_size as u64);
-
-        // ---- Container omap ----
-        // The container omap's oid is *physical* (it lives at that block
-        // number directly, like everything in the container superblock
-        // chain). Read the omap header, then its tree.
-        let omap_phys =
-            read_object::<OmapPhys>(dev, live_sb.omap_oid, block_size, OmapPhys::decode)?;
-
-        // The omap's tree root is also physical.
-        let mut omap_root_block = vec![0u8; block_size as usize];
-        dev.read_at(
-            omap_phys.tree_oid.saturating_mul(block_size as u64),
-            &mut omap_root_block,
-        )?;
-
-        // ---- Resolve the first volume's APSB through the container omap ----
-        let vol_oid = live_sb
+        let ctx = load_container(dev)?;
+        let vol_index = ctx
+            .live_sb
             .fs_oid
             .iter()
-            .copied()
-            .find(|&o| o != 0)
+            .position(|&o| o != 0)
             .ok_or_else(|| {
                 crate::Error::InvalidImage("apfs: container has no volumes in nx_fs_oid".into())
             })?;
-        // Target xid is the container's current xid.
-        let target_xid = live_sb.obj.xid;
+        Self::open_volume_with_ctx(dev, &ctx, vol_index, None)
+    }
+
+    /// List every populated `nx_fs_oid[]` slot. Encrypted volumes are
+    /// returned with `encrypted = true` so callers can surface them in
+    /// UIs even though [`Apfs::open_volume`] will refuse them.
+    pub fn list_volumes(dev: &mut dyn BlockDevice) -> Result<Vec<VolumeInfo>> {
+        let ctx = load_container(dev)?;
+        let target_xid = ctx.live_sb.obj.xid;
+        let mut out = Vec::new();
+        for (i, &vol_oid) in ctx.live_sb.fs_oid.iter().enumerate() {
+            if vol_oid == 0 {
+                continue;
+            }
+            let mut dev_reader = DevReader {
+                dev,
+                block_size: ctx.block_size,
+            };
+            let vol_loc =
+                match omap_lookup(&ctx.omap_root, vol_oid, target_xid, &mut |paddr, buf| {
+                    dev_reader.read(paddr, buf)
+                })? {
+                    Some(v) => v,
+                    None => continue,
+                };
+            let mut apsb_block = vec![0u8; ctx.block_size as usize];
+            dev_reader.read(vol_loc.paddr, &mut apsb_block)?;
+            let apsb = match ApfsSuperblock::decode(&apsb_block) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            const APFS_FS_UNENCRYPTED: u64 = 0x0000_0001;
+            // `apfs_role` lives at offset 964; superblock.rs doesn't
+            // capture it directly, so peek here.
+            let role = if apsb_block.len() >= 966 {
+                u16::from_le_bytes(apsb_block[964..966].try_into().unwrap())
+            } else {
+                0
+            };
+            out.push(VolumeInfo {
+                index: i,
+                vol_oid,
+                name: apsb.volname.clone(),
+                role,
+                encrypted: apsb.fs_flags & APFS_FS_UNENCRYPTED == 0,
+                uuid: apsb.vol_uuid,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Open the volume at `nx_fs_oid[index]`. Use [`Apfs::list_volumes`]
+    /// to enumerate slots first.
+    pub fn open_volume(dev: &mut dyn BlockDevice, index: usize) -> Result<Self> {
+        let ctx = load_container(dev)?;
+        Self::open_volume_with_ctx(dev, &ctx, index, None)
+    }
+
+    /// Internal: open a specific volume slot, optionally rebound to a
+    /// snapshot view via `(sblock_paddr, snap_xid)`.
+    fn open_volume_with_ctx(
+        dev: &mut dyn BlockDevice,
+        ctx: &ContainerCtx,
+        index: usize,
+        snapshot: Option<(u64, u64)>,
+    ) -> Result<Self> {
+        if index >= ctx.live_sb.fs_oid.len() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "apfs: volume index {index} out of range"
+            )));
+        }
+        let vol_oid = ctx.live_sb.fs_oid[index];
+        if vol_oid == 0 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "apfs: nx_fs_oid[{index}] is empty"
+            )));
+        }
+        let block_size = ctx.block_size;
+        let target_xid = ctx.live_sb.obj.xid;
         let mut dev_reader = DevReader { dev, block_size };
-        let vol_loc = omap_lookup(&omap_root_block, vol_oid, target_xid, &mut |paddr, buf| {
-            dev_reader.read(paddr, buf)
-        })?
-        .ok_or_else(|| {
-            crate::Error::InvalidImage(format!(
-                "apfs: container omap has no entry for volume oid {vol_oid:#x}"
-            ))
-        })?;
+
+        // Resolve the APSB physical block: either look it up live in the
+        // container omap, or use a snapshot-supplied physical block.
+        let apsb_paddr = match snapshot {
+            Some((p, _)) => p,
+            None => {
+                let vol_loc =
+                    omap_lookup(&ctx.omap_root, vol_oid, target_xid, &mut |paddr, buf| {
+                        dev_reader.read(paddr, buf)
+                    })?
+                    .ok_or_else(|| {
+                        crate::Error::InvalidImage(format!(
+                            "apfs: container omap has no entry for volume oid {vol_oid:#x}"
+                        ))
+                    })?;
+                vol_loc.paddr
+            }
+        };
 
         let mut apsb_block = vec![0u8; block_size as usize];
-        dev_reader.read(vol_loc.paddr, &mut apsb_block)?;
+        dev_reader.read(apsb_paddr, &mut apsb_block)?;
         let apsb = ApfsSuperblock::decode(&apsb_block)?;
 
         // Bail early on encrypted volumes — we can't decrypt anything.
@@ -193,6 +304,13 @@ impl Apfs {
         if apsb.fs_flags & APFS_FS_UNENCRYPTED == 0 {
             return Err(crate::Error::Unsupported(
                 "apfs: encrypted volumes are not supported (read)".into(),
+            ));
+        }
+        // Sealed-volume integrity hashes are not honoured.
+        const APFS_INCOMPAT_SEALED_VOLUME: u64 = 0x0000_0080;
+        if apsb.incompatible_features & APFS_INCOMPAT_SEALED_VOLUME != 0 {
+            return Err(crate::Error::Unsupported(
+                "apfs: sealed volumes (integrity hashes) are not supported".into(),
             ));
         }
 
@@ -203,16 +321,23 @@ impl Apfs {
         let mut vol_omap_root = vec![0u8; block_size as usize];
         dev_reader.read(vol_omap_phys.tree_oid, &mut vol_omap_root)?;
 
+        // For snapshots the omap xid is the snapshot's xid; for the
+        // live volume it's the APSB's own xid.
+        let omap_xid = match snapshot {
+            Some((_, xid)) => xid,
+            None => apsb.obj.xid,
+        };
+
         // ---- Resolve fsroot through the volume omap (multi-level safe) ----
         let fsroot_loc = omap_lookup(
             &vol_omap_root,
             apsb.root_tree_oid,
-            apsb.obj.xid,
+            omap_xid,
             &mut |paddr, buf| dev_reader.read(paddr, buf),
         )?
         .ok_or_else(|| {
             crate::Error::InvalidImage(format!(
-                "apfs: volume omap has no entry for root_tree_oid {:#x}",
+                "apfs: volume omap has no entry for root_tree_oid {:#x} @ xid {omap_xid}",
                 apsb.root_tree_oid
             ))
         })?;
@@ -235,16 +360,103 @@ impl Apfs {
                 DrecKeyLayout::Plain
             };
 
-        let fs_ctx = FsTreeCtx::new(vol_omap_root, apsb.obj.xid, block_size as usize);
+        let fs_ctx = FsTreeCtx::new(vol_omap_root, omap_xid, block_size as usize);
 
         Ok(Self {
             block_size,
-            total_bytes,
+            total_bytes: ctx.total_bytes,
             volume_name: apsb.volname,
+            snap_meta_tree_oid: apsb.snap_meta_tree_oid,
+            volume_index: index,
             fsroot_block,
             fs_ctx: std::cell::RefCell::new(fs_ctx),
             drec_layout,
         })
+    }
+
+    /// List every snapshot recorded in the volume's snapshot-metadata
+    /// tree. The snap-meta tree is a physical B-tree; we read its root
+    /// block directly. Multi-level snap-meta trees return `Unsupported`
+    /// cleanly.
+    pub fn list_snapshots(&self, dev: &mut dyn BlockDevice) -> Result<Vec<SnapshotInfo>> {
+        if self.snap_meta_tree_oid == 0 {
+            return Ok(Vec::new());
+        }
+        let mut root = vec![0u8; self.block_size as usize];
+        let off = self
+            .snap_meta_tree_oid
+            .saturating_mul(self.block_size as u64);
+        dev.read_at(off, &mut root)?;
+        let node = btree::BTreeNode::decode(&root)?;
+        if !node.is_leaf() {
+            return Err(crate::Error::Unsupported(
+                "apfs: multi-level snapshot-metadata trees are not supported".into(),
+            ));
+        }
+        let mut out = Vec::new();
+        for i in 0..node.nkeys {
+            let (kb, vb) = node.entry_at(i, 0, 0)?;
+            let (kind, xid) = match decode_snap_meta_key(kb) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if kind != jrec::APFS_TYPE_SNAP_METADATA {
+                continue;
+            }
+            let meta = match SnapMetaVal::decode(vb) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            out.push(SnapshotInfo {
+                xid,
+                name: meta.name,
+                sblock_paddr: meta.sblock_oid,
+                create_time: meta.create_time,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Open a snapshot of this volume by transaction id.
+    ///
+    /// The returned [`Apfs`] reads through the same volume omap as
+    /// `self` but filters lookups by the snapshot's xid, so it sees
+    /// the on-disk state that existed at that xid.
+    pub fn open_snapshot(&self, dev: &mut dyn BlockDevice, xid: u64) -> Result<Self> {
+        let snaps = self.list_snapshots(dev)?;
+        let snap = snaps
+            .iter()
+            .find(|s| s.xid == xid)
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("apfs: no snapshot with xid {xid}"))
+            })?
+            .clone();
+        let ctx = load_container(dev)?;
+        Self::open_volume_with_ctx(
+            dev,
+            &ctx,
+            self.volume_index,
+            Some((snap.sblock_paddr, snap.xid)),
+        )
+    }
+
+    /// Open a snapshot of this volume by name.
+    pub fn open_snapshot_by_name(&self, dev: &mut dyn BlockDevice, name: &str) -> Result<Self> {
+        let snaps = self.list_snapshots(dev)?;
+        let snap = snaps
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("apfs: no snapshot named {name:?}"))
+            })?
+            .clone();
+        let ctx = load_container(dev)?;
+        Self::open_volume_with_ctx(
+            dev,
+            &ctx,
+            self.volume_index,
+            Some((snap.sblock_paddr, snap.xid)),
+        )
     }
 
     /// List the children of `path`. Only absolute paths starting at "/"
@@ -436,7 +648,9 @@ impl Apfs {
             let ino = InodeVal::decode(&vb)?;
             const S_IFMT: u16 = 0o170_000;
             const S_IFREG: u16 = 0o100_000;
-            if ino.mode & S_IFMT != S_IFREG {
+            const S_IFLNK: u16 = 0o120_000;
+            let mt = ino.mode & S_IFMT;
+            if mt != S_IFREG && mt != S_IFLNK {
                 return Err(crate::Error::InvalidArgument(format!(
                     "apfs: oid {oid:#x} is not a regular file (mode {:#o})",
                     ino.mode
@@ -584,6 +798,46 @@ pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
 }
 
 // ---- small free helpers below ----
+
+/// Load the container-level state required to (re-)open any volume on
+/// `dev`: the live NXSB plus its already-loaded container omap root.
+fn load_container(dev: &mut dyn BlockDevice) -> Result<ContainerCtx> {
+    // ---- Container superblock at block 0 ----
+    let mut block0 = vec![0u8; 4096];
+    dev.read_at(0, &mut block0)?;
+    let label_sb = NxSuperblock::decode(&block0)?;
+    let block_size = label_sb.block_size;
+    if block_size == 0 || block_size > 65_536 || !block_size.is_power_of_two() {
+        return Err(crate::Error::InvalidImage(format!(
+            "apfs: nx_block_size {block_size} is not a sensible power of two"
+        )));
+    }
+
+    // Re-read block 0 at the real block size in case it differs.
+    let mut block0 = vec![0u8; block_size as usize];
+    dev.read_at(0, &mut block0)?;
+    let label_sb = NxSuperblock::decode(&block0)?;
+
+    // ---- Walk the checkpoint descriptor area for the live NXSB ----
+    let live_sb = find_live_nxsb(dev, &label_sb, block_size)?.unwrap_or(label_sb.clone());
+
+    let total_bytes = live_sb.block_count.saturating_mul(block_size as u64);
+
+    // ---- Container omap ----
+    let omap_phys = read_object::<OmapPhys>(dev, live_sb.omap_oid, block_size, OmapPhys::decode)?;
+    let mut omap_root_block = vec![0u8; block_size as usize];
+    dev.read_at(
+        omap_phys.tree_oid.saturating_mul(block_size as u64),
+        &mut omap_root_block,
+    )?;
+
+    Ok(ContainerCtx {
+        live_sb,
+        omap_root: omap_root_block,
+        block_size,
+        total_bytes,
+    })
+}
 
 /// Walk the checkpoint descriptor area looking for an NXSB whose xid is
 /// strictly larger than the label NXSB's xid. Returns the chosen super-
@@ -743,5 +997,14 @@ mod tests {
             e,
             crate::Error::InvalidImage(_) | crate::Error::OutOfBounds { .. }
         ));
+    }
+
+    /// list_volumes on a blank device fails the same way `open` does
+    /// (InvalidImage at the magic check).
+    #[test]
+    fn list_volumes_blank_fails() {
+        let mut dev = MemoryBackend::new(64 * 1024);
+        let e = Apfs::list_volumes(&mut dev).unwrap_err();
+        assert!(matches!(e, crate::Error::InvalidImage(_)));
     }
 }

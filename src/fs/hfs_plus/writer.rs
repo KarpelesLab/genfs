@@ -1591,6 +1591,20 @@ pub(crate) fn ensure_private_dir(writer: &mut Writer) -> Result<u32> {
     // mode 0700 / uid root / gid root, S_IFDIR is or'ed in by insert_folder.
     insert_folder(writer, ROOT_FOLDER_ID, &name, cnid, 0o700, 0, 0)?;
     writer.private_dir_cnid = Some(cnid);
+    // Apple marks the Private Data directory as invisible in Finder:
+    // FolderInfo.frFlags |= kIsInvisible (0x4000). The FolderInfo block
+    // sits at byte 48..64 of the 88-byte folder body; frFlags is the
+    // u16 at byte 48 + 8 = 56.
+    let folder_key = OwnedKey {
+        parent_id: ROOT_FOLDER_ID,
+        name,
+    };
+    if let Some(body) = writer.catalog.get_mut(&folder_key) {
+        if body.len() >= 58 {
+            let cur = u16::from_be_bytes([body[56], body[57]]);
+            body[56..58].copy_from_slice(&(cur | 0x4000).to_be_bytes());
+        }
+    }
     Ok(cnid)
 }
 

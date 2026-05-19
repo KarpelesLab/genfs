@@ -7,7 +7,6 @@
 //! counter, and they preserve directory-entry slack so an LFN run plus
 //! its 8.3 entry land in consecutive slots as the spec requires.
 
-use std::io::Read;
 use std::path::Path;
 
 use super::{Fat32, SECTOR, dir, table};
@@ -253,13 +252,28 @@ impl Fat32 {
         dest_path: &str,
         host_src: &Path,
     ) -> Result<()> {
+        let size = std::fs::metadata(host_src)?.len();
+        let mut file = std::fs::File::open(host_src)?;
+        self.add_file_from_reader(dev, dest_path, &mut file, size)
+    }
+
+    /// Like [`Self::add_file`] but pulls bytes from any [`std::io::Read`]
+    /// instead of a host filesystem path. The reader must produce exactly
+    /// `size` bytes; used by the repack path to stream content directly
+    /// from another opened filesystem.
+    pub fn add_file_from_reader(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dest_path: &str,
+        reader: &mut dyn std::io::Read,
+        size: u64,
+    ) -> Result<()> {
         let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
         if self.find_entry(dev, parent_cluster, &leaf)?.is_some() {
             return Err(crate::Error::InvalidArgument(format!(
                 "fat32: {dest_path:?} already exists"
             )));
         }
-        let size = std::fs::metadata(host_src)?.len();
         let cb = self.cluster_bytes();
         let chain = if size == 0 {
             Vec::new()
@@ -267,11 +281,37 @@ impl Fat32 {
             let n = size.div_ceil(cb) as u32;
             self.alloc_free_clusters(n)?
         };
-        self.stream_file_chain(dev, host_src, &chain, size)?;
+        self.stream_reader_chain(dev, reader, &chain, size)?;
         let first = chain.first().copied().unwrap_or(0);
         let mut entries: Vec<u8> = Vec::new();
         self.push_dir_entry(&mut entries, &leaf, dir::ATTR_ARCHIVE, first, size as u32);
         self.append_dir_entries(dev, parent_cluster, &entries)?;
+        Ok(())
+    }
+
+    fn stream_reader_chain(
+        &self,
+        dev: &mut dyn BlockDevice,
+        reader: &mut dyn std::io::Read,
+        chain: &[u32],
+        size: u64,
+    ) -> Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+        let cb = self.cluster_bytes() as usize;
+        let mut buf = vec![0u8; cb];
+        let mut remaining = size;
+        for &c in chain {
+            let want = remaining.min(cb as u64) as usize;
+            buf[..want].fill(0);
+            reader.read_exact(&mut buf[..want])?;
+            dev.write_at(self.cluster_offset(c), &buf[..want])?;
+            remaining -= want as u64;
+            if remaining == 0 {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -425,34 +465,6 @@ impl Fat32 {
             file_size,
         };
         entries.extend_from_slice(&entry.encode());
-    }
-
-    /// Stream a host file into a pre-allocated cluster chain.
-    fn stream_file_chain(
-        &self,
-        dev: &mut dyn BlockDevice,
-        host: &Path,
-        chain: &[u32],
-        size: u64,
-    ) -> Result<()> {
-        if size == 0 {
-            return Ok(());
-        }
-        let cb = self.cluster_bytes() as usize;
-        let mut file = std::fs::File::open(host)?;
-        let mut buf = vec![0u8; cb];
-        let mut remaining = size;
-        for &c in chain {
-            let want = remaining.min(cb as u64) as usize;
-            buf[..want].fill(0);
-            file.read_exact(&mut buf[..want])?;
-            dev.write_at(self.cluster_offset(c), &buf[..want])?;
-            remaining -= want as u64;
-            if remaining == 0 {
-                break;
-            }
-        }
-        Ok(())
     }
 }
 

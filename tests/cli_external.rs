@@ -943,3 +943,103 @@ fn cli_repack_ext_to_fat32() {
         "missing README.txt in FAT32 output:\n{s}"
     );
 }
+
+/// `fstool repack` preserves symlinks, mode, and uid/gid (ext → ext).
+/// Verifies that the direct FS-to-FS copier doesn't drop metadata that
+/// the previous host-tempdir staging implementation lost.
+#[test]
+fn cli_repack_preserves_symlinks_and_mode() {
+    if !which("e2fsck") || !which("mke2fs") || !which("debugfs") {
+        eprintln!("skipping: e2fsprogs missing");
+        return;
+    }
+
+    // Build a source ext4 with a regular file (mode 0640), a relative
+    // symlink, and an absolute symlink — none of which the old
+    // staging path could reproduce without root.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("regular.txt"), b"keep me\n").unwrap();
+    std::os::unix::fs::symlink("regular.txt", srcdir.path().join("link-rel")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", srcdir.path().join("link-abs")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let p = srcdir.path().join("regular.txt");
+    let mut perms = std::fs::metadata(&p).unwrap().permissions();
+    perms.set_mode(0o640);
+    std::fs::set_permissions(&p, perms).unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "16M"])
+        .arg(src.path())
+        .output()
+        .unwrap();
+    Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .output()
+        .unwrap();
+
+    let dst = NamedTempFile::new().unwrap();
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(src.path())
+        .arg(dst.path())
+        .arg("--shrink")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "repack failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // debugfs reports per-inode mode + symlink targets.
+    let ls = Command::new("debugfs")
+        .arg("-R")
+        .arg("ls -l /")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    // mode for regular.txt should be 0640 (octal "100640" = REG | 0640).
+    assert!(
+        listing.contains("100640"),
+        "mode 0640 not preserved on regular.txt:\n{listing}"
+    );
+
+    let abs = Command::new("debugfs")
+        .arg("-R")
+        .arg("stat /link-abs")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    let abs_out = String::from_utf8_lossy(&abs.stdout);
+    assert!(
+        abs_out.contains("/etc/passwd"),
+        "absolute symlink target lost:\n{abs_out}"
+    );
+
+    let rel = Command::new("debugfs")
+        .arg("-R")
+        .arg("stat /link-rel")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    let rel_out = String::from_utf8_lossy(&rel.stdout);
+    assert!(
+        rel_out.contains("regular.txt"),
+        "relative symlink target lost:\n{rel_out}"
+    );
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after repack:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+}

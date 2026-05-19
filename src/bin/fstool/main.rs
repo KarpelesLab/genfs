@@ -331,34 +331,6 @@ fn run(cli: Cli) -> fstool::Result<()> {
     }
 }
 
-/// A self-cleaning host-side staging directory. Used by `repack` to
-/// materialise the source filesystem's content before re-formatting
-/// into the destination. Drop removes the whole tree.
-struct StagingDir(std::path::PathBuf);
-
-impl StagingDir {
-    fn new() -> fstool::Result<Self> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let mut path = std::env::temp_dir();
-        path.push(format!("fstool-repack-{}-{}", std::process::id(), nanos));
-        std::fs::create_dir(&path)?;
-        Ok(Self(path))
-    }
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for StagingDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn convert_cmd(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -416,105 +388,330 @@ fn repack_cmd(
     cluster_size: &str,
 ) -> fstool::Result<()> {
     let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
-    let target = fstool::inspect::Target::parse(src);
+    let src_target = fstool::inspect::Target::parse(src);
 
-    // Stage source FS content into a host tempdir. The tempdir's lifetime
-    // covers the destination build below; Drop cleans it up.
-    let staging = StagingDir::new()?;
-    let (source_kind, src_total_size) = fstool::inspect::with_target_device(&target, |dev| {
-        let fs = fstool::inspect::AnyFs::open(dev)?;
-        let kind = fs.kind_string().to_string();
-        let total = dev.total_size();
-        stage_fs_to_dir(dev, &fs, staging.path())?;
-        Ok::<_, fstool::Error>((kind, total))
-    })?;
+    // Open the source once and walk it; the source FS stays open across
+    // the destination build so we stream each file straight through
+    // without ever touching the host filesystem.
+    fstool::inspect::with_target_device(&src_target, |src_dev| {
+        let src_fs = fstool::inspect::AnyFs::open(src_dev)?;
+        let source_kind = src_fs.kind_string();
+        let src_total = src_dev.total_size();
 
-    // Pick destination FS type.
-    let target_fs = fs_type_override
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| source_kind.clone());
+        // Compute the destination size + a BuildPlan-shaped sketch by
+        // walking the source FS, no host I/O involved.
+        let target_fs_str = fs_type_override.unwrap_or(source_kind).to_string();
+        let lower = target_fs_str.to_ascii_lowercase();
+        let dst_size = match (size_arg, shrink) {
+            (Some(s), _) => fstool::spec::parse_size(s)?,
+            (None, true) => match lower.as_str() {
+                "ext2" | "ext3" | "ext4" => {
+                    let plan = build_ext_plan(src_dev, &src_fs, block_size, &lower)?;
+                    plan.blocks_count() as u64 * plan.block_size as u64
+                }
+                "fat32" | "vfat" => {
+                    let bytes = sum_source_file_bytes(src_dev, &src_fs)?;
+                    let needed = bytes
+                        .saturating_mul(2)
+                        .max(fstool::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024);
+                    needed.div_ceil(512) * 512
+                }
+                other => {
+                    return Err(fstool::Error::InvalidArgument(format!(
+                        "repack: unknown --fs-type {other:?}"
+                    )));
+                }
+            },
+            (None, false) => src_total,
+        };
 
-    // Pick destination size.
-    let target_size = match (size_arg, shrink) {
-        (Some(s), _) => fstool::spec::parse_size(s)?,
-        (None, true) => 0, // sentinel: auto-shrink, computed below
-        (None, false) => src_total_size,
-    };
-
-    // Dispatch to ext-build or fat-build paths, sourcing from the
-    // staged tree.
-    match target_fs.to_ascii_lowercase().as_str() {
-        "ext2" | "ext3" | "ext4" => repack_into_ext(
-            staging.path(),
+        // Format the destination.
+        let mut dst_dev = fstool::block::create_image(
             dst,
-            &target_fs,
-            block_size,
-            target_size,
-            shrink,
-            qcow2_cluster_size,
-        )?,
-        "fat32" | "vfat" => {
-            repack_into_fat32(staging.path(), dst, target_size, shrink, qcow2_cluster_size)?
+            dst_size,
+            &fstool::block::CreateOpts {
+                cluster_size: qcow2_cluster_size,
+            },
+        )?;
+        match lower.as_str() {
+            "ext2" | "ext3" | "ext4" => {
+                let plan = build_ext_plan(src_dev, &src_fs, block_size, &lower)?;
+                let mut opts = plan.to_format_opts();
+                // Grow to fill the destination if the user requested an
+                // explicit size larger than the auto-min.
+                let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
+                if dst_size > plan_size {
+                    let max = (dst_size / opts.block_size as u64) as u32;
+                    opts.blocks_count = (max / 8) * 8;
+                    let by_density =
+                        (opts.blocks_count as u64 * opts.block_size as u64 / 16_384) as u32;
+                    opts.inodes_count = opts.inodes_count.max(by_density);
+                }
+                let mut dst_ext = fstool::fs::ext::Ext::format_with(dst_dev.as_mut(), &opts)?;
+                copy_into_ext(src_dev, &src_fs, dst_dev.as_mut(), &mut dst_ext)?;
+                dst_ext.flush(dst_dev.as_mut())?;
+            }
+            "fat32" | "vfat" => {
+                let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
+                    fstool::Error::InvalidArgument(
+                        "repack: FAT32 size doesn't fit in a u32 sector count".into(),
+                    )
+                })?;
+                let label = *b"REPACKED   ";
+                let opts = fstool::fs::fat::FatFormatOpts {
+                    total_sectors,
+                    volume_id: 0,
+                    volume_label: label,
+                };
+                let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
+                copy_into_fat32(src_dev, &src_fs, dst_dev.as_mut(), &mut dst_fat)?;
+                dst_fat.flush(dst_dev.as_mut())?;
+            }
+            other => {
+                return Err(fstool::Error::InvalidArgument(format!(
+                    "repack: unknown --fs-type {other:?}"
+                )));
+            }
         }
-        other => {
-            return Err(fstool::Error::InvalidArgument(format!(
-                "repack: unknown --fs-type {other:?}"
-            )));
+        dst_dev.sync()?;
+        eprintln!(
+            "repacked {src} → {} (fs: {source_kind} → {target_fs_str}, {dst_size} bytes)",
+            dst.display()
+        );
+        Ok(())
+    })
+}
+
+/// Walk the source filesystem and recreate every entry inside the
+/// destination ext. Preserves mode, uid/gid, mtime, atime, ctime; copies
+/// symlinks and device nodes verbatim when the source is ext (FAT
+/// source has none of those).
+fn copy_into_ext(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src_fs: &fstool::inspect::AnyFs,
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::ext::Ext,
+) -> fstool::Result<()> {
+    use fstool::fs::FileMeta;
+    use fstool::inspect::AnyFs;
+    match src_fs {
+        AnyFs::Ext(src_ext) => copy_ext_dir(src_dev, src_ext, 2, dst_dev, dst, 2),
+        AnyFs::Fat32(src_fat) => {
+            copy_fat_dir_into_ext(src_dev, src_fat, "/", dst_dev, dst, 2, &FileMeta::default())
         }
     }
+}
 
-    eprintln!(
-        "repacked {} → {} (fs: {} → {})",
-        src,
-        dst.display(),
-        source_kind,
-        target_fs
-    );
+/// Walk the source filesystem and recreate every entry inside the
+/// destination FAT32. FAT can't represent symlinks / device nodes /
+/// per-file permissions — those are dropped (with a stderr note when
+/// the source had them).
+fn copy_into_fat32(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src_fs: &fstool::inspect::AnyFs,
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::fat::Fat32,
+) -> fstool::Result<()> {
+    use fstool::inspect::AnyFs;
+    match src_fs {
+        AnyFs::Ext(src_ext) => copy_ext_dir_into_fat(src_dev, src_ext, 2, "/", dst_dev, dst),
+        AnyFs::Fat32(src_fat) => copy_fat_dir_into_fat(src_dev, src_fat, "/", dst_dev, dst),
+    }
+}
+
+// ─── ext → ext (full metadata preservation) ─────────────────────────────
+
+fn copy_ext_dir(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::ext::Ext,
+    src_ino: u32,
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::ext::Ext,
+    dst_ino: u32,
+) -> fstool::Result<()> {
+    use fstool::fs::ext::inode::decode_devnum;
+    use fstool::fs::{DeviceKind, FileMeta};
+
+    let entries = src.list_inode(src_dev, src_ino)?;
+    for e in entries {
+        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
+            continue;
+        }
+        let inode = src.read_inode(src_dev, e.inode)?;
+        let meta = FileMeta {
+            mode: inode.mode & 0o7777,
+            uid: inode.uid as u32,
+            gid: inode.gid as u32,
+            mtime: inode.mtime,
+            atime: inode.atime,
+            ctime: inode.ctime,
+        };
+        let name = e.name.as_bytes();
+        let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
+        match mode_type {
+            t if t == fstool::fs::ext::constants::S_IFREG => {
+                // Stream cluster-by-cluster: read the source file's bytes
+                // into the destination ext's per-block buffer via a
+                // borrowed Read — no host filesystem involvement, no
+                // 'static-lifetime wrappers.
+                let mut reader = src.open_file_reader(src_dev, e.inode)?;
+                dst.add_file_to_streaming(
+                    dst_dev,
+                    dst_ino,
+                    name,
+                    &mut reader,
+                    inode.size as u64,
+                    meta,
+                )?;
+            }
+            t if t == fstool::fs::ext::constants::S_IFDIR => {
+                let new_ino = dst.add_dir_to(dst_dev, dst_ino, name, meta)?;
+                copy_ext_dir(src_dev, src, e.inode, dst_dev, dst, new_ino)?;
+            }
+            t if t == fstool::fs::ext::constants::S_IFLNK => {
+                let target = src.read_symlink_target(src_dev, e.inode)?;
+                dst.add_symlink_to(dst_dev, dst_ino, name, target.as_bytes(), meta)?;
+            }
+            t if t == fstool::fs::ext::constants::S_IFCHR => {
+                let (major, minor) = decode_devnum(inode.block[0]);
+                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Char, major, minor, meta)?;
+            }
+            t if t == fstool::fs::ext::constants::S_IFBLK => {
+                let (major, minor) = decode_devnum(inode.block[0]);
+                dst.add_device_to(
+                    dst_dev,
+                    dst_ino,
+                    name,
+                    DeviceKind::Block,
+                    major,
+                    minor,
+                    meta,
+                )?;
+            }
+            t if t == fstool::fs::ext::constants::S_IFIFO => {
+                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Fifo, 0, 0, meta)?;
+            }
+            t if t == fstool::fs::ext::constants::S_IFSOCK => {
+                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Socket, 0, 0, meta)?;
+            }
+            _ => {
+                eprintln!(
+                    "repack: skipping inode {} ({:?}) — unknown mode {:#o}",
+                    e.inode, e.name, inode.mode
+                );
+            }
+        }
+    }
     Ok(())
 }
 
-/// Walk every directory / regular file in `fs` and stage it under
-/// `staging`. Symlinks and device nodes are skipped with a warning;
-/// per-inode owner/mode is not preserved on the host filesystem (a
-/// repack is best-effort metadata-wise — file content is the contract).
-fn stage_fs_to_dir(
-    dev: &mut dyn fstool::block::BlockDevice,
-    fs: &fstool::inspect::AnyFs,
-    staging: &std::path::Path,
+// ─── FAT32 → FAT32 ──────────────────────────────────────────────────────
+
+fn copy_fat_dir_into_fat(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::fat::Fat32,
+    src_path: &str,
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::fat::Fat32,
 ) -> fstool::Result<()> {
     use fstool::fs::EntryKind;
-    // BFS using a queue of (fs-path, host-path) pairs.
-    let mut queue: Vec<(String, std::path::PathBuf)> =
-        vec![("/".to_string(), staging.to_path_buf())];
-    while let Some((fs_path, host_path)) = queue.pop() {
-        let entries = fs.list(dev, &fs_path)?;
-        for e in entries {
-            if e.name == "." || e.name == ".." || e.name == "lost+found" {
-                continue;
+    let entries = src.list_path(src_dev, src_path)?;
+    for e in entries {
+        let child = join_fs_path(src_path, &e.name);
+        match e.kind {
+            EntryKind::Dir => {
+                dst.add_dir(dst_dev, &child)?;
+                copy_fat_dir_into_fat(src_dev, src, &child, dst_dev, dst)?;
             }
-            let child_fs = join_fs_path(&fs_path, &e.name);
-            let child_host = host_path.join(&e.name);
-            match e.kind {
-                EntryKind::Dir => {
-                    std::fs::create_dir_all(&child_host)?;
-                    queue.push((child_fs, child_host));
-                }
-                EntryKind::Regular => {
-                    let mut out = std::fs::File::create(&child_host)?;
-                    fs.copy_file_to(dev, &child_fs, &mut out)?;
-                }
-                EntryKind::Symlink
-                | EntryKind::Char
-                | EntryKind::Block
-                | EntryKind::Fifo
-                | EntryKind::Socket
-                | EntryKind::Unknown => {
-                    eprintln!(
-                        "repack: skipping {child_fs:?} ({:?} — not preserved)",
-                        e.kind
-                    );
-                }
+            EntryKind::Regular => {
+                // Resolve the source entry to get its actual file_size.
+                let (entry, _) = src.resolve_entry(src_dev, &child)?;
+                let mut reader = src.open_file_reader(src_dev, &child)?;
+                dst.add_file_from_reader(dst_dev, &child, &mut reader, entry.file_size as u64)?;
             }
+            _ => {} // FAT can't carry anything else
+        }
+    }
+    Ok(())
+}
+
+// ─── ext → FAT32 (drops metadata FAT can't store) ───────────────────────
+
+fn copy_ext_dir_into_fat(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::ext::Ext,
+    src_ino: u32,
+    cur_path: &str,
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::fat::Fat32,
+) -> fstool::Result<()> {
+    let entries = src.list_inode(src_dev, src_ino)?;
+    for e in entries {
+        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
+            continue;
+        }
+        let inode = src.read_inode(src_dev, e.inode)?;
+        let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
+        let child = join_fs_path(cur_path, &e.name);
+        match mode_type {
+            t if t == fstool::fs::ext::constants::S_IFREG => {
+                let mut reader = src.open_file_reader(src_dev, e.inode)?;
+                dst.add_file_from_reader(dst_dev, &child, &mut reader, inode.size as u64)?;
+            }
+            t if t == fstool::fs::ext::constants::S_IFDIR => {
+                dst.add_dir(dst_dev, &child)?;
+                copy_ext_dir_into_fat(src_dev, src, e.inode, &child, dst_dev, dst)?;
+            }
+            t if t == fstool::fs::ext::constants::S_IFLNK
+                || t == fstool::fs::ext::constants::S_IFCHR
+                || t == fstool::fs::ext::constants::S_IFBLK
+                || t == fstool::fs::ext::constants::S_IFIFO
+                || t == fstool::fs::ext::constants::S_IFSOCK =>
+            {
+                eprintln!(
+                    "repack: dropping {child:?} ({:?}) — FAT32 can't represent it",
+                    fstool_mode_kind(mode_type)
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+// ─── FAT32 → ext ────────────────────────────────────────────────────────
+
+fn copy_fat_dir_into_ext(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::fat::Fat32,
+    src_path: &str,
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::ext::Ext,
+    dst_ino: u32,
+    meta: &fstool::fs::FileMeta,
+) -> fstool::Result<()> {
+    use fstool::fs::EntryKind;
+    let entries = src.list_path(src_dev, src_path)?;
+    for e in entries {
+        let child = join_fs_path(src_path, &e.name);
+        match e.kind {
+            EntryKind::Dir => {
+                let new_ino = dst.add_dir_to(dst_dev, dst_ino, e.name.as_bytes(), *meta)?;
+                copy_fat_dir_into_ext(src_dev, src, &child, dst_dev, dst, new_ino, meta)?;
+            }
+            EntryKind::Regular => {
+                let (entry, _) = src.resolve_entry(src_dev, &child)?;
+                let mut reader = src.open_file_reader(src_dev, &child)?;
+                dst.add_file_to_streaming(
+                    dst_dev,
+                    dst_ino,
+                    e.name.as_bytes(),
+                    &mut reader,
+                    entry.file_size as u64,
+                    *meta,
+                )?;
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -528,17 +725,31 @@ fn join_fs_path(parent: &str, leaf: &str) -> String {
     }
 }
 
-fn repack_into_ext(
-    staging: &std::path::Path,
-    dst: &std::path::Path,
-    fs_type: &str,
+fn fstool_mode_kind(mode_type: u16) -> &'static str {
+    use fstool::fs::ext::constants::*;
+    match mode_type {
+        t if t == S_IFLNK => "symlink",
+        t if t == S_IFCHR => "char-device",
+        t if t == S_IFBLK => "block-device",
+        t if t == S_IFIFO => "fifo",
+        t if t == S_IFSOCK => "socket",
+        _ => "other",
+    }
+}
+
+// ─── shrink sizing ───────────────────────────────────────────────────────
+
+/// Build a BuildPlan that reflects the source filesystem's content,
+/// without touching the host filesystem.
+fn build_ext_plan(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src_fs: &fstool::inspect::AnyFs,
     block_size: u32,
-    explicit_size: u64,
-    shrink: bool,
-    qcow2_cluster_size: u32,
-) -> fstool::Result<()> {
-    use fstool::fs::ext::{BuildPlan, Ext, FsKind};
-    let kind = match fs_type.to_ascii_lowercase().as_str() {
+    fs_kind_str: &str,
+) -> fstool::Result<fstool::fs::ext::BuildPlan> {
+    use fstool::fs::ext::{BuildPlan, FsKind};
+    use fstool::inspect::AnyFs;
+    let kind = match fs_kind_str {
         "ext2" => FsKind::Ext2,
         "ext3" => FsKind::Ext3,
         "ext4" => FsKind::Ext4,
@@ -549,86 +760,122 @@ fn repack_into_ext(
         }
     };
     let mut plan = BuildPlan::new(block_size, kind);
-    plan.scan_host_path(staging)?;
-    let mut opts = plan.to_format_opts();
-    let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
-    let final_size = if shrink {
-        plan_size
-    } else if explicit_size > plan_size {
-        // Scale opts.blocks_count up to the requested size; preserve
-        // byte-aligned blocks_per_group invariant.
-        let max_blocks_u64 = explicit_size / opts.block_size as u64;
-        let max_blocks = u32::try_from(max_blocks_u64).unwrap_or(u32::MAX);
-        opts.blocks_count = (max_blocks / 8) * 8;
-        let by_density = (opts.blocks_count as u64 * opts.block_size as u64 / 16_384) as u32;
-        opts.inodes_count = opts.inodes_count.max(by_density);
-        opts.blocks_count as u64 * opts.block_size as u64
-    } else {
-        plan_size
-    };
-
-    let mut dev = fstool::block::create_image(
-        dst,
-        final_size,
-        &fstool::block::CreateOpts {
-            cluster_size: qcow2_cluster_size,
-        },
-    )?;
-    let mut ext = Ext::format_with(dev.as_mut(), &opts)?;
-    ext.populate_from_host_dir(dev.as_mut(), 2, staging)?;
-    ext.flush(dev.as_mut())?;
-    dev.sync()?;
-    Ok(())
+    match src_fs {
+        AnyFs::Ext(src_ext) => walk_ext_for_plan(src_dev, src_ext, 2, &mut plan)?,
+        AnyFs::Fat32(src_fat) => walk_fat_for_plan(src_dev, src_fat, "/", &mut plan)?,
+    }
+    Ok(plan)
 }
 
-fn repack_into_fat32(
-    staging: &std::path::Path,
-    dst: &std::path::Path,
-    explicit_size: u64,
-    shrink: bool,
-    qcow2_cluster_size: u32,
+fn walk_ext_for_plan(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::ext::Ext,
+    src_ino: u32,
+    plan: &mut fstool::fs::ext::BuildPlan,
 ) -> fstool::Result<()> {
-    use fstool::fs::fat::{Fat32, MIN_FAT32_CLUSTERS};
-
-    let size = if shrink {
-        // Sum file sizes; pad to FAT32 minimum.
-        let total = walk_host_size(staging)?;
-        let needed = total
-            .saturating_mul(2)
-            .max(MIN_FAT32_CLUSTERS as u64 * 1024);
-        needed.div_ceil(512) * 512
-    } else {
-        explicit_size
-    };
-    let total_sectors: u32 = (size / 512).try_into().map_err(|_| {
-        fstool::Error::InvalidArgument(
-            "repack: FAT32 destination size doesn't fit in a u32 sector count".into(),
-        )
-    })?;
-    let mut dev = fstool::block::create_image(
-        dst,
-        size,
-        &fstool::block::CreateOpts {
-            cluster_size: qcow2_cluster_size,
-        },
-    )?;
-    Fat32::build_from_host_dir(dev.as_mut(), total_sectors, staging, 0, *b"REPACKED   ")?;
-    dev.sync()?;
+    let entries = src.list_inode(src_dev, src_ino)?;
+    for e in entries {
+        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
+            continue;
+        }
+        let inode = src.read_inode(src_dev, e.inode)?;
+        let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
+        match mode_type {
+            t if t == fstool::fs::ext::constants::S_IFREG => plan.add_file(inode.size as u64),
+            t if t == fstool::fs::ext::constants::S_IFDIR => {
+                plan.add_dir();
+                walk_ext_for_plan(src_dev, src, e.inode, plan)?;
+            }
+            t if t == fstool::fs::ext::constants::S_IFLNK => plan.add_symlink(inode.size as usize),
+            t if t
+                == fstool::fs::ext::constants::S_IFCHR
+                    | fstool::fs::ext::constants::S_IFBLK
+                    | fstool::fs::ext::constants::S_IFIFO
+                    | fstool::fs::ext::constants::S_IFSOCK =>
+            {
+                plan.add_device()
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
-fn walk_host_size(root: &std::path::Path) -> fstool::Result<u64> {
-    let mut total = 0u64;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(p) = stack.pop() {
-        for entry in std::fs::read_dir(&p)? {
-            let entry = entry?;
-            let m = entry.metadata()?;
-            if m.is_dir() {
-                stack.push(entry.path());
-            } else if m.is_file() {
-                total += m.len();
+fn walk_fat_for_plan(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::fat::Fat32,
+    src_path: &str,
+    plan: &mut fstool::fs::ext::BuildPlan,
+) -> fstool::Result<()> {
+    use fstool::fs::EntryKind;
+    let entries = src.list_path(src_dev, src_path)?;
+    for e in entries {
+        let child = join_fs_path(src_path, &e.name);
+        match e.kind {
+            EntryKind::Dir => {
+                plan.add_dir();
+                walk_fat_for_plan(src_dev, src, &child, plan)?;
             }
+            EntryKind::Regular => {
+                let (entry, _) = src.resolve_entry(src_dev, &child)?;
+                plan.add_file(entry.file_size as u64);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Sum the size of every regular file in the source filesystem — used
+/// by FAT32 shrink sizing.
+fn sum_source_file_bytes(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src_fs: &fstool::inspect::AnyFs,
+) -> fstool::Result<u64> {
+    use fstool::inspect::AnyFs;
+    match src_fs {
+        AnyFs::Ext(src_ext) => sum_ext_file_bytes(src_dev, src_ext, 2),
+        AnyFs::Fat32(src_fat) => sum_fat_file_bytes(src_dev, src_fat, "/"),
+    }
+}
+
+fn sum_ext_file_bytes(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::ext::Ext,
+    src_ino: u32,
+) -> fstool::Result<u64> {
+    let mut total = 0u64;
+    for e in src.list_inode(src_dev, src_ino)? {
+        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
+            continue;
+        }
+        let inode = src.read_inode(src_dev, e.inode)?;
+        let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
+        if mode_type == fstool::fs::ext::constants::S_IFREG {
+            total += inode.size as u64;
+        } else if mode_type == fstool::fs::ext::constants::S_IFDIR {
+            total += sum_ext_file_bytes(src_dev, src, e.inode)?;
+        }
+    }
+    Ok(total)
+}
+
+fn sum_fat_file_bytes(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::fat::Fat32,
+    src_path: &str,
+) -> fstool::Result<u64> {
+    use fstool::fs::EntryKind;
+    let mut total = 0u64;
+    for e in src.list_path(src_dev, src_path)? {
+        let child = join_fs_path(src_path, &e.name);
+        match e.kind {
+            EntryKind::Regular => {
+                let (entry, _) = src.resolve_entry(src_dev, &child)?;
+                total += entry.file_size as u64;
+            }
+            EntryKind::Dir => total += sum_fat_file_bytes(src_dev, src, &child)?,
+            _ => {}
         }
     }
     Ok(total)

@@ -826,8 +826,25 @@ impl Ext {
         src: FileSource,
         meta: FileMeta,
     ) -> Result<u32> {
-        let bs = self.layout.block_size;
         let len = src.len()?;
+        let (mut reader, _) = src.open()?;
+        self.add_file_to_streaming(dev, parent_ino, name, &mut *reader, len, meta)
+    }
+
+    /// Like [`Self::add_file_to`] but pulls bytes from any [`std::io::Read`]
+    /// instead of a [`FileSource`]. Useful when streaming from a borrowed
+    /// reader (e.g. another filesystem's `open_file_reader`) where the
+    /// `'static` lifetime in `FileSource::Reader` doesn't fit.
+    pub fn add_file_to_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_ino: u32,
+        name: &[u8],
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        meta: FileMeta,
+    ) -> Result<u32> {
+        let bs = self.layout.block_size;
         if len > u32::MAX as u64 {
             return Err(crate::Error::Unsupported(
                 "ext: file > 4 GiB requires LARGE_FILE (deferred to ext4)".into(),
@@ -844,22 +861,20 @@ impl Ext {
             meta.mtime,
         );
 
-        // Stream the source one block at a time. Each block is read into a
-        // fixed buffer (the file is never fully resident in memory). In
-        // sparse mode an all-zero block becomes a hole: `data_blocks[i] == 0`
+        // Stream one block at a time. Each block is read into a fixed
+        // buffer (the file is never fully resident in memory). In sparse
+        // mode an all-zero block becomes a hole: `data_blocks[i] == 0`
         // means logical block i is unallocated and reads back as zero.
-        let (mut reader, _) = src.open()?;
         let mut buf = vec![0u8; bs as usize];
         let mut data_blocks = Vec::with_capacity(n_data_blocks as usize);
         let mut remaining = len;
         let mut allocated_data = 0u32;
         for _ in 0..n_data_blocks {
             let to_read = remaining.min(bs as u64) as usize;
-            // Zero the whole buffer so a short final block's tail is zero.
             buf.fill(0);
             reader.read_exact(&mut buf[..to_read])?;
             if self.sparse && buf.iter().all(|&b| b == 0) {
-                data_blocks.push(0); // hole
+                data_blocks.push(0);
             } else {
                 let blk = self.alloc_data_block()?;
                 dev.write_at(blk as u64 * bs as u64, &buf[..to_read])?;
@@ -1614,6 +1629,48 @@ impl Ext {
     /// Open a streaming reader over the regular file at `ino`. The reader
     /// holds a mutable borrow of `dev` for its lifetime; reads pull the
     /// file's data blocks lazily through a per-block fetch.
+    /// Read the target of the symlink at inode `ino`. Errors if the inode
+    /// isn't a symlink.
+    ///
+    /// ext stores short symlinks (≤ 60 bytes) inline in the inode's
+    /// `block` array; longer ones go through the normal block-pointer
+    /// machinery and are streamed via [`Self::open_file_reader`].
+    pub fn read_symlink_target(&self, dev: &mut dyn BlockDevice, ino: u32) -> Result<String> {
+        use std::io::Read as _;
+        let inode = self.read_inode(dev, ino)?;
+        if inode.mode & constants::S_IFMT != constants::S_IFLNK {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: inode {ino} is not a symlink"
+            )));
+        }
+        let size = inode.size as usize;
+        // Fast (inline) symlink: target is in the 60 bytes of block[].
+        if size <= 60 && inode.blocks_512 == 0 {
+            let mut bytes = [0u8; 60];
+            for (i, &w) in inode.block.iter().enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            return Ok(String::from_utf8_lossy(&bytes[..size]).into_owned());
+        }
+        // Slow symlink: stored in data blocks, same as a regular file's body.
+        // Spoof the mode bits so open_file_reader accepts it.
+        let mut reg_inode = inode;
+        reg_inode.mode = (reg_inode.mode & !constants::S_IFMT) | constants::S_IFREG;
+        let reader = FileReader {
+            ext: self,
+            dev,
+            inode: reg_inode,
+            pos: 0,
+            block_buf: vec![0u8; self.layout.block_size as usize],
+            cached_block: u32::MAX,
+        };
+        let mut buf = Vec::with_capacity(size);
+        let mut r = reader;
+        r.read_to_end(&mut buf)?;
+        buf.truncate(size);
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
     pub fn open_file_reader<'a>(
         &'a self,
         dev: &'a mut dyn BlockDevice,

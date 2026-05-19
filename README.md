@@ -44,7 +44,9 @@ device / empty directory), `shell` (interactive SFTP-style REPL with
 `ls`/`cd`/`pwd`/`cat`/`put`/`rm`/`mkdir`/`info`), `convert` (byte-level
 raw↔qcow2 conversion with optional grow), `repack` (walk the source
 filesystem and rebuild into a fresh image, with `--shrink` for
-auto-min sizing and `--fs-type` to convert between FS types). All
+auto-min sizing and `--fs-type` to convert between FS types — preserves
+symlinks, device nodes, mode and uid/gid for ext → ext via a direct
+FS-to-FS copier, no host filesystem involvement). All
 inspection and in-place modification commands accept a `disk.img:N`
 (1-indexed) target to walk into a partition of a GPT or MBR disk
 image; `fstool info disk.img` (no suffix) prints the partition table.

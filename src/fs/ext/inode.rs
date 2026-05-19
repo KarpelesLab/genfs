@@ -240,6 +240,14 @@ pub fn encode_devnum(major: u32, minor: u32) -> u32 {
     (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & 0xfff00) << 12)
 }
 
+/// Inverse of [`encode_devnum`]. Pulls `(major, minor)` out of an
+/// ext-style devnum word stored in `inode.block[0]`.
+pub fn decode_devnum(raw: u32) -> (u32, u32) {
+    let major = (raw >> 8) & 0xfff;
+    let minor = (raw & 0xff) | ((raw >> 12) & 0xfff00);
+    (major, minor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

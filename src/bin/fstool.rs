@@ -52,6 +52,27 @@ enum Command {
         sparse: bool,
     },
 
+    /// Build a bare FAT32 image from a host directory. FAT32 has no
+    /// streaming auto-size (it needs ≥ 65525 clusters → ~33 MiB minimum),
+    /// so `--size` is required.
+    FatBuild {
+        /// Source directory on the host filesystem.
+        #[arg(value_name = "SRC_DIR")]
+        src_dir: PathBuf,
+        /// Output image file. Will be created (truncating any existing file).
+        #[arg(short = 'o', long = "output", value_name = "IMAGE")]
+        output: PathBuf,
+        /// Image size, e.g. "64MiB" or "1GiB".
+        #[arg(long, value_name = "SIZE")]
+        size: String,
+        /// Volume label (up to 11 ASCII bytes, upper-cased).
+        #[arg(long, default_value = "NO NAME")]
+        label: String,
+        /// Volume ID / serial number. Default 0 for reproducible output.
+        #[arg(long, default_value_t = 0)]
+        volume_id: u32,
+    },
+
     /// List a directory inside an image. One entry per line:
     /// `<inode>\t<kind>\t<name>`.
     Ls {
@@ -155,6 +176,13 @@ fn run(cli: Cli) -> fstool::Result<()> {
             block_size,
             sparse,
         } => ext_build(&src_dir, &output, kind.into(), block_size, sparse),
+        Command::FatBuild {
+            src_dir,
+            output,
+            size,
+            label,
+            volume_id,
+        } => fat_build(&src_dir, &output, &size, &label, volume_id),
         Command::Ls { image, path } => ls(&image, &path),
         Command::Cat { image, path } => cat(&image, &path),
         Command::Info { image } => info(&image),
@@ -224,6 +252,46 @@ fn build(spec_path: &std::path::Path, output: &std::path::Path) -> fstool::Resul
     fstool::spec::build(&spec, output)?;
     eprintln!("built {} from {}", output.display(), spec_path.display());
     Ok(())
+}
+
+fn fat_build(
+    src_dir: &std::path::Path,
+    output: &std::path::Path,
+    size: &str,
+    label: &str,
+    volume_id: u32,
+) -> fstool::Result<()> {
+    use fstool::fs::fat::Fat32;
+    let bytes = fstool::spec::parse_size(size)?;
+    let total_sectors: u32 = (bytes / 512).try_into().map_err(|_| {
+        fstool::Error::InvalidArgument("fat-build: --size doesn't fit in a u32 sector count".into())
+    })?;
+    let label_bytes = fat32_label_bytes(label);
+    let mut dev = FileBackend::create(output, bytes)?;
+    Fat32::build_from_host_dir(&mut dev, total_sectors, src_dir, volume_id, label_bytes)?;
+    dev.sync()?;
+    eprintln!(
+        "wrote {} ({} bytes, fat32, label {:?})",
+        output.display(),
+        bytes,
+        label
+    );
+    Ok(())
+}
+
+/// Pack a label into the 11-byte FAT32 short-label slot: ASCII upper-case,
+/// space-padded, non-printable bytes replaced with `_`.
+fn fat32_label_bytes(label: &str) -> [u8; 11] {
+    let mut out = [b' '; 11];
+    let upper = label.to_ascii_uppercase();
+    for (i, &b) in upper.as_bytes().iter().take(11).enumerate() {
+        out[i] = if b.is_ascii() && b >= 0x20 && b != 0x7F {
+            b
+        } else {
+            b'_'
+        };
+    }
+    out
 }
 
 fn ext_build(

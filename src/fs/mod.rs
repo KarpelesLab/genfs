@@ -20,6 +20,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub mod ext;
+pub mod fat;
 pub mod rootdevs;
 
 pub use rootdevs::{DeviceEntry, RootDevs};

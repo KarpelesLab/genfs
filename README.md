@@ -7,7 +7,7 @@
 Build disk images and filesystem images from a directory tree and a TOML
 spec — in the spirit of `genext2fs`, but going further:
 
-- **Multiple filesystems** — ext2 / ext3 / ext4 (v1), FAT32 to follow.
+- **Multiple filesystems** — ext2, ext3, ext4, and FAT32.
 - **Whole disk images** — MBR and GPT partition tables, not just bare FS images.
 - **Streaming** — file contents are never preloaded in memory regardless of
   size. Generation is a two-pass scan-then-stream.
@@ -33,13 +33,14 @@ Early in development. Public API is **unstable** until v0.5.
 | 3. ext2 writer                           | ✅ done        |
 | 4. ext2/3/4 reader + writer              | ✅ done        |
 | 5. TOML spec + CLI                       | ✅ done        |
-| 6. FAT32                                 | post-v1        |
+| 6. FAT32                                 | ✅ done        |
 
 What works today:
 
 **CLI** — `build` (from a TOML spec), `ext-build` (bare ext FS from a
-directory), `ls`, `cat`, `info`, `add` (copy a host file/tree in), `rm`
-(unlink a file / symlink / device / empty directory).
+directory), `fat-build` (bare FAT32 from a directory), `ls`, `cat`,
+`info`, `add` (copy a host file/tree in), `rm` (unlink a file / symlink /
+device / empty directory).
 
 **Block layer** — `fstool::block::{FileBackend, MemoryBackend,
 SlicedBackend}`: sparse file-backed devices, in-memory devices for tests,
@@ -70,9 +71,20 @@ headers, CRC32 on header and entry array). Cross-checked against
   for `Standard`), so a non-root user can build a Linux root FS without
   CAP_MKNOD.
 
+**FAT32** — `fstool::fs::fat::Fat32`:
+- Format a fresh volume (boot sector + backup, FSInfo + backup, two FAT
+  copies, root cluster with a mirrored volume-label entry).
+- Build from a host directory in one pass — VFAT LFN entries for any
+  name that isn't strictly 8.3, a generated `FTxxxxxx` short name as
+  the alias, and `.` / `..` in every subdirectory. Symlinks and device
+  nodes in the source are skipped (FAT has no representation).
+- Files stream cluster-by-cluster, never resident in memory.
+- Every produced image is verified `fsck.vfat -n` clean, and `mdir` /
+  `mtype` see the populated tree.
+
 **TOML spec** — `fstool::spec`: declarative image descriptions, either a
-bare filesystem (`[filesystem]`) or a partitioned disk (`[image]` +
-`[[partitions]]`, MBR or GPT, one ext FS per partition).
+bare filesystem (`[filesystem]`, ext or FAT32) or a partitioned disk
+(`[image]` + `[[partitions]]`, MBR or GPT, ext or FAT32 per partition).
 
 ## Architecture
 
@@ -170,7 +182,8 @@ In-place modification is restricted to whole-file granularity in v1 (add,
 remove, replace). Partial-file rewrites are explicitly out of scope until
 there's a use case that demands them.
 
-Not yet implemented: FAT32; `sparse_super` / `flex_bg` on the *write* path
+Not yet implemented: a FAT32 reader (open / ls / cat / info — the v1 path
+is write-only); `sparse_super` / `flex_bg` on the ext4 *write* path
 (the reader handles both); an interactive SFTP-style shell.
 
 ## Licence

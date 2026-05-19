@@ -23,7 +23,9 @@ jobs:
             gdisk \
             fdisk \
             e2fsprogs \
-            genext2fs
+            genext2fs \
+            dosfstools \
+            mtools
           # Sanity-check that everything we cross-validate against is on PATH.
           which sgdisk
           which fdisk
@@ -31,6 +33,9 @@ jobs:
           which debugfs
           which mke2fs
           which genext2fs
+          which fsck.vfat
+          which mdir
+          which mtype
 
       - uses: dtolnay/rust-toolchain@stable
         with:

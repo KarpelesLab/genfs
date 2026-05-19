@@ -91,26 +91,32 @@ pub struct PartitionSpec {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemSpec {
-    /// `"ext2"`, `"ext3"`, or `"ext4"`. (FAT32 is post-v1.)
+    /// `"ext2"`, `"ext3"`, `"ext4"`, or `"fat32"`.
     #[serde(rename = "type")]
     pub fs_type: String,
     /// Host directory whose contents become the filesystem's tree.
     /// Omitted → an empty filesystem (just `/` and `/lost+found`).
     pub source: Option<PathBuf>,
-    /// FS block size in bytes (1024 / 2048 / 4096). Default 1024.
+    /// FS block size in bytes (1024 / 2048 / 4096). Default 1024. (ext only.)
     pub block_size: Option<u32>,
     /// Journal size in blocks (ext3/ext4 only). Default 1024.
     pub journal_blocks: Option<u32>,
-    /// `"none"`, `"minimal"`, or `"standard"` — pre-populate `/dev`.
+    /// `"none"`, `"minimal"`, or `"standard"` — pre-populate `/dev`. (ext only.)
     pub rootdevs: Option<String>,
-    /// Volume label (≤ 16 bytes).
+    /// Volume label (≤ 16 bytes for ext, ≤ 11 bytes for FAT32).
     pub volume_label: Option<String>,
     /// Modification timestamp baked into every inode (seconds since epoch).
-    /// Default 0 for reproducible output.
+    /// Default 0 for reproducible output. (ext only.)
     pub mtime: Option<u32>,
     /// When true, regular files are written sparsely — all-zero blocks
-    /// become holes instead of consuming data blocks. Default false.
+    /// become holes instead of consuming data blocks. Default false. (ext only.)
     pub sparse: Option<bool>,
+    /// Explicit filesystem size, e.g. `"64MiB"`. Required for FAT32 in
+    /// bare-FS mode (FAT32 has a ~33 MiB minimum and no streaming auto-size).
+    /// Ignored when the FS sits in a partition (the partition size wins).
+    pub size: Option<String>,
+    /// FAT32 volume ID / serial number. Default 0 for reproducible output.
+    pub volume_id: Option<u32>,
 }
 
 impl Spec {
@@ -170,6 +176,16 @@ pub fn build(spec: &Spec, output: &Path) -> Result<()> {
 }
 
 fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
+    match fs.fs_type.to_ascii_lowercase().as_str() {
+        "ext2" | "ext3" | "ext4" => build_bare_ext(fs, output),
+        "fat32" | "vfat" => build_bare_fat32(fs, output),
+        other => Err(crate::Error::InvalidArgument(format!(
+            "spec: unknown filesystem type {other:?}"
+        ))),
+    }
+}
+
+fn build_bare_ext(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     let kind = parse_fs_kind(&fs.fs_type)?;
     let block_size = fs.block_size.unwrap_or(1024);
     let opts = ext_format_opts(fs, kind, block_size, None)?;
@@ -178,6 +194,68 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     format_ext_into(&mut dev, fs, &opts)?;
     dev.sync()?;
     Ok(())
+}
+
+fn build_bare_fat32(fs: &FilesystemSpec, output: &Path) -> Result<()> {
+    let size_str = fs.size.as_deref().ok_or_else(|| {
+        crate::Error::InvalidArgument(
+            "spec: FAT32 requires an explicit `size` (no streaming auto-size; minimum ~33 MiB)"
+                .into(),
+        )
+    })?;
+    let bytes = parse_size(size_str)?;
+    let total_sectors: u32 = (bytes / SECTOR).try_into().map_err(|_| {
+        crate::Error::InvalidArgument(
+            "spec: FAT32 image size doesn't fit in a u32 sector count".into(),
+        )
+    })?;
+    let label = fat32_volume_label(fs.volume_label.as_deref());
+    let volume_id = fs.volume_id.unwrap_or(0);
+    let mut dev = FileBackend::create(output, bytes)?;
+    format_fat32_into(&mut dev, fs, total_sectors, volume_id, label)?;
+    dev.sync()?;
+    Ok(())
+}
+
+fn format_fat32_into(
+    dev: &mut dyn BlockDevice,
+    fs: &FilesystemSpec,
+    total_sectors: u32,
+    volume_id: u32,
+    label: [u8; 11],
+) -> Result<()> {
+    use crate::fs::fat::Fat32;
+    if let Some(src) = &fs.source {
+        Fat32::build_from_host_dir(dev, total_sectors, src, volume_id, label)?;
+    } else {
+        let opts = crate::fs::fat::FatFormatOpts {
+            total_sectors,
+            volume_id,
+            volume_label: label,
+        };
+        Fat32::format(dev, &opts)?;
+    }
+    Ok(())
+}
+
+/// Space-pad and truncate `label` to exactly 11 bytes for FAT32. ASCII only;
+/// non-ASCII bytes are replaced with `_` (FAT32 short labels are OEM-encoded;
+/// we don't try to translate code pages).
+fn fat32_volume_label(label: Option<&str>) -> [u8; 11] {
+    let mut out = [b' '; 11];
+    let Some(s) = label else {
+        return *b"NO NAME    ";
+    };
+    let upper = s.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    for (i, &b) in bytes.iter().take(11).enumerate() {
+        out[i] = if b.is_ascii() && b >= 0x20 && b != 0x7F {
+            b
+        } else {
+            b'_'
+        };
+    }
+    out
 }
 
 /// Build the [`crate::fs::ext::FormatOpts`] for a [`FilesystemSpec`].
@@ -360,15 +438,34 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
         let Some(fs) = &p.filesystem else {
             continue;
         };
-        let kind = parse_fs_kind(&fs.fs_type)?;
-        let block_size = fs.block_size.unwrap_or(1024);
         let part_bytes = placed[i].size_lba * SECTOR;
-        // Fill the partition: blocks_count = partition_bytes / fs_block_size,
-        // rounded DOWN to a multiple of 8 (the byte-aligned-group invariant).
-        let blocks = ((part_bytes / block_size as u64) / 8 * 8) as u32;
-        let opts = ext_format_opts(fs, kind, block_size, Some(blocks))?;
         let mut slice = slice_partition(table_obj.as_ref(), &mut dev, i)?;
-        format_ext_into(&mut slice, fs, &opts)?;
+        match fs.fs_type.to_ascii_lowercase().as_str() {
+            "ext2" | "ext3" | "ext4" => {
+                let kind = parse_fs_kind(&fs.fs_type)?;
+                let block_size = fs.block_size.unwrap_or(1024);
+                // Fill the partition: blocks_count = partition_bytes / fs_block_size,
+                // rounded DOWN to a multiple of 8 (the byte-aligned-group invariant).
+                let blocks = ((part_bytes / block_size as u64) / 8 * 8) as u32;
+                let opts = ext_format_opts(fs, kind, block_size, Some(blocks))?;
+                format_ext_into(&mut slice, fs, &opts)?;
+            }
+            "fat32" | "vfat" => {
+                let total_sectors: u32 = (part_bytes / SECTOR).try_into().map_err(|_| {
+                    crate::Error::InvalidArgument(
+                        "spec: FAT32 partition size doesn't fit in a u32 sector count".into(),
+                    )
+                })?;
+                let label = fat32_volume_label(fs.volume_label.as_deref());
+                let volume_id = fs.volume_id.unwrap_or(0);
+                format_fat32_into(&mut slice, fs, total_sectors, volume_id, label)?;
+            }
+            other => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "spec: unknown filesystem type {other:?}"
+                )));
+            }
+        }
     }
 
     dev.sync()?;
@@ -410,11 +507,8 @@ fn parse_fs_kind(s: &str) -> Result<FsKind> {
         "ext2" => Ok(FsKind::Ext2),
         "ext3" => Ok(FsKind::Ext3),
         "ext4" => Ok(FsKind::Ext4),
-        "fat32" | "vfat" => Err(crate::Error::Unsupported(
-            "spec: FAT32 is not implemented yet (post-v1)".into(),
-        )),
         other => Err(crate::Error::InvalidArgument(format!(
-            "spec: unknown filesystem type {other:?}"
+            "spec: parse_fs_kind only handles ext2/3/4 (got {other:?})"
         ))),
     }
 }

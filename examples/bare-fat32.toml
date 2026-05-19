@@ -1,0 +1,25 @@
+# Example fstool spec: a bare FAT32 filesystem image (no partition table).
+#
+#   fstool build examples/bare-fat32.toml -o /tmp/fat.img
+#   fsck.vfat -n /tmp/fat.img
+#   mdir -i /tmp/fat.img ::/
+#
+# FAT32 requires at least ~33 MiB (65525 clusters at 512 B/cluster) — the
+# spec parser rejects smaller `size` values.
+
+[filesystem]
+type = "fat32"
+
+# Image size — required for FAT32 in bare-FS mode (there is no
+# streaming auto-size for FAT32).
+size = "64MiB"
+
+# Host directory whose contents become the image's tree. Optional —
+# omit it for an empty volume with just the root directory.
+source = "./rootfs"
+
+# Volume label (≤ 11 ASCII bytes, upper-cased). Default "NO NAME".
+volume_label = "FSTOOL"
+
+# Volume ID / serial number. Default 0 for reproducible output.
+volume_id = 0xDEADBEEF

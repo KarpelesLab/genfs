@@ -1,0 +1,544 @@
+//! FAT32 filesystem writer.
+//!
+//! Produces a FAT32 image from a host directory tree. FAT32 has no concept
+//! of symlinks, device nodes, or Unix ownership/permissions, so those are
+//! silently skipped when copying a tree.
+//!
+//! v1 scope: write path only (`format` + `build_from_host_dir`). Long file
+//! names use VFAT LFN entries; short 8.3 names are generated where needed.
+//!
+//! Reference: the public Microsoft FAT specification.
+
+pub mod boot;
+pub mod dir;
+pub mod fsinfo;
+pub mod table;
+
+use std::io::Read;
+use std::path::Path;
+
+use boot::BootSector;
+use fsinfo::FsInfo;
+use table::Fat;
+
+use crate::Result;
+use crate::block::BlockDevice;
+
+/// FAT32 requires at least this many data clusters; fewer makes it a
+/// FAT12/FAT16 volume, which fsck.vfat rejects as "not FAT32".
+pub const MIN_FAT32_CLUSTERS: u32 = 65525;
+
+/// Logical sector size. FAT32 supports others; genfs fixes it at 512.
+pub const SECTOR: u32 = 512;
+
+/// Options for [`Fat32::format`].
+#[derive(Debug, Clone)]
+pub struct FatFormatOpts {
+    /// Total volume size in 512-byte sectors.
+    pub total_sectors: u32,
+    /// Volume ID (serial number).
+    pub volume_id: u32,
+    /// Volume label — up to 11 bytes, space-padded.
+    pub volume_label: [u8; 11],
+}
+
+impl Default for FatFormatOpts {
+    fn default() -> Self {
+        Self {
+            total_sectors: 0,
+            volume_id: 0,
+            volume_label: *b"NO NAME    ",
+        }
+    }
+}
+
+/// An under-construction FAT32 filesystem.
+#[derive(Debug)]
+pub struct Fat32 {
+    boot: BootSector,
+    fat: Fat,
+    /// Cluster to hand out next from the free pool.
+    next_free: u32,
+}
+
+impl Fat32 {
+    /// Pick `sectors_per_cluster` for a volume of `total_sectors`, mirroring
+    /// the conventional mkfs.vfat size thresholds.
+    fn pick_spc(total_sectors: u32) -> u8 {
+        match total_sectors {
+            0..=532_480 => 1,          // ≤ 260 MiB
+            532_481..=16_777_216 => 8, // ≤ 8 GiB
+            16_777_217..=33_554_432 => 16,
+            33_554_433..=67_108_864 => 32,
+            _ => 64,
+        }
+    }
+
+    /// Compute `(sectors_per_cluster, fat_size_sectors, cluster_count)` for a
+    /// volume of `total_sectors`. Errors if the volume is too small to be a
+    /// valid FAT32.
+    fn geometry(total_sectors: u32) -> Result<(u8, u32, u32)> {
+        let spc = Self::pick_spc(total_sectors);
+        let reserved = 32u32;
+        let num_fats = 2u32;
+        let entries_per_fat_sector = SECTOR / 4; // 128
+
+        // Converge fat_size upward until the FAT is big enough to map every
+        // data cluster it leaves room for.
+        let mut fat_size = 1u32;
+        loop {
+            let meta = reserved + num_fats * fat_size;
+            if meta >= total_sectors {
+                return Err(crate::Error::InvalidArgument(
+                    "fat32: volume too small to hold the FAT metadata".into(),
+                ));
+            }
+            let clusters = (total_sectors - meta) / spc as u32;
+            let needed = (clusters + 2).div_ceil(entries_per_fat_sector);
+            if needed <= fat_size {
+                if clusters < MIN_FAT32_CLUSTERS {
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "fat32: {clusters} clusters is below the FAT32 minimum of \
+                         {MIN_FAT32_CLUSTERS} — use a volume of at least ~33 MiB"
+                    )));
+                }
+                return Ok((spc, fat_size, clusters));
+            }
+            fat_size = needed;
+        }
+    }
+
+    /// Format a fresh, empty FAT32 onto `dev`. Writes the boot sector and
+    /// its backup, the FSInfo sector and its backup, both FAT copies, and
+    /// the (empty) root-directory cluster.
+    pub fn format(dev: &mut dyn BlockDevice, opts: &FatFormatOpts) -> Result<Self> {
+        let total = opts.total_sectors;
+        let need = total as u64 * SECTOR as u64;
+        if dev.total_size() < need {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fat32: device has {} bytes, need {need}",
+                dev.total_size()
+            )));
+        }
+        let (spc, fat_size, clusters) = Self::geometry(total)?;
+
+        let mut boot = BootSector::fat32_default();
+        boot.sectors_per_cluster = spc;
+        boot.total_sectors = total;
+        boot.fat_size = fat_size;
+        boot.volume_id = opts.volume_id;
+        boot.volume_label = opts.volume_label;
+
+        // FAT has one entry per cluster (+ the 2 reserved); size the table
+        // to the full on-disk FAT so encode() produces exactly fat_size
+        // sectors.
+        let fat_entries = (fat_size * (SECTOR / 4)) as usize;
+        let mut fat = Fat::new(fat_entries, boot.media);
+        // Root directory occupies cluster 2, a one-cluster chain.
+        fat.set(boot.root_cluster, table::EOC);
+
+        let fs = Self {
+            boot,
+            fat,
+            next_free: 3,
+        };
+        // Zero the whole volume up front so unwritten clusters read clean.
+        dev.zero_range(0, need)?;
+
+        // Mirror the boot-sector volume label as the first root-dir entry;
+        // without this fsck.vfat treats the boot label as stale and would
+        // "auto-remove" it (-n exit 1).
+        dev.write_at(
+            fs.cluster_offset(fs.boot.root_cluster),
+            &fs.volume_label_entry(),
+        )?;
+
+        fs.flush(dev, clusters)?;
+        Ok(fs)
+    }
+
+    /// Encode the volume-label directory entry that mirrors the boot
+    /// sector's `volume_label` field.
+    fn volume_label_entry(&self) -> [u8; dir::ENTRY_SIZE] {
+        dir::DirEntry {
+            name_83: self.boot.volume_label,
+            attr: dir::ATTR_VOLUME_ID,
+            first_cluster: 0,
+            file_size: 0,
+        }
+        .encode()
+    }
+
+    /// Absolute byte offset of a cluster's first sector.
+    fn cluster_offset(&self, cluster: u32) -> u64 {
+        let sector =
+            self.boot.data_start_sector() + (cluster - 2) * self.boot.sectors_per_cluster as u32;
+        sector as u64 * SECTOR as u64
+    }
+
+    /// Bytes per cluster.
+    fn cluster_bytes(&self) -> u64 {
+        self.boot.sectors_per_cluster as u64 * SECTOR as u64
+    }
+
+    /// Allocate `n` clusters, linking them into one chain, and return the
+    /// chain. The last cluster's FAT entry is the end-of-chain marker.
+    fn alloc_chain(&mut self, n: u32) -> Result<Vec<u32>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut chain = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let c = self.next_free;
+            if c as usize >= self.fat.capacity() {
+                return Err(crate::Error::Unsupported("fat32: out of clusters".into()));
+            }
+            chain.push(c);
+            self.next_free += 1;
+        }
+        for w in chain.windows(2) {
+            self.fat.set(w[0], w[1]);
+        }
+        self.fat.set(*chain.last().unwrap(), table::EOC);
+        Ok(chain)
+    }
+
+    /// Write `data` across the cluster `chain` (the chain must be large
+    /// enough). The final cluster's slack is left zero.
+    fn write_chain(&self, dev: &mut dyn BlockDevice, chain: &[u32], data: &[u8]) -> Result<()> {
+        let cb = self.cluster_bytes() as usize;
+        for (i, &c) in chain.iter().enumerate() {
+            let start = i * cb;
+            if start >= data.len() {
+                break;
+            }
+            let end = (start + cb).min(data.len());
+            dev.write_at(self.cluster_offset(c), &data[start..end])?;
+        }
+        Ok(())
+    }
+
+    /// Persist the boot sector (+ backup), FSInfo (+ backup) and both FAT
+    /// copies. `clusters` is the volume's data-cluster count, needed for the
+    /// FSInfo free count.
+    fn flush(&self, dev: &mut dyn BlockDevice, clusters: u32) -> Result<()> {
+        let boot_bytes = self.boot.encode();
+        dev.write_at(0, &boot_bytes)?;
+        dev.write_at(
+            self.boot.backup_boot_sector as u64 * SECTOR as u64,
+            &boot_bytes,
+        )?;
+
+        // free_count = total clusters minus the ones handed out so far.
+        // next_free starts at 3 and only advances, so used = next_free - 2.
+        let used = self.next_free - 2;
+        let fsinfo = FsInfo {
+            free_count: clusters.saturating_sub(used),
+            next_free: self.next_free,
+        };
+        let fsinfo_bytes = fsinfo.encode();
+        dev.write_at(
+            self.boot.fs_info_sector as u64 * SECTOR as u64,
+            &fsinfo_bytes,
+        )?;
+        // The backup boot region also carries a backup FSInfo at +1.
+        dev.write_at(
+            (self.boot.backup_boot_sector as u64 + 1) * SECTOR as u64,
+            &fsinfo_bytes,
+        )?;
+
+        let fat_bytes = self.fat.encode();
+        for i in 0..self.boot.num_fats as u32 {
+            let off = (self.boot.reserved_sector_count as u64
+                + i as u64 * self.boot.fat_size as u64)
+                * SECTOR as u64;
+            dev.write_at(off, &fat_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// One-shot: format `dev` to `total_sectors` and copy a host directory
+    /// tree into the root. Symlinks and device nodes in the source are
+    /// skipped (FAT has no representation for them).
+    pub fn build_from_host_dir(
+        dev: &mut dyn BlockDevice,
+        total_sectors: u32,
+        src: &Path,
+        volume_id: u32,
+        volume_label: [u8; 11],
+    ) -> Result<()> {
+        let opts = FatFormatOpts {
+            total_sectors,
+            volume_id,
+            volume_label,
+        };
+        let mut fs = Self::format(dev, &opts)?;
+        let (_, _, clusters) = Self::geometry(total_sectors)?;
+        let root_cluster = fs.boot.root_cluster;
+        // Root is its own "parent" placeholder; parent_cluster is unused when
+        // is_root = true.
+        fs.write_dir_tree(dev, src, root_cluster, true, root_cluster)?;
+        fs.flush(dev, clusters)?;
+        dev.sync()?;
+        Ok(())
+    }
+
+    /// Recursively populate the directory whose data starts at `dir_cluster`
+    /// from the host directory `src`. `is_root` suppresses the "." / ".."
+    /// entries (the FAT32 root has none).
+    ///
+    /// `dir_cluster` must already be a one-cluster chain; the directory is
+    /// extended if its entries overflow one cluster.
+    fn write_dir_tree(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        src: &Path,
+        dir_cluster: u32,
+        is_root: bool,
+        parent_cluster: u32,
+    ) -> Result<()> {
+        // Assemble the directory's 32-byte entries in memory.
+        let mut entries: Vec<u8> = Vec::new();
+        if is_root {
+            // Mirror the boot-sector volume label as a root-dir entry; without
+            // this fsck.vfat treats the boot label as stale.
+            entries.extend_from_slice(&self.volume_label_entry());
+        } else {
+            entries.extend_from_slice(&dot_entry(b".          ", dir_cluster));
+            // ".." points at the parent; a parent that is the root is
+            // recorded as cluster 0 by convention.
+            let pc = if parent_cluster == self.boot.root_cluster {
+                0
+            } else {
+                parent_cluster
+            };
+            entries.extend_from_slice(&dot_entry(b"..         ", pc));
+        }
+
+        let mut short_seq: u32 = 0;
+        let mut children: Vec<(std::path::PathBuf, std::fs::Metadata)> = Vec::new();
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            children.push((entry.path(), meta));
+        }
+        // Deterministic order.
+        children.sort_by(|a, b| a.0.file_name().cmp(&b.0.file_name()));
+
+        for (path, meta) in children {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 file name".into()))?
+                .to_string();
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                continue; // FAT has no symlinks
+            }
+            if ft.is_file() {
+                let size = meta.len();
+                let cb = self.cluster_bytes();
+                let n_clusters = size.div_ceil(cb).max(1) as u32;
+                let chain = self.alloc_chain(n_clusters)?;
+                self.stream_file(dev, &path, &chain, size)?;
+                let first = if size == 0 { 0 } else { chain[0] };
+                self.push_entry(
+                    &mut entries,
+                    &name,
+                    dir::ATTR_ARCHIVE,
+                    first,
+                    size as u32,
+                    &mut short_seq,
+                );
+                // A zero-length file keeps no clusters.
+                if size == 0 {
+                    self.free_unused_chain(&chain);
+                }
+            } else if ft.is_dir() {
+                // Each subdirectory starts as a one-cluster chain.
+                let chain = self.alloc_chain(1)?;
+                let child_cluster = chain[0];
+                self.write_dir_tree(dev, &path, child_cluster, false, dir_cluster)?;
+                self.push_entry(
+                    &mut entries,
+                    &name,
+                    dir::ATTR_DIRECTORY,
+                    child_cluster,
+                    0,
+                    &mut short_seq,
+                );
+            }
+            // Other types (devices, fifos, sockets) are skipped.
+        }
+
+        self.write_dir_entries(dev, dir_cluster, &entries)?;
+        Ok(())
+    }
+
+    /// Append a directory entry for `name` to `entries`, emitting LFN
+    /// fragments first when the name isn't a plain 8.3 name.
+    fn push_entry(
+        &self,
+        entries: &mut Vec<u8>,
+        name: &str,
+        attr: u8,
+        first_cluster: u32,
+        file_size: u32,
+        short_seq: &mut u32,
+    ) {
+        let upper = name.to_ascii_uppercase();
+        let name_83 = if dir::is_valid_83(&upper) {
+            dir::pack_83(&upper)
+        } else {
+            let s = dir::generate_83(name, *short_seq);
+            *short_seq += 1;
+            s
+        };
+        // LFN fragments precede the 8.3 entry whenever the on-disk 8.3 name
+        // doesn't reproduce the original name verbatim.
+        let need_lfn = dir::pack_83(&upper) != name_83 || upper != name;
+        if need_lfn {
+            let csum = dir::lfn_checksum(&name_83);
+            for frag in dir::encode_lfn_run(name, csum) {
+                entries.extend_from_slice(&frag);
+            }
+        }
+        let entry = dir::DirEntry {
+            name_83,
+            attr,
+            first_cluster,
+            file_size,
+        };
+        entries.extend_from_slice(&entry.encode());
+    }
+
+    /// Write a directory's assembled entry bytes into its cluster chain,
+    /// extending the chain if the entries overflow `dir_cluster`'s single
+    /// cluster.
+    fn write_dir_entries(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        entries: &[u8],
+    ) -> Result<()> {
+        let cb = self.cluster_bytes() as usize;
+        let need_clusters = entries.len().div_ceil(cb).max(1) as u32;
+        let mut chain = vec![dir_cluster];
+        // Extend if more than one cluster of entries.
+        if need_clusters > 1 {
+            let extra = self.alloc_chain(need_clusters - 1)?;
+            // Link dir_cluster -> extra[0] -> ... -> EOC.
+            self.fat.set(dir_cluster, extra[0]);
+            chain.extend_from_slice(&extra);
+        }
+        // Pad to a whole number of clusters with zero (free entries).
+        let mut buf = entries.to_vec();
+        buf.resize(need_clusters as usize * cb, 0);
+        self.write_chain(dev, &chain, &buf)?;
+        Ok(())
+    }
+
+    /// Stream a host file's bytes into its cluster chain. The file is read
+    /// one cluster at a time — never fully resident in memory.
+    fn stream_file(
+        &self,
+        dev: &mut dyn BlockDevice,
+        host: &Path,
+        chain: &[u32],
+        size: u64,
+    ) -> Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+        let cb = self.cluster_bytes() as usize;
+        let mut file = std::fs::File::open(host)?;
+        let mut buf = vec![0u8; cb];
+        let mut remaining = size;
+        for &c in chain {
+            let want = remaining.min(cb as u64) as usize;
+            buf[..want].fill(0);
+            file.read_exact(&mut buf[..want])?;
+            dev.write_at(self.cluster_offset(c), &buf[..want])?;
+            remaining -= want as u64;
+            if remaining == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Return clusters allocated for a zero-length file to the free pool.
+    /// Only valid for the most-recently-allocated chain (we just rewind
+    /// `next_free`); used right after `alloc_chain` for empty files.
+    fn free_unused_chain(&mut self, chain: &[u32]) {
+        for &c in chain {
+            self.fat.set(c, table::FREE);
+        }
+        // The chain was the tail of the free pool — rewind.
+        if let Some(&first) = chain.first()
+            && first + chain.len() as u32 == self.next_free
+        {
+            self.next_free = first;
+        }
+    }
+}
+
+/// Build a "." or ".." directory entry (11-byte raw name, directory attr).
+fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
+    dir::DirEntry {
+        name_83: *name_83,
+        attr: dir::ATTR_DIRECTORY,
+        first_cluster: cluster,
+        file_size: 0,
+    }
+    .encode()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::MemoryBackend;
+
+    #[test]
+    fn geometry_small_volume() {
+        // 64 MiB volume = 131072 sectors.
+        let (spc, fat_size, clusters) = Fat32::geometry(131072).unwrap();
+        assert_eq!(spc, 1);
+        assert!(fat_size > 0);
+        assert!(clusters >= MIN_FAT32_CLUSTERS);
+        // Consistency: reserved + 2*fat + clusters*spc <= total.
+        assert!(32 + 2 * fat_size + clusters * spc as u32 <= 131072);
+        // The FAT must map every cluster.
+        assert!(fat_size * (SECTOR / 4) >= clusters + 2);
+    }
+
+    #[test]
+    fn geometry_rejects_tiny_volume() {
+        // 4 MiB is far below the FAT32 minimum.
+        assert!(Fat32::geometry(8192).is_err());
+    }
+
+    #[test]
+    fn format_empty_volume() {
+        let mut dev = MemoryBackend::new(48 * 1024 * 1024);
+        let opts = FatFormatOpts {
+            total_sectors: 48 * 1024 * 1024 / 512,
+            volume_id: 0xCAFE_F00D,
+            volume_label: *b"TESTVOL    ",
+        };
+        let fs = Fat32::format(&mut dev, &opts).unwrap();
+        // Boot sector round-trips.
+        let mut bs = [0u8; 512];
+        dev.read_at(0, &mut bs).unwrap();
+        let decoded = BootSector::decode(&bs).unwrap();
+        assert_eq!(decoded.total_sectors, opts.total_sectors);
+        assert_eq!(decoded.root_cluster, 2);
+        assert_eq!(decoded.volume_id, 0xCAFE_F00D);
+        // Backup boot sector matches.
+        let mut backup = [0u8; 512];
+        dev.read_at(6 * 512, &mut backup).unwrap();
+        assert_eq!(bs, backup);
+        // Root cluster's FAT entry is an end-of-chain marker.
+        assert!(Fat::is_eoc(fs.fat.get(2)));
+    }
+}

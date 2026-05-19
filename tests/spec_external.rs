@@ -206,6 +206,60 @@ fn build_partitioned_gpt_disk_from_spec() {
 }
 
 #[test]
+fn build_bare_fat32_from_spec() {
+    let Some(_) = which("fsck.vfat") else {
+        eprintln!("skipping: fsck.vfat not installed");
+        return;
+    };
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hello.txt"), b"from spec\n").unwrap();
+
+    let spec_text = format!(
+        r#"
+        [filesystem]
+        type = "fat32"
+        source = "{}"
+        size = "64MiB"
+        volume_label = "specfat"
+        volume_id = 0xDEADBEEF
+        "#,
+        srcdir.path().display()
+    );
+    let spec = fstool::spec::Spec::parse(&spec_text).unwrap();
+    let out = NamedTempFile::new().unwrap();
+    fstool::spec::build(&spec, out.path()).unwrap();
+
+    let res = Command::new("fsck.vfat")
+        .args(["-n", "-v"])
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "fsck.vfat failed:\n{}",
+        String::from_utf8_lossy(&res.stdout)
+    );
+}
+
+#[test]
+fn fat32_bare_requires_explicit_size() {
+    let spec = fstool::spec::Spec::parse(
+        r#"
+        [filesystem]
+        type = "fat32"
+        "#,
+    )
+    .unwrap();
+    let out = NamedTempFile::new().unwrap();
+    let err = fstool::spec::build(&spec, out.path()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("FAT32 requires an explicit `size`"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
 fn build_empty_ext2_from_spec() {
     let Some(_) = which("e2fsck") else {
         eprintln!("skipping: e2fsck not installed");

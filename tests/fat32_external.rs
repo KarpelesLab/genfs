@@ -239,6 +239,123 @@ fn open_reads_back_our_own_image() {
 }
 
 #[test]
+fn modify_in_place_add_and_remove() {
+    let Some(_) = which("fsck.vfat") else {
+        eprintln!("skipping: fsck.vfat not installed");
+        return;
+    };
+    // Build a FAT32 from a small source, then mutate it in place.
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("original.txt"), b"original\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let total_sectors = 64 * 1024 * 1024 / 512;
+    {
+        use fstool::block::BlockDevice;
+        let mut dev = FileBackend::create(img.path(), total_sectors as u64 * 512).unwrap();
+        Fat32::build_from_host_dir(
+            &mut dev,
+            total_sectors,
+            src.path(),
+            0x1234_5678,
+            *b"MUTATE     ",
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+
+    // Open + add a file at root, add a directory, drop a long-named file
+    // in the new directory, then remove the original file.
+    let host = TempDir::new().unwrap();
+    let added_file = host.path().join("added.txt");
+    std::fs::write(&added_file, b"added body\n").unwrap();
+    let nested_file = host.path().join("A Long Name.md");
+    std::fs::write(&nested_file, b"nested body\n").unwrap();
+
+    {
+        use fstool::block::BlockDevice;
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Fat32::open(&mut dev).unwrap();
+        fs.add_file(&mut dev, "/added.txt", &added_file).unwrap();
+        fs.add_dir(&mut dev, "/new").unwrap();
+        fs.add_file(&mut dev, "/new/A Long Name.md", &nested_file)
+            .unwrap();
+        fs.remove(&mut dev, "/original.txt").unwrap();
+        fs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    let res = Command::new("fsck.vfat")
+        .args(["-n", "-v"])
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "fsck.vfat failed after modify:\n{}",
+        String::from_utf8_lossy(&res.stdout)
+    );
+
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let fs = Fat32::open(&mut dev).unwrap();
+    let root: Vec<String> = fs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(!root.iter().any(|n| n == "original.txt"));
+    assert!(root.iter().any(|n| n == "added.txt"));
+    assert!(root.iter().any(|n| n == "new"));
+
+    let mut reader = fs.open_file_reader(&mut dev, "/added.txt").unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"added body\n");
+
+    let mut reader = fs
+        .open_file_reader(&mut dev, "/new/A Long Name.md")
+        .unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"nested body\n");
+}
+
+#[test]
+fn remove_rejects_non_empty_directory() {
+    let src = TempDir::new().unwrap();
+    std::fs::create_dir(src.path().join("dir")).unwrap();
+    std::fs::write(src.path().join("dir/inner.txt"), b"x\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let total_sectors = 64 * 1024 * 1024 / 512;
+    {
+        use fstool::block::BlockDevice;
+        let mut dev = FileBackend::create(img.path(), total_sectors as u64 * 512).unwrap();
+        Fat32::build_from_host_dir(
+            &mut dev,
+            total_sectors,
+            src.path(),
+            0x1234_5678,
+            *b"MUTATE     ",
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let mut fs = Fat32::open(&mut dev).unwrap();
+    let err = fs.remove(&mut dev, "/dir").unwrap_err();
+    assert!(
+        format!("{err}").contains("not empty"),
+        "expected non-empty error, got {err}"
+    );
+    // Removing the inner file then the dir must succeed.
+    fs.remove(&mut dev, "/dir/inner.txt").unwrap();
+    fs.remove(&mut dev, "/dir").unwrap();
+}
+
+#[test]
 fn open_reads_back_an_mkfs_vfat_image() {
     let Some(_) = which("mkfs.vfat") else {
         eprintln!("skipping: mkfs.vfat not installed");

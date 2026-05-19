@@ -236,6 +236,96 @@ fn cli_info_reports_ext4() {
     );
 }
 
+/// FAT32 add/rm through `fstool`: parallel to the ext test.
+#[test]
+fn cli_fat32_add_and_rm() {
+    if !which("fsck.vfat") {
+        eprintln!("skipping: fsck.vfat not installed");
+        return;
+    }
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("keep.txt"), b"keep\n").unwrap();
+    std::fs::write(srcdir.path().join("goodbye.txt"), b"bye\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args(["fat-build", "--size", "64MiB", "--label", "CLIRM"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fat-build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // add a host file
+    let extra = NamedTempFile::new().unwrap();
+    std::fs::write(extra.path(), b"added via cli\n").unwrap();
+    let out = Command::new(FSTOOL)
+        .arg("add")
+        .arg(img.path())
+        .arg(extra.path())
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // cat the added file
+    let out = Command::new(FSTOOL)
+        .args(["cat"])
+        .arg(img.path())
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"added via cli\n");
+
+    // rm a different file
+    let out = Command::new(FSTOOL)
+        .arg("rm")
+        .arg(img.path())
+        .arg("/goodbye.txt")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rm failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // fsck must still be clean.
+    let res = Command::new("fsck.vfat")
+        .args(["-n", "-v"])
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "fsck.vfat failed after add/rm:\n{}",
+        String::from_utf8_lossy(&res.stdout)
+    );
+
+    // ls shows the expected state.
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(listing.contains("keep.txt"));
+    assert!(listing.contains("added.txt"));
+    assert!(!listing.contains("goodbye.txt"));
+}
+
 /// `fstool fat-build` → `ls` → `cat` → `info` on a FAT32 image. Exercises
 /// the unified inspection dispatch (the CLI doesn't know it's FAT32).
 #[test]

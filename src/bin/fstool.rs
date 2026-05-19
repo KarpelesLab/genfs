@@ -198,50 +198,30 @@ fn run(cli: Cli) -> fstool::Result<()> {
 
 fn rm(image: &std::path::Path, fs_path: &str) -> fstool::Result<()> {
     let mut dev = FileBackend::open(image)?;
-    let mut ext = Ext::open(&mut dev)?;
-    ext.remove_path(&mut dev, fs_path)?;
-    ext.flush(&mut dev)?;
+    let mut fs = fstool::inspect::AnyFs::open(&mut dev)?;
+    fs.remove(&mut dev, fs_path)?;
+    fs.flush(&mut dev)?;
     dev.sync()?;
     eprintln!("removed {fs_path}");
     Ok(())
 }
 
 fn add(image: &std::path::Path, host_src: &std::path::Path, fs_dest: &str) -> fstool::Result<()> {
-    use fstool::fs::{FileMeta, FileSource, Filesystem};
-    use std::os::unix::fs::PermissionsExt;
-
     let meta = std::fs::symlink_metadata(host_src)?;
     let mut dev = FileBackend::open(image)?;
-    let mut ext = Ext::open(&mut dev)?;
-    let dest = std::path::Path::new(fs_dest);
+    let mut fs = fstool::inspect::AnyFs::open(&mut dev)?;
 
     if meta.is_dir() {
-        let fmeta = FileMeta {
-            mode: (meta.permissions().mode() & 0o7777) as u16,
-            ..FileMeta::default()
-        };
-        ext.create_dir(&mut dev, dest, fmeta)?;
-        // Resolve the new directory's inode and recurse the host tree into it.
-        let dir_ino = ext.path_to_inode(&mut dev, fs_dest)?;
-        ext.populate_from_host_dir(&mut dev, dir_ino, host_src)?;
+        fs.add_dir_tree(&mut dev, fs_dest, host_src)?;
     } else if meta.is_file() {
-        let fmeta = FileMeta {
-            mode: (meta.permissions().mode() & 0o7777) as u16,
-            ..FileMeta::default()
-        };
-        ext.create_file(
-            &mut dev,
-            dest,
-            FileSource::HostPath(host_src.to_path_buf()),
-            fmeta,
-        )?;
+        fs.add_file(&mut dev, fs_dest, host_src)?;
     } else {
         return Err(fstool::Error::InvalidArgument(format!(
             "add: {} is neither a regular file nor a directory",
             host_src.display()
         )));
     }
-    ext.flush(&mut dev)?;
+    fs.flush(&mut dev)?;
     dev.sync()?;
     eprintln!("added {} → {fs_dest}", host_src.display());
     Ok(())

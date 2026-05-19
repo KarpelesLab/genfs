@@ -12,6 +12,7 @@
 pub mod boot;
 pub mod dir;
 pub mod fsinfo;
+pub mod mutate;
 pub mod table;
 
 use std::io::Read;
@@ -153,7 +154,8 @@ impl Fat32 {
             &fs.volume_label_entry(),
         )?;
 
-        fs.flush(dev, clusters)?;
+        let _ = clusters;
+        fs.flush(dev)?;
         Ok(fs)
     }
 
@@ -219,9 +221,9 @@ impl Fat32 {
     }
 
     /// Persist the boot sector (+ backup), FSInfo (+ backup) and both FAT
-    /// copies. `clusters` is the volume's data-cluster count, needed for the
-    /// FSInfo free count.
-    fn flush(&self, dev: &mut dyn BlockDevice, clusters: u32) -> Result<()> {
+    /// copies. Free-cluster accounting is derived from the current FAT, so
+    /// this works for both fresh-format and modify-in-place flows.
+    pub fn flush(&self, dev: &mut dyn BlockDevice) -> Result<()> {
         let boot_bytes = self.boot.encode();
         dev.write_at(0, &boot_bytes)?;
         dev.write_at(
@@ -229,12 +231,16 @@ impl Fat32 {
             &boot_bytes,
         )?;
 
-        // free_count = total clusters minus the ones handed out so far.
-        // next_free starts at 3 and only advances, so used = next_free - 2.
-        let used = self.next_free - 2;
+        let clusters = self.boot.cluster_count();
+        let free_count = self.count_free_clusters();
+        let next_hint = if self.next_free >= 2 && self.next_free < clusters + 2 {
+            self.next_free
+        } else {
+            2
+        };
         let fsinfo = FsInfo {
-            free_count: clusters.saturating_sub(used),
-            next_free: self.next_free,
+            free_count,
+            next_free: next_hint,
         };
         let fsinfo_bytes = fsinfo.encode();
         dev.write_at(
@@ -257,6 +263,19 @@ impl Fat32 {
         Ok(())
     }
 
+    /// Count clusters whose FAT entry is FREE, across the data-cluster
+    /// range `[2, cluster_count + 2)`.
+    fn count_free_clusters(&self) -> u32 {
+        let clusters = self.boot.cluster_count();
+        let mut n = 0u32;
+        for c in 2..(2 + clusters) {
+            if self.fat.get(c) == table::FREE {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// One-shot: format `dev` to `total_sectors` and copy a host directory
     /// tree into the root. Symlinks and device nodes in the source are
     /// skipped (FAT has no representation for them).
@@ -273,12 +292,11 @@ impl Fat32 {
             volume_label,
         };
         let mut fs = Self::format(dev, &opts)?;
-        let (_, _, clusters) = Self::geometry(total_sectors)?;
         let root_cluster = fs.boot.root_cluster;
         // Root is its own "parent" placeholder; parent_cluster is unused when
         // is_root = true.
         fs.write_dir_tree(dev, src, root_cluster, true, root_cluster)?;
-        fs.flush(dev, clusters)?;
+        fs.flush(dev)?;
         dev.sync()?;
         Ok(())
     }

@@ -12,9 +12,9 @@ use std::path::Path;
 
 use crate::Result;
 use crate::block::BlockDevice;
-use crate::fs::DirEntry;
 use crate::fs::ext::Ext;
 use crate::fs::fat::Fat32;
+use crate::fs::{DirEntry, Filesystem};
 
 /// Which filesystem an image carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +128,84 @@ impl AnyFs {
         Ok(total)
     }
 
+    /// Add a regular file at `dest_path`, populated from a host file.
+    /// Parent directories must already exist. For ext, the destination's
+    /// mode is taken from the host file's permission bits; FAT has no
+    /// Unix permissions and ignores them.
+    pub fn add_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dest_path: &str,
+        host_src: &Path,
+    ) -> Result<()> {
+        match self {
+            Self::Ext(ext) => {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::symlink_metadata(host_src)?;
+                let fmeta = crate::fs::FileMeta {
+                    mode: (meta.permissions().mode() & 0o7777) as u16,
+                    ..crate::fs::FileMeta::default()
+                };
+                let dest = std::path::Path::new(dest_path);
+                use crate::fs::FileSource;
+                ext.create_file(
+                    dev,
+                    dest,
+                    FileSource::HostPath(host_src.to_path_buf()),
+                    fmeta,
+                )
+            }
+            Self::Fat32(fat) => fat.add_file(dev, dest_path, host_src),
+        }
+    }
+
+    /// Recursively add a host directory tree at `dest_path`. The
+    /// destination's parent must exist; the leaf is created. Symlinks in
+    /// the source are skipped on FAT.
+    pub fn add_dir_tree(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dest_path: &str,
+        host_src: &Path,
+    ) -> Result<()> {
+        match self {
+            Self::Ext(ext) => {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::symlink_metadata(host_src)?;
+                let fmeta = crate::fs::FileMeta {
+                    mode: (meta.permissions().mode() & 0o7777) as u16,
+                    ..crate::fs::FileMeta::default()
+                };
+                let dest = std::path::Path::new(dest_path);
+                ext.create_dir(dev, dest, fmeta)?;
+                let dir_ino = ext.path_to_inode(dev, dest_path)?;
+                ext.populate_from_host_dir(dev, dir_ino, host_src)?;
+                Ok(())
+            }
+            Self::Fat32(fat) => {
+                fat.add_dir(dev, dest_path)?;
+                add_host_tree_into_fat32(fat, dev, dest_path, host_src)
+            }
+        }
+    }
+
+    /// Remove an entry at `path` — a file, symlink, device, or empty
+    /// directory. Non-empty directories are rejected.
+    pub fn remove(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        match self {
+            Self::Ext(ext) => ext.remove_path(dev, path),
+            Self::Fat32(fat) => fat.remove(dev, path),
+        }
+    }
+
+    /// Persist any in-memory metadata changes to the device.
+    pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        match self {
+            Self::Ext(ext) => ext.flush(dev),
+            Self::Fat32(fat) => fat.flush(dev),
+        }
+    }
+
     /// One-line FS summary, used by `fstool info`'s heading.
     pub fn kind_string(&self) -> &'static str {
         match self {
@@ -139,6 +217,46 @@ impl AnyFs {
             Self::Fat32(_) => "fat32",
         }
     }
+}
+
+/// Recursively copy a host directory tree into a pre-existing FAT32
+/// directory at `dest_path`. Used by [`AnyFs::add_dir_tree`] for the
+/// FAT32 backend; symlinks in the source are skipped, regular files are
+/// streamed through `add_file`, and subdirectories recurse.
+fn add_host_tree_into_fat32(
+    fat: &mut Fat32,
+    dev: &mut dyn BlockDevice,
+    dest_path: &str,
+    host_src: &Path,
+) -> Result<()> {
+    let mut entries: Vec<std::fs::DirEntry> =
+        std::fs::read_dir(host_src)?.collect::<std::result::Result<_, _>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let meta = entry.metadata()?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 file name".into()))?
+            .to_string();
+        let child_dest = if dest_path.ends_with('/') {
+            format!("{dest_path}{name}")
+        } else {
+            format!("{dest_path}/{name}")
+        };
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            continue; // FAT has no symlinks
+        }
+        if ft.is_file() {
+            fat.add_file(dev, &child_dest, &path)?;
+        } else if ft.is_dir() {
+            fat.add_dir(dev, &child_dest)?;
+            add_host_tree_into_fat32(fat, dev, &child_dest, &path)?;
+        }
+    }
+    Ok(())
 }
 
 /// One-shot helper: open `path` as a file-backed device, identify the FS,

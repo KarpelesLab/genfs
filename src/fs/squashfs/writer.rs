@@ -30,10 +30,13 @@ use std::io::Read;
 
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::fs::DeviceKind;
 use crate::fs::FileSource;
 use crate::fs::squashfs::Compression;
 use crate::fs::squashfs::inode::{
-    INODE_BASIC_DIR, INODE_BASIC_FILE, INODE_BASIC_SYMLINK, INODE_EXT_FILE, INODE_EXT_SYMLINK,
+    INODE_BASIC_BLOCK, INODE_BASIC_CHAR, INODE_BASIC_DIR, INODE_BASIC_FIFO, INODE_BASIC_FILE,
+    INODE_BASIC_SOCKET, INODE_BASIC_SYMLINK, INODE_EXT_BLOCK, INODE_EXT_CHAR, INODE_EXT_DIR,
+    INODE_EXT_FIFO, INODE_EXT_FILE, INODE_EXT_SOCKET, INODE_EXT_SYMLINK,
 };
 use crate::fs::squashfs::metablock::{compression_to_algo, encode_metablock};
 use crate::fs::squashfs::xattr::Xattr;
@@ -71,6 +74,17 @@ enum BuiltKind {
     Dir,
     File(FileSource),
     Symlink(String),
+    /// A second directory entry pointing at an existing inode. The `String`
+    /// is the *normalised* path of the source entry. We resolve it at
+    /// flush() time and share its inode number + position.
+    Hardlink(String),
+    /// Device node (block / char / fifo / socket). Major/minor are packed
+    /// using the Linux MKDEV formula at emission time.
+    Device {
+        kind: DeviceKind,
+        major: u32,
+        minor: u32,
+    },
 }
 
 struct BuiltEntry {
@@ -187,6 +201,91 @@ impl WriteState {
         Ok(())
     }
 
+    /// Register a hard link at `dst_path` pointing at the existing inode of
+    /// `src_path`. SquashFS rejects hard links to directories, so the source
+    /// must resolve to a regular file or symlink — anything else returns
+    /// [`crate::Error::InvalidArgument`].
+    pub fn create_hardlink(&mut self, src_path: &str, dst_path: &str) -> Result<()> {
+        let src = normalise_path(src_path)?;
+        let dst = normalise_path(dst_path)?;
+        if dst == "/" {
+            return Err(crate::Error::InvalidArgument(
+                "squashfs: cannot create hardlink at /".into(),
+            ));
+        }
+        if dst == src {
+            return Err(crate::Error::InvalidArgument(
+                "squashfs: hardlink source and destination are identical".into(),
+            ));
+        }
+        // Resolve the source: must be a non-dir file/symlink/device.
+        let (real_src, src_meta) = {
+            let Some(entry) = self.files.get(&src) else {
+                if self.dirs.contains_key(&src) {
+                    return Err(crate::Error::InvalidArgument(
+                        "squashfs: hardlinks to directories are not allowed".into(),
+                    ));
+                }
+                return Err(crate::Error::InvalidArgument(format!(
+                    "squashfs: hardlink source {src:?} does not exist"
+                )));
+            };
+            // Disallow nesting hardlinks (collapse to the ultimate source).
+            let real_src = match &entry.kind {
+                BuiltKind::Hardlink(s) => s.clone(),
+                _ => src.clone(),
+            };
+            (real_src, entry.meta)
+        };
+        let parent = parent_path(&dst);
+        self.ensure_parent(parent)?;
+        // Copy metadata + xattrs from source for completeness; consumers
+        // who want different metadata should attach it to the source. The
+        // hardlinked entry won't materialise its own inode anyway — the
+        // shared inode wins.
+        self.files.insert(
+            dst,
+            BuiltEntry {
+                kind: BuiltKind::Hardlink(real_src),
+                meta: src_meta,
+                xattrs: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Buffer a new device node, FIFO or socket. `major`/`minor` are packed
+    /// per the Linux `MKDEV(major, minor)` formula; only the low 20 bits of
+    /// `minor` and low 12 bits of `major` are preserved (matching the
+    /// SquashFS legacy 32-bit device format).
+    pub fn create_device(
+        &mut self,
+        path: &str,
+        kind: DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: EntryMeta,
+        xattrs: Vec<Xattr>,
+    ) -> Result<()> {
+        let p = normalise_path(path)?;
+        if p == "/" {
+            return Err(crate::Error::InvalidArgument(
+                "squashfs: cannot create device at /".into(),
+            ));
+        }
+        let parent = parent_path(&p);
+        self.ensure_parent(parent)?;
+        self.files.insert(
+            p,
+            BuiltEntry {
+                kind: BuiltKind::Device { kind, major, minor },
+                meta,
+                xattrs,
+            },
+        );
+        Ok(())
+    }
+
     fn ensure_parent(&mut self, parent: String) -> Result<()> {
         if parent == "/" {
             return Ok(());
@@ -214,25 +313,48 @@ impl WriteState {
         // ---- 1) Assign inode numbers in deterministic order. ----
         //
         // Inode 1 = root; the rest follow the BTreeMap's natural order so
-        // listings are alphabetical inside each directory.
+        // listings are alphabetical inside each directory. Hardlinks share
+        // the source's inode number — they don't consume a slot.
         let mut inode_numbers: BTreeMap<String, u32> = BTreeMap::new();
+        // Count hard links per source path so we can populate link_count
+        // correctly when we emit the source inode.
+        let mut hardlink_count: BTreeMap<String, u32> = BTreeMap::new();
+        for entry in self.files.values() {
+            if let BuiltKind::Hardlink(src) = &entry.kind {
+                *hardlink_count.entry(src.clone()).or_insert(0) += 1;
+            }
+        }
         let mut next_inode: u32 = 1;
         inode_numbers.insert("/".into(), next_inode);
         next_inode += 1;
-        // Combine dirs + files into a sorted path list, skipping "/".
+        // Combine dirs + files into a sorted path list, skipping "/" and
+        // hardlinks (the latter are filled in below).
         let mut all_paths: Vec<&String> = Vec::new();
         for p in self.dirs.keys() {
             if p != "/" {
                 all_paths.push(p);
             }
         }
-        for p in self.files.keys() {
-            all_paths.push(p);
+        for (p, e) in &self.files {
+            if !matches!(e.kind, BuiltKind::Hardlink(_)) {
+                all_paths.push(p);
+            }
         }
         all_paths.sort();
         for p in &all_paths {
             inode_numbers.insert((*p).clone(), next_inode);
             next_inode += 1;
+        }
+        // Now fill in inode numbers for hardlinks (they alias the source).
+        for (p, e) in &self.files {
+            if let BuiltKind::Hardlink(src) = &e.kind {
+                let src_inode = *inode_numbers.get(src).ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "squashfs: hardlink source {src:?} not found at flush time"
+                    ))
+                })?;
+                inode_numbers.insert(p.clone(), src_inode);
+            }
         }
         let total_inodes = next_inode - 1;
 
@@ -294,14 +416,34 @@ impl WriteState {
             file_size: u64,
         }
         let mut file_layouts: BTreeMap<String, FileLayout> = BTreeMap::new();
-        // Fragment block accumulator: we pack file tails (and small whole
-        // files) into a single in-memory buffer, flushed as one fragment
-        // entry. SquashFS allows many fragment blocks; one is enough for
-        // a v4 archive built from a moderately small tree.
+        // Fragment block accumulator. Tails are packed into the *current*
+        // fragment buffer; once it would exceed `block_size`, we emit it as
+        // one fragment-table entry and start a fresh buffer. This produces
+        // multiple fragment-table entries for trees with many small files.
         let mut frag_buf: Vec<u8> = Vec::new();
+        // Fragment table entries built as we flush each frag buffer.
+        let mut fragment_entries: Vec<(u64, u32)> = Vec::new(); // (disk_offset, size_word)
 
         let block_size = self.block_size;
         let mut scratch = vec![0u8; 65_536];
+
+        // Local helper to flush the current frag buffer if it's non-empty.
+        // Returns the index assigned to the just-flushed buffer.
+        let flush_frag_buf = |frag_buf: &mut Vec<u8>,
+                              fragment_entries: &mut Vec<(u64, u32)>,
+                              compression: Compression,
+                              dev: &mut dyn BlockDevice,
+                              next_disk_offset: &mut u64|
+         -> Result<()> {
+            if frag_buf.is_empty() {
+                return Ok(());
+            }
+            let start = *next_disk_offset;
+            let size_word = emit_data_block(dev, frag_buf, compression, next_disk_offset)?;
+            fragment_entries.push((start, size_word));
+            frag_buf.clear();
+            Ok(())
+        };
 
         // Iterate files in deterministic order.
         let file_keys: Vec<String> = self.files.keys().cloned().collect();
@@ -340,9 +482,21 @@ impl WriteState {
                 continue;
             }
             if total < block_size as u64 {
+                // Whole file goes to a fragment. Flush the current frag
+                // buffer first if appending this tail would push it past
+                // `block_size`.
+                if frag_buf.len() as u64 + total > block_size as u64 {
+                    flush_frag_buf(
+                        &mut frag_buf,
+                        &mut fragment_entries,
+                        self.compression,
+                        dev,
+                        &mut next_disk_offset,
+                    )?;
+                }
                 let off = frag_buf.len();
                 copy_to_buf(&mut *reader, &mut scratch, total, &mut frag_buf)?;
-                layout.fragment_index = 0;
+                layout.fragment_index = fragment_entries.len() as u32;
                 layout.fragment_offset = off as u32;
                 file_layouts.insert(path.clone(), layout);
                 continue;
@@ -357,22 +511,31 @@ impl WriteState {
             }
             let tail = (total - consumed) as usize;
             if tail > 0 {
+                if frag_buf.len() + tail > block_size as usize {
+                    flush_frag_buf(
+                        &mut frag_buf,
+                        &mut fragment_entries,
+                        self.compression,
+                        dev,
+                        &mut next_disk_offset,
+                    )?;
+                }
                 let off = frag_buf.len();
                 copy_to_buf(&mut *reader, &mut scratch, tail as u64, &mut frag_buf)?;
-                layout.fragment_index = 0;
+                layout.fragment_index = fragment_entries.len() as u32;
                 layout.fragment_offset = off as u32;
             }
             file_layouts.insert(path.clone(), layout);
         }
 
-        // Emit the single fragment block (if any).
-        let mut fragment_entries: Vec<(u64, u32)> = Vec::new(); // (disk_offset, size_word)
-        if !frag_buf.is_empty() {
-            let start = next_disk_offset;
-            let size_word =
-                emit_data_block(dev, &frag_buf, self.compression, &mut next_disk_offset)?;
-            fragment_entries.push((start, size_word));
-        }
+        // Emit the final (possibly only) fragment block, if any.
+        flush_frag_buf(
+            &mut frag_buf,
+            &mut fragment_entries,
+            self.compression,
+            dev,
+            &mut next_disk_offset,
+        )?;
 
         // ---- 5) Phase B — assign uid/gid + xattr indices, build inode metablocks. ----
         //
@@ -423,15 +586,24 @@ impl WriteState {
         // doesn't require the root to be first — only that root_inode in
         // the superblock points at it. So we emit dirs *after* non-dirs.
 
-        // ---- Build all non-directory inodes. ----
+        // ---- Build all non-directory inodes (skip hardlinks — they alias). ----
         for path in &file_keys {
             let entry = self.files.get(path).unwrap();
+            // Hardlinks alias an existing inode; no inode emission.
+            if matches!(entry.kind, BuiltKind::Hardlink(_)) {
+                continue;
+            }
             let uid_idx = intern_id(entry.meta.uid)?;
             let gid_idx = intern_id(entry.meta.gid)?;
             let inode_no = inode_numbers[path];
+            // 1 (the entry itself) + N hardlinks pointing at it.
+            let link_count: u32 = 1 + hardlink_count.get(path).copied().unwrap_or(0);
             // Intern the xattr set up front so we know whether we need
             // the extended inode form (which carries an xattr_index).
             let xattr_idx = intern_xattr(&entry.xattrs, &mut xattr_sets, &mut xattr_set_index);
+            // Hardlinks force the extended form on the target so the
+            // link_count field is materialised on disk.
+            let force_ext = link_count > 1;
             match &entry.kind {
                 BuiltKind::File(_) => {
                     let layout = &file_layouts[path];
@@ -446,7 +618,7 @@ impl WriteState {
                         ));
                     }
                     let mut bytes = Vec::with_capacity(64 + layout.block_size_words.len() * 4);
-                    if xattr_idx == u32::MAX {
+                    if xattr_idx == u32::MAX && !force_ext {
                         // Basic file inode.
                         bytes.extend_from_slice(&INODE_BASIC_FILE.to_le_bytes());
                         bytes.extend_from_slice(&entry.meta.mode.to_le_bytes());
@@ -460,7 +632,7 @@ impl WriteState {
                         bytes.extend_from_slice(&(layout.file_size as u32).to_le_bytes());
                     } else {
                         // Extended file inode: u64 blocks_start, u64 file_size,
-                        // u64 sparse=0, u32 link_count=1, u32 fragment_index,
+                        // u64 sparse=0, u32 link_count, u32 fragment_index,
                         // u32 fragment_offset, u32 xattr_index.
                         bytes.extend_from_slice(&INODE_EXT_FILE.to_le_bytes());
                         bytes.extend_from_slice(&entry.meta.mode.to_le_bytes());
@@ -471,7 +643,7 @@ impl WriteState {
                         bytes.extend_from_slice(&layout.blocks_start.to_le_bytes());
                         bytes.extend_from_slice(&layout.file_size.to_le_bytes());
                         bytes.extend_from_slice(&0u64.to_le_bytes()); // sparse
-                        bytes.extend_from_slice(&1u32.to_le_bytes()); // link_count
+                        bytes.extend_from_slice(&link_count.to_le_bytes());
                         bytes.extend_from_slice(&layout.fragment_index.to_le_bytes());
                         bytes.extend_from_slice(&layout.fragment_offset.to_le_bytes());
                         bytes.extend_from_slice(&xattr_idx.to_le_bytes());
@@ -494,7 +666,7 @@ impl WriteState {
                     bytes.extend_from_slice(&gid_idx.to_le_bytes());
                     bytes.extend_from_slice(&entry.meta.mtime.to_le_bytes());
                     bytes.extend_from_slice(&inode_no.to_le_bytes());
-                    bytes.extend_from_slice(&1u32.to_le_bytes()); // link_count
+                    bytes.extend_from_slice(&link_count.to_le_bytes());
                     bytes.extend_from_slice(&(target.len() as u32).to_le_bytes());
                     bytes.extend_from_slice(target.as_bytes());
                     if xattr_idx != u32::MAX {
@@ -503,6 +675,49 @@ impl WriteState {
                     let off = emit_inode(&mut inode_table_raw, &bytes);
                     nondir_raw_offsets.insert(path.clone(), off);
                 }
+                BuiltKind::Device { kind, major, minor } => {
+                    // Pack into u32 per Linux MKDEV: top 12 bits = major,
+                    // bottom 20 bits = minor (legacy SquashFS format).
+                    let dev_word: u32 = ((*major & 0xFFF) << 20) | (*minor & 0xF_FFFF);
+                    let (basic_id, ext_id) = match kind {
+                        DeviceKind::Block => (INODE_BASIC_BLOCK, INODE_EXT_BLOCK),
+                        DeviceKind::Char => (INODE_BASIC_CHAR, INODE_EXT_CHAR),
+                        DeviceKind::Fifo => (INODE_BASIC_FIFO, INODE_EXT_FIFO),
+                        DeviceKind::Socket => (INODE_BASIC_SOCKET, INODE_EXT_SOCKET),
+                    };
+                    let use_ext = xattr_idx != u32::MAX || force_ext;
+                    let mut bytes = Vec::new();
+                    if use_ext {
+                        bytes.extend_from_slice(&ext_id.to_le_bytes());
+                    } else {
+                        bytes.extend_from_slice(&basic_id.to_le_bytes());
+                    }
+                    bytes.extend_from_slice(&entry.meta.mode.to_le_bytes());
+                    bytes.extend_from_slice(&uid_idx.to_le_bytes());
+                    bytes.extend_from_slice(&gid_idx.to_le_bytes());
+                    bytes.extend_from_slice(&entry.meta.mtime.to_le_bytes());
+                    bytes.extend_from_slice(&inode_no.to_le_bytes());
+                    bytes.extend_from_slice(&link_count.to_le_bytes());
+                    // Block/char carry a device word; fifo/socket spec is
+                    // device-less but we still write the word as 0 for
+                    // block/char-shaped on-disk layout consistency. The
+                    // SquashFS spec defines fifo/socket inodes as
+                    // header + link_count only (no device field). To
+                    // remain spec-correct, only emit the device word for
+                    // block/char.
+                    match kind {
+                        DeviceKind::Block | DeviceKind::Char => {
+                            bytes.extend_from_slice(&dev_word.to_le_bytes());
+                        }
+                        DeviceKind::Fifo | DeviceKind::Socket => {}
+                    }
+                    if use_ext {
+                        bytes.extend_from_slice(&xattr_idx.to_le_bytes());
+                    }
+                    let off = emit_inode(&mut inode_table_raw, &bytes);
+                    nondir_raw_offsets.insert(path.clone(), off);
+                }
+                BuiltKind::Hardlink(_) => unreachable!(),
                 BuiltKind::Dir => unreachable!(),
             }
         }
@@ -522,15 +737,42 @@ impl WriteState {
         for p in &file_keys {
             let parent = parent_path(p);
             let name = leaf_name(p).to_string();
-            let kind = match &self.files[p].kind {
-                BuiltKind::File(_) => INODE_BASIC_FILE,
-                BuiltKind::Symlink(_) => INODE_BASIC_SYMLINK,
-                BuiltKind::Dir => INODE_BASIC_DIR,
+            // For a hardlink, the directory entry points at the *source*
+            // path's inode position. We resolve that here so the listing
+            // emitter further down uses the right (block_rel, offset).
+            let (kind, target_path) = match &self.files[p].kind {
+                BuiltKind::File(_) => (INODE_BASIC_FILE, p.clone()),
+                BuiltKind::Symlink(_) => (INODE_BASIC_SYMLINK, p.clone()),
+                BuiltKind::Dir => (INODE_BASIC_DIR, p.clone()),
+                BuiltKind::Hardlink(src) => {
+                    // Source kind: peek at the source entry.
+                    let k = match &self.files[src].kind {
+                        BuiltKind::File(_) => INODE_BASIC_FILE,
+                        BuiltKind::Symlink(_) => INODE_BASIC_SYMLINK,
+                        BuiltKind::Device { kind, .. } => match kind {
+                            DeviceKind::Block => INODE_BASIC_BLOCK,
+                            DeviceKind::Char => INODE_BASIC_CHAR,
+                            DeviceKind::Fifo => INODE_BASIC_FIFO,
+                            DeviceKind::Socket => INODE_BASIC_SOCKET,
+                        },
+                        BuiltKind::Dir | BuiltKind::Hardlink(_) => INODE_BASIC_FILE,
+                    };
+                    (k, src.clone())
+                }
+                BuiltKind::Device { kind, .. } => {
+                    let id = match kind {
+                        DeviceKind::Block => INODE_BASIC_BLOCK,
+                        DeviceKind::Char => INODE_BASIC_CHAR,
+                        DeviceKind::Fifo => INODE_BASIC_FIFO,
+                        DeviceKind::Socket => INODE_BASIC_SOCKET,
+                    };
+                    (id, p.clone())
+                }
             };
             listings
                 .get_mut(&parent)
                 .unwrap()
-                .push((name, p.clone(), kind));
+                .push((name, target_path, kind));
         }
         for d in self.dirs.keys() {
             if d == "/" {
@@ -567,31 +809,37 @@ impl WriteState {
         // simply record the post-non-dir-inode raw_offset for each dir.
         let mut dir_raw_offsets: BTreeMap<String, usize> = BTreeMap::new();
         // Encode directory listings into a single raw byte buffer; record
-        // each directory's (raw_offset, raw_size). We use one listing run
-        // per directory (no run-splitting), which keeps the writer simple
-        // and correct for trees that fit one inode-block (8 KiB) at a time.
+        // each directory's (raw_offset, raw_size). One or more runs per
+        // listing — see step 8.
         let mut dir_table_raw: Vec<u8> = Vec::new();
         let mut dir_listing_offsets: BTreeMap<String, (usize, usize)> = BTreeMap::new(); // path -> (raw_offset, raw_size)
-        // Helper to encode metablock-relative inode offsets requires the
-        // final inode-table metablock layout, but for the directory entry
-        // "inode_offset_signed" field we only need the difference from a
-        // base inode number. So encoding works without knowing inode-table
-        // chunking yet — for that we just need each child's inode-block
-        // offset (block_rel) plus its in_block offset.
 
-        // We need child positions before encoding listings. So first we
-        // do the inode-table chunking for non-dir inodes + dir inodes.
-        // But dir inode contents include listing offsets in the directory
-        // table, which we don't have yet. Resolution: dir inode size is
-        // fixed at 32 bytes (basic_dir form: 16 header + 16 payload). So
-        // we know dir inodes' positions before knowing their contents —
-        // we can reserve 32 bytes per directory now, encode listings using
-        // those positions, then go back and fill in dir inode bytes.
+        // Decide which directories need the extended-dir inode form
+        // (40 bytes instead of 32). We promote a dir to ext form when its
+        // listing-size upper bound, OR its xattr set, requires it.
+        //
+        // Upper bound per directory: in the worst case every entry lives
+        // in its own run, so each entry costs `12 (header) + 8 + name_len`
+        // bytes. A basic-dir's `file_size` field is a u16 storing size+3,
+        // so it caps at 65532 bytes of listing data.
+        let mut dir_is_ext: BTreeMap<String, bool> = BTreeMap::new();
+        for d in self.dirs.keys() {
+            let mut upper: usize = 0;
+            if let Some(entries) = listings.get(d) {
+                for (name, _, _) in entries {
+                    upper += 12 + 8 + name.len();
+                }
+            }
+            let needs_ext_for_size = upper > 65_532;
+            let needs_ext_for_xattr = !self.dirs[d].xattrs.is_empty();
+            dir_is_ext.insert(d.clone(), needs_ext_for_size || needs_ext_for_xattr);
+        }
 
+        // Reserve appropriate space per directory inode (32 basic, 40 ext).
         for d in self.dirs.keys() {
             let off = inode_table_raw.len();
-            // Reserve 32 bytes per dir inode for later back-patch.
-            inode_table_raw.extend_from_slice(&[0u8; 32]);
+            let sz = if dir_is_ext[d] { 40 } else { 32 };
+            inode_table_raw.extend_from_slice(&vec![0u8; sz]);
             dir_raw_offsets.insert(d.clone(), off);
         }
 
@@ -700,31 +948,51 @@ impl WriteState {
             let dir_meta = &self.dirs[d];
             let uid_idx = intern_id(dir_meta.meta.uid)?;
             let gid_idx = intern_id(dir_meta.meta.gid)?;
-            // Header
             let off = dir_raw_offsets[d];
-            // BasicDir: 16-byte header + 16-byte payload.
-            let mut buf = [0u8; 32];
-            buf[0..2].copy_from_slice(&INODE_BASIC_DIR.to_le_bytes());
-            buf[2..4].copy_from_slice(&dir_meta.meta.mode.to_le_bytes());
-            buf[4..6].copy_from_slice(&uid_idx.to_le_bytes());
-            buf[6..8].copy_from_slice(&gid_idx.to_le_bytes());
-            buf[8..12].copy_from_slice(&dir_meta.meta.mtime.to_le_bytes());
-            buf[12..16].copy_from_slice(&inode_no.to_le_bytes());
-            // Payload
-            buf[16..20].copy_from_slice(&block_index.to_le_bytes());
             let link_count = count_subdirs(&listings, d) as u32 + 2;
-            buf[20..24].copy_from_slice(&link_count.to_le_bytes());
-            // file_size: stored as size+3 for basic dirs (clamped to u16).
-            let stored = if listing_size == 0 {
-                3u16
+            let xattr_idx = intern_xattr(&dir_meta.xattrs, &mut xattr_sets, &mut xattr_set_index);
+            if dir_is_ext[d] {
+                // ExtDir: 16-byte header + 24-byte payload + 0 index entries.
+                let mut buf = [0u8; 40];
+                buf[0..2].copy_from_slice(&INODE_EXT_DIR.to_le_bytes());
+                buf[2..4].copy_from_slice(&dir_meta.meta.mode.to_le_bytes());
+                buf[4..6].copy_from_slice(&uid_idx.to_le_bytes());
+                buf[6..8].copy_from_slice(&gid_idx.to_le_bytes());
+                buf[8..12].copy_from_slice(&dir_meta.meta.mtime.to_le_bytes());
+                buf[12..16].copy_from_slice(&inode_no.to_le_bytes());
+                // Payload: u32 link_count, u32 file_size (size+3),
+                //          u32 block_index, u32 parent_inode,
+                //          u16 index_count=0, u16 block_offset, u32 xattr.
+                buf[16..20].copy_from_slice(&link_count.to_le_bytes());
+                let stored: u32 = (listing_size as u32).saturating_add(3);
+                buf[20..24].copy_from_slice(&stored.to_le_bytes());
+                buf[24..28].copy_from_slice(&block_index.to_le_bytes());
+                buf[28..32].copy_from_slice(&parent_inode.to_le_bytes());
+                buf[32..34].copy_from_slice(&0u16.to_le_bytes()); // index_count
+                buf[34..36].copy_from_slice(&block_offset.to_le_bytes());
+                buf[36..40].copy_from_slice(&xattr_idx.to_le_bytes());
+                inode_table_raw[off..off + 40].copy_from_slice(&buf);
             } else {
-                (listing_size as u16).saturating_add(3)
-            };
-            buf[24..26].copy_from_slice(&stored.to_le_bytes());
-            buf[26..28].copy_from_slice(&block_offset.to_le_bytes());
-            buf[28..32].copy_from_slice(&parent_inode.to_le_bytes());
-            inode_table_raw[off..off + 32].copy_from_slice(&buf);
-            let _ = intern_xattr(&dir_meta.xattrs, &mut xattr_sets, &mut xattr_set_index);
+                // BasicDir: 16-byte header + 16-byte payload.
+                let mut buf = [0u8; 32];
+                buf[0..2].copy_from_slice(&INODE_BASIC_DIR.to_le_bytes());
+                buf[2..4].copy_from_slice(&dir_meta.meta.mode.to_le_bytes());
+                buf[4..6].copy_from_slice(&uid_idx.to_le_bytes());
+                buf[6..8].copy_from_slice(&gid_idx.to_le_bytes());
+                buf[8..12].copy_from_slice(&dir_meta.meta.mtime.to_le_bytes());
+                buf[12..16].copy_from_slice(&inode_no.to_le_bytes());
+                buf[16..20].copy_from_slice(&block_index.to_le_bytes());
+                buf[20..24].copy_from_slice(&link_count.to_le_bytes());
+                let stored = if listing_size == 0 {
+                    3u16
+                } else {
+                    (listing_size as u16).saturating_add(3)
+                };
+                buf[24..26].copy_from_slice(&stored.to_le_bytes());
+                buf[26..28].copy_from_slice(&block_offset.to_le_bytes());
+                buf[28..32].copy_from_slice(&parent_inode.to_le_bytes());
+                inode_table_raw[off..off + 32].copy_from_slice(&buf);
+            }
         }
 
         // ---- 11) Re-encode inode metablocks after the back-patch. ----
@@ -774,8 +1042,16 @@ impl WriteState {
             u64::MAX
         } else {
             // Inverse map: inode_number -> path.
+            // Build inv: inode number → path. Skip hardlink aliases so a
+            // hard link's path doesn't shadow the real entry (which is the
+            // one that has an `inode_positions` mapping).
             let mut inv: BTreeMap<u32, String> = BTreeMap::new();
             for (p, &i) in &inode_numbers {
+                if let Some(e) = self.files.get(p)
+                    && matches!(e.kind, BuiltKind::Hardlink(_))
+                {
+                    continue;
+                }
                 inv.insert(i, p.clone());
             }
             let mut raw: Vec<u8> = Vec::with_capacity(total_inodes as usize * 8);

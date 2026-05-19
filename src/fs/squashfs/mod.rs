@@ -29,6 +29,7 @@ use std::io::Read;
 
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::fs::DeviceKind;
 use crate::fs::DirEntry;
 use crate::fs::FileSource;
 
@@ -350,6 +351,46 @@ impl Squashfs {
             .as_mut()
             .ok_or_else(|| crate::Error::InvalidArgument("squashfs: not in write mode".into()))?;
         s.create_symlink(path, target, meta, xattrs)
+    }
+
+    /// Add a second directory entry at `dst_path` aliasing the inode of
+    /// `src_path`. Bumps the source inode's `link_count`. Rejected if the
+    /// source resolves to a directory (POSIX-style — SquashFS doesn't
+    /// support directory hard links).
+    pub fn create_hardlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        src_path: &str,
+        dst_path: &str,
+    ) -> Result<()> {
+        let s = self
+            .write_state
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: not in write mode".into()))?;
+        s.create_hardlink(src_path, dst_path)
+    }
+
+    /// Buffer a device node, FIFO, or Unix-domain socket at `path`. The
+    /// `major`/`minor` pair is encoded with the Linux `MKDEV` formula
+    /// (top 12 bits major, bottom 20 bits minor) into the device word that
+    /// lives on disk for block / char inodes. FIFO / socket inodes have no
+    /// device word — `major`/`minor` are accepted but ignored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_device(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &str,
+        kind: DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: EntryMeta,
+        xattrs: Vec<Xattr>,
+    ) -> Result<()> {
+        let s = self
+            .write_state
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: not in write mode".into()))?;
+        s.create_device(path, kind, major, minor, meta, xattrs)
     }
 
     /// Lay every buffered entry out on the device. After flushing the
@@ -979,5 +1020,296 @@ mod tests {
         // An entry without xattrs returns an empty vec.
         let xs2 = s.read_xattrs(&mut dev, "/lnk").unwrap();
         assert_eq!(xs2.len(), 0);
+    }
+
+    /// Full-coverage round-trip: build an image containing a file, a
+    /// nested directory, a symlink, a hardlink, every device-node kind,
+    /// and xattrs on a few entries. Flush, re-open via [`Squashfs::open`],
+    /// then validate every entry via [`Squashfs::list_path`],
+    /// [`Squashfs::read_xattrs`], [`Squashfs::inode_meta`],
+    /// [`Squashfs::open_file_reader`], and [`Squashfs::read_symlink`].
+    #[test]
+    fn cross_validation_round_trip_full() {
+        let mut dev = crate::block::MemoryBackend::new(2 * 1024 * 1024);
+        let mut s = Squashfs::format(
+            &mut dev,
+            &FormatOpts {
+                block_size: 4096,
+                compression: Compression::Unknown(0),
+            },
+        )
+        .unwrap();
+
+        // /etc dir, /etc/hosts file, /etc/link (hardlink to hosts).
+        s.create_dir(
+            &mut dev,
+            "/etc",
+            EntryMeta {
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                mtime: 100,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        s.create_file(
+            &mut dev,
+            "/etc/hosts",
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"127.0.0.1 localhost\n".to_vec())),
+                len: 20,
+            },
+            EntryMeta {
+                mode: 0o644,
+                uid: 7,
+                gid: 8,
+                mtime: 200,
+            },
+            vec![Xattr {
+                key: "user.kind".into(),
+                value: b"file".to_vec(),
+            }],
+        )
+        .unwrap();
+        s.create_hardlink(&mut dev, "/etc/hosts", "/etc/link")
+            .unwrap();
+
+        // /sym -> etc/hosts symlink.
+        s.create_symlink(
+            &mut dev,
+            "/sym",
+            "etc/hosts",
+            EntryMeta {
+                mode: 0o777,
+                uid: 0,
+                gid: 0,
+                mtime: 300,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+
+        // Device nodes — one of each.
+        s.create_device(
+            &mut dev,
+            "/dev/null",
+            crate::fs::DeviceKind::Char,
+            1,
+            3,
+            EntryMeta {
+                mode: 0o666,
+                uid: 0,
+                gid: 0,
+                mtime: 400,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        s.create_device(
+            &mut dev,
+            "/dev/sda",
+            crate::fs::DeviceKind::Block,
+            8,
+            0,
+            EntryMeta {
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                mtime: 500,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        s.create_device(
+            &mut dev,
+            "/run/fifo",
+            crate::fs::DeviceKind::Fifo,
+            0,
+            0,
+            EntryMeta {
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                mtime: 600,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        s.create_device(
+            &mut dev,
+            "/run/sock",
+            crate::fs::DeviceKind::Socket,
+            0,
+            0,
+            EntryMeta {
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                mtime: 700,
+            },
+            vec![Xattr {
+                key: "security.selinux".into(),
+                value: b"system_u:object_r:tmp_t:s0".to_vec(),
+            }],
+        )
+        .unwrap();
+
+        s.flush(&mut dev).unwrap();
+
+        // Re-open and inspect.
+        let s = Squashfs::open(&mut dev).unwrap();
+
+        // Root listing.
+        let mut root_names: Vec<String> = s
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        root_names.sort();
+        assert_eq!(root_names, vec!["dev", "etc", "run", "sym"]);
+
+        // /etc listing contains both hosts and link, link points at hosts' inode.
+        let etc = s.list_path(&mut dev, "/etc").unwrap();
+        let by_name: std::collections::HashMap<_, _> =
+            etc.iter().map(|e| (e.name.clone(), e.clone())).collect();
+        assert!(by_name.contains_key("hosts"));
+        assert!(by_name.contains_key("link"));
+        assert_eq!(by_name["hosts"].inode, by_name["link"].inode);
+        assert_eq!(by_name["hosts"].kind, crate::fs::EntryKind::Regular);
+        assert_eq!(by_name["link"].kind, crate::fs::EntryKind::Regular);
+
+        // File contents readable via both names.
+        for path in ["/etc/hosts", "/etc/link"] {
+            let mut r = s.open_file_reader(&mut dev, path).unwrap();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+            drop(r);
+            assert_eq!(buf, b"127.0.0.1 localhost\n", "via {path}");
+        }
+
+        // Symlink target.
+        let tgt = s.read_symlink(&mut dev, "/sym").unwrap();
+        assert_eq!(tgt, "etc/hosts");
+
+        // Device-node listings.
+        let dev_dir = s.list_path(&mut dev, "/dev").unwrap();
+        let dev_by: std::collections::HashMap<_, _> =
+            dev_dir.iter().map(|e| (e.name.clone(), e.kind)).collect();
+        assert_eq!(dev_by["null"], crate::fs::EntryKind::Char);
+        assert_eq!(dev_by["sda"], crate::fs::EntryKind::Block);
+        let run_dir = s.list_path(&mut dev, "/run").unwrap();
+        let run_by: std::collections::HashMap<_, _> =
+            run_dir.iter().map(|e| (e.name.clone(), e.kind)).collect();
+        assert_eq!(run_by["fifo"], crate::fs::EntryKind::Fifo);
+        assert_eq!(run_by["sock"], crate::fs::EntryKind::Socket);
+
+        // Inode metadata.
+        let m = s.inode_meta(&mut dev, "/etc/hosts").unwrap();
+        assert_eq!(m.uid, 7);
+        assert_eq!(m.gid, 8);
+        assert_eq!(m.mtime, 200);
+        assert_eq!(m.file_size, 20);
+        let m_null = s.inode_meta(&mut dev, "/dev/null").unwrap();
+        assert_eq!(m_null.kind, crate::fs::EntryKind::Char);
+        assert_eq!(m_null.mode, 0o666);
+
+        // Xattrs on the file.
+        let xs = s.read_xattrs(&mut dev, "/etc/hosts").unwrap();
+        assert_eq!(xs.len(), 1);
+        assert_eq!(xs[0].key, "user.kind");
+        assert_eq!(xs[0].value, b"file");
+        // Xattrs on the socket.
+        let xs = s.read_xattrs(&mut dev, "/run/sock").unwrap();
+        assert_eq!(xs.len(), 1);
+        assert_eq!(xs[0].key, "security.selinux");
+    }
+
+    /// Multi-fragment-block spill: build a tree with many small files
+    /// whose tails collectively exceed one block_size's worth of fragment
+    /// data, forcing the writer to emit multiple fragment-table entries.
+    /// The reader fetches the right entry per file.
+    #[test]
+    fn writer_spills_to_multiple_fragment_blocks() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        // 4 KiB block; each file is ~1500 bytes, so 3 files saturate one
+        // fragment block. Five files = at least two fragment blocks.
+        let mut s = Squashfs::format(
+            &mut dev,
+            &FormatOpts {
+                block_size: 4096,
+                compression: Compression::Unknown(0),
+            },
+        )
+        .unwrap();
+        let payloads: Vec<Vec<u8>> = (0..5)
+            .map(|i| (0..1500).map(|j| ((i * 1500 + j) % 251) as u8).collect())
+            .collect();
+        for (i, p) in payloads.iter().enumerate() {
+            s.create_file(
+                &mut dev,
+                &format!("/f{i}.bin"),
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(p.clone())),
+                    len: p.len() as u64,
+                },
+                EntryMeta::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        }
+        s.flush(&mut dev).unwrap();
+        // The superblock should advertise >1 fragment.
+        let s = Squashfs::open(&mut dev).unwrap();
+        assert!(
+            s.superblock().fragment_count >= 2,
+            "expected multi-fragment image, got {}",
+            s.superblock().fragment_count
+        );
+        // Each file reads back exactly.
+        for (i, p) in payloads.iter().enumerate() {
+            let mut r = s.open_file_reader(&mut dev, &format!("/f{i}.bin")).unwrap();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+            drop(r);
+            assert_eq!(&buf, p, "file f{i}.bin contents differ");
+        }
+    }
+
+    /// Large directory spill: build a directory whose listing exceeds the
+    /// basic-dir's 65532-byte limit, forcing the writer to promote it to
+    /// the extended-dir inode form. The reader handles both, so list_path
+    /// should still return the full set.
+    #[test]
+    fn writer_spills_to_extended_dir_inode() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let mut s = Squashfs::format(
+            &mut dev,
+            &FormatOpts {
+                block_size: 4096,
+                compression: Compression::Unknown(0),
+            },
+        )
+        .unwrap();
+        // 4000 entries, each named ~16 bytes — upper-bound estimate
+        // exceeds 65532, forcing ext-dir form.
+        for i in 0..4000 {
+            s.create_symlink(
+                &mut dev,
+                &format!("/big/sym_{i:08}"),
+                "target",
+                EntryMeta::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        }
+        s.flush(&mut dev).unwrap();
+        let s = Squashfs::open(&mut dev).unwrap();
+        let listing = s.list_path(&mut dev, "/big").unwrap();
+        assert_eq!(listing.len(), 4000);
+        // Spot-check one to confirm the entry kind decoded correctly.
+        assert!(listing.iter().any(|e| e.name == "sym_00000000"));
+        assert!(listing.iter().any(|e| e.name == "sym_00003999"));
     }
 }

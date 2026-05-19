@@ -126,6 +126,8 @@ pub enum Inode {
     Other {
         header: InodeHeader,
         kind: EntryKind,
+        /// Xattr index, or `u32::MAX` if absent (basic form).
+        xattr_index: u32,
     },
 }
 
@@ -154,7 +156,7 @@ impl Inode {
             Inode::Dir(d) => d.xattr_index,
             Inode::File(f) => f.xattr_index,
             Inode::Symlink(s) => s.xattr_index,
-            Inode::Other { .. } => u32::MAX,
+            Inode::Other { xattr_index, .. } => *xattr_index,
         }
     }
 }
@@ -195,22 +197,18 @@ pub fn read_inode(
         INODE_BASIC_SYMLINK | INODE_EXT_SYMLINK => {
             decode_symlink(dev, mr, header_bytes.1, header_bytes.2, header)
         }
-        INODE_BASIC_BLOCK | INODE_EXT_BLOCK => Ok(Inode::Other {
-            header,
-            kind: EntryKind::Block,
-        }),
-        INODE_BASIC_CHAR | INODE_EXT_CHAR => Ok(Inode::Other {
-            header,
-            kind: EntryKind::Char,
-        }),
-        INODE_BASIC_FIFO | INODE_EXT_FIFO => Ok(Inode::Other {
-            header,
-            kind: EntryKind::Fifo,
-        }),
-        INODE_BASIC_SOCKET | INODE_EXT_SOCKET => Ok(Inode::Other {
-            header,
-            kind: EntryKind::Socket,
-        }),
+        INODE_BASIC_BLOCK | INODE_EXT_BLOCK => {
+            decode_device_inode(dev, mr, header_bytes.1, header_bytes.2, header, true)
+        }
+        INODE_BASIC_CHAR | INODE_EXT_CHAR => {
+            decode_device_inode(dev, mr, header_bytes.1, header_bytes.2, header, true)
+        }
+        INODE_BASIC_FIFO | INODE_EXT_FIFO => {
+            decode_device_inode(dev, mr, header_bytes.1, header_bytes.2, header, false)
+        }
+        INODE_BASIC_SOCKET | INODE_EXT_SOCKET => {
+            decode_device_inode(dev, mr, header_bytes.1, header_bytes.2, header, false)
+        }
         other => Err(crate::Error::InvalidImage(format!(
             "squashfs: unknown inode type {other}"
         ))),
@@ -330,6 +328,52 @@ fn decode_ext_file(
         block_sizes,
         xattr_index,
     }))
+}
+
+/// Decode a device / fifo / socket inode. `has_dev_word` controls whether
+/// the on-disk payload includes the 4-byte device number (true for
+/// block/char, false for fifo/socket). Extended forms append a u32
+/// xattr_index; basic forms set it to `u32::MAX`.
+fn decode_device_inode(
+    dev: &mut dyn BlockDevice,
+    mr: &mut MetadataReader,
+    block_rel: u64,
+    offset: usize,
+    header: InodeHeader,
+    has_dev_word: bool,
+) -> Result<Inode> {
+    let kind = match header.kind {
+        INODE_BASIC_BLOCK | INODE_EXT_BLOCK => EntryKind::Block,
+        INODE_BASIC_CHAR | INODE_EXT_CHAR => EntryKind::Char,
+        INODE_BASIC_FIFO | INODE_EXT_FIFO => EntryKind::Fifo,
+        INODE_BASIC_SOCKET | INODE_EXT_SOCKET => EntryKind::Socket,
+        _ => unreachable!(),
+    };
+    let is_ext = matches!(
+        header.kind,
+        INODE_EXT_BLOCK | INODE_EXT_CHAR | INODE_EXT_FIFO | INODE_EXT_SOCKET
+    );
+    // Payload = u32 link_count, [u32 dev_word], [u32 xattr_index].
+    let mut want = 4;
+    if has_dev_word {
+        want += 4;
+    }
+    if is_ext {
+        want += 4;
+    }
+    let (buf, _, _) = read_bytes(dev, mr, block_rel, offset, want)?;
+    let _link_count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let xattr_index = if is_ext {
+        let xoff = if has_dev_word { 8 } else { 4 };
+        u32::from_le_bytes(buf[xoff..xoff + 4].try_into().unwrap())
+    } else {
+        u32::MAX
+    };
+    Ok(Inode::Other {
+        header,
+        kind,
+        xattr_index,
+    })
 }
 
 fn decode_symlink(

@@ -531,3 +531,414 @@ fn lookup_path_missing_component() {
     let err = ntfs.lookup_path(&mut dev, "/no_such_file").unwrap_err();
     assert!(matches!(err, crate::Error::InvalidImage(_)));
 }
+
+// --- Case-insensitive lookup via $UpCase ----------------------------------
+//
+// The tiny image has no $UpCase metadata file, so the driver should fall
+// back to the identity table — lookups remain case-sensitive in that
+// degraded mode. We exercise the case-folding code path by installing an
+// ASCII-uppercasing UpCase directly into the cached field after open.
+
+#[test]
+fn case_insensitive_lookup_with_ascii_upcase() {
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    // Read record 0 first to bootstrap the MFT runs.
+    let mut scratch = vec![0u8; REC_SIZE as usize];
+    ntfs.read_mft_record(&mut dev, 0, &mut scratch).unwrap();
+
+    // Install an ASCII-uppercasing UpCase table directly.
+    let mut bytes = Vec::with_capacity(0x10000 * 2);
+    for i in 0..0x10000u32 {
+        let v = if (0x61..=0x7A).contains(&i) {
+            i as u16 - 0x20
+        } else {
+            i as u16
+        };
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    ntfs.upcase = Some(super::secure::UpcaseTable::from_bytes(&bytes));
+
+    // Now "/HELLO.TXT" should resolve to the same record as "/hello.txt".
+    let lower = ntfs.lookup_path(&mut dev, "/hello.txt").unwrap();
+    let upper = ntfs.lookup_path(&mut dev, "/HELLO.TXT").unwrap();
+    assert_eq!(lower, upper);
+}
+
+// --- $ATTRIBUTE_LIST spill ------------------------------------------------
+//
+// We fabricate a base record whose $DATA lives entirely in an extension
+// record, referenced through an $ATTRIBUTE_LIST. The full attribute view
+// is then assembled by `load_record_set` and `open_stream_by_record` must
+// find $DATA across records.
+
+#[test]
+fn data_attribute_from_extension_record() {
+    let cluster_size = (BPS as u32) * (SPC as u32);
+    let mft_lcn = 4u64;
+    let mft_byte_off = mft_lcn * cluster_size as u64;
+    let total_size = 32 * cluster_size as u64;
+    let mut dev = MemoryBackend::new(total_size);
+    // Boot
+    let boot = fake_boot(BPS, SPC, mft_lcn, -10);
+    dev.write_at(0, &boot[..]).unwrap();
+    dev.write_at(0x44, &[(-12i8) as u8]).unwrap();
+
+    let si_value = vec![0u8; 48];
+    let si_attr = build_resident_attr(TYPE_STANDARD_INFORMATION, &[], &si_value, 0);
+
+    // Record 0: $MFT
+    let mft_fname_value = build_file_name_value(
+        5,
+        "$MFT",
+        FileName::FLAG_DIRECTORY,
+        8 * REC_SIZE as u64,
+        FileName::NAMESPACE_WIN32,
+    );
+    let mft_fname_attr = build_resident_attr(TYPE_FILE_NAME, &[], &mft_fname_value, 1);
+    let mft_runs = vec![0x11u8, 0x02, 0x04, 0x00];
+    let mft_data = build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &mft_runs,
+        0,
+        1,
+        2 * cluster_size as u64,
+        8 * REC_SIZE as u64,
+        8 * REC_SIZE as u64,
+        2,
+    );
+    let rec0 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![si_attr.clone(), mft_fname_attr, mft_data],
+    );
+    dev.write_at(mft_byte_off, &rec0).unwrap();
+
+    // Record 5: root directory pointing at "split.dat" (record 6).
+    let root_fname_value = build_file_name_value(
+        5,
+        ".",
+        FileName::FLAG_DIRECTORY,
+        0,
+        FileName::NAMESPACE_WIN32,
+    );
+    let root_fname_attr = build_resident_attr(TYPE_FILE_NAME, &[], &root_fname_value, 1);
+    let split_ref: u64 = 6 | (1u64 << 48);
+    let split_fn = build_file_name_value(5, "split.dat", 0, 6, FileName::NAMESPACE_WIN32);
+    let split_entry = build_index_entry(split_ref, &split_fn, 0, None);
+    let term_entry = build_terminator_entry(None);
+    let idx_root_value = build_index_root_value(&[split_entry, term_entry]);
+    let i30_name = utf16_le("$I30");
+    let idx_root_attr = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &idx_root_value, 2);
+    let rec5 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE | mft::RecordHeader::FLAG_DIRECTORY,
+        vec![si_attr.clone(), root_fname_attr, idx_root_attr],
+    );
+    dev.write_at(mft_byte_off + 5 * REC_SIZE as u64, &rec5)
+        .unwrap();
+
+    // Record 6: base record. Holds $SI + $FILE_NAME + $ATTRIBUTE_LIST.
+    // The $ATTRIBUTE_LIST points at record 7 for $DATA.
+    let file_fname_value = build_file_name_value(5, "split.dat", 0, 6, FileName::NAMESPACE_WIN32);
+    let file_fname_attr = build_resident_attr(TYPE_FILE_NAME, &[], &file_fname_value, 1);
+
+    // Build $ATTRIBUTE_LIST entry: one row pointing at record 7 for $DATA.
+    let mut alist_value: Vec<u8> = Vec::new();
+    let entry_len: u16 = 0x20;
+    alist_value.extend_from_slice(&TYPE_DATA.to_le_bytes()); // type
+    alist_value.extend_from_slice(&entry_len.to_le_bytes()); // entry_len
+    alist_value.push(0); // name_len
+    alist_value.push(0x1A); // name_off
+    alist_value.extend_from_slice(&0u64.to_le_bytes()); // starting_vcn
+    let rec7_ref: u64 = 7 | (1u64 << 48);
+    alist_value.extend_from_slice(&rec7_ref.to_le_bytes()); // mft ref to rec 7
+    alist_value.extend_from_slice(&3u16.to_le_bytes()); // attr id
+    while alist_value.len() < entry_len as usize {
+        alist_value.push(0);
+    }
+    let alist_attr = build_resident_attr(TYPE_ATTRIBUTE_LIST, &[], &alist_value, 2);
+
+    let rec6 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![si_attr.clone(), file_fname_attr, alist_attr],
+    );
+    dev.write_at(mft_byte_off + 6 * REC_SIZE as u64, &rec6)
+        .unwrap();
+
+    // Record 7: extension record carrying the actual $DATA = b"hello!".
+    // base_record_ref points back at record 6 (low 48 bits) seq 1.
+    let data_attr = build_resident_attr(TYPE_DATA, &[], b"hello!", 3);
+    let mut rec7 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![data_attr],
+    );
+    // Patch base_record_ref at 0x20..0x28 to point at record 6.
+    let base_ref: u64 = 6 | (1u64 << 48);
+    rec7[0x20..0x28].copy_from_slice(&base_ref.to_le_bytes());
+    // Re-install fixup since we touched bytes after build_record installed it.
+    mft::install_fixup(&mut rec7, BPS as usize, 0x0001);
+    dev.write_at(mft_byte_off + 7 * REC_SIZE as u64, &rec7)
+        .unwrap();
+
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let mut reader = ntfs.open_file_reader(&mut dev, "/split.dat").unwrap();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hello!");
+}
+
+// --- LZNT1 compressed $DATA ----------------------------------------------
+//
+// Build a synthetic CU of 4 clusters (16 KiB at 4 KiB clusters). The CU's
+// run list has 1 real cluster of LZNT1 data and 3 sparse clusters; the
+// decoder should produce 6 bytes of output ("ABCABC"), then zero-fill to
+// `real_size`.
+
+#[test]
+fn compressed_data_decodes_via_cu() {
+    let cluster_size = (BPS as u32) * (SPC as u32);
+    let mft_lcn = 4u64;
+    let mft_byte_off = mft_lcn * cluster_size as u64;
+    let total_size = 64 * cluster_size as u64;
+    let mut dev = MemoryBackend::new(total_size);
+    let boot = fake_boot(BPS, SPC, mft_lcn, -10);
+    dev.write_at(0, &boot[..]).unwrap();
+    dev.write_at(0x44, &[(-12i8) as u8]).unwrap();
+
+    // Build a compressed CU payload: one chunk → "ABCABC".
+    // (See compression::tests::decompresses_back_reference for the encoding.)
+    let chunk_payload = vec![0x08u8, b'A', b'B', b'C', 0x00, 0x20];
+    let chunk_len_minus_1 = chunk_payload.len() as u16 - 1;
+    let header = 0xB000u16 | chunk_len_minus_1;
+    let mut compressed = header.to_le_bytes().to_vec();
+    compressed.extend_from_slice(&chunk_payload);
+    // The driver expects one cluster of compressed data; pad to cluster.
+    while compressed.len() < cluster_size as usize {
+        compressed.push(0);
+    }
+    // Drop the data into cluster 20.
+    let data_lcn = 20u64;
+    dev.write_at(data_lcn * cluster_size as u64, &compressed)
+        .unwrap();
+
+    let si_value = vec![0u8; 48];
+    let si_attr = build_resident_attr(TYPE_STANDARD_INFORMATION, &[], &si_value, 0);
+
+    // Record 0: $MFT
+    let mft_fname_attr = build_resident_attr(
+        TYPE_FILE_NAME,
+        &[],
+        &build_file_name_value(
+            5,
+            "$MFT",
+            FileName::FLAG_DIRECTORY,
+            8 * REC_SIZE as u64,
+            FileName::NAMESPACE_WIN32,
+        ),
+        1,
+    );
+    let mft_runs = vec![0x11u8, 0x02, 0x04, 0x00];
+    let mft_data = build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &mft_runs,
+        0,
+        1,
+        2 * cluster_size as u64,
+        8 * REC_SIZE as u64,
+        8 * REC_SIZE as u64,
+        2,
+    );
+    let rec0 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![si_attr.clone(), mft_fname_attr, mft_data],
+    );
+    dev.write_at(mft_byte_off, &rec0).unwrap();
+
+    // Record 5: root dir indexing "lz.dat" → record 6.
+    let lz_ref: u64 = 6 | (1u64 << 48);
+    let lz_fn = build_file_name_value(5, "lz.dat", 0, 6, FileName::NAMESPACE_WIN32);
+    let lz_entry = build_index_entry(lz_ref, &lz_fn, 0, None);
+    let term = build_terminator_entry(None);
+    let idx_root_value = build_index_root_value(&[lz_entry, term]);
+    let i30_name = utf16_le("$I30");
+    let idx_root_attr = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &idx_root_value, 2);
+    let rec5 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE | mft::RecordHeader::FLAG_DIRECTORY,
+        vec![
+            si_attr.clone(),
+            build_resident_attr(
+                TYPE_FILE_NAME,
+                &[],
+                &build_file_name_value(
+                    5,
+                    ".",
+                    FileName::FLAG_DIRECTORY,
+                    0,
+                    FileName::NAMESPACE_WIN32,
+                ),
+                1,
+            ),
+            idx_root_attr,
+        ],
+    );
+    dev.write_at(mft_byte_off + 5 * REC_SIZE as u64, &rec5)
+        .unwrap();
+
+    // Record 6: lz.dat. Compressed $DATA, compression_unit=2 (1 << 2 = 4
+    // clusters per CU). Run list: 1 real cluster at LCN 20, then 3 sparse
+    // clusters. real_size = 6 (we only emit "ABCABC").
+    // Run encoding: 0x11 0x01 0x14 (len=1, offset=+20), 0x01 0x03 (len=3 sparse), 0x00.
+    let runs = vec![0x11u8, 0x01, 0x14, 0x01, 0x03, 0x00];
+    let mut data_attr = build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &runs,
+        0,
+        3,
+        4 * cluster_size as u64,
+        6,
+        6,
+        3,
+    );
+    // Set compression flag + compression_unit=2 inside the header.
+    // Flags are at offset 12 of the attribute header.
+    data_attr[12..14].copy_from_slice(&ATTR_FLAG_COMPRESSED.to_le_bytes());
+    // compression_unit lives at attr_start + 0x22 (u16 low byte).
+    data_attr[0x22] = 2;
+    data_attr[0x23] = 0;
+    let rec6 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![
+            si_attr.clone(),
+            build_resident_attr(
+                TYPE_FILE_NAME,
+                &[],
+                &build_file_name_value(5, "lz.dat", 0, 6, FileName::NAMESPACE_WIN32),
+                1,
+            ),
+            data_attr,
+        ],
+    );
+    dev.write_at(mft_byte_off + 6 * REC_SIZE as u64, &rec6)
+        .unwrap();
+
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let mut reader = ntfs.open_file_reader(&mut dev, "/lz.dat").unwrap();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"ABCABC");
+}
+
+// --- Encrypted $DATA is rejected ----------------------------------------
+
+#[test]
+fn encrypted_data_is_unsupported() {
+    let cluster_size = (BPS as u32) * (SPC as u32);
+    let mft_lcn = 4u64;
+    let mft_byte_off = mft_lcn * cluster_size as u64;
+    let total_size = 32 * cluster_size as u64;
+    let mut dev = MemoryBackend::new(total_size);
+    let boot = fake_boot(BPS, SPC, mft_lcn, -10);
+    dev.write_at(0, &boot[..]).unwrap();
+    dev.write_at(0x44, &[(-12i8) as u8]).unwrap();
+
+    let si_value = vec![0u8; 48];
+    let si_attr = build_resident_attr(TYPE_STANDARD_INFORMATION, &[], &si_value, 0);
+
+    let mft_fname_attr = build_resident_attr(
+        TYPE_FILE_NAME,
+        &[],
+        &build_file_name_value(
+            5,
+            "$MFT",
+            FileName::FLAG_DIRECTORY,
+            8 * REC_SIZE as u64,
+            FileName::NAMESPACE_WIN32,
+        ),
+        1,
+    );
+    let mft_runs = vec![0x11u8, 0x02, 0x04, 0x00];
+    let mft_data = build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &mft_runs,
+        0,
+        1,
+        2 * cluster_size as u64,
+        8 * REC_SIZE as u64,
+        8 * REC_SIZE as u64,
+        2,
+    );
+    let rec0 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![si_attr.clone(), mft_fname_attr, mft_data],
+    );
+    dev.write_at(mft_byte_off, &rec0).unwrap();
+
+    let efs_ref: u64 = 6 | (1u64 << 48);
+    let efs_fn = build_file_name_value(5, "efs.dat", 0, 0, FileName::NAMESPACE_WIN32);
+    let efs_entry = build_index_entry(efs_ref, &efs_fn, 0, None);
+    let term = build_terminator_entry(None);
+    let idx_root_value = build_index_root_value(&[efs_entry, term]);
+    let i30_name = utf16_le("$I30");
+    let idx_root_attr = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &idx_root_value, 2);
+    let rec5 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE | mft::RecordHeader::FLAG_DIRECTORY,
+        vec![
+            si_attr.clone(),
+            build_resident_attr(
+                TYPE_FILE_NAME,
+                &[],
+                &build_file_name_value(
+                    5,
+                    ".",
+                    FileName::FLAG_DIRECTORY,
+                    0,
+                    FileName::NAMESPACE_WIN32,
+                ),
+                1,
+            ),
+            idx_root_attr,
+        ],
+    );
+    dev.write_at(mft_byte_off + 5 * REC_SIZE as u64, &rec5)
+        .unwrap();
+
+    // Record 6: efs.dat with ATTR_FLAG_ENCRYPTED set on $DATA.
+    let mut data_attr = build_resident_attr(TYPE_DATA, &[], b"AAAA", 3);
+    data_attr[12..14].copy_from_slice(&ATTR_FLAG_ENCRYPTED.to_le_bytes());
+    let rec6 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![
+            si_attr.clone(),
+            build_resident_attr(
+                TYPE_FILE_NAME,
+                &[],
+                &build_file_name_value(5, "efs.dat", 0, 0, FileName::NAMESPACE_WIN32),
+                1,
+            ),
+            data_attr,
+        ],
+    );
+    dev.write_at(mft_byte_off + 6 * REC_SIZE as u64, &rec6)
+        .unwrap();
+
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let result = ntfs.open_file_reader(&mut dev, "/efs.dat");
+    match result {
+        Ok(_) => panic!("expected Unsupported error for EFS-encrypted file"),
+        Err(crate::Error::Unsupported(msg)) => assert!(msg.contains("EFS")),
+        Err(other) => panic!("expected Unsupported, got {other:?}"),
+    }
+}

@@ -3,13 +3,20 @@
 //! ## Status
 //!
 //! Detection, MFT decode, attribute decode, directory walking via
-//! $INDEX_ROOT + $INDEX_ALLOCATION, and streaming reads of the default
-//! unnamed $DATA stream are implemented. Write support is out of scope.
+//! $INDEX_ROOT + $INDEX_ALLOCATION, and streaming reads of $DATA streams
+//! (resident, non-resident, sparse, LZNT1-compressed, and alternate data
+//! streams) are implemented. The driver follows `$ATTRIBUTE_LIST` spill
+//! across multiple MFT records, resolves shared security descriptors via
+//! `$Secure:$SDS` (looked up through `$Secure:$SII`), and case-folds
+//! directory lookups through the `$UpCase` table. Write support is out
+//! of scope.
 //!
 //! ## Reference
 //!
 //! - Microsoft "[MS-FSCC] File System Control Codes":
 //!   <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/>
+//! - Microsoft "[MS-XCA]" §2.5 ("LZNT1 Algorithm Details"):
+//!   <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/>
 //! - Linux kernel "NTFS3" docs:
 //!   <https://docs.kernel.org/filesystems/ntfs3.html>
 //! - "NTFS Documentation" by Richard Russon and Yuval Fledel.
@@ -25,8 +32,8 @@
 //! | Object ID GUID (`$OBJECT_ID`)             | `user.ntfs.object_id`                    | 16 bytes raw GUID                                        |
 //! | Reparse point tag + data (`$REPARSE_POINT`)| `user.ntfs.reparse`                     | Tag (LE u32) prepended to raw reparse data               |
 //! | Alternate Data Streams (named `$DATA`)    | `user.ntfs.ads.<name>`                   | Per-stream xattr; binary stream contents                 |
-//! | `$SECURITY_DESCRIPTOR` (raw NT SD blob)   | `system.ntfs_security`                   | Self-relative SD blob; consumers who understand it       |
-//! |                                           |                                          | can decode to SDDL                                       |
+//! | `$SECURITY_DESCRIPTOR` (raw NT SD blob)   | `system.ntfs_security`                   | Resident attribute, OR resolved from `$Secure:$SDS`      |
+//! |                                           |                                          | via `$STANDARD_INFORMATION.security_id`                  |
 //! | Short (8.3) filename                      | `user.ntfs.short_name`                   | UTF-16LE per `$FILE_NAME` with namespace=DOS             |
 //! | Last-write / creation / change / access   | inode timestamps + `user.ntfs.times.raw` | The latter holds all four NT-FILETIME (100 ns) values    |
 //!
@@ -35,6 +42,15 @@
 //! The cross-FS xattr mapping above is lossy at the sub-100ns level. For
 //! NTFS-to-NTFS transfers, the writer copies raw attribute byte streams
 //! verbatim rather than going through this mapping.
+//!
+//! ### Reparse points
+//!
+//! `$REPARSE_POINT` data is surfaced via `user.ntfs.reparse` (tag + raw
+//! data). This driver does NOT follow junctions, symlinks or any other
+//! reparse-point type — the target's bytes are intentionally exposed as-is
+//! so the caller can decide whether to interpret them. A symlink read as
+//! a "file" via `open_file_reader` returns the reparse point's
+//! `$DATA` (typically empty) rather than dereferencing the link.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -43,23 +59,36 @@ use crate::Result;
 use crate::block::BlockDevice;
 
 pub mod attribute;
+pub mod attribute_list;
 pub mod boot;
+pub mod compression;
 pub mod index;
 pub mod mft;
 pub mod run_list;
+pub mod secure;
 
 use attribute::{
-    AttributeIter, AttributeKind, FileName, StandardInformation, TYPE_DATA, TYPE_FILE_NAME,
-    TYPE_INDEX_ALLOCATION, TYPE_INDEX_ROOT, TYPE_OBJECT_ID, TYPE_REPARSE_POINT,
-    TYPE_SECURITY_DESCRIPTOR, TYPE_STANDARD_INFORMATION,
+    ATTR_FLAG_COMPRESSED, ATTR_FLAG_ENCRYPTED, AttributeIter, AttributeKind, FileName,
+    StandardInformation, TYPE_ATTRIBUTE_LIST, TYPE_DATA, TYPE_FILE_NAME, TYPE_INDEX_ALLOCATION,
+    TYPE_INDEX_ROOT, TYPE_OBJECT_ID, TYPE_REPARSE_POINT, TYPE_SECURITY_DESCRIPTOR,
+    TYPE_STANDARD_INFORMATION,
 };
 use boot::BootSector;
 use index::IndexEntry;
 use run_list::Extent;
+use secure::UpcaseTable;
 
 /// Hard-coded MFT record numbers reserved by NTFS.
 pub const MFT_RECORD_MFT: u64 = 0;
 pub const MFT_RECORD_ROOT: u64 = 5;
+pub const MFT_RECORD_SECURE: u64 = 9;
+pub const MFT_RECORD_UPCASE: u64 = 10;
+
+/// Cap on the size of a single security descriptor we'll pull out of
+/// `$Secure:$SDS` and surface as `system.ntfs_security`. SDs are normally
+/// well under 1 KiB; the 64 KiB cap exists purely as a sanity check
+/// against malformed images.
+const MAX_SECURITY_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 
 pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
     if dev.total_size() < 11 {
@@ -78,6 +107,14 @@ pub struct Ntfs {
     /// Cached MFT run list: where to read MFT record N from. Empty before
     /// `load_mft_runs` has been called.
     mft_runs: Vec<Extent>,
+    /// Cached `$UpCase` table for case-insensitive directory lookups.
+    /// `None` means "haven't tried yet"; `Some(identity)` means we tried
+    /// and the image didn't expose one — names are compared exactly.
+    upcase: Option<UpcaseTable>,
+    /// Cache of decoded `$Secure:$SII` entries (security_id -> SDS slice).
+    /// `None` means "haven't tried yet". An empty `Some(_)` means we tried
+    /// and the image had no usable `$Secure`.
+    sii_cache: Option<HashMap<u32, (u64, u32)>>,
 }
 
 impl Ntfs {
@@ -95,6 +132,8 @@ impl Ntfs {
         Ok(Self {
             boot,
             mft_runs: Vec::new(),
+            upcase: None,
+            sii_cache: None,
         })
     }
 
@@ -218,6 +257,80 @@ impl Ntfs {
         Ok(())
     }
 
+    /// Read the base record `rec_no` plus, if it has an `$ATTRIBUTE_LIST`,
+    /// every extension record named in that list. Returns a vector of
+    /// `(record_number, record_bytes)` pairs ordered base-first.
+    fn load_record_set(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        rec_no: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        let rec_size = self.boot.mft_record_size() as usize;
+        let mut base = vec![0u8; rec_size];
+        self.read_mft_record(dev, rec_no, &mut base)?;
+        let mut records: Vec<(u64, Vec<u8>)> = vec![(rec_no, base)];
+
+        // Look for $ATTRIBUTE_LIST in the base record.
+        let base_bytes = records[0].1.clone();
+        let hdr = mft::RecordHeader::parse(&base_bytes)?;
+        let mut alist_bytes: Option<Vec<u8>> = None;
+        for attr_res in AttributeIter::new(&base_bytes, hdr.first_attribute_offset as usize) {
+            let attr = attr_res?;
+            if attr.type_code != TYPE_ATTRIBUTE_LIST {
+                continue;
+            }
+            match attr.kind {
+                AttributeKind::Resident { value, .. } => {
+                    alist_bytes = Some(value.to_vec());
+                }
+                AttributeKind::NonResident {
+                    real_size, runs, ..
+                } => {
+                    // Non-resident $ATTRIBUTE_LIST: stream it cluster by
+                    // cluster through a dedicated reader. This is uncommon
+                    // (the list rarely overflows a record) but legal.
+                    let mut reader = NonResidentReader {
+                        dev: &mut *dev,
+                        cluster_size: self.boot.cluster_size() as u64,
+                        runs,
+                        real_size,
+                        initialized_size: real_size,
+                        pos: 0,
+                        cluster_buf: vec![0u8; self.boot.cluster_size() as usize],
+                        cached_vcn: u64::MAX,
+                        cached_cluster_filled: false,
+                    };
+                    let mut buf = Vec::with_capacity(real_size as usize);
+                    reader.read_to_end(&mut buf).map_err(crate::Error::from)?;
+                    alist_bytes = Some(buf);
+                }
+            }
+            break;
+        }
+
+        let Some(alist_bytes) = alist_bytes else {
+            return Ok(records);
+        };
+        let entries = attribute_list::decode(&alist_bytes)?;
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(rec_no);
+        for entry in entries {
+            let extension_rec = entry.record_number();
+            if extension_rec == rec_no {
+                // The list also names attributes that live in the base
+                // record — skip those.
+                continue;
+            }
+            if !seen.insert(extension_rec) {
+                continue;
+            }
+            let mut buf = vec![0u8; rec_size];
+            self.read_mft_record(dev, extension_rec, &mut buf)?;
+            records.push((extension_rec, buf));
+        }
+        Ok(records)
+    }
+
     /// Walk a directory's index, returning the (file_ref, FileName) of each
     /// entry. Skips DOS-namespace duplicates (those are covered by the
     /// Win32+DOS combined entry that has both names).
@@ -226,33 +339,41 @@ impl Ntfs {
         dev: &mut dyn BlockDevice,
         dir_rec: u64,
     ) -> Result<Vec<IndexEntry>> {
-        let rec_size = self.boot.mft_record_size() as usize;
-        let mut rec_buf = vec![0u8; rec_size];
-        self.read_mft_record(dev, dir_rec, &mut rec_buf)?;
-        let header = mft::RecordHeader::parse(&rec_buf)?;
-        if !header.is_in_use() {
+        let records = self.load_record_set(dev, dir_rec)?;
+        let hdr = mft::RecordHeader::parse(&records[0].1)?;
+        if !hdr.is_in_use() {
             return Err(crate::Error::InvalidImage(format!(
                 "ntfs: directory record {dir_rec} is not in use"
             )));
         }
 
         // Locate $INDEX_ROOT (must be named "$I30") and optional
-        // $INDEX_ALLOCATION (same name).
+        // $INDEX_ALLOCATION (same name) across the merged record set.
         let mut root_value: Option<Vec<u8>> = None;
         let mut alloc_runs: Option<Vec<Extent>> = None;
-        for attr_res in AttributeIter::new(&rec_buf, header.first_attribute_offset as usize) {
-            let attr = attr_res?;
-            if attr.name != "$I30" {
-                continue;
-            }
-            match (attr.type_code, attr.kind) {
-                (TYPE_INDEX_ROOT, AttributeKind::Resident { value, .. }) => {
-                    root_value = Some(value.to_vec());
+        for (_rec, rec_buf) in &records {
+            let h = mft::RecordHeader::parse(rec_buf)?;
+            for attr_res in AttributeIter::new(rec_buf, h.first_attribute_offset as usize) {
+                let attr = attr_res?;
+                if attr.name != "$I30" {
+                    continue;
                 }
-                (TYPE_INDEX_ALLOCATION, AttributeKind::NonResident { runs, .. }) => {
-                    alloc_runs = Some(runs);
+                match (attr.type_code, attr.kind) {
+                    (TYPE_INDEX_ROOT, AttributeKind::Resident { value, .. }) => {
+                        root_value = Some(value.to_vec());
+                    }
+                    (TYPE_INDEX_ALLOCATION, AttributeKind::NonResident { runs, .. }) => {
+                        // Multiple $INDEX_ALLOCATION segments are appended
+                        // in starting_vcn order via load_record_set, so
+                        // just chain runs as we encounter them. NTFS only
+                        // splits these for very large directories.
+                        match alloc_runs.as_mut() {
+                            Some(existing) => existing.extend(runs),
+                            None => alloc_runs = Some(runs),
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         let root_value = root_value.ok_or_else(|| {
@@ -365,22 +486,31 @@ impl Ntfs {
     }
 
     /// Resolve a path to its MFT record number. Path components are matched
-    /// case-sensitively against the FILE_NAME entries (NTFS itself
-    /// case-folds with the $UpCase table; for v1 we keep things case
-    /// sensitive). The root path "/" maps to record 5.
+    /// case-insensitively through the `$UpCase` table (when available). The
+    /// root path "/" maps to record 5.
     pub fn lookup_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
         if !path.starts_with('/') {
             return Err(crate::Error::InvalidArgument(format!(
                 "ntfs: path must be absolute, got {path:?}"
             )));
         }
+        self.ensure_upcase(dev)?;
         let mut current = MFT_RECORD_ROOT;
         for component in path.split('/').filter(|s| !s.is_empty()) {
             let entries = self.read_directory(dev, current)?;
             let mut next: Option<u64> = None;
             for entry in entries {
                 if let Some(fname) = entry.file_name {
-                    if fname.name == component && fname.namespace != FileName::NAMESPACE_DOS {
+                    if fname.namespace == FileName::NAMESPACE_DOS {
+                        // DOS-namespace entries are covered by the matching
+                        // Win32 entry; skip to avoid double matching.
+                        continue;
+                    }
+                    let matches = match self.upcase.as_ref() {
+                        Some(t) => t.equals_ignore_case(&fname.name, component),
+                        None => fname.name == component,
+                    };
+                    if matches {
                         next = Some(entry.file_ref & 0x0000_FFFF_FFFF_FFFF);
                         break;
                     }
@@ -443,83 +573,132 @@ impl Ntfs {
 
     /// Open a named stream by MFT record + name. `""` means the default
     /// unnamed $DATA. Used by both `open_file_reader` and ADS extraction.
+    ///
+    /// Honours `$ATTRIBUTE_LIST` spill: if the stream's runs are split
+    /// across multiple MFT records, all segments are gathered and chained
+    /// by `starting_vcn` before the reader is constructed.
+    ///
+    /// Compressed `$DATA` (LZNT1) is decoded on the fly, one 16-cluster
+    /// "compression unit" at a time. Encrypted `$DATA` (EFS) is refused
+    /// with [`crate::Error::Unsupported`].
     pub fn open_stream_by_record<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,
         rec_no: u64,
         stream_name: &str,
     ) -> Result<Box<dyn Read + 'a>> {
-        let rec_size = self.boot.mft_record_size() as usize;
-        let mut rec_buf = vec![0u8; rec_size];
-        self.read_mft_record(dev, rec_no, &mut rec_buf)?;
-        let header = mft::RecordHeader::parse(&rec_buf)?;
-        if !header.is_in_use() {
+        let records = self.load_record_set(dev, rec_no)?;
+        let hdr = mft::RecordHeader::parse(&records[0].1)?;
+        if !hdr.is_in_use() {
             return Err(crate::Error::InvalidImage(format!(
                 "ntfs: record {rec_no} is not in use"
             )));
         }
 
-        // Find the matching $DATA attribute.
-        let mut info: Option<DataStreamInfo> = None;
-        for attr_res in AttributeIter::new(&rec_buf, header.first_attribute_offset as usize) {
-            let attr = attr_res?;
-            if attr.type_code != TYPE_DATA {
-                continue;
+        // Gather every $DATA segment matching the requested name across
+        // all records in the set. For non-resident attributes we'll merge
+        // their run lists; for resident ones we expect exactly one match.
+        let mut resident_bytes: Option<Vec<u8>> = None;
+        // (starting_vcn, last_vcn, allocated, real, initialized, comp_unit, runs)
+        type Segment = (u64, u64, u64, u64, u64, u8, Vec<Extent>);
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut is_encrypted = false;
+        let mut is_compressed = false;
+        for (_rec, rec_buf) in &records {
+            let h = mft::RecordHeader::parse(rec_buf)?;
+            for attr_res in AttributeIter::new(rec_buf, h.first_attribute_offset as usize) {
+                let attr = attr_res?;
+                if attr.type_code != TYPE_DATA {
+                    continue;
+                }
+                if attr.name != stream_name {
+                    continue;
+                }
+                if attr.flags & ATTR_FLAG_ENCRYPTED != 0 {
+                    is_encrypted = true;
+                }
+                if attr.flags & ATTR_FLAG_COMPRESSED != 0 {
+                    is_compressed = true;
+                }
+                match attr.kind {
+                    AttributeKind::Resident { value, .. } => {
+                        resident_bytes = Some(value.to_vec());
+                    }
+                    AttributeKind::NonResident {
+                        starting_vcn,
+                        last_vcn,
+                        allocated_size,
+                        real_size,
+                        initialized_size,
+                        compression_unit,
+                        runs,
+                    } => {
+                        segments.push((
+                            starting_vcn,
+                            last_vcn,
+                            allocated_size,
+                            real_size,
+                            initialized_size,
+                            compression_unit,
+                            runs,
+                        ));
+                    }
+                }
             }
-            if attr.name != stream_name {
-                continue;
-            }
-            if attr.is_encrypted() {
-                return Err(crate::Error::Unsupported(
-                    "ntfs: encrypted $DATA is not supported".into(),
-                ));
-            }
-            if attr.is_compressed() {
-                return Err(crate::Error::Unsupported(
-                    "ntfs: compressed $DATA is not supported".into(),
-                ));
-            }
-            info = Some(match attr.kind {
-                AttributeKind::Resident { value, .. } => DataStreamInfo::Resident {
-                    bytes: value.to_vec(),
-                },
-                AttributeKind::NonResident {
-                    real_size,
-                    initialized_size,
-                    runs,
-                    ..
-                } => DataStreamInfo::NonResident {
-                    real_size,
-                    initialized_size,
-                    runs,
-                },
-            });
-            break;
         }
-        let info = info.ok_or_else(|| {
-            crate::Error::InvalidImage(format!(
-                "ntfs: stream {stream_name:?} not found on record {rec_no}"
-            ))
-        })?;
 
-        match info {
-            DataStreamInfo::Resident { bytes } => Ok(Box::new(ResidentReader { bytes, pos: 0 })),
-            DataStreamInfo::NonResident {
-                real_size,
-                initialized_size,
-                runs,
-            } => Ok(Box::new(NonResidentReader {
-                dev,
-                cluster_size: self.boot.cluster_size() as u64,
-                runs,
-                real_size,
-                initialized_size,
-                pos: 0,
-                cluster_buf: vec![0u8; self.boot.cluster_size() as usize],
-                cached_vcn: u64::MAX,
-                cached_cluster_filled: false,
-            })),
+        if is_encrypted {
+            return Err(crate::Error::Unsupported(
+                "ntfs: encrypted $DATA (EFS) is not supported".into(),
+            ));
         }
+
+        if let Some(bytes) = resident_bytes {
+            return Ok(Box::new(ResidentReader { bytes, pos: 0 }));
+        }
+
+        if segments.is_empty() {
+            return Err(crate::Error::InvalidImage(format!(
+                "ntfs: stream {stream_name:?} not found on record {rec_no}"
+            )));
+        }
+
+        // Sort and merge segments by starting_vcn. The first segment's
+        // header carries the canonical real_size / initialized_size /
+        // compression_unit; later segments only contribute runs.
+        segments.sort_by_key(|s| s.0);
+        let real_size = segments[0].3;
+        let initialized_size = segments[0].4;
+        let compression_unit = segments[0].5;
+        let mut runs: Vec<Extent> = Vec::new();
+        for seg in &segments {
+            runs.extend(seg.6.iter().copied());
+        }
+
+        let cluster_size = self.boot.cluster_size() as u64;
+        if is_compressed && compression_unit > 0 {
+            let cu_clusters = 1u64 << compression_unit;
+            return Ok(Box::new(CompressedReader::new(
+                dev,
+                cluster_size,
+                cu_clusters,
+                runs,
+                real_size,
+                initialized_size,
+            )));
+        }
+
+        Ok(Box::new(NonResidentReader {
+            dev,
+            cluster_size,
+            runs,
+            real_size,
+            initialized_size,
+            pos: 0,
+            cluster_buf: vec![0u8; cluster_size as usize],
+            cached_vcn: u64::MAX,
+            cached_cluster_filled: false,
+        }))
     }
 
     /// Collect cross-FS xattr metadata for `path` using the
@@ -532,69 +711,90 @@ impl Ntfs {
         path: &str,
     ) -> Result<HashMap<String, Vec<u8>>> {
         let rec_no = self.lookup_path(dev, path)?;
-        let rec_size = self.boot.mft_record_size() as usize;
-        let mut rec_buf = vec![0u8; rec_size];
-        self.read_mft_record(dev, rec_no, &mut rec_buf)?;
-        let header = mft::RecordHeader::parse(&rec_buf)?;
+        let records = self.load_record_set(dev, rec_no)?;
 
         let mut out: HashMap<String, Vec<u8>> = HashMap::new();
         let mut ads_names: Vec<String> = Vec::new();
         let mut win32_short_name: Option<Vec<u8>> = None;
-        for attr_res in AttributeIter::new(&rec_buf, header.first_attribute_offset as usize) {
-            let attr = attr_res?;
-            match attr.type_code {
-                TYPE_STANDARD_INFORMATION => {
-                    if let AttributeKind::Resident { value, .. } = attr.kind {
-                        let si = StandardInformation::parse(value)?;
-                        out.insert(
-                            xattr_keys::DOS_ATTRS.into(),
-                            si.file_attributes.to_le_bytes().to_vec(),
-                        );
-                        out.insert(xattr_keys::TIMES_RAW.into(), si.times_raw().to_vec());
-                    }
-                }
-                TYPE_FILE_NAME => {
-                    if let AttributeKind::Resident { value, .. } = attr.kind {
-                        let fname = FileName::parse(value)?;
-                        if fname.namespace == FileName::NAMESPACE_DOS
-                            || fname.namespace == FileName::NAMESPACE_WIN32_DOS
-                        {
-                            let raw_utf16: Vec<u8> = fname
-                                .name
-                                .encode_utf16()
-                                .flat_map(|u| u.to_le_bytes())
-                                .collect();
-                            win32_short_name = Some(raw_utf16);
+        let mut security_id: Option<u32> = None;
+        let mut have_inline_security = false;
+        for (_rec, rec_buf) in &records {
+            let h = mft::RecordHeader::parse(rec_buf)?;
+            for attr_res in AttributeIter::new(rec_buf, h.first_attribute_offset as usize) {
+                let attr = attr_res?;
+                match attr.type_code {
+                    TYPE_STANDARD_INFORMATION => {
+                        if let AttributeKind::Resident { value, .. } = attr.kind {
+                            let si = StandardInformation::parse(value)?;
+                            out.insert(
+                                xattr_keys::DOS_ATTRS.into(),
+                                si.file_attributes.to_le_bytes().to_vec(),
+                            );
+                            out.insert(xattr_keys::TIMES_RAW.into(), si.times_raw().to_vec());
+                            // NTFS >= 3.0 extended $STANDARD_INFORMATION
+                            // includes a security_id at offset 0x54.
+                            if value.len() >= 0x58 {
+                                let id = u32::from_le_bytes(value[0x54..0x58].try_into().unwrap());
+                                if id != 0 {
+                                    security_id = Some(id);
+                                }
+                            }
                         }
                     }
-                }
-                TYPE_OBJECT_ID => {
-                    if let AttributeKind::Resident { value, .. } = attr.kind {
-                        // First 16 bytes are the GUID.
-                        let take = value.len().min(16);
-                        out.insert(xattr_keys::OBJECT_ID.into(), value[..take].to_vec());
+                    TYPE_FILE_NAME => {
+                        if let AttributeKind::Resident { value, .. } = attr.kind {
+                            let fname = FileName::parse(value)?;
+                            if fname.namespace == FileName::NAMESPACE_DOS
+                                || fname.namespace == FileName::NAMESPACE_WIN32_DOS
+                            {
+                                let raw_utf16: Vec<u8> = fname
+                                    .name
+                                    .encode_utf16()
+                                    .flat_map(|u| u.to_le_bytes())
+                                    .collect();
+                                win32_short_name = Some(raw_utf16);
+                            }
+                        }
                     }
-                }
-                TYPE_SECURITY_DESCRIPTOR => {
-                    if let AttributeKind::Resident { value, .. } = attr.kind {
-                        out.insert(xattr_keys::SECURITY.into(), value.to_vec());
+                    TYPE_OBJECT_ID => {
+                        if let AttributeKind::Resident { value, .. } = attr.kind {
+                            // First 16 bytes are the GUID.
+                            let take = value.len().min(16);
+                            out.insert(xattr_keys::OBJECT_ID.into(), value[..take].to_vec());
+                        }
                     }
-                    // Non-resident SDs are uncommon in record-local form
-                    // (they normally live in $Secure). Skip.
-                }
-                TYPE_REPARSE_POINT => {
-                    if let AttributeKind::Resident { value, .. } = attr.kind {
-                        out.insert(xattr_keys::REPARSE.into(), value.to_vec());
+                    TYPE_SECURITY_DESCRIPTOR => {
+                        if let AttributeKind::Resident { value, .. } = attr.kind {
+                            out.insert(xattr_keys::SECURITY.into(), value.to_vec());
+                            have_inline_security = true;
+                        }
+                        // Non-resident inline SDs are unusual; $Secure
+                        // handles the common shared-SD case below.
                     }
+                    TYPE_REPARSE_POINT => {
+                        if let AttributeKind::Resident { value, .. } = attr.kind {
+                            out.insert(xattr_keys::REPARSE.into(), value.to_vec());
+                        }
+                    }
+                    TYPE_DATA if !attr.name.is_empty()
+                        && !ads_names.contains(&attr.name) => {
+                            ads_names.push(attr.name.clone());
+                        }
+                    _ => {}
                 }
-                TYPE_DATA if !attr.name.is_empty() => {
-                    ads_names.push(attr.name.clone());
-                }
-                _ => {}
             }
         }
         if let Some(name) = win32_short_name {
             out.insert(xattr_keys::SHORT_NAME.into(), name);
+        }
+
+        // Resolve shared security descriptor via $Secure if applicable.
+        if !have_inline_security {
+            if let Some(id) = security_id {
+                if let Some(sd) = self.resolve_security_descriptor(dev, id)? {
+                    out.insert(xattr_keys::SECURITY.into(), sd);
+                }
+            }
         }
 
         // Pull each ADS payload through the streaming reader, with a
@@ -621,18 +821,217 @@ impl Ntfs {
 
         Ok(out)
     }
-}
 
-/// Internal representation of a $DATA stream we're about to read.
-enum DataStreamInfo {
-    Resident {
-        bytes: Vec<u8>,
-    },
-    NonResident {
-        real_size: u64,
-        initialized_size: u64,
-        runs: Vec<Extent>,
-    },
+    /// Lazily load `$UpCase` (record 10) into the `Ntfs::upcase` cache.
+    /// Failure to read it falls back to an identity table — synthetic test
+    /// images may not carry `$UpCase`, and case-sensitive comparison is
+    /// the safe degraded behaviour. Any error encountered is silently
+    /// swallowed in favour of the identity table.
+    fn ensure_upcase(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if self.upcase.is_some() {
+            return Ok(());
+        }
+        // Attempt to open record 10's default $DATA stream.
+        match self.read_metadata_stream(dev, MFT_RECORD_UPCASE, "", 256 * 1024) {
+            Ok(bytes) => {
+                self.upcase = Some(UpcaseTable::from_bytes(&bytes));
+            }
+            Err(_) => {
+                self.upcase = Some(UpcaseTable::identity());
+            }
+        }
+        Ok(())
+    }
+
+    /// Read up to `cap` bytes of `(rec_no, stream_name)` into a `Vec<u8>`.
+    /// Used for `$UpCase` and `$Secure:$SDS`. Bypasses path lookup (so it
+    /// doesn't recurse into upcase / the security file itself).
+    fn read_metadata_stream(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        rec_no: u64,
+        stream_name: &str,
+        cap: usize,
+    ) -> Result<Vec<u8>> {
+        let mut reader = self.open_stream_by_record(dev, rec_no, stream_name)?;
+        let mut out = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = reader.read(&mut tmp).map_err(crate::Error::from)?;
+            if n == 0 {
+                break;
+            }
+            if out.len() + n > cap {
+                let take = cap - out.len();
+                out.extend_from_slice(&tmp[..take]);
+                break;
+            }
+            out.extend_from_slice(&tmp[..n]);
+        }
+        Ok(out)
+    }
+
+    /// Resolve a `security_id` (from `$STANDARD_INFORMATION`) to its raw
+    /// self-relative `SECURITY_DESCRIPTOR` bytes. The id is keyed through
+    /// `$Secure:$SII`, which points at an offset + size within
+    /// `$Secure:$SDS`. The SDS entry is prefixed with a 20-byte header
+    /// (hash, id, offset, size) followed by the SD payload.
+    ///
+    /// Returns `Ok(None)` if `$Secure` is missing / unreadable, or if the
+    /// id doesn't match any SII entry. Returns `Ok(Some(_))` with the SD
+    /// bytes only, capped at `MAX_SECURITY_DESCRIPTOR_BYTES`.
+    fn resolve_security_descriptor(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        security_id: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        // Build / reuse the $SII cache.
+        if self.sii_cache.is_none() {
+            let cache = self.build_sii_cache(dev).unwrap_or_default();
+            self.sii_cache = Some(cache);
+        }
+        let cache = self.sii_cache.as_ref().expect("sii_cache populated");
+        let Some(&(offset, size)) = cache.get(&security_id) else {
+            return Ok(None);
+        };
+        if size as u64 > MAX_SECURITY_DESCRIPTOR_BYTES {
+            return Ok(None);
+        }
+
+        // Read `size` bytes from $Secure:$SDS starting at `offset`.
+        let mut reader = self.open_stream_by_record(dev, MFT_RECORD_SECURE, "$SDS")?;
+        // Skip to `offset`.
+        let mut skipped: u64 = 0;
+        let mut sink = [0u8; 8192];
+        while skipped < offset {
+            let want = (offset - skipped).min(sink.len() as u64) as usize;
+            let n = reader.read(&mut sink[..want]).map_err(crate::Error::from)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            skipped += n as u64;
+        }
+        let mut blob = vec![0u8; size as usize];
+        let mut filled = 0;
+        while filled < blob.len() {
+            let n = reader
+                .read(&mut blob[filled..])
+                .map_err(crate::Error::from)?;
+            if n == 0 {
+                blob.truncate(filled);
+                break;
+            }
+            filled += n;
+        }
+        if blob.len() < 0x14 {
+            return Ok(None);
+        }
+        // First 20 bytes are the SDS-entry header; the SD payload follows.
+        let entry_size = u32::from_le_bytes(blob[16..20].try_into().unwrap()) as usize;
+        if entry_size <= 0x14 || entry_size > blob.len() {
+            return Ok(None);
+        }
+        let sd = blob[0x14..entry_size].to_vec();
+        Ok(Some(sd))
+    }
+
+    /// Walk `$Secure:$SII` (an `$INDEX_ROOT` + optional `$INDEX_ALLOCATION`
+    /// keyed by security_id) and return a `security_id -> (offset, size)`
+    /// map into `$SDS`.
+    fn build_sii_cache(&mut self, dev: &mut dyn BlockDevice) -> Result<HashMap<u32, (u64, u32)>> {
+        let records = self.load_record_set(dev, MFT_RECORD_SECURE)?;
+        let mut root_value: Option<Vec<u8>> = None;
+        let mut alloc_runs: Option<Vec<Extent>> = None;
+        let mut index_block_size: u32 = 0;
+        for (_rec, rec_buf) in &records {
+            let h = mft::RecordHeader::parse(rec_buf)?;
+            for attr_res in AttributeIter::new(rec_buf, h.first_attribute_offset as usize) {
+                let attr = attr_res?;
+                if attr.name != "$SII" {
+                    continue;
+                }
+                match (attr.type_code, attr.kind) {
+                    (TYPE_INDEX_ROOT, AttributeKind::Resident { value, .. }) => {
+                        let hdr = index::IndexRootHeader::parse(value)?;
+                        index_block_size = hdr.index_block_size;
+                        root_value = Some(value.to_vec());
+                    }
+                    (TYPE_INDEX_ALLOCATION, AttributeKind::NonResident { runs, .. }) => {
+                        match alloc_runs.as_mut() {
+                            Some(existing) => existing.extend(runs),
+                            None => alloc_runs = Some(runs),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some(root_value) = root_value else {
+            return Ok(HashMap::new());
+        };
+        let root_hdr = index::IndexRootHeader::parse(&root_value)?;
+        let entries_start = root_hdr.header_offset + root_hdr.first_entry_offset as usize;
+        let entries_len = (root_hdr.bytes_in_use as usize).saturating_sub(16);
+        let mut cache = HashMap::new();
+        let entry_buf = &root_value
+            [entries_start..entries_start + entries_len.min(root_value.len() - entries_start)];
+        for e in secure::walk_sii_node(entry_buf)? {
+            cache.insert(e.security_id, (e.sds_offset, e.sds_size));
+        }
+
+        // Walk allocation blocks if any. Each INDX block carries the same
+        // entry stream layout we just decoded for the root.
+        if let Some(runs) = alloc_runs {
+            if index_block_size > 0 {
+                let cluster_size = u64::from(self.boot.cluster_size());
+                let block_size = index_block_size as usize;
+                let mut visited = std::collections::HashSet::<u64>::new();
+                // Iterate every block in the run list rather than tree-
+                // descending — $SII isn't deep in practice and a flat
+                // scan keeps the cache builder simple.
+                let mut walked: u64 = 0;
+                for ext in &runs {
+                    let span = ext.length * cluster_size;
+                    if let Some(lcn) = ext.lcn {
+                        let mut local: u64 = 0;
+                        while local < span {
+                            let phys = lcn * cluster_size + local;
+                            if visited.insert(phys) {
+                                let mut blk = vec![0u8; block_size];
+                                if dev.read_at(phys, &mut blk).is_ok()
+                                    && mft::apply_fixup(
+                                        &mut blk,
+                                        self.boot.bytes_per_sector as usize,
+                                    )
+                                    .is_ok()
+                                {
+                                    if let Ok(blk_hdr) = index::IndexBlockHeader::parse(&blk) {
+                                        let s = blk_hdr.entries_start();
+                                        let l = blk_hdr.entries_byte_len();
+                                        if s + l <= blk.len() {
+                                            let entries = &blk[s..s + l];
+                                            if let Ok(rows) = secure::walk_sii_node(entries) {
+                                                for r in rows {
+                                                    cache.insert(
+                                                        r.security_id,
+                                                        (r.sds_offset, r.sds_size),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            local += block_size as u64;
+                        }
+                    }
+                    walked += span;
+                }
+                let _ = walked;
+            }
+        }
+        Ok(cache)
+    }
 }
 
 /// Streaming reader over a resident $DATA value (whole payload already in
@@ -729,6 +1128,172 @@ impl<'a> Read for NonResidentReader<'a> {
     }
 }
 
+/// Streaming reader over an LZNT1-compressed non-resident `$DATA` stream.
+///
+/// NTFS groups clusters into "compression units" of `1 << compression_unit`
+/// clusters each (16 at the canonical 4 KiB-cluster / `compression_unit=4`
+/// case). One unit on disk is one of:
+///
+/// * **All-zero** — the unit's run list slice is wholly sparse. We yield
+///   `cu_size` bytes of zero.
+/// * **Stored** — exactly `cu_clusters` clusters of real data with no
+///   sparse tail; the unit is held verbatim. We pass those bytes through.
+/// * **Compressed** — fewer than `cu_clusters` clusters of data followed
+///   by sparse tail (NTFS deallocates the saved tail). We LZNT1-decode
+///   the real prefix into a `cu_size`-byte buffer.
+///
+/// The reader keeps one decoded compression unit cached so reads inside
+/// the same unit are zero-cost after the initial fetch.
+struct CompressedReader<'a> {
+    dev: &'a mut dyn BlockDevice,
+    cluster_size: u64,
+    cu_clusters: u64,
+    cu_size: u64,
+    runs: Vec<Extent>,
+    real_size: u64,
+    initialized_size: u64,
+    pos: u64,
+    /// Scratch buffer for one CU's compressed-on-disk bytes (up to
+    /// `cu_size`).
+    src_buf: Vec<u8>,
+    /// Decoded CU contents. Always exactly `cu_size` bytes long.
+    out_buf: Vec<u8>,
+    /// Which compression unit (counted in CUs from the start of the
+    /// attribute) is currently materialized in `out_buf`, or `u64::MAX`
+    /// if none.
+    cached_cu_index: u64,
+}
+
+impl<'a> CompressedReader<'a> {
+    fn new(
+        dev: &'a mut dyn BlockDevice,
+        cluster_size: u64,
+        cu_clusters: u64,
+        runs: Vec<Extent>,
+        real_size: u64,
+        initialized_size: u64,
+    ) -> Self {
+        let cu_size = cluster_size * cu_clusters;
+        Self {
+            dev,
+            cluster_size,
+            cu_clusters,
+            cu_size,
+            runs,
+            real_size,
+            initialized_size,
+            pos: 0,
+            src_buf: vec![0u8; cu_size as usize],
+            out_buf: vec![0u8; cu_size as usize],
+            cached_cu_index: u64::MAX,
+        }
+    }
+
+    /// Resolve the `i`th run-list cluster (counted as VCN) to its on-disk
+    /// (lcn, length-remaining-in-run) tuple, or `None` for sparse.
+    fn map_vcn(&self, vcn: u64) -> std::io::Result<Option<u64>> {
+        let mut walked: u64 = 0;
+        for ext in &self.runs {
+            if vcn < walked + ext.length {
+                let local = vcn - walked;
+                return Ok(ext.lcn.map(|lcn| (lcn + local) * self.cluster_size));
+            }
+            walked += ext.length;
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("ntfs: VCN {vcn} past end of run list"),
+        ))
+    }
+
+    /// Walk `cu_clusters` consecutive VCNs and decide how many of them have
+    /// a real LCN. The first `real_clusters` VCNs of the CU carry data;
+    /// the remaining `cu_clusters - real_clusters` are sparse (i.e. the
+    /// compression saved those clusters). All-zero CUs report 0.
+    fn count_real_clusters_in_cu(&self, base_vcn: u64) -> std::io::Result<u64> {
+        let mut count = 0u64;
+        for k in 0..self.cu_clusters {
+            let phys = self.map_vcn(base_vcn + k)?;
+            if phys.is_some() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Materialize CU number `cu_index` into `self.out_buf`.
+    fn load_cu(&mut self, cu_index: u64) -> std::io::Result<()> {
+        if self.cached_cu_index == cu_index {
+            return Ok(());
+        }
+        let base_vcn = cu_index * self.cu_clusters;
+        let real_clusters = self.count_real_clusters_in_cu(base_vcn)?;
+        if real_clusters == 0 {
+            // All-sparse CU → all zero.
+            for b in &mut self.out_buf {
+                *b = 0;
+            }
+        } else if real_clusters == self.cu_clusters {
+            // Stored verbatim — concatenate every cluster's bytes.
+            for k in 0..self.cu_clusters {
+                let phys = self
+                    .map_vcn(base_vcn + k)?
+                    .ok_or_else(|| std::io::Error::other("ntfs: stored-CU sparse cluster"))?;
+                let lo = (k * self.cluster_size) as usize;
+                let hi = lo + self.cluster_size as usize;
+                self.dev
+                    .read_at(phys, &mut self.out_buf[lo..hi])
+                    .map_err(std::io::Error::other)?;
+            }
+        } else {
+            // Compressed: first `real_clusters` clusters carry an LZNT1
+            // stream; the rest of the CU is sparse padding.
+            let src_len = (real_clusters * self.cluster_size) as usize;
+            self.src_buf.resize(src_len, 0);
+            for k in 0..real_clusters {
+                let phys = self.map_vcn(base_vcn + k)?.ok_or_else(|| {
+                    std::io::Error::other("ntfs: compressed-CU sparse mid-cluster")
+                })?;
+                let lo = (k * self.cluster_size) as usize;
+                let hi = lo + self.cluster_size as usize;
+                self.dev
+                    .read_at(phys, &mut self.src_buf[lo..hi])
+                    .map_err(std::io::Error::other)?;
+            }
+            compression::decompress_unit(&self.src_buf, &mut self.out_buf)
+                .map_err(std::io::Error::other)?;
+        }
+        self.cached_cu_index = cu_index;
+        Ok(())
+    }
+}
+
+impl<'a> Read for CompressedReader<'a> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.real_size {
+            return Ok(0);
+        }
+        let cu_index = self.pos / self.cu_size;
+        let off = (self.pos % self.cu_size) as usize;
+        self.load_cu(cu_index)?;
+        let remaining_file = self.real_size - self.pos;
+        let n = ((self.cu_size - off as u64) as usize)
+            .min(out.len())
+            .min(remaining_file as usize);
+        if self.pos + n as u64 <= self.initialized_size {
+            out[..n].copy_from_slice(&self.out_buf[off..off + n]);
+        } else if self.pos >= self.initialized_size {
+            out[..n].fill(0);
+        } else {
+            let copy_n = (self.initialized_size - self.pos) as usize;
+            out[..copy_n].copy_from_slice(&self.out_buf[off..off + copy_n]);
+            out[copy_n..n].fill(0);
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
 /// Names for the xattr namespace this driver will use when round-tripping
 /// NTFS metadata through other filesystems.
 pub mod xattr_keys {
@@ -736,11 +1301,16 @@ pub mod xattr_keys {
     pub const DOS_ATTRS: &str = "user.ntfs.dos_attrs";
     /// $OBJECT_ID GUID (16 raw bytes).
     pub const OBJECT_ID: &str = "user.ntfs.object_id";
-    /// Reparse-point tag (LE u32) followed by raw reparse data.
+    /// Reparse-point tag (LE u32) followed by raw reparse data. The driver
+    /// surfaces this as-is and does NOT follow junctions, symlinks, or any
+    /// other reparse-point type during path resolution or reads.
     pub const REPARSE: &str = "user.ntfs.reparse";
     /// Alternate Data Streams; full key is `user.ntfs.ads.<name>`.
     pub const ADS_PREFIX: &str = "user.ntfs.ads.";
-    /// Self-relative NT SECURITY_DESCRIPTOR blob.
+    /// Self-relative NT SECURITY_DESCRIPTOR blob. Sourced from either a
+    /// resident `$SECURITY_DESCRIPTOR` attribute or, when the file uses a
+    /// shared SD, resolved via `$STANDARD_INFORMATION.security_id` against
+    /// `$Secure:$SII` → `$Secure:$SDS`.
     pub const SECURITY: &str = "system.ntfs_security";
     /// Short 8.3 filename (UTF-16LE from a $FILE_NAME with namespace=DOS).
     pub const SHORT_NAME: &str = "user.ntfs.short_name";

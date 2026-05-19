@@ -27,11 +27,13 @@ use std::io::{Read, Seek, Write};
 
 use crate::Result;
 
+pub mod dmg;
 pub mod file;
 pub mod memory;
 pub mod qcow2;
 pub mod sliced;
 
+pub use dmg::DmgBackend;
 pub use file::FileBackend;
 pub use memory::MemoryBackend;
 pub use qcow2::Qcow2Backend;
@@ -40,15 +42,23 @@ pub use sliced::SlicedBackend;
 use std::path::Path;
 
 /// Open `path` as a [`BlockDevice`], picking the backend automatically.
-/// qcow2 files (detected by magic `"QFI\xfb"`) get a [`Qcow2Backend`];
-/// everything else — regular files, block devices — gets a
-/// [`FileBackend`]. The detection reads just the first four bytes.
+///
+/// Detection order:
+///
+/// - qcow2 magic `"QFI\xfb"` at offset 0   → [`Qcow2Backend`]
+/// - UDIF `koly` trailer at `file_size-512` → [`DmgBackend`] (scaffold:
+///   parses the trailer; reads return `Unsupported` until the chunk
+///   decoder lands)
+/// - everything else (regular file, block device, raw image) →
+///   [`FileBackend`]
 ///
 /// This does **not** handle compressed inputs like `.tar.gz`. Use
 /// [`open_image_maybe_compressed`] when the path might carry a codec.
 pub fn open_image(path: &Path) -> crate::Result<Box<dyn BlockDevice>> {
     if Qcow2Backend::probe(path)? {
         Ok(Box::new(Qcow2Backend::open(path)?))
+    } else if dmg::probe(path)? {
+        Ok(Box::new(DmgBackend::open(path)?))
     } else {
         Ok(Box::new(FileBackend::open(path)?))
     }

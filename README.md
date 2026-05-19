@@ -37,6 +37,7 @@ fstool repack out.img out.tar                    # convert ext4 → tar (and bac
 | F2FS       | ✅              | —     | CP / NAT / dnodes / inline data + dentries         |
 | SquashFS   | ✅              | —     | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features |
 | qcow2      | ✅              | ✅     | v2 + v3, allocate-on-write writer                  |
+| dmg        | scaffold        | —     | UDIF v4 trailer parsed; chunk decoder TBD          |
 
 The reader for each FS streams: file contents are never fully resident in
 memory regardless of size. The writers do the same, two-pass: scan to size

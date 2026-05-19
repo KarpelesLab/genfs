@@ -21,6 +21,7 @@
 
 pub mod build_plan;
 pub mod constants;
+pub mod csum;
 pub mod dir;
 pub mod extent;
 pub mod group;
@@ -593,7 +594,7 @@ impl Ext {
             if i != 0 {
                 let mut sb_copy = self.sb.clone();
                 sb_copy.block_group_nr = i as u16;
-                dev.write_at(g.start_block as u64 * bs, &sb_copy.encode())?;
+                dev.write_at(g.start_block as u64 * bs, &self.encode_sb(&sb_copy))?;
             }
             // GDT block(s):
             // - group 0 (first_data_block=1): GDT at block 2 (after SB at 1)
@@ -628,9 +629,21 @@ impl Ext {
         }
 
         // Primary SB last.
-        dev.write_at(SUPERBLOCK_OFFSET, &self.sb.encode())?;
+        dev.write_at(SUPERBLOCK_OFFSET, &self.encode_sb(&self.sb))?;
         dev.sync()?;
         Ok(())
+    }
+
+    /// Encode a superblock, stamping the CRC32C `s_checksum` field when the
+    /// `metadata_csum` feature is set. Without the feature the field stays
+    /// zero (the kernel ignores it).
+    fn encode_sb(&self, sb: &Superblock) -> [u8; constants::SUPERBLOCK_SIZE] {
+        let mut buf = sb.encode();
+        if self.sb.feature_ro_compat & constants::feature::RO_COMPAT_METADATA_CSUM != 0 {
+            let c = csum::superblock(&buf);
+            buf[1020..1024].copy_from_slice(&c.to_le_bytes());
+        }
+        buf
     }
 
     fn inode_location(&self, ino: u32) -> (u32, u32) {
@@ -978,6 +991,18 @@ impl Ext {
         let mut sb_buf = [0u8; constants::SUPERBLOCK_SIZE];
         dev.read_at(constants::SUPERBLOCK_OFFSET, &mut sb_buf)?;
         let sb = Superblock::decode(&sb_buf)?;
+        // When metadata_csum is set, the superblock carries a CRC32C in its
+        // last 4 bytes. A mismatch means the image is corrupt — refuse it
+        // rather than silently working from bad metadata.
+        if sb.feature_ro_compat & constants::feature::RO_COMPAT_METADATA_CSUM != 0 {
+            let stored = u32::from_le_bytes(sb_buf[1020..1024].try_into().unwrap());
+            let computed = csum::superblock(&sb_buf);
+            if stored != computed {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext: superblock checksum mismatch (stored {stored:#010x}, computed {computed:#010x})"
+                )));
+            }
+        }
         let mut layout = layout::from_superblock(&sb)?;
 
         // GDT location: same logic as the writer.

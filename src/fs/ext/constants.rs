@@ -110,6 +110,7 @@ pub mod feature {
     pub const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
     pub const RO_COMPAT_DIR_NLINK: u32 = 0x0020;
     pub const RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
+    pub const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 }
 
 /// Inode flag `EXT4_EXTENTS_FL` — set on inodes whose `i_block` array

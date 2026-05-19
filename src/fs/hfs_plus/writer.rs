@@ -1802,16 +1802,26 @@ pub(crate) fn promote_to_hardlink(
     // zero since the iNode is just storage, not a user-facing file.
     let inode_name_str = format!("iNode{link_inode}");
     let inode_name = UniStr::from_str_lossy(&inode_name_str);
-    let inode_body = encode_file_body(
+    // Per Apple's hardlink convention: the iNode storage file in
+    // the Private Data directory must carry fileType='iNod' and
+    // creator='hfs+' so fsck.hfsplus / the kernel driver recognise
+    // it. BSDInfo.special holds the link count (= number of hlnk
+    // references pointing at this iNode); we start at 2 since the
+    // promotion always creates a (src + dst) pair.
+    let mut inode_body = encode_file_body(
         inode_cnid,
         mode_full,
         uid,
         gid,
         writer.create_date,
-        *b"\0\0\0\0",
-        *b"\0\0\0\0",
+        *b"iNod",
+        *b"hfs+",
         &src_fork,
     );
+    // Patch BSDInfo.special = link_count (2 = src + dst). BSDInfo
+    // starts at byte 32 of the 248-byte file body; `special` is the
+    // last u32 of the 16-byte BSDInfo struct, so byte 32+12 = 44.
+    inode_body[44..48].copy_from_slice(&2u32.to_be_bytes());
     writer.catalog.insert(
         OwnedKey {
             parent_id: private_dir,

@@ -340,3 +340,100 @@ fn dump_mkfs_vs_fstool_extents_header() {
     let f = parse(&fstool_bytes, "fstool");
     panic!("\n{m}\n{f}");
 }
+
+/// Diagnostic: dumps catalog leaf bytes from the failing test so we can
+/// see what's actually on disk that fsck.hfsplus rejects.
+#[test]
+#[ignore = "diagnostic — run via `cargo test -- --ignored`"]
+fn dump_fstool_catalog_leaf() {
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        volume_name: "FstoolHFS".into(),
+        ..FormatOpts::default()
+    };
+    let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
+    hfs.create_dir(&mut dev, "/etc", 0o755, 0, 0).unwrap();
+    let body = b"x=1\n";
+    let mut src = Cursor::new(&body[..]);
+    hfs.create_file(
+        &mut dev,
+        "/etc/conf",
+        &mut src,
+        body.len() as u64,
+        0o644,
+        0,
+        0,
+    )
+    .unwrap();
+    let big: Vec<u8> = (0..16 * 1024).map(|i| (i & 0xFF) as u8).collect();
+    let mut src = Cursor::new(&big[..]);
+    hfs.create_file(&mut dev, "/readme", &mut src, big.len() as u64, 0o644, 0, 0)
+        .unwrap();
+    hfs.create_symlink(&mut dev, "/link", "etc/conf", 0o777, 0, 0)
+        .unwrap();
+    hfs.create_hardlink(&mut dev, "/readme", "/alias").unwrap();
+    hfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let data = std::fs::read(tmp.path()).unwrap();
+    let vh = &data[1024..1024 + 512];
+    let bs = u32::from_be_bytes(vh[0x28..0x2C].try_into().unwrap()) as usize;
+    let cat_start = u32::from_be_bytes(vh[0x110 + 16..0x110 + 20].try_into().unwrap()) as usize;
+    let cat_off = cat_start * bs;
+    let h = &data[cat_off..cat_off + 256];
+    let node_size = u16::from_be_bytes(h[32..34].try_into().unwrap()) as usize;
+    let first_leaf = u32::from_be_bytes(h[24..28].try_into().unwrap()) as usize;
+    let leaf_off = cat_off + first_leaf * node_size;
+    let n = &data[leaf_off..leaf_off + node_size];
+    let num_records = u16::from_be_bytes(n[10..12].try_into().unwrap()) as usize;
+    let mut offs = Vec::new();
+    for i in 0..(num_records + 1) {
+        let p = node_size - 2 * (i + 1);
+        offs.push(u16::from_be_bytes(n[p..p + 2].try_into().unwrap()) as usize);
+    }
+    let mut out = String::new();
+    out += &format!(
+        "first leaf has {} records, node_size={}\n",
+        num_records, node_size
+    );
+    for i in 0..num_records {
+        let s = offs[i];
+        let e = offs[i + 1];
+        let rec = &n[s..e];
+        let key_len = u16::from_be_bytes(rec[0..2].try_into().unwrap()) as usize;
+        let parent = u32::from_be_bytes(rec[2..6].try_into().unwrap());
+        let name_len = u16::from_be_bytes(rec[6..8].try_into().unwrap()) as usize;
+        let mut name = String::new();
+        for j in 0..name_len {
+            let bo = 8 + 2 * j;
+            let u = u16::from_be_bytes(rec[bo..bo + 2].try_into().unwrap());
+            if u == 0 {
+                name.push_str("\\0");
+            } else if u < 0x80 {
+                name.push(u as u8 as char);
+            } else {
+                name.push_str(&format!("\\u{{{:x}}}", u));
+            }
+        }
+        let body_start = 2 + key_len + ((2 + key_len) & 1); // 2-byte align after key
+        let body_len = e - s - body_start;
+        let rec_type_bytes = &rec[body_start..body_start.min(rec.len() - 2) + 2];
+        let rec_type = if rec_type_bytes.len() >= 2 {
+            i16::from_be_bytes([rec_type_bytes[0], rec_type_bytes[1]])
+        } else {
+            -99
+        };
+        out += &format!(
+            "[{i:02}] key_len={key_len} parent={parent} name=\"{name}\" body_start={body_start} body_len={body_len} rec_type={rec_type}\n"
+        );
+        // Dump first 32 bytes of body
+        let body_end = (body_start + 32).min(e - s);
+        out += &format!(
+            "     body[0..{}]: {:02x?}\n",
+            body_end - body_start,
+            &rec[body_start..body_end]
+        );
+    }
+    panic!("\n{}", out);
+}

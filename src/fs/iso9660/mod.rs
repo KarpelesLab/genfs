@@ -326,7 +326,7 @@ impl crate::fs::Filesystem for Iso9660 {
     ) -> Result<()> {
         self.writer
             .as_mut()
-            .ok_or(crate::Error::RepackOnly {
+            .ok_or(crate::Error::Immutable {
                 kind: "iso9660",
                 op: "write",
             })?
@@ -341,7 +341,7 @@ impl crate::fs::Filesystem for Iso9660 {
     ) -> Result<()> {
         self.writer
             .as_mut()
-            .ok_or(crate::Error::RepackOnly {
+            .ok_or(crate::Error::Immutable {
                 kind: "iso9660",
                 op: "write",
             })?
@@ -357,7 +357,7 @@ impl crate::fs::Filesystem for Iso9660 {
     ) -> Result<()> {
         self.writer
             .as_mut()
-            .ok_or(crate::Error::RepackOnly {
+            .ok_or(crate::Error::Immutable {
                 kind: "iso9660",
                 op: "write",
             })?
@@ -375,7 +375,7 @@ impl crate::fs::Filesystem for Iso9660 {
     ) -> Result<()> {
         self.writer
             .as_mut()
-            .ok_or(crate::Error::RepackOnly {
+            .ok_or(crate::Error::Immutable {
                 kind: "iso9660",
                 op: "write",
             })?
@@ -385,7 +385,7 @@ impl crate::fs::Filesystem for Iso9660 {
     fn remove(&mut self, _dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
         self.writer
             .as_mut()
-            .ok_or(crate::Error::RepackOnly {
+            .ok_or(crate::Error::Immutable {
                 kind: "iso9660",
                 op: "write",
             })?
@@ -417,8 +417,8 @@ impl crate::fs::Filesystem for Iso9660 {
         Ok(())
     }
 
-    fn supports_mutation(&self) -> bool {
-        false
+    fn mutation_capability(&self) -> crate::fs::MutationCapability {
+        crate::fs::MutationCapability::Immutable
     }
 }
 

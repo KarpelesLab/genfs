@@ -692,7 +692,7 @@ impl crate::fs::Filesystem for Squashfs {
     }
 
     fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
-        Err(crate::Error::RepackOnly {
+        Err(crate::Error::Immutable {
             kind: "squashfs",
             op: "rm",
         })
@@ -725,8 +725,8 @@ impl crate::fs::Filesystem for Squashfs {
         Self::flush(self, dev)
     }
 
-    fn supports_mutation(&self) -> bool {
-        false
+    fn mutation_capability(&self) -> crate::fs::MutationCapability {
+        crate::fs::MutationCapability::Immutable
     }
 
     fn read_symlink(

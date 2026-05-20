@@ -158,6 +158,24 @@ pub struct DirEntry {
     pub size: u64,
 }
 
+/// How — and whether — a filesystem can be mutated after `flush()`.
+/// Returned by [`Filesystem::mutation_capability`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationCapability {
+    /// Full in-place edits: open an existing image, `create_*` /
+    /// `remove`, flush back. ext, FAT32, F2FS today.
+    Mutable,
+    /// Writer is sequential / streaming — once bytes are emitted you
+    /// can't seek backward to patch. The only way to "modify" is to
+    /// produce a new image from scratch. Tar today.
+    Streaming,
+    /// On-disk layout is laid down at format time and the format has
+    /// no in-place mutation hooks (no free-list, no journal). The
+    /// writer can seek, but the image isn't re-openable as writable.
+    /// ISO 9660 and SquashFS today.
+    Immutable,
+}
+
 /// File-type bucket exposed by [`DirEntry`]. Mirrors POSIX `d_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -241,17 +259,28 @@ pub trait Filesystem {
     /// Persist outstanding dirty state to the device.
     fn flush(&mut self, dev: &mut dyn crate::block::BlockDevice) -> crate::Result<()>;
 
-    /// True if this filesystem can mutate an *existing* on-disk image
-    /// — i.e. open it, call `create_*` / `remove` against it, and
-    /// flush back. False for sequential / one-shot formats (ISO 9660,
-    /// SquashFS, …) whose layout is fixed at format time. Such
-    /// filesystems can still be `format`-ed and populated in one shot
-    /// via `repack`, but `add` / `rm` on an already-flushed image
-    /// returns a clear error rather than a low-level surprise.
+    /// Capability of this filesystem with respect to mutating an
+    /// already-flushed image. Three cases:
     ///
-    /// Default: `true`. Repack-only filesystems override to `false`.
+    /// - [`MutationCapability::Mutable`]: full in-place edits via
+    ///   `create_*` / `remove` (ext, FAT32, F2FS).
+    /// - [`MutationCapability::Streaming`]: writer is sequential
+    ///   only — adding to an existing image means producing a new
+    ///   one from scratch (tar).
+    /// - [`MutationCapability::Immutable`]: writer can seek but the
+    ///   on-disk format has no in-place mutation hooks (ISO 9660,
+    ///   SquashFS). `repack` rebuilds.
+    ///
+    /// Default: `Mutable`. Override on backends that aren't.
+    fn mutation_capability(&self) -> MutationCapability {
+        MutationCapability::Mutable
+    }
+
+    /// Convenience shortcut for `mutation_capability() == Mutable`.
+    /// Pre-existing callers that don't care about *why* a filesystem
+    /// can't be mutated keep working unchanged.
     fn supports_mutation(&self) -> bool {
-        true
+        matches!(self.mutation_capability(), MutationCapability::Mutable)
     }
 
     /// Read a symbolic link's target. Default returns `Unsupported`

@@ -367,7 +367,7 @@ impl crate::fs::Filesystem for Tar {
         _src: crate::fs::FileSource,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::RepackOnly {
+        Err(crate::Error::Streaming {
             kind: "tar",
             op: "write",
         })
@@ -379,7 +379,7 @@ impl crate::fs::Filesystem for Tar {
         _path: &std::path::Path,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::RepackOnly {
+        Err(crate::Error::Streaming {
             kind: "tar",
             op: "write",
         })
@@ -392,7 +392,7 @@ impl crate::fs::Filesystem for Tar {
         _target: &std::path::Path,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::RepackOnly {
+        Err(crate::Error::Streaming {
             kind: "tar",
             op: "write",
         })
@@ -407,14 +407,14 @@ impl crate::fs::Filesystem for Tar {
         _minor: u32,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::RepackOnly {
+        Err(crate::Error::Streaming {
             kind: "tar",
             op: "write",
         })
     }
 
     fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
-        Err(crate::Error::RepackOnly {
+        Err(crate::Error::Streaming {
             kind: "tar",
             op: "write",
         })
@@ -447,8 +447,8 @@ impl crate::fs::Filesystem for Tar {
         Ok(())
     }
 
-    fn supports_mutation(&self) -> bool {
-        false
+    fn mutation_capability(&self) -> crate::fs::MutationCapability {
+        crate::fs::MutationCapability::Streaming
     }
 
     fn read_symlink(

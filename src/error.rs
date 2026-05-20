@@ -34,20 +34,37 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
-    /// The requested operation tried to mutate a repack-only filesystem
-    /// (ISO 9660, SquashFS, tar, …) on an already-flushed image.
-    /// Distinct from [`Error::Unsupported`] so callers can match the
-    /// variant directly instead of grepping a message string and route
-    /// the user to `repack`.
+    /// The operation tried to modify a **streaming** filesystem — one
+    /// whose writer can't seek backward once bytes have been emitted.
+    /// Tar today; any future stream-of-records format that lands in
+    /// fstool. Distinct from [`Error::Immutable`] so callers can tell
+    /// "the writer fundamentally can't go back" apart from "the
+    /// on-disk layout was never designed for in-place edits."
     #[error(
-        "{op}: {kind} is a repack-only filesystem — use `fstool repack` to rebuild it"
+        "{op}: {kind} is a streaming format — use `fstool repack` to produce a new one"
     )]
-    RepackOnly {
-        /// The filesystem kind that refused the operation (e.g.
-        /// `"iso9660"`, `"squashfs"`, `"tar"`).
+    Streaming {
+        /// The filesystem kind that refused (today: `"tar"`).
         kind: &'static str,
-        /// The operation that was attempted (`"add"`, `"rm"`, `"mkdir"`,
-        /// …). Free-form short verb; not a stable enum.
+        /// Short verb describing the attempted op (`"add"`, `"rm"`, …).
+        /// Free-form; not a stable enum.
+        op: &'static str,
+    },
+
+    /// The operation tried to modify a **write-once** filesystem whose
+    /// on-disk layout has no in-place mutation hooks (no free-block
+    /// tracking, no journal). ISO 9660 and SquashFS today. The
+    /// writer can seek, but re-opening the image as writable isn't
+    /// part of the format's design — modifications go through
+    /// `fstool repack` to rebuild the image from scratch.
+    #[error(
+        "{op}: {kind} is a write-once format — use `fstool repack` to rebuild it"
+    )]
+    Immutable {
+        /// The filesystem kind that refused (today: `"iso9660"`,
+        /// `"squashfs"`).
+        kind: &'static str,
+        /// Short verb describing the attempted op.
         op: &'static str,
     },
 }

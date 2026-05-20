@@ -384,50 +384,58 @@ impl AnyFs {
     }
 
     /// Whether this filesystem can mutate an already-flushed image
-    /// (`add` / `rm` against an existing on-disk FS). Delegates to the
-    /// inner [`crate::fs::Filesystem::supports_mutation`]. Repack-only
-    /// formats (tar / ISO 9660 / SquashFS) override the trait method
-    /// to false; everyone else inherits the `true` default — though
-    /// individual write methods on FSes whose writer isn't fully
-    /// implemented yet (APFS, exFAT) still return `Unsupported`
-    /// per-call.
+    /// (`add` / `rm` against an existing on-disk FS). Convenience
+    /// shortcut for `mutation_capability() == Mutable`. Callers who
+    /// need to distinguish *why* a filesystem isn't mutable should
+    /// use [`Self::mutation_capability`] instead.
     pub fn supports_mutation(&self) -> bool {
-        // Use the trait's `supports_mutation`, going through the same
-        // dispatch helper the rest of the surface uses. We don't take
-        // `&mut self` here, so we re-do a small per-variant match.
+        matches!(
+            self.mutation_capability(),
+            crate::fs::MutationCapability::Mutable
+        )
+    }
+
+    /// How this filesystem can be mutated. Delegates to the inner
+    /// [`crate::fs::Filesystem::mutation_capability`]. Tar reports
+    /// `Streaming`; ISO 9660 and SquashFS report `Immutable`;
+    /// everything else (including APFS / exFAT whose writers aren't
+    /// implemented yet — those return `Unsupported` per-call from
+    /// individual methods) reports `Mutable`.
+    pub fn mutation_capability(&self) -> crate::fs::MutationCapability {
         match self {
-            Self::Ext(ext) => crate::fs::Filesystem::supports_mutation(ext.as_ref()),
-            Self::Fat32(fat) => crate::fs::Filesystem::supports_mutation(fat.as_ref()),
-            Self::HfsPlus(h) => crate::fs::Filesystem::supports_mutation(h.as_ref()),
-            Self::Ntfs(n) => crate::fs::Filesystem::supports_mutation(n.as_ref()),
-            Self::F2fs(fs2) => crate::fs::Filesystem::supports_mutation(fs2.as_ref()),
-            Self::Squashfs(sq) => crate::fs::Filesystem::supports_mutation(sq.as_ref()),
-            Self::Xfs(x) => crate::fs::Filesystem::supports_mutation(x.as_ref()),
-            Self::Iso9660(iso) => crate::fs::Filesystem::supports_mutation(iso.as_ref()),
-            Self::Tar(t) => crate::fs::Filesystem::supports_mutation(t.as_ref()),
-            Self::Apfs(a) => crate::fs::Filesystem::supports_mutation(a.as_ref()),
-            Self::Exfat(e) => crate::fs::Filesystem::supports_mutation(e.as_ref()),
+            Self::Ext(ext) => crate::fs::Filesystem::mutation_capability(ext.as_ref()),
+            Self::Fat32(fat) => crate::fs::Filesystem::mutation_capability(fat.as_ref()),
+            Self::HfsPlus(h) => crate::fs::Filesystem::mutation_capability(h.as_ref()),
+            Self::Ntfs(n) => crate::fs::Filesystem::mutation_capability(n.as_ref()),
+            Self::F2fs(fs2) => crate::fs::Filesystem::mutation_capability(fs2.as_ref()),
+            Self::Squashfs(sq) => crate::fs::Filesystem::mutation_capability(sq.as_ref()),
+            Self::Xfs(x) => crate::fs::Filesystem::mutation_capability(x.as_ref()),
+            Self::Iso9660(iso) => crate::fs::Filesystem::mutation_capability(iso.as_ref()),
+            Self::Tar(t) => crate::fs::Filesystem::mutation_capability(t.as_ref()),
+            Self::Apfs(a) => crate::fs::Filesystem::mutation_capability(a.as_ref()),
+            Self::Exfat(e) => crate::fs::Filesystem::mutation_capability(e.as_ref()),
         }
     }
 
-    /// Internal guard: if this filesystem is genuinely repack-only
-    /// (sequential layout — tar / ISO 9660 / SquashFS), emit
-    /// [`crate::Error::RepackOnly`] before dispatching a write call.
-    /// For filesystems whose writer simply isn't wired yet (APFS,
-    /// exFAT, …) the underlying trait method's own `Unsupported`
-    /// error will surface from the dispatch instead — the right
-    /// answer is "not implemented", not "use repack."
+    /// Internal guard: emit the right typed error variant for the
+    /// failure mode of a non-mutable filesystem before dispatching a
+    /// write call. APFS/exFAT — whose writers simply aren't wired
+    /// yet — report `Mutable`, so they fall through this guard and
+    /// the underlying create_* method's own `Unsupported("…not yet
+    /// implemented")` surfaces instead.
     fn require_mutable(&self, op: &'static str) -> Result<()> {
-        if self.supports_mutation() {
-            return Ok(());
+        use crate::fs::MutationCapability;
+        match self.mutation_capability() {
+            MutationCapability::Mutable => Ok(()),
+            MutationCapability::Streaming => Err(crate::Error::Streaming {
+                kind: self.kind_string(),
+                op,
+            }),
+            MutationCapability::Immutable => Err(crate::Error::Immutable {
+                kind: self.kind_string(),
+                op,
+            }),
         }
-        // Only sequential / one-shot formats hit this — APFS/exFAT
-        // default to `supports_mutation == true` and let their own
-        // create_* methods return `Unsupported`.
-        Err(crate::Error::RepackOnly {
-            kind: self.kind_string(),
-            op,
-        })
     }
 
     /// Dispatch a closure to whichever inner filesystem implements
@@ -873,13 +881,14 @@ mod tests {
         assert!(s.supports_mutation);
     }
 
-    /// `add` / `rm` on a repack-only filesystem (here: tar) should
-    /// surface the typed `Error::RepackOnly` variant — callers
-    /// shouldn't have to grep the message string to detect this.
+    /// `add` on a streaming filesystem (tar) should surface
+    /// `Error::Streaming`, not the generic `Unsupported` and not the
+    /// `Immutable` variant that's reserved for write-once
+    /// random-access formats (ISO 9660, SquashFS).
     #[test]
-    fn add_on_repack_only_returns_typed_error() {
+    fn add_on_streaming_fs_returns_streaming_error() {
         use crate::fs::tar::{TarEntryMeta, TarStreamWriter};
-        // Build a minimal in-memory tar so AnyFs can open it. The
+        // Build a minimal in-memory tar so AnyFs can open it. A
         // single `/etc/` directory entry is enough for tar's parser.
         let mut buf = Vec::<u8>::new();
         {
@@ -891,15 +900,19 @@ mod tests {
         dev.write_at(0, &buf).unwrap();
 
         let mut fs = AnyFs::open(&mut dev).unwrap();
+        assert_eq!(
+            fs.mutation_capability(),
+            crate::fs::MutationCapability::Streaming
+        );
         let err = fs
             .add_file(&mut dev, "/etc/new", std::path::Path::new("/dev/null"))
             .expect_err("add on tar must fail");
         match err {
-            crate::Error::RepackOnly { kind, op } => {
+            crate::Error::Streaming { kind, op } => {
                 assert_eq!(kind, "tar");
                 assert_eq!(op, "add");
             }
-            other => panic!("expected RepackOnly, got {other:?}"),
+            other => panic!("expected Streaming, got {other:?}"),
         }
     }
 }

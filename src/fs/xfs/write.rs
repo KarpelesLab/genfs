@@ -32,9 +32,13 @@
 //! - **Files.** Streamed through a 64 KiB scratch buffer; allocated as
 //!   one contiguous extent in whichever AG the round-robin picks.
 //!
-//! - **Xattrs.** [`Xfs::add_xattr`] / [`Xfs::read_xattrs`] use the
-//!   shortform (LOCAL) attribute fork; spill to leaf/node attr blocks
-//!   surfaces `Error::Unsupported`.
+//! - **Xattrs.** [`Xfs::add_xattr`] / [`Xfs::remove_xattr`] /
+//!   [`Xfs::read_xattrs`] support both **shortform** (inline LOCAL
+//!   attribute fork) and **leaf form** (one full FS-block leaf, via
+//!   [`super::xattr_leaf`]). The writer picks the cheapest form that
+//!   fits; promotion shortform → leaf happens transparently when the
+//!   inline area overflows. Node-form (multi-leaf dabtree) is not
+//!   implemented and surfaces `Error::Unsupported`.
 //!
 //! ## What's not done
 //!
@@ -1250,27 +1254,95 @@ impl Xfs {
                 "xfs: empty xattr name".into(),
             ));
         }
-        let (ino_buf, core) = self.read_inode(dev, ino)?;
-        // Decode any existing xattrs from the inode's attr fork.
-        let mut current: Vec<(String, Vec<u8>)> = self
-            .read_xattrs_from_core(&ino_buf, &core)?
-            .into_iter()
-            .collect();
-        // Replace or append.
+        let mut current = self.read_xattrs_vec(dev, ino)?;
         if let Some(slot) = current.iter_mut().find(|(n, _)| n == name) {
             slot.1 = value.to_vec();
         } else {
             current.push((name.to_string(), value.to_vec()));
         }
-        // Encode the new shortform area.
-        let encoded = super::xattr::encode_shortform(&current)?;
-        // Determine the attr-fork allocation.
-        //
-        // Inode literal area starts at offset 176 (v3 / 512-B inode)
-        // and is 336 bytes long. The data fork must keep its current
-        // bytes intact — so we must NOT overwrite the bytes the data
-        // fork already uses. The data fork's actual occupancy depends
-        // on di_format:
+        self.rebuild_xattr_fork(dev, ino, &current)
+    }
+
+    /// Remove a single extended attribute. Returns `Ok(false)` if the
+    /// attribute didn't exist on the inode (the caller can treat that
+    /// as "already gone"); `Ok(true)` after a successful removal. When
+    /// the last attribute is removed, the attribute fork is collapsed
+    /// — forkoff goes back to 0, di_aformat back to 2 (the default
+    /// "extents" indicator the writer uses for inodes with no attrs).
+    pub fn remove_xattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u64,
+        name: &str,
+    ) -> Result<bool> {
+        let mut current = self.read_xattrs_vec(dev, ino)?;
+        let before = current.len();
+        current.retain(|(n, _)| n != name);
+        if current.len() == before {
+            return Ok(false);
+        }
+        self.rebuild_xattr_fork(dev, ino, &current)?;
+        Ok(true)
+    }
+
+    /// Read all xattrs on this inode as a deterministic `Vec` (sorted
+    /// by name) — used by [`add_xattr`] / [`remove_xattr`] so they
+    /// produce byte-stable output regardless of `HashMap` iteration
+    /// order.
+    fn read_xattrs_vec(
+        &self,
+        dev: &mut dyn BlockDevice,
+        ino: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let (ino_buf, core) = self.read_inode(dev, ino)?;
+        let mut v: Vec<(String, Vec<u8>)> = self
+            .read_xattrs_from_core(dev, &ino_buf, &core)?
+            .into_iter()
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(v)
+    }
+
+    /// Rebuild this inode's attribute fork in place with exactly the
+    /// `attrs` set passed in. Picks the cheapest format that fits
+    /// (shortform first, then a single leaf block), and frees any
+    /// previously-allocated leaf block the inode pointed at. When
+    /// `attrs` is empty, clears the fork entirely (forkoff = 0,
+    /// aformat = 2 = "extents" sentinel).
+    fn rebuild_xattr_fork(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u64,
+        attrs: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        let (ino_buf, core) = self.read_inode(dev, ino)?;
+        let prev_aformat = if ino_buf.len() >= 84 { ino_buf[83] } else { 0 };
+        let prev_leaf_fsb = if prev_aformat == 2 {
+            let attr_start = core.literal_offset + (core.forkoff as usize) * 8;
+            let inodesize = self.sb.inodesize as usize;
+            // di_anextents lives at dinode offset 80..82 (BE u16) —
+            // this is the actual xfsprogs layout. Don't trust the
+            // older "88" comment in inode.rs.
+            let anextents = if ino_buf.len() >= 82 {
+                u16::from_be_bytes(ino_buf[80..82].try_into().unwrap())
+            } else {
+                0
+            };
+            if anextents == 1 && attr_start + 16 <= inodesize.min(ino_buf.len()) {
+                let exts = super::bmbt::decode_extents(
+                    &ino_buf[attr_start..inodesize.min(ino_buf.len())],
+                    1,
+                )?;
+                Some(exts[0].startblock)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Determine the data-fork occupancy — we must NOT overwrite
+        // the bytes the data fork already uses.
         //
         //   - LOCAL (1)    → core.size bytes
         //   - DEV (0)      → 8 bytes
@@ -1286,40 +1358,82 @@ impl Xfs {
             super::inode::DiFormat::Extents => (core.nextents as usize) * 16,
             super::inode::DiFormat::Btree => {
                 return Err(crate::Error::Unsupported(
-                    "xfs: add_xattr to BTREE-format inode not supported".into(),
+                    "xfs: rebuild_xattr_fork on BTREE-format inode not supported".into(),
                 ));
             }
             super::inode::DiFormat::Unknown(b) => {
                 return Err(crate::Error::Unsupported(format!(
-                    "xfs: add_xattr to inode with unknown di_format {b}"
+                    "xfs: rebuild_xattr_fork on inode with unknown di_format {b}"
                 )));
             }
         };
         let data_fork_words = data_fork_bytes.div_ceil(8);
-        // attr-fork bytes needed (round up to multiple of 8).
-        let attr_words = encoded.len().div_ceil(8);
+        let data_fork_slice = ino_buf[176..176 + data_fork_bytes].to_vec();
+
+        // Pick the cheapest format that holds these attrs.
+        //   attrs empty            → forkoff=0, aformat=2 (no fork)
+        //   shortform fits         → aformat=1
+        //   else                   → aformat=2 + one leaf block
+        let (aformat, attr_words, attr_payload, new_leaf_fsb): (u8, usize, Vec<u8>, Option<u64>) =
+            if attrs.is_empty() {
+                (2, 0, Vec::new(), None)
+            } else {
+                let shortform_encoded = super::xattr::encode_shortform(attrs).ok();
+                let mut chosen = None;
+                if let Some(enc) = &shortform_encoded {
+                    let attr_words = enc.len().div_ceil(8);
+                    let min_forkoff = data_fork_words.max(1);
+                    let max_forkoff = (lit_size / 8).saturating_sub(attr_words);
+                    if min_forkoff <= max_forkoff {
+                        chosen = Some((1u8, attr_words, enc.clone(), None));
+                    }
+                }
+                match chosen {
+                    Some(x) => x,
+                    None => self.encode_leaf_form_payload(dev, attrs, ino)?,
+                }
+            };
+
         // forkoff is the BOUNDARY between forks — i.e., data fork
         // length in 8-byte words. We need `forkoff*8 + attr_size <=
-        // lit_size`. Pick the smallest forkoff that fits the data
-        // fork.
-        let min_forkoff = data_fork_words.max(1);
-        let max_forkoff = (lit_size / 8).saturating_sub(attr_words);
-        if min_forkoff > max_forkoff {
-            return Err(crate::Error::Unsupported(format!(
-                "xfs: shortform xattrs ({} bytes) don't fit in inode literal area",
-                encoded.len()
-            )));
-        }
-        let forkoff = min_forkoff as u8;
-        let attr_off = (forkoff as usize) * 8;
-        if attr_off + encoded.len() > lit_size {
-            return Err(crate::Error::Unsupported(format!(
-                "xfs: shortform xattrs at forkoff={forkoff} overrun literal area"
-            )));
-        }
+        // lit_size`. When the fork is empty we encode forkoff = 0.
+        let forkoff: u8 = if attrs.is_empty() {
+            0
+        } else {
+            let min_forkoff = data_fork_words.max(1);
+            let max_forkoff = (lit_size / 8).saturating_sub(attr_words);
+            if min_forkoff > max_forkoff {
+                if let Some(fsb) = new_leaf_fsb {
+                    // Roll back the leaf-block allocation we just made.
+                    self.free_blocks_fsb(fsb, 1)?;
+                }
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: xattr fork ({} bytes) does not fit alongside data fork",
+                    attr_payload.len()
+                )));
+            }
+            let f = min_forkoff as u8;
+            let attr_off = (f as usize) * 8;
+            if attr_off + attr_payload.len() > lit_size {
+                if let Some(fsb) = new_leaf_fsb {
+                    self.free_blocks_fsb(fsb, 1)?;
+                }
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: xattr fork at forkoff={f} overruns literal area"
+                )));
+            }
+            f
+        };
 
-        // Rebuild the inode in place. We keep the data fork bytes as-is.
-        let data_fork_slice = &ino_buf[176..176 + data_fork_bytes];
+        // For leaf form, di_anextents is 1 (one attr-fork extent).
+        let anextents: u16 = if aformat == 2 && !attrs.is_empty() {
+            1
+        } else {
+            0
+        };
+
+        let new_nblocks = core.nblocks + if new_leaf_fsb.is_some() { 1 } else { 0 }
+            - if prev_leaf_fsb.is_some() { 1 } else { 0 };
 
         let builder = V3DinodeBuilder {
             inodesize: XFS_INODESIZE as usize,
@@ -1339,11 +1453,11 @@ impl Xfs {
             ctime: core.ctime,
             crtime: core.mtime,
             size: core.size,
-            nblocks: core.nblocks,
+            nblocks: new_nblocks,
             extsize: 0,
             nextents: core.nextents,
             forkoff,
-            aformat: 1, // LOCAL
+            aformat,
             flags: core.flags,
             generation: core.generation,
             di_ino: ino,
@@ -1351,13 +1465,61 @@ impl Xfs {
         };
         let mut buf = builder.build();
         // Restore the data fork.
-        buf[176..176 + data_fork_bytes].copy_from_slice(data_fork_slice);
-        // Lay down the attribute fork at the forkoff boundary.
-        buf[176 + attr_off..176 + attr_off + encoded.len()].copy_from_slice(&encoded);
+        buf[176..176 + data_fork_bytes].copy_from_slice(&data_fork_slice);
+        // Lay down the attribute fork at the forkoff boundary (if any).
+        if forkoff != 0 && !attr_payload.is_empty() {
+            let attr_off = (forkoff as usize) * 8;
+            buf[176 + attr_off..176 + attr_off + attr_payload.len()].copy_from_slice(&attr_payload);
+        }
+        // di_anextents at offset 80..82.
+        buf[80..82].copy_from_slice(&anextents.to_be_bytes());
         stamp_v3_inode_crc(&mut buf);
         let ino_off = self.ino_byte_offset(ino)?;
         dev.write_at(ino_off, &buf)?;
+
+        // If we replaced/cleared an existing leaf block, free it.
+        if let Some(old_fsb) = prev_leaf_fsb
+            && Some(old_fsb) != new_leaf_fsb
+        {
+            self.free_blocks_fsb(old_fsb, 1)?;
+        }
         Ok(())
+    }
+
+    /// Allocate + write a leaf-form attribute block for `attrs`, and
+    /// return `(aformat=2, attr_fork_words, attr_fork_payload,
+    /// Some(leaf_fsb))` — the payload is the packed bmbt extent record
+    /// pointing at the new leaf block.
+    fn encode_leaf_form_payload(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        attrs: &[(String, Vec<u8>)],
+        owner_ino: u64,
+    ) -> Result<(u8, usize, Vec<u8>, Option<u64>)> {
+        let bs = self.sb.blocksize as usize;
+        let needed = super::xattr_leaf::min_leaf_block_size(attrs);
+        if needed > bs {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: leaf xattr block needs {needed} bytes, > one FS block ({bs}); \
+                 node-form attribute trees are not implemented"
+            )));
+        }
+        let leaf_fsb = self.alloc_blocks_fsb(1)?;
+        let uuid = self.uuid_for_writes();
+        let byte = self.fsb_to_byte(leaf_fsb);
+        let basic_blkno = byte / 512;
+        let block = super::xattr_leaf::encode_v5_leaf(attrs, bs, owner_ino, &uuid, basic_blkno)?;
+        dev.write_at(byte, &block)?;
+
+        let ext = super::bmbt::Extent {
+            offset: 0,
+            startblock: leaf_fsb,
+            blockcount: 1,
+            unwritten: false,
+        };
+        let payload = ext.encode().to_vec();
+        // 16 bytes = 2 8-byte words.
+        Ok((2u8, 2usize, payload, Some(leaf_fsb)))
     }
 
     /// Read all extended attributes from an inode's attribute fork.
@@ -1370,15 +1532,17 @@ impl Xfs {
         ino: u64,
     ) -> Result<std::collections::HashMap<String, Vec<u8>>> {
         let (buf, core) = self.read_inode(dev, ino)?;
-        self.read_xattrs_from_core(&buf, &core)
+        self.read_xattrs_from_core(dev, &buf, &core)
     }
 
     /// Decode this inode's attr fork from its already-read on-disk
     /// bytes + core. Used by both [`read_xattrs`] and the read side of
     /// [`add_xattr`] (so updates round-trip without re-reading the
-    /// inode).
+    /// inode). Needs `dev` so it can pull leaf-form attr blocks off
+    /// disk when `di_aformat = EXTENTS`.
     fn read_xattrs_from_core(
         &self,
+        dev: &mut dyn BlockDevice,
         ino_buf: &[u8],
         core: &super::inode::DinodeCore,
     ) -> Result<std::collections::HashMap<String, Vec<u8>>> {
@@ -1399,9 +1563,35 @@ impl Xfs {
         match aformat {
             1 => super::xattr::decode_shortform(attr_buf),
             0 => Ok(std::collections::HashMap::new()),
-            2 => Err(crate::Error::Unsupported(
-                "xfs: extents-format attribute fork not supported on read".into(),
-            )),
+            2 => {
+                // di_anextents lives at dinode offset 80..82 (BE u16)
+                // per the on-disk xfsprogs layout.
+                let anextents = if ino_buf.len() >= 82 {
+                    u16::from_be_bytes(ino_buf[80..82].try_into().unwrap())
+                } else {
+                    0
+                };
+                if anextents == 0 {
+                    return Ok(std::collections::HashMap::new());
+                }
+                // Decode the attr fork's extent list (packed records,
+                // same shape as data-fork extents).
+                let extents = super::bmbt::decode_extents(attr_buf, anextents as u32)?;
+                // v1 supports a single-block leaf attr fork only.
+                if extents.len() != 1 || extents[0].blockcount != 1 {
+                    return Err(crate::Error::Unsupported(format!(
+                        "xfs: leaf-form xattr fork with {} extents \
+                         (multi-block / node-form deferred)",
+                        extents.len()
+                    )));
+                }
+                let ext = &extents[0];
+                let bs = self.sb.blocksize as usize;
+                let byte = self.fsb_to_byte_xattr(ext.startblock);
+                let mut block = vec![0u8; bs];
+                dev.read_at(byte, &mut block)?;
+                super::xattr_leaf::decode_leaf(&block)
+            }
             3 => Err(crate::Error::Unsupported(
                 "xfs: btree-format attribute fork not supported on read".into(),
             )),
@@ -1409,6 +1599,15 @@ impl Xfs {
                 "xfs: unknown attribute-fork format {other}"
             ))),
         }
+    }
+
+    /// FSB → byte offset (private mirror of the read-side helper so the
+    /// xattr read path doesn't have to reach into `super` for it).
+    fn fsb_to_byte_xattr(&self, fsb: u64) -> u64 {
+        let ag = fsb >> self.sb.agblklog as u32;
+        let agblk = fsb & ((1u64 << self.sb.agblklog as u32) - 1);
+        ag * (self.sb.agblocks as u64) * (self.sb.blocksize as u64)
+            + agblk * (self.sb.blocksize as u64)
     }
 
     /// Flush in-memory allocator state to disk: rewrite the AGF / AGI /
@@ -1878,6 +2077,38 @@ mod tests {
         assert_eq!(target, "/etc/hostname");
     }
 
+    /// A symlink target longer than the inode literal area (336 bytes
+    /// for a 512-byte v3 inode) must be stored in a separate v5
+    /// XSLM-headered block and read back via the extent-list path.
+    /// Reopening the image guarantees we're not just round-tripping
+    /// through an in-memory cache.
+    #[test]
+    fn add_symlink_remote_round_trip() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        // 400-byte target — longer than the 336-byte literal area, so
+        // add_symlink must promote to remote (extents) form.
+        let target: String = "a/long/path/segment/repeated/".repeat(20);
+        assert!(target.len() > 336 && target.len() < 4096);
+        xfs.add_symlink(&mut dev, rootino, "lnk", &target, EntryMeta::default())
+            .unwrap();
+        xfs.flush_writes(&mut dev).unwrap();
+
+        // Reopen the volume cold to make sure the on-disk extent + the
+        // XSLM block are what carries the target — not a writer-side
+        // cache.
+        let xfs2 = super::super::Xfs::open(&mut dev).unwrap();
+        let got = xfs2.read_symlink(&mut dev, "/lnk").unwrap();
+        assert_eq!(got, target);
+        // The symlink inode must be di_format=EXTENTS (2), not LOCAL.
+        let (_lnk_ino, _buf, core) = xfs2.resolve_path(&mut dev, "/lnk").unwrap();
+        assert_eq!(core.format, super::super::inode::DiFormat::Extents);
+        assert!(core.is_symlink());
+    }
+
     #[test]
     fn remove_regular_file() {
         let mut dev = MemoryBackend::new(64 * 1024 * 1024);
@@ -1961,6 +2192,141 @@ mod tests {
         assert_eq!(out, b"hello");
     }
 
+    /// xattrs that overflow the inode literal area must promote to a
+    /// single leaf block. After writing many small xattrs (well past
+    /// what shortform's ~256-byte window holds), reopening the volume
+    /// and reading them back must return the exact same set.
+    #[test]
+    fn xattr_leaf_form_round_trip() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        let mut src = std::io::Cursor::new(b"x".to_vec());
+        let ino = xfs
+            .add_file(&mut dev, rootino, "f", EntryMeta::default(), 1, &mut src)
+            .unwrap();
+
+        // 32 attrs × (~16-byte name + 32-byte value) ≈ 1.5 KiB —
+        // definitely overflows shortform.
+        let mut expected: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        for i in 0..32 {
+            let name = format!("user.attr_{i:02}");
+            let value = format!("the value of attribute number {i:02}").into_bytes();
+            xfs.add_xattr(&mut dev, ino, &name, &value).unwrap();
+            expected.insert(name, value);
+        }
+        // Also mix in trusted.* / security.* to exercise the namespace
+        // flag bits.
+        xfs.add_xattr(&mut dev, ino, "trusted.acme.token", b"opaque")
+            .unwrap();
+        expected.insert("trusted.acme.token".into(), b"opaque".to_vec());
+        xfs.add_xattr(&mut dev, ino, "security.selinux", b"unconfined_u")
+            .unwrap();
+        expected.insert("security.selinux".into(), b"unconfined_u".to_vec());
+
+        xfs.flush_writes(&mut dev).unwrap();
+
+        // Reopen the image to make sure the on-disk state alone is
+        // sufficient — i.e. the leaf-form decode works end-to-end.
+        let xfs2 = super::super::Xfs::open(&mut dev).unwrap();
+        let got = xfs2.read_xattrs(&mut dev, ino).unwrap();
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "leaf-form attr count mismatch: got {got:#?}",
+        );
+        for (k, v) in &expected {
+            assert_eq!(got.get(k), Some(v), "leaf-form mismatch for {k}");
+        }
+
+        // The inode's on-disk aformat must be EXTENTS (2), not LOCAL
+        // (1) — confirming we actually exercised the leaf path.
+        let (raw, _core) = xfs2.read_inode(&mut dev, ino).unwrap();
+        assert_eq!(raw[83], 2, "expected leaf-form aformat=2 on disk");
+        assert_eq!(
+            u16::from_be_bytes(raw[80..82].try_into().unwrap()),
+            1,
+            "expected di_anextents=1 for one leaf-form block"
+        );
+    }
+
+    /// Adding an xattr large enough to overflow shortform on its own
+    /// must immediately promote to leaf form, not error.
+    #[test]
+    fn xattr_single_large_attr_promotes_to_leaf() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        let mut src = std::io::Cursor::new(b"x".to_vec());
+        let ino = xfs
+            .add_file(&mut dev, rootino, "f", EntryMeta::default(), 1, &mut src)
+            .unwrap();
+        // 1 KiB value — clearly past shortform's 255-byte cap.
+        let value = vec![0x55u8; 1024];
+        xfs.add_xattr(&mut dev, ino, "user.big", &value).unwrap();
+        xfs.flush_writes(&mut dev).unwrap();
+
+        let xfs2 = super::super::Xfs::open(&mut dev).unwrap();
+        let got = xfs2.read_xattrs(&mut dev, ino).unwrap();
+        assert_eq!(got.get("user.big"), Some(&value));
+    }
+
+    /// remove_xattr deletes from leaf and shortform alike, collapsing
+    /// the fork when the last attribute is gone.
+    #[test]
+    fn xattr_remove_round_trip() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        let mut src = std::io::Cursor::new(b"x".to_vec());
+        let ino = xfs
+            .add_file(&mut dev, rootino, "f", EntryMeta::default(), 1, &mut src)
+            .unwrap();
+
+        // Shortform path.
+        xfs.add_xattr(&mut dev, ino, "user.a", b"1").unwrap();
+        xfs.add_xattr(&mut dev, ino, "user.b", b"2").unwrap();
+        assert!(xfs.remove_xattr(&mut dev, ino, "user.a").unwrap());
+        let attrs = xfs.read_xattrs(&mut dev, ino).unwrap();
+        assert!(!attrs.contains_key("user.a"));
+        assert_eq!(attrs.get("user.b"), Some(&b"2".to_vec()));
+        // Remove the last → fork collapses.
+        assert!(xfs.remove_xattr(&mut dev, ino, "user.b").unwrap());
+        let attrs = xfs.read_xattrs(&mut dev, ino).unwrap();
+        assert!(attrs.is_empty());
+        let (raw, _core) = xfs.read_inode(&mut dev, ino).unwrap();
+        assert_eq!(raw[82], 0, "forkoff should be cleared when last attr gone");
+
+        // Leaf-form path: stuff enough attrs to overflow shortform,
+        // then remove every other one and verify the remainder
+        // round-trips.
+        for i in 0..20 {
+            let n = format!("user.k_{i:02}");
+            let v = format!("value_{i:02}_padding_to_make_it_bigger");
+            xfs.add_xattr(&mut dev, ino, &n, v.as_bytes()).unwrap();
+        }
+        // Removing a missing attr returns Ok(false).
+        assert!(!xfs.remove_xattr(&mut dev, ino, "user.nope").unwrap());
+        for i in (0..20).step_by(2) {
+            let n = format!("user.k_{i:02}");
+            assert!(xfs.remove_xattr(&mut dev, ino, &n).unwrap());
+        }
+        let attrs = xfs.read_xattrs(&mut dev, ino).unwrap();
+        assert_eq!(attrs.len(), 10);
+        for i in (1..20).step_by(2) {
+            let n = format!("user.k_{i:02}");
+            let v = format!("value_{i:02}_padding_to_make_it_bigger");
+            assert_eq!(attrs.get(&n), Some(&v.into_bytes()));
+        }
+    }
+
     #[test]
     fn xattr_overwrite_replaces() {
         let mut dev = MemoryBackend::new(64 * 1024 * 1024);
@@ -2020,6 +2386,16 @@ mod tests {
             .add_file(&mut dev, sub, "leaf", EntryMeta::default(), 2, &mut src2)
             .unwrap();
         xfs.add_xattr(&mut dev, fino, "user.k", b"v").unwrap();
+        // Also exercise leaf-form xattrs (overflows shortform).
+        for i in 0..20 {
+            xfs.add_xattr(
+                &mut dev,
+                fino,
+                &format!("user.spill_{i:02}"),
+                b"some longer value padding bytes",
+            )
+            .unwrap();
+        }
         xfs.flush_writes(&mut dev).unwrap();
     }
 

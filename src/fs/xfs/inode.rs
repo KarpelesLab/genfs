@@ -19,29 +19,29 @@
 //!    32    8  (v3) di_changecount
 //!    32   16  di_atime/mtime overlap (see below)
 //!    32   32  di_atime/mtime/ctime  v2:  3*8-byte timestamps   sec(BE u32) + nsec(BE u32)
-//!    64    8  di_size           size in bytes
-//!    72    8  di_nblocks        blocks consumed
-//!    80    4  di_extsize        preferred extent size
-//!    84    4  di_nextents       number of extents in data fork
-//!    88    2  di_anextents
-//!    90    1  di_forkoff        offset in 8-byte words of attribute fork
-//!    91    1  di_aformat
-//!    92    4  di_dmevmask
-//!    96    2  di_dmstate
-//!    98    2  di_flags
-//!   100    4  di_gen
+//!    56    8  di_size           size in bytes
+//!    64    8  di_nblocks        blocks consumed
+//!    72    4  di_extsize        preferred extent size
+//!    76    4  di_nextents       number of extents in data fork
+//!    80    2  di_anextents      number of extents in attribute fork
+//!    82    1  di_forkoff        offset in 8-byte words of attribute fork
+//!    83    1  di_aformat
+//!    84    4  di_dmevmask
+//!    88    2  di_dmstate
+//!    90    2  di_flags
+//!    92    4  di_gen
 //!
 //!   v3 extension (di_version == 3):
-//!   104    4  di_next_unlinked
-//!   108    4  di_crc
-//!   112    8  di_changecount
-//!   120    8  di_lsn
-//!   128    8  di_flags2
-//!   136    4  di_cowextsize
-//!   140   12  di_pad2
-//!   152    8  di_crtime          creation time (sec + nsec)
-//!   160    8  di_ino             self-reference
-//!   168   16  di_uuid            volume meta UUID
+//!    96    4  di_next_unlinked
+//!   100    4  di_crc             stored little-endian
+//!   104    8  di_changecount
+//!   112    8  di_lsn
+//!   120    8  di_flags2
+//!   128    4  di_cowextsize
+//!   132   12  di_pad2
+//!   144    8  di_crtime          creation time (sec + nsec)
+//!   152    8  di_ino             self-reference
+//!   160   16  di_uuid            volume meta UUID
 //!   ^-- end of v3 core (176 bytes); fork starts at di_literal_area
 //! ```
 //!

@@ -45,6 +45,7 @@ pub mod superblock;
 pub mod symlink;
 pub mod write;
 pub mod xattr;
+pub mod xattr_leaf;
 
 pub use format::{FormatOpts, format};
 pub use write::{DeviceKind, EntryMeta, WriteState};

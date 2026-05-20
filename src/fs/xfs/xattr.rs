@@ -23,15 +23,17 @@
 //! flag byte encodes the on-disk namespace. We map the Linux-userland
 //! prefixes (`user.X`, `trusted.X`, `security.X`) to/from these flags.
 //!
-//! Spill to leaf / node attribute blocks (when the xattrs don't fit
-//! inline) is intentionally out of scope for v1; `add_xattr` returns
-//! `Error::Unsupported` in that case.
+//! Spill to a single **leaf** attribute block (when the xattrs don't
+//! fit inline) is handled by [`super::xattr_leaf`]; spill all the way
+//! to node form (multi-leaf dabtree) is out of scope for v1 and
+//! surfaces `Error::Unsupported`.
 //!
 //! Reference: <https://mirrors.edge.kernel.org/pub/linux/utils/fs/xfs/docs/xfs_filesystem_structure.pdf>
 //! section "Shortform Attributes".
 //!
-//! This module is read+write: the encoder is used by `Xfs::add_xattr`,
-//! the decoder by `Xfs::read_xattrs`.
+//! This module is read+write: the encoder is used by `Xfs::add_xattr`
+//! (and its `remove_xattr` companion), the decoder by
+//! `Xfs::read_xattrs`.
 
 use std::collections::HashMap;
 

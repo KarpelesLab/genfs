@@ -1666,12 +1666,7 @@ pub(crate) fn insert_journal_files(
     Ok(())
 }
 
-fn insert_journal_entry(
-    writer: &mut Writer,
-    name: &str,
-    cnid: u32,
-    fork: &ForkData,
-) -> Result<()> {
+fn insert_journal_entry(writer: &mut Writer, name: &str, cnid: u32, fork: &ForkData) -> Result<()> {
     let name_uni = UniStr::from_str_lossy(name);
     let key = OwnedKey {
         parent_id: ROOT_FOLDER_ID,

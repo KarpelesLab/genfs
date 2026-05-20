@@ -1,20 +1,22 @@
-//! Apple Disk Image (DMG) — scaffold.
+//! Apple Disk Image (DMG) — read-only chunk-decoding backend.
 //!
 //! ## Status
 //!
-//! Detection + koly-trailer parse only. `DmgBackend::open` validates
-//! the trailer and exposes [`BlockDevice::total_size`] (= `sector_count
-//! * 512`), but every `read_at` returns
-//! [`crate::Error::Unsupported`] until the chunk decoder is built.
+//! - Detection + 512-byte koly trailer parse.
+//! - XML resource-fork plist + per-partition `mish` block decode.
+//! - Per-chunk reader for the three types that cover ~95% of real
+//!   `.dmg` images: zero-fill, raw / uncompressed, and zlib.
+//! - The other compressed types (ADC, bzip2, LZFSE, LZMA) are
+//!   recognised in the chunk table but return
+//!   [`crate::Error::Unsupported`] when read; follow-up work will add
+//!   each codec one at a time.
 //!
-//! The real reader will decompress per-chunk UDIF blocks (raw, ADC,
-//! zlib, bzip2, LZFSE, LZMA) into the requested byte range. Writers
-//! are out of scope for v1.
+//! [`DmgBackend`] satisfies the [`BlockDevice`] trait, so dropping it
+//! into the existing [`crate::inspect::detect_fs`] / [`crate::inspect::AnyFs`]
+//! pipeline transparently exposes whatever filesystem lives inside the
+//! image (HFS+, APFS, ISO 9660, …). Writers are out of scope for v1.
 //!
-//! ## Background
-//!
-//! UDIF (Universal Disk Image Format) is the modern .dmg layout. The
-//! file is laid out as:
+//! ## File layout (recap)
 //!
 //! ```text
 //!   [ data-fork bytes (compressed chunks) ]
@@ -38,12 +40,18 @@
 //! All offsets and field meanings are public spec; no Apple
 //! source / SDK was consulted.
 
+mod base64;
+mod mish;
+mod plist;
+
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::Result;
 use crate::block::BlockDevice;
+
+pub use mish::{Chunk, ChunkType, Mish};
 
 /// `koly` magic — first four bytes of the 512-byte UDIF trailer.
 pub const KOLY_MAGIC: u32 = 0x6B6F_6C79; // "koly"
@@ -188,17 +196,17 @@ pub fn probe(path: &Path) -> Result<bool> {
 
 /// Read-only DMG backend.
 ///
-/// Today this opens the file, parses the koly trailer, and exposes the
-/// virtual size via [`BlockDevice::total_size`]. `read_at` returns
-/// [`crate::Error::Unsupported`] until the chunk decoder lands — at
-/// which point this scaffold will look the same to callers, just with
-/// real bytes coming out.
+/// Holds the source file, the decoded koly trailer, and all per-partition
+/// mish blocks recovered from the resource-fork plist. [`read_at`]
+/// walks the virtual byte range, locates each chunk it intersects in a
+/// flat list sorted by virtual-sector start, and emits zero / raw /
+/// zlib-decompressed bytes. The other compressed chunk kinds are
+/// recognised but error out as [`crate::Error::Unsupported`] — this
+/// matches the README's "Limitations" entry.
+///
+/// [`read_at`]: BlockDevice::read_at
 #[derive(Debug)]
 pub struct DmgBackend {
-    /// The backing `.dmg` file. Held by the scaffold so a future
-    /// chunk-decoder pass can `pread` at `data_fork_offset`. The
-    /// `dead_code` allow is temporary; remove once the decoder lands.
-    #[allow(dead_code)]
     file: File,
     trailer: KolyTrailer,
     /// Cached virtual size in bytes (`sector_count * 512`).
@@ -206,12 +214,18 @@ pub struct DmgBackend {
     /// Position of the implicit `Seek` cursor — kept so the `Seek`
     /// impl works the way callers expect from a `BlockDevice`.
     cursor: u64,
+    /// All chunks from every mish block, flattened and sorted by
+    /// `virtual_sector_start`. The sort is what makes a chunk lookup
+    /// a binary search; on a 100 GB image with thousands of chunks
+    /// the linear cost would otherwise dominate every read.
+    chunks: Vec<Chunk>,
 }
 
 impl DmgBackend {
     /// Open a DMG file. Validates the koly trailer, the version field
-    /// (must be 4), and that the trailer's sector_count fits in i64.
-    /// Does not yet load the resource-fork chunk table.
+    /// (must be 4), and loads the resource-fork plist + every mish
+    /// block it references. Errors out for multi-segment images
+    /// (segment_count > 1) and for plists that carry no `blkx` array.
     pub fn open(path: &Path) -> Result<Self> {
         let meta = std::fs::metadata(path)?;
         if meta.len() < KOLY_SIZE {
@@ -235,11 +249,69 @@ impl DmgBackend {
             .sector_count
             .checked_mul(512)
             .ok_or_else(|| crate::Error::InvalidImage("dmg: sector_count overflows u64".into()))?;
+
+        // Pull the XML plist out of the resource-fork window.
+        if trailer.xml_length == 0 {
+            return Err(crate::Error::InvalidImage(
+                "dmg: koly trailer has empty XML resource fork (xml_length = 0)".into(),
+            ));
+        }
+        // The plist can be up to ~megabytes for huge images; that's
+        // still fine to hold in RAM (it's a tiny fraction of the
+        // image and we need random access to all of it to parse).
+        // Cap it at 128 MiB to keep hostile inputs from OOMing.
+        const MAX_PLIST_BYTES: u64 = 128 * 1024 * 1024;
+        if trailer.xml_length > MAX_PLIST_BYTES {
+            return Err(crate::Error::InvalidImage(format!(
+                "dmg: resource-fork plist is implausibly large ({} bytes)",
+                trailer.xml_length
+            )));
+        }
+        file.seek(SeekFrom::Start(trailer.xml_offset))?;
+        let mut plist_bytes = vec![0u8; trailer.xml_length as usize];
+        file.read_exact(&mut plist_bytes)?;
+        let plist_str = std::str::from_utf8(&plist_bytes).map_err(|e| {
+            crate::Error::InvalidImage(format!("dmg: resource-fork plist isn't UTF-8: {e}"))
+        })?;
+
+        let data_entries = plist::extract_blkx_data_entries(plist_str)?;
+        if data_entries.is_empty() {
+            return Err(crate::Error::InvalidImage(
+                "dmg: blkx array is empty — no chunks to map".into(),
+            ));
+        }
+
+        let mut chunks: Vec<Chunk> = Vec::new();
+        for entry in &data_entries {
+            let raw = base64::decode(entry)?;
+            let m = mish::decode_mish(&raw)?;
+            chunks.extend(m.chunks);
+        }
+        chunks.sort_by_key(|c| c.virtual_sector_start);
+
+        // Sanity: chunks shouldn't overlap. We don't fail loud on this
+        // (some images emit zero-byte stub chunks at partition
+        // boundaries that look like duplicates), but adjacent chunks
+        // should be monotonic.
+        for w in chunks.windows(2) {
+            let prev_end = w[0]
+                .virtual_sector_start
+                .saturating_add(w[0].sector_count);
+            if w[1].virtual_sector_start < prev_end {
+                log::warn!(
+                    "dmg: chunk overlap detected: chunk ending at sector {} > next chunk start {}",
+                    prev_end,
+                    w[1].virtual_sector_start
+                );
+            }
+        }
+
         Ok(Self {
             file,
             trailer,
             virtual_size,
             cursor: 0,
+            chunks,
         })
     }
 
@@ -247,6 +319,131 @@ impl DmgBackend {
     pub fn trailer(&self) -> &KolyTrailer {
         &self.trailer
     }
+
+    /// Number of chunks discovered across all mish blocks. Useful
+    /// for diagnostics and tests.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Read the raw on-disk bytes of a single chunk's compressed
+    /// payload. Splits out of [`read_chunk_into`] so the latter can
+    /// hand the buffer to a codec without re-reading.
+    fn read_compressed_payload(&mut self, chunk: &Chunk) -> Result<Vec<u8>> {
+        let abs_offset = self
+            .trailer
+            .data_fork_offset
+            .checked_add(chunk.compressed_offset_in_fork)
+            .ok_or_else(|| {
+                crate::Error::InvalidImage(
+                    "dmg: chunk absolute offset overflows the data fork".into(),
+                )
+            })?;
+        let len = chunk.compressed_length as usize;
+        self.file.seek(SeekFrom::Start(abs_offset))?;
+        let mut buf = vec![0u8; len];
+        self.file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Decode a single chunk into a full-sized byte buffer (the
+    /// uncompressed length is `sector_count * 512`).
+    ///
+    /// We materialise the whole chunk because chunks are intentionally
+    /// small (typically 2 MiB / 4096 sectors at most) — peeking into
+    /// arbitrary byte ranges of a deflate stream isn't possible without
+    /// running the inflate state machine to that point anyway.
+    fn decode_chunk(&mut self, chunk: &Chunk) -> Result<Vec<u8>> {
+        let plain_len = (chunk.sector_count as usize)
+            .checked_mul(512)
+            .ok_or_else(|| {
+                crate::Error::InvalidImage("dmg: chunk plain length overflows usize".into())
+            })?;
+
+        match chunk.kind {
+            ChunkType::Zero | ChunkType::Ignored => Ok(vec![0u8; plain_len]),
+            ChunkType::Raw => {
+                let buf = self.read_compressed_payload(chunk)?;
+                if buf.len() != plain_len {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "dmg: raw chunk has compressed_length {} but sector_count*512 = {}",
+                        buf.len(),
+                        plain_len
+                    )));
+                }
+                Ok(buf)
+            }
+            ChunkType::Zlib => decode_zlib(&self.read_compressed_payload(chunk)?, plain_len),
+            ChunkType::Adc | ChunkType::Bz2 | ChunkType::Lzfse | ChunkType::Lzma => {
+                Err(crate::Error::Unsupported(format!(
+                    "dmg: chunk type {:?} not implemented yet (only zero / raw / zlib are wired in v1)",
+                    chunk.kind
+                )))
+            }
+            // Comment / Terminator are filtered during mish parsing.
+            ChunkType::Comment | ChunkType::Terminator => Ok(vec![0u8; plain_len]),
+        }
+    }
+
+    /// Locate the chunk whose virtual-sector span contains `sector`.
+    /// Binary-searches the sorted list. Returns `Err(OutOfBounds)`
+    /// when the sector lies in an unmapped gap — which shouldn't
+    /// happen on a well-formed image but is worth catching.
+    fn find_chunk_idx(&self, sector: u64) -> Result<usize> {
+        // `partition_point` returns the first index whose start sector
+        // is **strictly greater** than `sector`; subtract one to land
+        // on the candidate chunk.
+        let after = self
+            .chunks
+            .partition_point(|c| c.virtual_sector_start <= sector);
+        if after == 0 {
+            return Err(crate::Error::OutOfBounds {
+                offset: sector * 512,
+                len: 0,
+                size: self.virtual_size,
+            });
+        }
+        let idx = after - 1;
+        let c = &self.chunks[idx];
+        let end = c.virtual_sector_start + c.sector_count;
+        if sector >= end {
+            return Err(crate::Error::OutOfBounds {
+                offset: sector * 512,
+                len: 0,
+                size: self.virtual_size,
+            });
+        }
+        Ok(idx)
+    }
+}
+
+/// Inflate `src` as a zlib (RFC 1950) stream into a buffer of exactly
+/// `plain_len` bytes. Wraps the `flate2` reader API behind the `gzip`
+/// feature flag — the same flag that gates SquashFS gzip / zlib reads,
+/// so any build that can open a SquashFS can also open a zlib DMG.
+#[cfg(feature = "gzip")]
+fn decode_zlib(src: &[u8], plain_len: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut dec = flate2::read::ZlibDecoder::new(src);
+    let mut out = Vec::with_capacity(plain_len);
+    dec.read_to_end(&mut out)
+        .map_err(|e| crate::Error::InvalidImage(format!("dmg: zlib chunk inflate failed: {e}")))?;
+    if out.len() != plain_len {
+        return Err(crate::Error::InvalidImage(format!(
+            "dmg: zlib chunk inflated to {} bytes but sector_count*512 = {}",
+            out.len(),
+            plain_len
+        )));
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "gzip"))]
+fn decode_zlib(_src: &[u8], _plain_len: usize) -> Result<Vec<u8>> {
+    Err(crate::Error::Unsupported(
+        "dmg: zlib chunks require the `gzip` Cargo feature (the same one that gates SquashFS gzip)"
+            .into(),
+    ))
 }
 
 impl BlockDevice for DmgBackend {
@@ -262,12 +459,54 @@ impl BlockDevice for DmgBackend {
         Ok(())
     }
 
-    fn read_at(&mut self, _offset: u64, _buf: &mut [u8]) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "dmg: chunk decompression is not implemented yet — this scaffold \
-             only parses the koly trailer + reports virtual size"
-                .into(),
-        ))
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        // Bounds check, matching the trait contract.
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(crate::Error::OutOfBounds {
+                offset,
+                len: buf.len() as u64,
+                size: self.virtual_size,
+            })?;
+        if end > self.virtual_size {
+            return Err(crate::Error::OutOfBounds {
+                offset,
+                len: buf.len() as u64,
+                size: self.virtual_size,
+            });
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        // Walk one chunk at a time, filling whatever portion of `buf`
+        // intersects the chunk's virtual-sector span.
+        let mut filled = 0usize;
+        let mut cursor = offset;
+        while filled < buf.len() {
+            let sector = cursor / 512;
+            let idx = self.find_chunk_idx(sector)?;
+            let chunk = self.chunks[idx];
+
+            let chunk_byte_start = chunk.virtual_sector_start * 512;
+            let chunk_byte_end = chunk_byte_start + chunk.sector_count * 512;
+
+            // Decode the chunk once; we may take a partial slice on
+            // either end. A future optimisation is to LRU-cache the
+            // most recently decoded chunk so sequential reads don't
+            // re-inflate the same buffer for every 4 KiB request.
+            let plain = self.decode_chunk(&chunk)?;
+            debug_assert_eq!(plain.len() as u64, chunk.sector_count * 512);
+
+            let local_start = (cursor - chunk_byte_start) as usize;
+            let available = (chunk_byte_end - cursor) as usize;
+            let want = (buf.len() - filled).min(available);
+            buf[filled..filled + want].copy_from_slice(&plain[local_start..local_start + want]);
+
+            filled += want;
+            cursor += want as u64;
+        }
+        Ok(())
     }
 
     fn write_at(&mut self, _offset: u64, _buf: &[u8]) -> Result<()> {
@@ -278,10 +517,19 @@ impl BlockDevice for DmgBackend {
 }
 
 impl Read for DmgBackend {
-    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-        Err(io::Error::other(
-            "dmg: chunk decompression is not implemented yet",
-        ))
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cursor >= self.virtual_size {
+            return Ok(0);
+        }
+        let remaining = self.virtual_size - self.cursor;
+        let take = (buf.len() as u64).min(remaining) as usize;
+        if take == 0 {
+            return Ok(0);
+        }
+        self.read_at(self.cursor, &mut buf[..take])
+            .map_err(|e| io::Error::other(format!("{e}")))?;
+        self.cursor += take as u64;
+        Ok(take)
     }
 }
 
@@ -310,21 +558,117 @@ impl Seek for DmgBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::dmg::mish::{Chunk, ChunkType, encode_mish_for_tests};
 
-    /// Build a minimal koly trailer with the given sector_count. Big-endian
-    /// fields; everything else stays zero.
-    fn fake_trailer(sector_count: u64, version: u32) -> Vec<u8> {
+    /// Build a minimal koly trailer with the given fields. Big-endian
+    /// fields; everything not explicitly set stays zero.
+    fn fake_trailer(
+        sector_count: u64,
+        version: u32,
+        data_fork_offset: u64,
+        data_fork_length: u64,
+        xml_offset: u64,
+        xml_length: u64,
+    ) -> Vec<u8> {
         let mut v = vec![0u8; KOLY_SIZE as usize];
         v[0x000..0x004].copy_from_slice(&KOLY_MAGIC.to_be_bytes());
         v[0x004..0x008].copy_from_slice(&version.to_be_bytes());
         v[0x008..0x00C].copy_from_slice(&512u32.to_be_bytes());
+        v[0x018..0x020].copy_from_slice(&data_fork_offset.to_be_bytes());
+        v[0x020..0x028].copy_from_slice(&data_fork_length.to_be_bytes());
+        v[0x0D8..0x0E0].copy_from_slice(&xml_offset.to_be_bytes());
+        v[0x0E0..0x0E8].copy_from_slice(&xml_length.to_be_bytes());
         v[0x1EC..0x1F4].copy_from_slice(&sector_count.to_be_bytes());
         v
     }
 
+    /// Encode `bytes` as standard-alphabet base64 with `=` padding.
+    /// Used only inside this test module to wrap a mish block before
+    /// embedding it in the XML plist.
+    fn b64_encode(bytes: &[u8]) -> String {
+        const ALPHA: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let (a, b, c, len) = match chunk.len() {
+                3 => (chunk[0], chunk[1], chunk[2], 3),
+                2 => (chunk[0], chunk[1], 0, 2),
+                1 => (chunk[0], 0, 0, 1),
+                _ => unreachable!(),
+            };
+            let v = ((a as u32) << 16) | ((b as u32) << 8) | (c as u32);
+            out.push(ALPHA[((v >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHA[((v >> 12) & 0x3F) as usize] as char);
+            if len >= 2 {
+                out.push(ALPHA[((v >> 6) & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if len == 3 {
+                out.push(ALPHA[(v & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    /// Build a complete, openable DMG file in `dir` with a single
+    /// mish block holding the given chunks + payload. Returns the
+    /// path to the synthesised image.
+    fn build_test_dmg(
+        dir: &std::path::Path,
+        sector_count: u64,
+        chunks: &[Chunk],
+        data_payload: &[u8],
+    ) -> std::path::PathBuf {
+        // Layout: [data fork][XML plist][koly trailer].
+        let data_offset = 0u64;
+        let xml_offset = data_payload.len() as u64;
+
+        let mish_buf = encode_mish_for_tests(0, sector_count, 0, chunks);
+        let b64 = b64_encode(&mish_buf);
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>resource-fork</key>
+  <dict>
+    <key>blkx</key>
+    <array>
+      <dict>
+        <key>Data</key>
+        <data>{b64}</data>
+      </dict>
+    </array>
+  </dict>
+</dict>
+</plist>"#
+        );
+        let xml_bytes = xml.into_bytes();
+        let xml_length = xml_bytes.len() as u64;
+
+        let trailer = fake_trailer(
+            sector_count,
+            4,
+            data_offset,
+            data_payload.len() as u64,
+            xml_offset,
+            xml_length,
+        );
+
+        let p = dir.join("img.dmg");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(data_payload);
+        buf.extend_from_slice(&xml_bytes);
+        buf.extend_from_slice(&trailer);
+        std::fs::write(&p, &buf).unwrap();
+        p
+    }
+
     #[test]
     fn decode_recognises_valid_trailer() {
-        let buf = fake_trailer(2048, 4);
+        let buf = fake_trailer(2048, 4, 0, 0, 0, 0);
         let t = KolyTrailer::decode(&buf).unwrap();
         assert_eq!(t.signature, KOLY_MAGIC);
         assert_eq!(t.version, 4);
@@ -334,7 +678,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_wrong_magic() {
-        let mut buf = fake_trailer(0, 4);
+        let mut buf = fake_trailer(0, 4, 0, 0, 0, 0);
         buf[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
         let err = KolyTrailer::decode(&buf).unwrap_err();
         match err {
@@ -345,7 +689,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_version() {
-        let buf = fake_trailer(0, 3);
+        let buf = fake_trailer(0, 3, 0, 0, 0, 0);
         let err = KolyTrailer::decode(&buf).unwrap_err();
         match err {
             crate::Error::Unsupported(_) => {}
@@ -357,9 +701,8 @@ mod tests {
     fn probe_matches_trailing_koly() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("img.dmg");
-        // 8 KiB of zero data + 512-byte trailer.
         let mut content = vec![0u8; 8192];
-        content.extend_from_slice(&fake_trailer(16, 4));
+        content.extend_from_slice(&fake_trailer(16, 4, 0, 0, 0, 0));
         std::fs::write(&p, &content).unwrap();
         assert!(probe(&p).unwrap());
     }
@@ -373,23 +716,10 @@ mod tests {
     }
 
     #[test]
-    fn open_reports_virtual_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("img.dmg");
-        let mut content = vec![0u8; 8192];
-        content.extend_from_slice(&fake_trailer(2048, 4));
-        std::fs::write(&p, &content).unwrap();
-        let dmg = DmgBackend::open(&p).unwrap();
-        assert_eq!(dmg.total_size(), 2048 * 512);
-        assert_eq!(dmg.block_size(), 512);
-        assert_eq!(dmg.trailer().sector_count, 2048);
-    }
-
-    #[test]
     fn open_rejects_multi_segment() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("img.dmg");
-        let mut t = fake_trailer(0, 4);
+        let mut t = fake_trailer(0, 4, 0, 0, 0, 0);
         // segment_count at 0x03C
         t[0x03C..0x040].copy_from_slice(&3u32.to_be_bytes());
         let mut content = vec![0u8; 8192];
@@ -402,19 +732,199 @@ mod tests {
         }
     }
 
+    /// End-to-end: build a one-chunk raw DMG, open it, read the bytes
+    /// back. Pins the data fork + XML plist + koly layout integration.
     #[test]
-    fn read_at_returns_unsupported() {
+    fn round_trip_raw_chunk() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("img.dmg");
-        let mut content = vec![0u8; 8192];
-        content.extend_from_slice(&fake_trailer(16, 4));
-        std::fs::write(&p, &content).unwrap();
+        let mut payload = vec![0u8; 512];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let chunks = vec![Chunk {
+            kind: ChunkType::Raw,
+            virtual_sector_start: 0,
+            sector_count: 1,
+            compressed_offset_in_fork: 0,
+            compressed_length: 512,
+        }];
+        let p = build_test_dmg(dir.path(), 1, &chunks, &payload);
+
         let mut dmg = DmgBackend::open(&p).unwrap();
-        let mut buf = [0u8; 16];
-        let err = dmg.read_at(0, &mut buf).unwrap_err();
+        assert_eq!(dmg.total_size(), 512);
+        assert_eq!(dmg.chunk_count(), 1);
+
+        let mut out = vec![0u8; 512];
+        dmg.read_at(0, &mut out).unwrap();
+        assert_eq!(out, payload);
+
+        // Partial read in the middle.
+        let mut out2 = vec![0u8; 16];
+        dmg.read_at(100, &mut out2).unwrap();
+        assert_eq!(out2, &payload[100..116]);
+    }
+
+    /// Zero-fill chunks must produce zero bytes without referencing
+    /// the data fork at all.
+    #[test]
+    fn round_trip_zero_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = vec![Chunk {
+            kind: ChunkType::Zero,
+            virtual_sector_start: 0,
+            sector_count: 4,
+            compressed_offset_in_fork: 0,
+            compressed_length: 0,
+        }];
+        let p = build_test_dmg(dir.path(), 4, &chunks, &[]);
+
+        let mut dmg = DmgBackend::open(&p).unwrap();
+        assert_eq!(dmg.total_size(), 4 * 512);
+        let mut out = vec![0xAAu8; 1024];
+        dmg.read_at(256, &mut out).unwrap();
+        assert!(out.iter().all(|&b| b == 0));
+    }
+
+    /// Zlib chunk: deflate a known payload, embed it, read it back.
+    /// Cross-checks the chunk router + the flate2 wiring.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn round_trip_zlib_chunk() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        // 1024 bytes of varied data so deflate produces a meaningful
+        // payload, not just a stored block.
+        let mut plain = vec![0u8; 1024];
+        for (i, b) in plain.iter_mut().enumerate() {
+            *b = ((i * 31 + 7) & 0xFF) as u8;
+        }
+        let mut compressed = Vec::new();
+        {
+            let mut enc =
+                flate2::write::ZlibEncoder::new(&mut compressed, flate2::Compression::default());
+            enc.write_all(&plain).unwrap();
+            enc.finish().unwrap();
+        }
+        let chunks = vec![Chunk {
+            kind: ChunkType::Zlib,
+            virtual_sector_start: 0,
+            sector_count: 2,
+            compressed_offset_in_fork: 0,
+            compressed_length: compressed.len() as u64,
+        }];
+        let p = build_test_dmg(dir.path(), 2, &chunks, &compressed);
+
+        let mut dmg = DmgBackend::open(&p).unwrap();
+        let mut out = vec![0u8; 1024];
+        dmg.read_at(0, &mut out).unwrap();
+        assert_eq!(out, plain);
+
+        // Cross-chunk-boundary read isn't exercised here (only one
+        // chunk), but partial-range reads inside the chunk are.
+        let mut out2 = vec![0u8; 200];
+        dmg.read_at(700, &mut out2).unwrap();
+        assert_eq!(out2, &plain[700..900]);
+    }
+
+    /// Mixed-chunk image: zero-fill followed by raw followed by zlib.
+    /// Exercises the binary-search router on more than one chunk and
+    /// confirms the boundary arithmetic for cross-chunk reads.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn round_trip_mixed_chunks() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Data layout, in sectors:
+        //  0..2  zero fill
+        //  2..4  raw       (1024 bytes of pattern A)
+        //  4..6  zlib      (1024 bytes of pattern B)
+        let mut raw_payload = vec![0u8; 1024];
+        for (i, b) in raw_payload.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let mut zlib_plain = vec![0u8; 1024];
+        for (i, b) in zlib_plain.iter_mut().enumerate() {
+            *b = ((255 - (i & 0xFF)) & 0xFF) as u8;
+        }
+        let mut zlib_payload = Vec::new();
+        {
+            let mut enc =
+                flate2::write::ZlibEncoder::new(&mut zlib_payload, flate2::Compression::default());
+            enc.write_all(&zlib_plain).unwrap();
+            enc.finish().unwrap();
+        }
+
+        // Data fork = raw_payload || zlib_payload.
+        let mut fork = Vec::new();
+        let raw_off = fork.len() as u64;
+        fork.extend_from_slice(&raw_payload);
+        let zlib_off = fork.len() as u64;
+        fork.extend_from_slice(&zlib_payload);
+
+        let chunks = vec![
+            Chunk {
+                kind: ChunkType::Zero,
+                virtual_sector_start: 0,
+                sector_count: 2,
+                compressed_offset_in_fork: 0,
+                compressed_length: 0,
+            },
+            Chunk {
+                kind: ChunkType::Raw,
+                virtual_sector_start: 2,
+                sector_count: 2,
+                compressed_offset_in_fork: raw_off,
+                compressed_length: 1024,
+            },
+            Chunk {
+                kind: ChunkType::Zlib,
+                virtual_sector_start: 4,
+                sector_count: 2,
+                compressed_offset_in_fork: zlib_off,
+                compressed_length: zlib_payload.len() as u64,
+            },
+        ];
+        let p = build_test_dmg(dir.path(), 6, &chunks, &fork);
+
+        let mut dmg = DmgBackend::open(&p).unwrap();
+        assert_eq!(dmg.chunk_count(), 3);
+        assert_eq!(dmg.total_size(), 6 * 512);
+
+        // Read the whole virtual disk in one shot — exercises the
+        // cross-chunk walk in `read_at`.
+        let mut out = vec![0xAAu8; 6 * 512];
+        dmg.read_at(0, &mut out).unwrap();
+        assert!(out[..1024].iter().all(|&b| b == 0), "zero region");
+        assert_eq!(&out[1024..2048], raw_payload.as_slice(), "raw region");
+        assert_eq!(&out[2048..3072], zlib_plain.as_slice(), "zlib region");
+
+        // Read straddling the raw → zlib boundary.
+        let mut out2 = vec![0u8; 32];
+        dmg.read_at(2048 - 16, &mut out2).unwrap();
+        assert_eq!(&out2[..16], &raw_payload[1008..1024]);
+        assert_eq!(&out2[16..], &zlib_plain[..16]);
+    }
+
+    /// Out-of-bounds reads must return `OutOfBounds` rather than
+    /// silently returning zero or panicking.
+    #[test]
+    fn read_at_rejects_out_of_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = vec![Chunk {
+            kind: ChunkType::Zero,
+            virtual_sector_start: 0,
+            sector_count: 1,
+            compressed_offset_in_fork: 0,
+            compressed_length: 0,
+        }];
+        let p = build_test_dmg(dir.path(), 1, &chunks, &[]);
+        let mut dmg = DmgBackend::open(&p).unwrap();
+        let mut buf = [0u8; 8];
+        let err = dmg.read_at(512, &mut buf).unwrap_err();
         match err {
-            crate::Error::Unsupported(_) => {}
-            _ => panic!("expected Unsupported, got {err:?}"),
+            crate::Error::OutOfBounds { .. } => {}
+            _ => panic!("expected OutOfBounds, got {err:?}"),
         }
     }
 }

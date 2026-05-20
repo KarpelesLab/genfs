@@ -39,7 +39,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | SquashFS   | ✅    | ✅     | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs` |
 | ISO 9660   | ✅    | ✅     | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only writer (no in-place modify) |
 | qcow2      | ✅    | ✅     | v2 + v3, allocate-on-write writer                                    |
-| dmg        | 🚧   | —     | UDIF v4 trailer parsed; chunk decoder TBD                            |
+| dmg        | 🚧   | —     | UDIF v4 trailer + mish chunk decoder (zero / raw / zlib); ADC / bzip2 / LZFSE / LZMA TBD |
 
 `🚧` marks writers that exist at the library level but have known
 gaps (see Limitations). All writable filesystems — ext2/3/4, FAT32,
@@ -346,6 +346,11 @@ Things explicitly out of scope today, in rough order of likely-to-change:
   are covered); writer assumes shortform / extent dirs.
 - ext4 `flex_bg` on the *write* path (the reader handles it).
 - Partial-file rewrites — in-place modification is whole-file granularity.
+- DMG chunk decoder: zero-fill / raw / zlib only. ADC, bzip2, LZFSE,
+  and LZMA chunks are recognised in the mish table but return
+  `Unsupported` from `read_at` until the codecs are wired up.
+  Multi-segment images and `koly` versions other than 4 are also
+  rejected at open time.
 
 ## Try it
 

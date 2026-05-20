@@ -106,10 +106,16 @@ impl DirEntryRaw {
         } else {
             EntryKind::Regular
         };
+        let size = if matches!(kind, EntryKind::Regular) {
+            self.record.length
+        } else {
+            0
+        };
         DirEntry {
             name: self.name,
             inode: self.record.extent_lba,
             kind,
+            size,
         }
     }
 }

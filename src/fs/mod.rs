@@ -151,6 +151,11 @@ pub struct DirEntry {
     pub name: String,
     pub inode: u32,
     pub kind: EntryKind,
+    /// Size in bytes when this is a regular file. `0` for directories,
+    /// symlinks, devices, etc. Filesystems that can't surface size
+    /// cheaply during a listing may also return `0` — callers that
+    /// need an authoritative figure should open the file and seek.
+    pub size: u64,
 }
 
 /// File-type bucket exposed by [`DirEntry`]. Mirrors POSIX `d_type`.
@@ -247,6 +252,33 @@ pub trait Filesystem {
     /// Default: `true`. Repack-only filesystems override to `false`.
     fn supports_mutation(&self) -> bool {
         true
+    }
+
+    /// Recursive sum of all regular-file sizes in the filesystem.
+    /// Uses the `size` field on [`DirEntry`] returned by [`Self::list`]
+    /// — filesystems that don't surface size from a listing return 0
+    /// for those entries, in which case the total is best-effort.
+    ///
+    /// Skips the special names `"."`, `".."`, and `"lost+found"` so
+    /// the walk doesn't loop / double-count ext's reserved tree.
+    fn total_file_bytes(&mut self, dev: &mut dyn crate::block::BlockDevice) -> crate::Result<u64> {
+        let mut total = 0u64;
+        let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("/")];
+        while let Some(dir) = stack.pop() {
+            let entries = self.list(dev, &dir)?;
+            for e in entries {
+                if e.name == "." || e.name == ".." || e.name == "lost+found" {
+                    continue;
+                }
+                let child = dir.join(&e.name);
+                match e.kind {
+                    EntryKind::Regular => total = total.saturating_add(e.size),
+                    EntryKind::Dir => stack.push(child),
+                    _ => {}
+                }
+            }
+        }
+        Ok(total)
     }
 }
 

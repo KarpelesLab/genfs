@@ -280,6 +280,11 @@ impl Exfat {
                 name: entry.name,
                 inode: entry.first_cluster,
                 kind,
+                size: if entry.is_directory {
+                    0
+                } else {
+                    entry.valid_data_length
+                },
             });
         }
         Ok(out)

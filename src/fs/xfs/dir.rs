@@ -223,6 +223,8 @@ pub fn shortform_to_generic(entries: &[ShortformEntry]) -> Vec<DirEntry> {
             // "stable per-entry id, not used for resolution".
             inode: e.inumber as u32,
             kind: ftype_to_kind(e.ftype),
+            // XFS dir entries don't embed file size; the inode does.
+            size: 0,
         })
         .collect()
 }
@@ -235,6 +237,7 @@ pub fn data_entries_to_generic(entries: &[DataEntry]) -> Vec<DirEntry> {
             name: e.name.clone(),
             inode: e.inumber as u32,
             kind: ftype_to_kind(e.ftype),
+            size: 0,
         })
         .collect()
 }

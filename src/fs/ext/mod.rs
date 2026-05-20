@@ -1741,10 +1741,17 @@ impl Ext {
                 };
                 if entry.inode != 0 && !entry.name.is_empty() {
                     let child = self.read_inode(dev, entry.inode)?;
+                    let kind = kind_from_mode(child.mode);
+                    let size = if matches!(kind, crate::fs::EntryKind::Regular) {
+                        u64::from(child.size)
+                    } else {
+                        0
+                    };
                     out.push(crate::fs::DirEntry {
                         name: String::from_utf8_lossy(entry.name).into_owned(),
                         inode: entry.inode,
-                        kind: kind_from_mode(child.mode),
+                        kind,
+                        size,
                     });
                 }
                 off += entry.rec_len;

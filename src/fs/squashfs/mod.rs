@@ -532,6 +532,9 @@ impl Squashfs {
                 name: e.name,
                 inode: e.inode_number,
                 kind: directory::entry_kind_from_type(e.inode_type),
+                // squashfs directory entries don't embed file size; it
+                // lives on the inode block referenced by `inode_number`.
+                size: 0,
             })
             .collect())
     }

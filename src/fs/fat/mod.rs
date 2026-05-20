@@ -743,14 +743,18 @@ impl Fat32 {
         let entries = self.list_cluster_raw(dev, dir_cluster)?;
         Ok(entries
             .into_iter()
-            .map(|(name, e)| FsDirEntry {
-                name,
-                inode: e.first_cluster,
-                kind: if e.attr & dir::ATTR_DIRECTORY != 0 {
-                    EntryKind::Dir
-                } else {
-                    EntryKind::Regular
-                },
+            .map(|(name, e)| {
+                let is_dir = e.attr & dir::ATTR_DIRECTORY != 0;
+                FsDirEntry {
+                    name,
+                    inode: e.first_cluster,
+                    kind: if is_dir {
+                        EntryKind::Dir
+                    } else {
+                        EntryKind::Regular
+                    },
+                    size: if is_dir { 0 } else { u64::from(e.file_size) },
+                }
             })
             .collect())
     }

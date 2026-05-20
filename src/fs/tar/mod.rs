@@ -315,10 +315,19 @@ impl Tar {
                 .unwrap_or(crate::fs::EntryKind::Dir);
             // "inode": fold the entry index for stability across runs.
             let inode = self.by_path.get(&child_path).copied().unwrap_or(0) as u32 + 1;
+            let size = if matches!(kind, crate::fs::EntryKind::Regular) {
+                self.by_path
+                    .get(&child_path)
+                    .map(|&i| self.entries[i].size)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             out.push(crate::fs::DirEntry {
                 name: name.clone(),
                 inode,
                 kind,
+                size,
             });
         }
         Ok(out)

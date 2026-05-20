@@ -517,8 +517,8 @@ pub fn fat32_min_bytes_for_source(source: &Source) -> Result<u64> {
             let target = crate::inspect::Target::parse(&path.to_string_lossy());
             let mut sum = 0u64;
             crate::inspect::with_target_device(&target, |src_dev| {
-                let src_fs = crate::inspect::AnyFs::open(src_dev)?;
-                sum = sum_source_file_bytes(src_dev, &src_fs)?;
+                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                sum = sum_source_file_bytes(src_dev, &mut src_fs)?;
                 Ok(())
             })?;
             sum
@@ -526,8 +526,8 @@ pub fn fat32_min_bytes_for_source(source: &Source) -> Result<u64> {
         Source::Image(target) => {
             let mut sum = 0u64;
             crate::inspect::with_target_device(target, |src_dev| {
-                let src_fs = crate::inspect::AnyFs::open(src_dev)?;
-                sum = sum_source_file_bytes(src_dev, &src_fs)?;
+                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                sum = sum_source_file_bytes(src_dev, &mut src_fs)?;
                 Ok(())
             })?;
             sum
@@ -540,8 +540,8 @@ pub fn fat32_min_bytes_for_source(source: &Source) -> Result<u64> {
             let target = crate::inspect::Target::parse(&merged_path);
             let mut sum = 0u64;
             crate::inspect::with_target_device(&target, |src_dev| {
-                let src_fs = crate::inspect::AnyFs::open(src_dev)?;
-                sum = sum_source_file_bytes(src_dev, &src_fs)?;
+                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                sum = sum_source_file_bytes(src_dev, &mut src_fs)?;
                 Ok(())
             })?;
             drop(tmp);
@@ -1454,20 +1454,9 @@ pub(crate) fn walk_fat_for_plan(
 /// by FAT32 shrink sizing.
 pub(crate) fn sum_source_file_bytes(
     src_dev: &mut dyn crate::block::BlockDevice,
-    src_fs: &crate::inspect::AnyFs,
+    src_fs: &mut crate::inspect::AnyFs,
 ) -> crate::Result<u64> {
-    use crate::inspect::AnyFs;
-    match src_fs {
-        AnyFs::Ext(src_ext) => sum_ext_file_bytes(src_dev, src_ext, 2),
-        AnyFs::Fat32(src_fat) => sum_fat_file_bytes(src_dev, src_fat, "/"),
-        AnyFs::Tar(src_tar) => Ok(src_tar
-            .entries()
-            .iter()
-            .filter(|e| matches!(e.kind, crate::fs::tar::EntryKind::Regular))
-            .map(|e| e.size)
-            .sum()),
-        _ => Err(unsupported_repack_src(src_fs)),
-    }
+    src_fs.total_file_bytes(src_dev)
 }
 
 /// Fold a tar archive's entries into a BuildPlan suitable for sizing an
@@ -1486,44 +1475,3 @@ pub(crate) fn walk_tar_for_plan(tar: &crate::fs::tar::Tar, plan: &mut crate::fs:
     }
 }
 
-pub(crate) fn sum_ext_file_bytes(
-    src_dev: &mut dyn crate::block::BlockDevice,
-    src: &crate::fs::ext::Ext,
-    src_ino: u32,
-) -> crate::Result<u64> {
-    let mut total = 0u64;
-    for e in src.list_inode(src_dev, src_ino)? {
-        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
-            continue;
-        }
-        let inode = src.read_inode(src_dev, e.inode)?;
-        let mode_type = inode.mode & crate::fs::ext::constants::S_IFMT;
-        if mode_type == crate::fs::ext::constants::S_IFREG {
-            total += inode.size as u64;
-        } else if mode_type == crate::fs::ext::constants::S_IFDIR {
-            total += sum_ext_file_bytes(src_dev, src, e.inode)?;
-        }
-    }
-    Ok(total)
-}
-
-pub(crate) fn sum_fat_file_bytes(
-    src_dev: &mut dyn crate::block::BlockDevice,
-    src: &crate::fs::fat::Fat32,
-    src_path: &str,
-) -> crate::Result<u64> {
-    use crate::fs::EntryKind;
-    let mut total = 0u64;
-    for e in src.list_path(src_dev, src_path)? {
-        let child = join_fs_path(src_path, &e.name);
-        match e.kind {
-            EntryKind::Regular => {
-                let (entry, _) = src.resolve_entry(src_dev, &child)?;
-                total += entry.file_size as u64;
-            }
-            EntryKind::Dir => total += sum_fat_file_bytes(src_dev, src, &child)?,
-            _ => {}
-        }
-    }
-    Ok(total)
-}

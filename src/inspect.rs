@@ -240,6 +240,14 @@ impl AnyFs {
         }
     }
 
+    /// Recursive sum of regular-file sizes across the whole FS.
+    /// Delegates to the inner backend's
+    /// [`crate::fs::Filesystem::total_file_bytes`] implementation,
+    /// which itself is a [`Self::list`]-driven walk.
+    pub fn total_file_bytes(&mut self, dev: &mut dyn BlockDevice) -> Result<u64> {
+        self.as_filesystem_dyn(|fs| fs.total_file_bytes(dev))
+    }
+
     /// Stream a regular file's bytes into `out`. The file is read in
     /// 64 KiB chunks; nothing larger than that buffer is ever resident.
     /// Takes `&mut self` for the same reason as [`AnyFs::list`].
@@ -412,10 +420,10 @@ impl AnyFs {
             Self::F2fs(fs2) => f(fs2.as_mut()),
             Self::Squashfs(sq) => f(sq.as_mut()),
             Self::Xfs(x) => f(x.as_mut()),
-            Self::Tar(_) => Err(read_only_fs("tar")),
-            Self::Apfs(_) => Err(read_only_fs("apfs")),
-            Self::Exfat(_) => Err(read_only_fs("exfat")),
-            Self::Iso9660(_) => Err(read_only_fs("iso9660")),
+            Self::Tar(t) => f(t.as_mut()),
+            Self::Apfs(a) => f(a.as_mut()),
+            Self::Exfat(e) => f(e.as_mut()),
+            Self::Iso9660(iso) => f(iso.as_mut()),
         }
     }
 
@@ -522,12 +530,6 @@ fn host_mode_from_meta(meta: &std::fs::Metadata, is_dir: bool) -> u16 {
         let _ = meta;
         if is_dir { 0o755 } else { 0o644 }
     }
-}
-
-fn read_only_fs(name: &str) -> crate::Error {
-    crate::Error::Unsupported(format!(
-        "{name} is mounted read-only by fstool; build a fresh output with `fstool repack`"
-    ))
 }
 
 /// Pump `reader` into `out` through `buf` until EOF, returning total

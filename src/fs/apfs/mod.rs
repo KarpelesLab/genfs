@@ -690,6 +690,7 @@ impl Apfs {
                 name: key.name,
                 inode: val.file_id as u32,
                 kind,
+                size: 0,
             });
         }
         Ok(out)

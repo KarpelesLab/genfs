@@ -556,10 +556,16 @@ impl Ntfs {
                 // to the low 32 bits of the record number. Callers
                 // doing a real cross-FS map should use `lookup_path`.
                 let rec_no = (entry.file_ref & 0x0000_FFFF_FFFF_FFFF) as u32;
+                let size = if fname.is_directory() {
+                    0
+                } else {
+                    fname.real_size
+                };
                 out.push(crate::fs::DirEntry {
                     name: fname.name,
                     inode: rec_no,
                     kind,
+                    size,
                 });
             }
         }

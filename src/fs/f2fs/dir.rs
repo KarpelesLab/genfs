@@ -42,6 +42,10 @@ impl RawDentry {
             name: String::from_utf8_lossy(&self.name).into_owned(),
             inode: self.ino,
             kind: type_to_kind(self.file_type),
+            // RawDentry doesn't carry the file size (it lives on the
+            // inode block, not the dentry). Callers that need a size
+            // should look it up via the FS's read API.
+            size: 0,
         }
     }
 }

@@ -791,10 +791,17 @@ impl HfsPlus {
                     }
                     CatalogRecord::Thread(_) => continue,
                 };
+                let size = match &record {
+                    CatalogRecord::File(f) if matches!(kind, EntryKind::Regular) => {
+                        f.data_fork.logical_size
+                    }
+                    _ => 0,
+                };
                 out.push(FsDirEntry {
                     name: key.name.to_string_lossy(),
                     inode: child_id,
                     kind,
+                    size,
                 });
             }
             if passed_parent {

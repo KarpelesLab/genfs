@@ -442,7 +442,7 @@ fn repack_cmd(
     // the destination build so we stream each file straight through
     // without ever touching the host filesystem.
     fstool::inspect::with_target_device(&src_target, |src_dev| {
-        let src_fs = fstool::inspect::AnyFs::open(src_dev)?;
+        let mut src_fs = fstool::inspect::AnyFs::open(src_dev)?;
         let source_kind = src_fs.kind_string();
         let src_total = src_dev.total_size();
 
@@ -485,7 +485,7 @@ fn repack_cmd(
                     plan.blocks_count() as u64 * plan.block_size as u64
                 }
                 "fat32" | "vfat" => {
-                    let bytes = sum_source_file_bytes(src_dev, &src_fs)?;
+                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs)?;
                     let needed = bytes
                         .saturating_mul(2)
                         .max(fstool::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024);
@@ -496,7 +496,7 @@ fn repack_cmd(
                     // ISO writer needs ~32 MiB headroom for a small tree.
                     // Real sizing happens during flush; we just want enough
                     // backing image to write into.
-                    let bytes = sum_source_file_bytes(src_dev, &src_fs)?;
+                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs)?;
                     bytes.saturating_add(32 * 1024 * 1024)
                 }
                 other => {
@@ -515,7 +515,7 @@ fn repack_cmd(
                     // path tables, dir records, and file data. Use a
                     // generous upper bound — the writer leaves the
                     // unused tail of the backing file alone.
-                    let bytes = sum_source_file_bytes(src_dev, &src_fs).unwrap_or(0);
+                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
                     bytes.saturating_add(32 * 1024 * 1024)
                 }
                 _ => src_total,
@@ -1263,10 +1263,16 @@ fn ls_tar_stream(
             TarKind::BlockDev => fstool::fs::EntryKind::Block,
             TarKind::Fifo => fstool::fs::EntryKind::Fifo,
         };
+        let size = if matches!(dirent_kind, fstool::fs::EntryKind::Regular) {
+            ix.entry.size
+        } else {
+            0
+        };
         children.push(fstool::fs::DirEntry {
             name: leaf.to_string(),
             inode: idx as u32 + 1,
             kind: dirent_kind,
+            size,
         });
     }
     if children.is_empty() && want != "/" {
@@ -1929,23 +1935,13 @@ fn walk_fat_for_plan(
 }
 
 /// Sum the size of every regular file in the source filesystem — used
-/// by FAT32 shrink sizing.
+/// by FAT32 / ISO shrink sizing. Trait-driven walk via
+/// [`fstool::inspect::AnyFs::total_file_bytes`].
 fn sum_source_file_bytes(
     src_dev: &mut dyn fstool::block::BlockDevice,
-    src_fs: &fstool::inspect::AnyFs,
+    src_fs: &mut fstool::inspect::AnyFs,
 ) -> fstool::Result<u64> {
-    use fstool::inspect::AnyFs;
-    match src_fs {
-        AnyFs::Ext(src_ext) => sum_ext_file_bytes(src_dev, src_ext, 2),
-        AnyFs::Fat32(src_fat) => sum_fat_file_bytes(src_dev, src_fat, "/"),
-        AnyFs::Tar(src_tar) => Ok(src_tar
-            .entries()
-            .iter()
-            .filter(|e| matches!(e.kind, fstool::fs::tar::EntryKind::Regular))
-            .map(|e| e.size)
-            .sum()),
-        _ => Err(unsupported_repack_src(src_fs)),
-    }
+    src_fs.total_file_bytes(src_dev)
 }
 
 /// Upper-bound the size of a tar archive built from `src_fs`. Walks the
@@ -2267,48 +2263,6 @@ fn walk_tar_for_plan(tar: &fstool::fs::tar::Tar, plan: &mut fstool::fs::ext::Bui
             EntryKind::CharDev | EntryKind::BlockDev | EntryKind::Fifo => plan.add_device(),
         }
     }
-}
-
-fn sum_ext_file_bytes(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::ext::Ext,
-    src_ino: u32,
-) -> fstool::Result<u64> {
-    let mut total = 0u64;
-    for e in src.list_inode(src_dev, src_ino)? {
-        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
-            continue;
-        }
-        let inode = src.read_inode(src_dev, e.inode)?;
-        let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
-        if mode_type == fstool::fs::ext::constants::S_IFREG {
-            total += inode.size as u64;
-        } else if mode_type == fstool::fs::ext::constants::S_IFDIR {
-            total += sum_ext_file_bytes(src_dev, src, e.inode)?;
-        }
-    }
-    Ok(total)
-}
-
-fn sum_fat_file_bytes(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::fat::Fat32,
-    src_path: &str,
-) -> fstool::Result<u64> {
-    use fstool::fs::EntryKind;
-    let mut total = 0u64;
-    for e in src.list_path(src_dev, src_path)? {
-        let child = join_fs_path(src_path, &e.name);
-        match e.kind {
-            EntryKind::Regular => {
-                let (entry, _) = src.resolve_entry(src_dev, &child)?;
-                total += entry.file_size as u64;
-            }
-            EntryKind::Dir => total += sum_fat_file_bytes(src_dev, src, &child)?,
-            _ => {}
-        }
-    }
-    Ok(total)
 }
 
 fn shell_cmd(image: &str) -> fstool::Result<()> {

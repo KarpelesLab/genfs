@@ -291,12 +291,214 @@ impl WriteState {
 }
 
 impl Xfs {
-    /// Initialise the in-memory write state. Idempotent: calling more
-    /// than once replaces the existing state, which is fine because all
-    /// allocator state is recoverable from the on-disk image.
+    /// Initialise the in-memory write state assuming a freshly-formatted
+    /// image (AG 0 has the root inode chunk pre-allocated; no other
+    /// chunks anywhere; bump pointer right after the log in AG 0 and
+    /// right after static metadata in every other AG). For images that
+    /// already contain files, use [`Self::resume_writes`] instead — it
+    /// reconstructs the write state by reading the on-disk AGF / AGI /
+    /// INOBT / BNO headers.
     pub fn begin_writes(&mut self, uuid: [u8; 16]) {
         let agcount = self.sb.agcount.max(1);
         self.write_state = Some(WriteState::initial(uuid, agcount));
+    }
+
+    /// Reconstruct the in-memory write state from the on-disk AG
+    /// headers — the inverse of [`Self::flush_writes`]. Reads each AG's
+    /// AGI (for the INOBT root pointer + free-inode count), the INOBT
+    /// leaf (for the list of inode chunks + each chunk's `ir_free`
+    /// bitmap), the AGF (for the BNO root pointer + freeblks), and the
+    /// BNO leaf (for the list of free-space extents). The free extent
+    /// whose end abuts `agf_length` becomes the bump pointer's tail;
+    /// all other free extents are re-attached to the AG's
+    /// `freed_extents` list so future allocations may reuse them.
+    ///
+    /// **Limitations.** Single-leaf B+trees only (level == 0): if any
+    /// AGI's INOBT has a `level != 0` root, or any AGF's BNO does, the
+    /// image was produced by something other than this writer and we
+    /// refuse with [`crate::Error::Unsupported`]. The classic 16-byte
+    /// inobt record (no sparse-inode `holemask`/`count` half-words) is
+    /// what the writer emits, so that's what we decode.
+    pub fn resume_writes(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let agblocks = self.sb.agblocks;
+        let total_blocks = self.sb.dblocks as u32;
+        let bs = self.sb.blocksize as u64;
+        let sect = super::format::XFS_SECTSIZE as u64;
+        let agcount = self.sb.agcount.max(1);
+        let uuid = self.sb.uuid;
+
+        let mut ags = Vec::with_capacity(agcount as usize);
+        let mut inodes_used: u64 = 0;
+        let mut inodes_free: u64 = 0;
+
+        for ag in 0..agcount {
+            let ag_byte = (ag as u64) * (agblocks as u64) * bs;
+            let this_ag_blocks = if ag == agcount - 1 {
+                total_blocks.saturating_sub(ag * agblocks).max(1)
+            } else {
+                agblocks
+            };
+
+            // -- AGI (sector 2): pull the INOBT root pointer + sanity-check magic.
+            let mut agi = vec![0u8; sect as usize];
+            dev.read_at(ag_byte + 2 * sect, &mut agi)?;
+            let agi_magic = u32::from_be_bytes(agi[0..4].try_into().unwrap());
+            if agi_magic != super::format::XFS_AGI_MAGIC {
+                return Err(crate::Error::InvalidImage(format!(
+                    "xfs: resume_writes: ag {ag} AGI magic {agi_magic:#010x} (expected XAGI)"
+                )));
+            }
+            let inobt_root = u32::from_be_bytes(agi[20..24].try_into().unwrap());
+            let inobt_level = u32::from_be_bytes(agi[24..28].try_into().unwrap());
+            // Some flush_writes paths stamp `level = 1` even when the
+            // leaf is empty (matches the formatter's behaviour). The
+            // root we read is still a leaf; the "level" field in AGI is
+            // really "number of B+tree levels above the root". Accept
+            // values <= 1.
+            if inobt_level > 1 {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: resume_writes: ag {ag} INOBT has {inobt_level} levels (writer only emits level 0)"
+                )));
+            }
+
+            // -- INOBT leaf: read every chunk record.
+            let mut inobt = vec![0u8; bs as usize];
+            dev.read_at(ag_byte + (inobt_root as u64) * bs, &mut inobt)?;
+            let inobt_magic = u32::from_be_bytes(inobt[0..4].try_into().unwrap());
+            if inobt_magic != super::format::XFS_IBT_CRC_MAGIC {
+                return Err(crate::Error::InvalidImage(format!(
+                    "xfs: resume_writes: ag {ag} INOBT magic {inobt_magic:#010x} (expected IAB3)"
+                )));
+            }
+            let inobt_block_level = u16::from_be_bytes(inobt[4..6].try_into().unwrap());
+            if inobt_block_level != 0 {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: resume_writes: ag {ag} INOBT root block is level {inobt_block_level} (need leaf, level 0)"
+                )));
+            }
+            let inobt_numrecs = u16::from_be_bytes(inobt[6..8].try_into().unwrap());
+            let mut chunks = Vec::with_capacity(inobt_numrecs as usize);
+            for i in 0..inobt_numrecs as usize {
+                let off = XFS_BTREE_SBLOCK_V5_SIZE + i * 16;
+                if off + 16 > inobt.len() {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "xfs: resume_writes: ag {ag} INOBT record {i} overflows leaf block"
+                    )));
+                }
+                let startino_ag = u32::from_be_bytes(inobt[off..off + 4].try_into().unwrap());
+                let freecount = u32::from_be_bytes(inobt[off + 4..off + 8].try_into().unwrap());
+                let ir_free = u64::from_be_bytes(inobt[off + 8..off + 16].try_into().unwrap());
+                if ir_free.count_ones() != freecount {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "xfs: resume_writes: ag {ag} chunk @ {startino_ag}: freecount {freecount} disagrees with ir_free popcount {}",
+                        ir_free.count_ones()
+                    )));
+                }
+                let inopblog = self.sb.inopblog as u32;
+                let agblock = startino_ag >> inopblog;
+                inodes_used += (64 - freecount) as u64;
+                inodes_free += freecount as u64;
+                chunks.push(InodeChunk {
+                    startino_ag,
+                    ir_free,
+                    agblock,
+                });
+            }
+
+            // -- AGF (sector 1): pull the BNO root pointer.
+            let mut agf = vec![0u8; sect as usize];
+            dev.read_at(ag_byte + sect, &mut agf)?;
+            let agf_magic = u32::from_be_bytes(agf[0..4].try_into().unwrap());
+            if agf_magic != super::format::XFS_AGF_MAGIC {
+                return Err(crate::Error::InvalidImage(format!(
+                    "xfs: resume_writes: ag {ag} AGF magic {agf_magic:#010x} (expected XAGF)"
+                )));
+            }
+            let bno_root = u32::from_be_bytes(agf[16..20].try_into().unwrap());
+            let bno_level = u32::from_be_bytes(agf[28..32].try_into().unwrap());
+            if bno_level > 1 {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: resume_writes: ag {ag} BNO has {bno_level} levels (writer only emits level 0)"
+                )));
+            }
+
+            // -- BNO leaf: read every free-extent record.
+            let mut bno = vec![0u8; bs as usize];
+            dev.read_at(ag_byte + (bno_root as u64) * bs, &mut bno)?;
+            let bno_magic = u32::from_be_bytes(bno[0..4].try_into().unwrap());
+            if bno_magic != super::format::XFS_ABTB_CRC_MAGIC {
+                return Err(crate::Error::InvalidImage(format!(
+                    "xfs: resume_writes: ag {ag} BNO magic {bno_magic:#010x} (expected AB3B)"
+                )));
+            }
+            let bno_block_level = u16::from_be_bytes(bno[4..6].try_into().unwrap());
+            if bno_block_level != 0 {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: resume_writes: ag {ag} BNO root block is level {bno_block_level} (need leaf, level 0)"
+                )));
+            }
+            let bno_numrecs = u16::from_be_bytes(bno[6..8].try_into().unwrap());
+            let mut free_extents: Vec<(u32, u32)> = Vec::with_capacity(bno_numrecs as usize);
+            for i in 0..bno_numrecs as usize {
+                let off = XFS_BTREE_SBLOCK_V5_SIZE + i * 8;
+                if off + 8 > bno.len() {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "xfs: resume_writes: ag {ag} BNO record {i} overflows leaf block"
+                    )));
+                }
+                let startblock = u32::from_be_bytes(bno[off..off + 4].try_into().unwrap());
+                let blockcount = u32::from_be_bytes(bno[off + 4..off + 8].try_into().unwrap());
+                free_extents.push((startblock, blockcount));
+            }
+
+            // The tail-end free extent (one whose end abuts this AG's
+            // length) is the bump-pointer tail; everything else is
+            // recoverable through freed_extents. If no tail extent
+            // exists the AG is full to the brim — pin next_agblock at
+            // `this_ag_blocks`.
+            let mut next_agblock = this_ag_blocks;
+            let mut freed_extents: Vec<(u32, u32)> = Vec::new();
+            for (s, c) in &free_extents {
+                let end = s.saturating_add(*c);
+                if end == this_ag_blocks {
+                    next_agblock = *s;
+                } else {
+                    freed_extents.push((*s, *c));
+                }
+            }
+            // If we never found a tail-aligned extent but there were
+            // free extents, every one of them is a recoverable hole.
+            // `next_agblock = this_ag_blocks` is still correct in that
+            // case (no room past the last allocation).
+            ags.push(AgState {
+                next_agblock,
+                chunks,
+                freed_extents,
+            });
+        }
+
+        self.write_state = Some(WriteState {
+            ags,
+            next_inode_ag: 0,
+            next_block_ag: 0,
+            uuid,
+            inodes_used,
+            inodes_free,
+        });
+        Ok(())
+    }
+
+    /// Ensure `write_state` is populated. If a previous [`format()`] or
+    /// [`begin_writes`](Self::begin_writes)/[`resume_writes`](Self::resume_writes)
+    /// call set it up already, this is a no-op; otherwise it reads the
+    /// on-disk AG headers via [`Self::resume_writes`]. Called from the
+    /// path-based mutators so that `Xfs::open` followed by `create_file`
+    /// works without an explicit kickoff call.
+    fn ensure_write_state(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if self.write_state.is_none() {
+            self.resume_writes(dev)?;
+        }
+        Ok(())
     }
 
     fn ws_mut(&mut self) -> Result<&mut WriteState> {
@@ -1426,6 +1628,7 @@ impl Xfs {
         size: u64,
         src: &mut R,
     ) -> Result<u64> {
+        self.ensure_write_state(dev)?;
         let (parent_ino, name) = self.split_path_for_create(dev, path)?;
         self.add_file(dev, parent_ino, &name, meta, size, src)
     }
@@ -1437,6 +1640,7 @@ impl Xfs {
         path: &str,
         meta: EntryMeta,
     ) -> Result<u64> {
+        self.ensure_write_state(dev)?;
         let (parent_ino, name) = self.split_path_for_create(dev, path)?;
         self.add_dir(dev, parent_ino, &name, meta)
     }
@@ -1449,6 +1653,7 @@ impl Xfs {
         target: &str,
         meta: EntryMeta,
     ) -> Result<u64> {
+        self.ensure_write_state(dev)?;
         let (parent_ino, name) = self.split_path_for_create(dev, path)?;
         self.add_symlink(dev, parent_ino, &name, target, meta)
     }
@@ -1463,12 +1668,14 @@ impl Xfs {
         minor: u32,
         meta: EntryMeta,
     ) -> Result<u64> {
+        self.ensure_write_state(dev)?;
         let (parent_ino, name) = self.split_path_for_create(dev, path)?;
         self.add_device(dev, parent_ino, &name, kind, major, minor, meta)
     }
 
     /// Path-based equivalent of [`Self::remove`].
     pub fn remove_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
+        self.ensure_write_state(dev)?;
         let (parent_ino, name) = self.split_path_for_create(dev, path)?;
         self.remove(dev, parent_ino, &name)
     }
@@ -1846,5 +2053,156 @@ mod tests {
         xfs2.flush_writes(&mut dev).unwrap();
         let entries = xfs2.list_path(&mut dev, "/").unwrap();
         assert!(entries.iter().any(|e| e.name == "ma"));
+    }
+
+    /// Add a file, flush, then re-open via `Xfs::open` (no
+    /// `begin_writes`) and add a second file. The second `add_file`
+    /// must auto-resume the write state from the on-disk AG headers
+    /// so the bump pointer skips the first file's blocks and the new
+    /// inode lands in a free slot. Verify both files survive the
+    /// final flush + reopen.
+    #[test]
+    fn reopen_as_writable_round_trip() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        // -- First lifecycle: format, add "a", flush.
+        {
+            let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+            xfs.begin_writes([0u8; 16]);
+            let rootino = xfs.superblock().rootino;
+            let mut src = std::io::Cursor::new(b"alpha".to_vec());
+            xfs.add_file(&mut dev, rootino, "a", EntryMeta::default(), 5, &mut src)
+                .unwrap();
+            xfs.flush_writes(&mut dev).unwrap();
+        }
+        // -- Second lifecycle: re-open (no begin_writes), add "b" via
+        // the path API which auto-resumes, then flush.
+        {
+            let mut xfs = super::super::Xfs::open(&mut dev).unwrap();
+            // Sanity: "a" is visible through the reader.
+            let entries = xfs.list_path(&mut dev, "/").unwrap();
+            assert!(
+                entries.iter().any(|e| e.name == "a"),
+                "first file gone after reopen"
+            );
+            // No begin_writes — add_file_path will auto-resume.
+            let mut src = std::io::Cursor::new(b"beta-data".to_vec());
+            xfs.add_file_path(&mut dev, "/b", EntryMeta::default(), 9, &mut src)
+                .unwrap();
+            xfs.flush_writes(&mut dev).unwrap();
+        }
+        // -- Third reopen: verify both files are intact and readable.
+        let xfs = super::super::Xfs::open(&mut dev).unwrap();
+        let entries = xfs.list_path(&mut dev, "/").unwrap();
+        let user: Vec<&crate::fs::DirEntry> = entries
+            .iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .collect();
+        let mut names: Vec<&str> = user.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a", "b"], "both files visible after reopen");
+        // Read each file's bytes.
+        let mut r = xfs.open_file_reader(&mut dev, "/a").unwrap();
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut out).unwrap();
+        assert_eq!(&out, b"alpha");
+        let mut r = xfs.open_file_reader(&mut dev, "/b").unwrap();
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut out).unwrap();
+        assert_eq!(&out, b"beta-data");
+    }
+
+    /// After flush_writes, `resume_writes` should reconstruct an
+    /// allocator state where the inode count + bump pointer match the
+    /// on-disk numbers exactly (modulo rounding from the writer's
+    /// "extents-only" representation). Asserts the round-trip
+    /// invariants.
+    #[test]
+    fn resume_writes_matches_on_disk_state() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.begin_writes([0u8; 16]);
+        let rootino = xfs.superblock().rootino;
+        let mut src = std::io::Cursor::new(b"hello".to_vec());
+        xfs.add_file(&mut dev, rootino, "f", EntryMeta::default(), 5, &mut src)
+            .unwrap();
+        xfs.flush_writes(&mut dev).unwrap();
+
+        // Capture the formatter's state so we can diff against the
+        // reconstructed one.
+        let pre = xfs.write_state.as_ref().unwrap().clone();
+
+        // Reload through the read path and resume.
+        let mut xfs2 = super::super::Xfs::open(&mut dev).unwrap();
+        xfs2.resume_writes(&mut dev).unwrap();
+        let post = xfs2.write_state.as_ref().unwrap();
+
+        assert_eq!(pre.ags.len(), post.ags.len());
+        assert_eq!(pre.inodes_used, post.inodes_used);
+        assert_eq!(pre.inodes_free, post.inodes_free);
+        for (i, (a, b)) in pre.ags.iter().zip(post.ags.iter()).enumerate() {
+            assert_eq!(
+                a.next_agblock, b.next_agblock,
+                "ag {i}: bump pointer mismatch"
+            );
+            assert_eq!(
+                a.chunks.len(),
+                b.chunks.len(),
+                "ag {i}: chunk count mismatch"
+            );
+            for (j, (ca, cb)) in a.chunks.iter().zip(b.chunks.iter()).enumerate() {
+                assert_eq!(
+                    ca.startino_ag, cb.startino_ag,
+                    "ag {i} chunk {j}: startino mismatch"
+                );
+                assert_eq!(
+                    ca.ir_free, cb.ir_free,
+                    "ag {i} chunk {j}: ir_free mismatch"
+                );
+            }
+        }
+    }
+
+    /// Multiple re-open-and-add cycles. Each iteration creates a fresh
+    /// inode + extent, flushes, then re-opens from scratch. Every file
+    /// added in every iteration must still be visible at the end.
+    #[test]
+    fn reopen_add_repeatedly() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        // Initial format.
+        {
+            let xfs = super::super::format(&mut dev, &opts).unwrap();
+            // No files written yet; just close out the formatter
+            // through Drop (the format() return value carries its own
+            // write_state).
+            drop(xfs);
+        }
+        let names = ["one", "two", "three"];
+        for n in &names {
+            let mut xfs = super::super::Xfs::open(&mut dev).unwrap();
+            let mut src = std::io::Cursor::new(n.as_bytes().to_vec());
+            xfs.add_file_path(
+                &mut dev,
+                &format!("/{n}"),
+                EntryMeta::default(),
+                n.len() as u64,
+                &mut src,
+            )
+            .unwrap();
+            xfs.flush_writes(&mut dev).unwrap();
+        }
+        // Final reopen — every file is listed and readable.
+        let xfs = super::super::Xfs::open(&mut dev).unwrap();
+        let entries = xfs.list_path(&mut dev, "/").unwrap();
+        let user_names: std::collections::HashSet<&str> = entries
+            .iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .map(|e| e.name.as_str())
+            .collect();
+        for n in &names {
+            assert!(user_names.contains(n), "file {n:?} missing after reopens");
+        }
     }
 }

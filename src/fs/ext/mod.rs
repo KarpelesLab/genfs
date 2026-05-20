@@ -26,6 +26,7 @@ pub mod dir;
 pub mod extent;
 pub mod group;
 pub mod inode;
+pub mod jbd2;
 pub mod layout;
 pub mod rw;
 pub mod superblock;
@@ -207,6 +208,12 @@ pub struct Ext {
     /// owning directory inode. Used at flush time to stamp the per-block
     /// CRC32C checksum tail when `metadata_csum` is active.
     dir_blocks: Vec<(u32, u32)>,
+    /// True until the first flush after a `format_with` lands. The
+    /// initial flush is a "blast everything fresh" write that doesn't
+    /// ride a journal transaction (there's nothing yet to be consistent
+    /// with — the journal is fresh and clean). Subsequent flushes on an
+    /// image with a journal go through the JBD2 commit/checkpoint path.
+    bootstrap: bool,
 }
 
 impl Ext {
@@ -339,6 +346,13 @@ impl Ext {
             inodes: Vec::new(),
             data_blocks: Vec::new(),
             dir_blocks: Vec::new(),
+            // During format the journal SB is staged in `data_blocks`
+            // and the file system as a whole is being assembled fresh;
+            // the initial flush is a "blast everything" write rather
+            // than a JBD2-protected transaction. After the first flush
+            // lands this is set to false so subsequent incremental
+            // edits ride the journal commit/checkpoint path.
+            bootstrap: true,
         };
 
         // Set feature flags up front — before create_root / create_lost_found
@@ -788,25 +802,95 @@ impl Ext {
 
     /// Write all staged state to the device. Primary superblock is written
     /// **last** to maintain the "torn write → unmountable, not corrupt"
-    /// invariant.
+    /// invariant. When the filesystem has a JBD2 journal the metadata
+    /// updates ride a real journal transaction (descriptor + data + commit);
+    /// otherwise they go straight to the device (ext2 path).
     fn flush_metadata(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
-        let bs = self.layout.block_size as u64;
+        // Stamp dir-block checksum tails into `data_blocks` before we
+        // serialise the metadata image set; the journal must carry the
+        // checksum-stamped versions.
+        self.stamp_dir_block_checksums();
 
-        // Build encoded GDT (same for every group copy). Each descriptor
-        // occupies `desc_size` bytes on disk (32 classic, 64 for 64-bit);
-        // the encoded 32-byte form goes in the low bytes, the rest stays
-        // zero — correct for sub-2^32-block filesystems.
-        //
-        // With metadata_csum, each descriptor also carries the CRC32C of
-        // its group's block + inode bitmaps (offsets 24 / 26) and a
-        // descriptor checksum (`bg_checksum`, offset 30) chained after the
-        // seed and the group number.
+        // Build the block-aligned metadata image set: every full-block
+        // write that flush would emit (bitmaps, GDTs, inode-table blocks,
+        // staged dir / extent leaf / indirect blocks). Excludes the
+        // primary and backup superblocks: those are written outside the
+        // journal as the final step.
+        let images = self.collect_metadata_images(dev)?;
+
+        // Initial format flush ("bootstrap") writes every block directly
+        // — the journal SB itself is in `images` and has no prior on-disk
+        // state to stay consistent with. Subsequent flushes on an image
+        // that carries a journal go through the JBD2 commit/checkpoint
+        // path so a crash mid-flush leaves a replayable transaction in
+        // the log instead of a torn metadata block.
+        if self.has_journal() && !self.bootstrap {
+            self.commit_journal_and_checkpoint(dev, &images)?;
+        } else {
+            for (blk, bytes) in &images {
+                let bs = self.layout.block_size as u64;
+                dev.write_at(*blk as u64 * bs, bytes)?;
+            }
+        }
+
+        // Backup SB copies and the primary SB. The primary SB is the very
+        // last write to preserve the "torn write → unmountable, not
+        // corrupt" invariant.
+        self.write_superblocks(dev)?;
+        dev.sync()?;
+
+        // Subsequent flushes (e.g. from open_file_rw) ride the journal.
+        self.bootstrap = false;
+
+        // The staged dir / extent leaf / indirect data blocks have
+        // landed on disk; drop them so the next flush only journals
+        // genuine new edits (not stale snapshots from before this
+        // flush). `self.inodes` is kept around — open file handles
+        // assume their inode stays staged across `sync` calls.
+        self.data_blocks.clear();
+        self.dir_blocks.clear();
+        Ok(())
+    }
+
+    /// Stamp every staged directory data block's CRC32C tail in place.
+    /// No-op when `metadata_csum` is off. Called by [`flush_metadata`]
+    /// before the journal commit so the journaled image matches what
+    /// the checkpoint phase writes to the directory's home block.
+    fn stamp_dir_block_checksums(&mut self) {
+        if !self.has_metadata_csum() {
+            return;
+        }
+        let seed = self.csum_seed();
+        for (blk, bytes) in &mut self.data_blocks {
+            if let Some((_, dir_ino)) = self.dir_blocks.iter().find(|(b, _)| b == blk) {
+                let generation = self
+                    .inodes
+                    .iter()
+                    .find(|(i, _)| i == dir_ino)
+                    .map(|(_, i)| i.generation)
+                    .unwrap_or(0);
+                let n = bytes.len();
+                let c = csum::dir_block(seed, *dir_ino, generation, &bytes[..n - 12]);
+                bytes[n - 4..].copy_from_slice(&c.to_le_bytes());
+            }
+        }
+    }
+
+    /// Build the block-aligned metadata image set (block_no, full-block
+    /// bytes). Includes bitmaps (every group), GDT blocks (every backup
+    /// group + group 0), inode-table blocks (each block patched with all
+    /// staged inodes whose slot falls inside it), and staged data blocks
+    /// (dir / extent leaf / indirect). Does NOT include superblocks.
+    fn collect_metadata_images(&self, dev: &mut dyn BlockDevice) -> Result<Vec<(u32, Vec<u8>)>> {
+        let bs = self.layout.block_size as u64;
+        let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
+
+        // Build encoded GDT (same content for every group's copy). With
+        // metadata_csum each descriptor's bg_checksum + bitmap checksums
+        // are stamped here.
         let desc_size = self.layout.desc_size;
         let with_csum = self.has_metadata_csum();
         let seed = self.csum_seed();
-        // Bitmap checksums cover only the in-use prefix of each bitmap:
-        // blocks_per_group/8 bytes for the block bitmap, inodes_per_group/8
-        // for the inode bitmap (both group counts are multiples of 8).
         let bbm_len = (self.layout.blocks_per_group / 8) as usize;
         let ibm_len = (self.layout.inodes_per_group / 8) as usize;
         let mut gdt = vec![0u8; self.layout.gdt_blocks as usize * bs as usize];
@@ -815,9 +899,6 @@ impl Ext {
             let desc = &mut gdt[off..off + desc_size];
             desc[..constants::GROUP_DESC_SIZE].copy_from_slice(&g.desc.encode());
             if with_csum {
-                // Bitmap checksums are 16-bit on a 32-byte descriptor (low
-                // half only at offsets 0x18 / 0x1A), 32-bit on a 64-byte
-                // descriptor (low half + high half at offsets 0x38 / 0x3A).
                 let bbm_full = csum::bitmap(seed, &g.block_bitmap[..bbm_len]);
                 let ibm_full = csum::bitmap(seed, &g.inode_bitmap[..ibm_len]);
                 let bbm_lo = bbm_full as u16;
@@ -830,77 +911,197 @@ impl Ext {
                     desc[0x38..0x3A].copy_from_slice(&bbm_hi.to_le_bytes());
                     desc[0x3A..0x3C].copy_from_slice(&ibm_hi.to_le_bytes());
                 }
-                // bg_checksum is computed over the descriptor with its own
-                // 2 bytes zeroed (they already are — fresh buffer).
                 let bg = csum::group_desc(seed, i as u32, desc);
                 desc[0x1E..0x20].copy_from_slice(&bg.to_le_bytes());
             }
         }
 
-        // For each group: write SB + GDT backup only when this group holds
-        // one (under sparse_super, groups 0/1 and powers of 3/5/7 do);
-        // bitmaps live in every group regardless.
+        // Bitmaps and GDT copies, per group.
         for (i, g) in self.layout.groups.iter().enumerate() {
             if g.has_superblock {
-                if i != 0 {
-                    let mut sb_copy = self.sb.clone();
-                    sb_copy.block_group_nr = i as u16;
-                    dev.write_at(g.start_block as u64 * bs, &self.encode_sb(&sb_copy))?;
-                }
-                // GDT block(s):
-                // - group 0 (first_data_block=1): GDT at block 2 (after SB at 1)
-                // - group 0 (first_data_block=0): GDT at block 1 (SB shares block 0)
-                // - other groups: GDT at start_block + 1 (after the SB copy)
-                let gdt_off = if i == 0 {
+                // The GDT itself; SB backup is handled by write_superblocks.
+                let gdt_start_block = if i == 0 {
                     if self.layout.first_data_block == 1 {
-                        2 * bs
+                        2u32
                     } else {
-                        bs
+                        1u32
                     }
                 } else {
-                    (g.start_block as u64 + 1) * bs
+                    g.start_block + 1
                 };
-                dev.write_at(gdt_off, &gdt)?;
+                for (blk_off, chunk) in gdt.chunks(bs as usize).enumerate() {
+                    out.push((gdt_start_block + blk_off as u32, chunk.to_vec()));
+                }
             }
-            dev.write_at(g.block_bitmap as u64 * bs, &self.groups[i].block_bitmap)?;
-            dev.write_at(g.inode_bitmap as u64 * bs, &self.groups[i].inode_bitmap)?;
+            out.push((g.block_bitmap, self.groups[i].block_bitmap.clone()));
+            out.push((g.inode_bitmap, self.groups[i].inode_bitmap.clone()));
         }
 
-        // Write all staged inodes into their slots in the inode table.
+        // Inode-table blocks: group staged inodes by their containing
+        // table block, then RMW each block.
+        let inode_size = self.layout.inode_size as u64;
+        let inodes_per_block = (bs / inode_size) as u32;
+        let mut by_block: std::collections::BTreeMap<u32, Vec<(u32, &Inode)>> =
+            std::collections::BTreeMap::new();
         for (ino, inode) in &self.inodes {
             let (group, idx_in_group) = self.inode_location(*ino);
             let table_block = self.layout.groups[group as usize].inode_table;
-            let off = table_block as u64 * bs + idx_in_group as u64 * self.layout.inode_size as u64;
-            dev.write_at(off, &self.encode_inode(*ino, inode))?;
+            let block_off = idx_in_group / inodes_per_block;
+            let blk = table_block + block_off;
+            by_block.entry(blk).or_default().push((*ino, inode));
         }
-
-        // Write staged data blocks. Directory blocks get their CRC32C
-        // checksum-tail stamped first when metadata_csum is active: the
-        // checksum covers the whole block minus its trailing 4 bytes,
-        // chained after the seed, the owning dir's inode number, and that
-        // inode's generation.
-        for (blk, bytes) in &mut self.data_blocks {
-            if with_csum && let Some((_, dir_ino)) = self.dir_blocks.iter().find(|(b, _)| b == blk)
-            {
-                let generation = self
-                    .inodes
-                    .iter()
-                    .find(|(i, _)| i == dir_ino)
-                    .map(|(_, i)| i.generation)
-                    .unwrap_or(0);
-                // The checksum covers everything before the 12-byte tail
-                // dirent; the value is stored in that tail's last 4 bytes.
-                let n = bytes.len();
-                let c = csum::dir_block(seed, *dir_ino, generation, &bytes[..n - 12]);
-                bytes[n - 4..].copy_from_slice(&c.to_le_bytes());
+        for (blk, slots) in by_block {
+            // RMW: start from the current on-disk content. We avoid
+            // touching staged data_blocks here because inode-table blocks
+            // are not staged in `data_blocks` (only dirs / extent leaves
+            // / indirects are).
+            let mut buf = vec![0u8; bs as usize];
+            dev.read_at(blk as u64 * bs, &mut buf)?;
+            for (ino, inode) in slots {
+                let (_, idx_in_group) = self.inode_location(ino);
+                let inblock_idx = idx_in_group % inodes_per_block;
+                let off = inblock_idx as u64 * inode_size;
+                let encoded = self.encode_inode(ino, inode);
+                let body_len = encoded.len().min(inode_size as usize);
+                buf[off as usize..off as usize + body_len].copy_from_slice(&encoded[..body_len]);
+                // Tail bytes (i_extra_isize region of large inodes, if any)
+                // are left as their on-disk values.
             }
-            dev.write_at(*blk as u64 * bs, bytes)?;
+            out.push((blk, buf));
         }
 
-        // Primary SB last.
-        dev.write_at(SUPERBLOCK_OFFSET, &self.encode_sb(&self.sb))?;
+        // Staged data blocks (directories, extent leaves, indirect blocks).
+        // These are already block-sized in `data_blocks`. Dir-block
+        // checksums are already stamped (stamp_dir_block_checksums).
+        for (blk, bytes) in &self.data_blocks {
+            out.push((*blk, bytes.clone()));
+        }
+
+        // De-duplicate by block number, keeping the latest write per block
+        // (a later entry wins). This matters when, e.g., an inode-table
+        // block is also staged as a generic data block (shouldn't happen
+        // today, but the guard is cheap and keeps the journal payload
+        // free of duplicates).
+        let mut seen: std::collections::BTreeMap<u32, Vec<u8>> = std::collections::BTreeMap::new();
+        for (blk, bytes) in out {
+            seen.insert(blk, bytes);
+        }
+        Ok(seen.into_iter().collect())
+    }
+
+    /// Write the GDT + bitmap + inode + data-block updates as a single
+    /// JBD2 transaction, fsync, then checkpoint by writing the same blocks
+    /// to their target FS locations.
+    fn commit_journal_and_checkpoint(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        images: &[(u32, Vec<u8>)],
+    ) -> Result<()> {
+        let jino = self.sb.journal_inum;
+        if jino == 0 {
+            return Err(crate::Error::InvalidImage(
+                "ext: HAS_JOURNAL set but s_journal_inum is 0".into(),
+            ));
+        }
+        let bs = self.layout.block_size;
+
+        if images.is_empty() {
+            // Nothing to journal; SB will still be written by the caller.
+            return Ok(());
+        }
+
+        // Read journal SB and inode. The journal SB may be staged in
+        // `data_blocks` (first flush after format) — consult that cache
+        // before falling back to the device.
+        let journal_inode = self.read_inode(dev, jino)?;
+        let jsb_phys = self.file_block(dev, &journal_inode, 0)?;
+        if jsb_phys == 0 {
+            return Err(crate::Error::InvalidImage(
+                "ext: journal block 0 unmapped".into(),
+            ));
+        }
+        let mut jsb_buf = vec![0u8; bs as usize];
+        self.read_block(dev, jsb_phys, &mut jsb_buf)?;
+        let jsb = jbd2::JournalSuperblock::decode(&jsb_buf)?;
+        if jsb.blocksize != bs {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: journal blocksize {} != FS blocksize {bs}",
+                jsb.blocksize
+            )));
+        }
+
+        // Build payload list.
+        let blocks: Vec<jbd2::JournalBlock> = images
+            .iter()
+            .map(|(blk, bytes)| jbd2::JournalBlock {
+                fs_block: *blk,
+                bytes: bytes.clone(),
+            })
+            .collect();
+
+        // Pick the next tid and the start of the log ring. Path A v1 only
+        // writes one transaction at a time, starting at `s_first`; the
+        // ring isn't reused mid-flush.
+        let tid = jsb.sequence;
+        let start_idx = jsb.first;
+        let _next_idx = jbd2::write_transaction(
+            self,
+            dev,
+            &journal_inode,
+            &mut jsb_buf,
+            &jsb,
+            start_idx,
+            tid,
+            &blocks,
+            self.sb.wtime as u64,
+            0,
+        )?;
         dev.sync()?;
+
+        // Now stamp s_start + s_sequence so a crash from here on yields
+        // a replayable journal: replay will see this exact transaction
+        // and re-apply it.
+        jbd2::set_start(&mut jsb_buf, start_idx);
+        jbd2::set_sequence(&mut jsb_buf, tid);
+        dev.write_at(jsb_phys as u64 * bs as u64, &jsb_buf)?;
+        dev.sync()?;
+
+        // Checkpoint: write each block image to its FS-home location.
+        let bs64 = bs as u64;
+        for (blk, bytes) in images {
+            dev.write_at(*blk as u64 * bs64, bytes)?;
+        }
+        dev.sync()?;
+
+        // Mark the journal clean: s_start = 0, s_sequence = tid + 1. A
+        // future open sees a clean journal and skips replay.
+        jbd2::set_start(&mut jsb_buf, 0);
+        jbd2::set_sequence(&mut jsb_buf, tid.wrapping_add(1));
+        dev.write_at(jsb_phys as u64 * bs as u64, &jsb_buf)?;
         Ok(())
+    }
+
+    /// Write every group's superblock copy (primary and any backups).
+    /// Called as the final phase of `flush_metadata` so a torn write of
+    /// the primary leaves the on-disk state mountable from a backup.
+    fn write_superblocks(&self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let bs = self.layout.block_size as u64;
+        for (i, g) in self.layout.groups.iter().enumerate() {
+            if g.has_superblock && i != 0 {
+                let mut sb_copy = self.sb.clone();
+                sb_copy.block_group_nr = i as u16;
+                dev.write_at(g.start_block as u64 * bs, &self.encode_sb(&sb_copy))?;
+            }
+        }
+        dev.write_at(SUPERBLOCK_OFFSET, &self.encode_sb(&self.sb))?;
+        Ok(())
+    }
+
+    /// Whether the filesystem has a JBD2 journal (`COMPAT_HAS_JOURNAL`)
+    /// AND it's not an external journal device.
+    fn has_journal(&self) -> bool {
+        self.sb.feature_compat & constants::feature::COMPAT_HAS_JOURNAL != 0
+            && self.sb.feature_incompat & constants::feature::INCOMPAT_JOURNAL_DEV == 0
     }
 
     /// Encode an inode, stamping its CRC32C checksum (`l_i_checksum_lo` at
@@ -1592,6 +1793,11 @@ impl Ext {
             inodes: Vec::new(),
             data_blocks: Vec::new(),
             dir_blocks: Vec::new(),
+            // Opened (vs. just-formatted) images go through the journal
+            // path on flush. `open()` itself runs JBD2 replay before
+            // returning, so by the time we land here the on-disk journal
+            // is clean.
+            bootstrap: false,
         })
     }
 
@@ -1599,6 +1805,39 @@ impl Ext {
     /// calls. Useful after [`Ext::open`], which defaults it off.
     pub fn set_sparse(&mut self, sparse: bool) {
         self.sparse = sparse;
+    }
+
+    /// Re-read every group's bitmaps and group descriptor from disk into
+    /// the in-memory `groups` vector. Called by the journal-replay path
+    /// after applying a transaction so subsequent staged metadata
+    /// writes don't shadow the just-replayed values.
+    pub(crate) fn reload_groups_from_disk(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let bs = self.layout.block_size as u64;
+        let gdt_off = if self.layout.first_data_block == 1 {
+            2 * bs
+        } else {
+            bs
+        };
+        let mut gdt = vec![0u8; self.layout.gdt_blocks as usize * bs as usize];
+        dev.read_at(gdt_off, &mut gdt)?;
+        let desc_size = self.layout.desc_size;
+        for i in 0..self.layout.groups.len() {
+            let off = i * desc_size;
+            let desc = GroupDesc::decode(&gdt[off..off + constants::GROUP_DESC_SIZE]);
+            self.layout.groups[i].block_bitmap = desc.block_bitmap;
+            self.layout.groups[i].inode_bitmap = desc.inode_bitmap;
+            self.layout.groups[i].inode_table = desc.inode_table;
+            dev.read_at(
+                desc.block_bitmap as u64 * bs,
+                &mut self.groups[i].block_bitmap,
+            )?;
+            dev.read_at(
+                desc.inode_bitmap as u64 * bs,
+                &mut self.groups[i].inode_bitmap,
+            )?;
+            self.groups[i].desc = desc;
+        }
+        Ok(())
     }
 
     /// Read inode number `ino`. Consults the in-memory staged-write cache
@@ -3174,42 +3413,152 @@ mod tests {
     }
 
     #[test]
-    fn open_file_rw_refused_on_ext3_dirty_journal() {
-        // Mark the journal dirty by writing a non-zero s_start (offset 28,
-        // big-endian) into the JBD2 superblock at the first block of the
-        // journal. open_file_rw must then refuse with Unsupported.
-        let payload = b"hi";
-        let (mut ext, mut dev) = ext3_with_file(b"foo.bin", payload);
+    fn open_file_rw_replays_dirty_journal_on_open() {
+        // Synthesize a "crash between commit and checkpoint":
+        //   1) Format ext3, snapshot the pre-write image (clean journal).
+        //   2) Run an open_file_rw `set_len` that extends the file —
+        //      this updates the inode (size, i_blocks) and the block
+        //      bitmap, both of which ride the journal.
+        //   3) The sync's journal-commit phase lands descriptor+data+
+        //      commit in the log, then the checkpoint phase writes the
+        //      same blocks to their FS homes and marks the journal
+        //      clean. We snapshot the journal *log* blocks at that
+        //      point — they still hold the committed transaction even
+        //      though the on-disk SB now says s_start=0.
+        //   4) Restore the pre-write image (rolls back the inode-table
+        //      and bitmaps), restore the journal log blocks (so the
+        //      committed transaction is back on disk), and stamp
+        //      s_start != 0 in the journal SB.
+        //   5) Open the image and confirm replay re-applies the
+        //      metadata: the extended file size is visible.
+        let payload = vec![b'a'; 1024];
+        let (mut ext, mut dev) = ext3_with_file(b"foo.bin", &payload);
+        let bs = ext.layout.block_size as usize;
+        let bs64 = ext.layout.block_size as u64;
+        let nblocks = ext.layout.blocks_count;
 
-        // Locate the journal SB block and dirty it.
+        // Snapshot the pre-write on-disk image (all rolled-back metadata
+        // will come from here).
+        let mut pre_image = vec![0u8; bs * nblocks as usize];
+        dev.read_at(0, &mut pre_image).expect("snapshot pre-image");
+
+        // Note the journal block layout. Journal blocks were allocated
+        // at format time and don't move; mapping indices to physical
+        // blocks once is sufficient. Only the leading log slots get
+        // touched by a small transaction, so iterate to the lower of
+        // (journal size, 64 — well within the direct-block range for
+        // 1 KiB indirect-tree inodes the reader can resolve).
         let jino = ext.sb.journal_inum;
-        assert_ne!(jino, 0, "ext3 image should have a journal inode");
         let jinode = ext.read_inode(&mut dev, jino).expect("journal inode");
-        let blk0 = ext.file_block(&mut dev, &jinode, 0).expect("journal blk 0");
-        let bs = ext.layout.block_size as u64;
-        let abs = blk0 as u64 * bs;
-        let mut buf = vec![0u8; bs as usize];
-        dev.read_at(abs, &mut buf).expect("read jsb");
-        // s_start at offset 28, big-endian.
-        buf[28..32].copy_from_slice(&7u32.to_be_bytes());
-        dev.write_at(abs, &buf).expect("write jsb");
-
-        let res = ext.open_file_rw(
-            &mut dev,
-            std::path::Path::new("/foo.bin"),
-            OpenFlags::default(),
-            None,
-        );
-        match res {
-            Ok(_) => panic!("must refuse on dirty journal"),
-            Err(crate::Error::Unsupported(msg)) => {
-                assert!(
-                    msg.contains("journal is dirty"),
-                    "unexpected message: {msg}"
-                );
-            }
-            Err(other) => panic!("expected Unsupported, got {other}"),
+        let n_journal_blocks = (jinode.size as u64 / bs64) as u32;
+        let probe = n_journal_blocks.min(64);
+        let mut journal_phys: Vec<u32> = Vec::with_capacity(probe as usize);
+        for i in 0..probe {
+            let phys = ext.file_block(&mut dev, &jinode, i).expect("file_block");
+            journal_phys.push(phys);
         }
+
+        // Extend the file via the rw handle — purely a metadata
+        // operation as far as the journal is concerned (inode-table,
+        // bitmap, GDT).
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/foo.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open_file_rw");
+            h.set_len(4096).expect("set_len");
+            h.sync().unwrap();
+        }
+
+        // Snapshot the journal log blocks (descriptor + data + commit).
+        // Even though the on-disk journal SB now reads s_start=0 (clean),
+        // the log payload from the just-finished commit is still on disk
+        // because the post-checkpoint cleanup only rewrites the SB.
+        let mut post_journal: Vec<(u32, Vec<u8>)> = Vec::new();
+        for phys in &journal_phys {
+            if *phys == 0 {
+                continue;
+            }
+            let mut buf = vec![0u8; bs];
+            dev.read_at(*phys as u64 * bs64, &mut buf).expect("read");
+            post_journal.push((*phys, buf));
+        }
+
+        // Roll the entire image back to the pre-write snapshot.
+        dev.write_at(0, &pre_image).expect("restore pre-image");
+        // Restore the journal *log* blocks from the post-write snapshot.
+        // Skip index 0 (the journal SB itself): pre_image already holds
+        // the clean (s_sequence=1, s_start=0) journal SB, and that's the
+        // baseline we need replay to use.
+        let jsb_phys = journal_phys[0];
+        for (phys, buf) in &post_journal {
+            if *phys == jsb_phys {
+                continue;
+            }
+            dev.write_at(*phys as u64 * bs64, buf)
+                .expect("restore journal");
+        }
+        // Dirty the journal SB: set s_start to `s_first` so replay
+        // walks the log starting at the descriptor we just restored.
+        // s_sequence is already the tid the transaction was committed
+        // with (the post-format value), so descriptor.tid will match.
+        let mut jsb_buf = vec![0u8; bs];
+        dev.read_at(jsb_phys as u64 * bs64, &mut jsb_buf)
+            .expect("read jsb");
+        let first = u32::from_be_bytes(jsb_buf[20..24].try_into().unwrap());
+        jsb_buf[28..32].copy_from_slice(&first.to_be_bytes());
+        dev.write_at(jsb_phys as u64 * bs64, &jsb_buf)
+            .expect("write jsb dirty");
+        BlockDevice::sync(&mut dev).expect("sync");
+
+        // Sanity: a plain read (no replay) still sees the pre-write
+        // file size — the rollback worked.
+        {
+            let reopened = Ext::open(&mut dev).expect("reopen pre-replay");
+            let ino = reopened
+                .path_to_inode(&mut dev, "/foo.bin")
+                .expect("path_to_inode");
+            let inode = reopened.read_inode(&mut dev, ino).expect("inode");
+            assert_eq!(
+                inode.size, 1024,
+                "pre-replay inode should still show original size"
+            );
+        }
+
+        // Open for writing: replay must apply the committed transaction
+        // before the handle attaches. After replay the inode size is
+        // the extended 4096.
+        {
+            let mut ext2 = Ext::open(&mut dev).expect("reopen");
+            let _ = ext2
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/foo.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open_file_rw triggers replay");
+        }
+        let reopened = Ext::open(&mut dev).expect("reopen after replay");
+        let ino = reopened
+            .path_to_inode(&mut dev, "/foo.bin")
+            .expect("path_to_inode");
+        let inode = reopened.read_inode(&mut dev, ino).expect("inode");
+        assert_eq!(
+            inode.size, 4096,
+            "replay should have applied the journaled inode-table block"
+        );
+
+        // And the journal is now clean.
+        let mut jsb_after = vec![0u8; bs];
+        dev.read_at(jsb_phys as u64 * bs64, &mut jsb_after)
+            .expect("read jsb");
+        let s_start_after = u32::from_be_bytes(jsb_after[28..32].try_into().unwrap());
+        assert_eq!(s_start_after, 0, "journal SB s_start must be cleared");
     }
 
     /// Build a fresh ext4 image (4 KiB blocks, depth-0 inline extents) with

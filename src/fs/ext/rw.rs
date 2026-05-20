@@ -1,24 +1,30 @@
-//! In-place read/write file handle for ext2/3/4 images (clean-journal bypass).
+//! In-place read/write file handle for ext2/3/4 images.
 //!
 //! Backs [`crate::fs::Filesystem::open_file_rw`] for any ext family image
-//! whose journal (if present) is clean. Writes go straight to the device
-//! for data blocks; metadata updates (inode, bitmaps, group descriptors,
-//! superblock) ride the existing staging vectors and become durable on
-//! [`FileHandle::sync`] / [`Ext::flush`].
+//! whose journal (if present) is either clean or carries only committed
+//! work that this open replays. File data blocks stream straight to the
+//! device; metadata updates (inode, bitmaps, group descriptors,
+//! extent leaf blocks) ride the existing staging vectors and become
+//! durable on [`FileHandle::sync`] / [`Ext::flush`].
 //!
-//! ## Journal handling (Path B: clean-shutdown bypass)
+//! ## Journal handling (Path A: real JBD2 transactions)
 //!
-//! ext3 and ext4 carry a JBD2 journal (`COMPAT_HAS_JOURNAL`). The proper
-//! way to mutate metadata is to wrap the change in a journal transaction
-//! (descriptor + data + commit block, `s_sequence` bump). genfs doesn't
-//! emit transactions yet. Instead we observe that a freshly-formatted
-//! image's journal is **clean** (`s_start == 0`, no `INCOMPAT_RECOVER`):
-//! there's nothing to replay, so an in-place metadata mutation that
-//! leaves the journal untouched yields the same visible state as if a
-//! no-op transaction had committed and been checkpointed. The reader
-//! verifies that precondition before opening the handle; if the journal
-//! is dirty (the image was previously interrupted) we refuse with
-//! [`crate::Error::Unsupported`].
+//! ext3 and ext4 carry a JBD2 journal (`COMPAT_HAS_JOURNAL`). On
+//! [`FileHandle::sync`] the flush path emits one JBD2 transaction
+//! covering every metadata block image that would otherwise be written
+//! directly: bitmaps, GDT, inode-table blocks containing patched inodes,
+//! and staged dir / extent-leaf / indirect blocks. The transaction
+//! ordering is descriptor → data payload → commit → journal-SB
+//! `s_start` update → checkpoint (write blocks to their FS-home
+//! locations) → journal-SB `s_start = 0`. A crash after the commit
+//! block lands but before checkpoint completes is caught at the next
+//! open: `jbd2::replay_journal` re-applies the committed transaction.
+//!
+//! On open, if `s_start != 0` we replay the log before attaching the
+//! handle; a clean journal opens with no replay work. The primary
+//! superblock is written outside the journal (the kernel does this too
+//! for many of its SB updates); free-block / free-inode counters in the
+//! SB are recomputed from the on-disk bitmaps each [`Ext::flush`].
 //!
 //! ## Extent-tree support
 //!
@@ -43,6 +49,7 @@ use super::constants::{
 use super::extent::{
     self, ExtentIdx, ExtentRun, MAX_EXTENTS_IN_INODE, MAX_INDICES_IN_INODE, MAX_LEN_PER_EXTENT,
 };
+use super::jbd2;
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::FileHandle;
@@ -1105,13 +1112,14 @@ impl<'a> Drop for Ext2FileHandle<'a> {
     }
 }
 
-/// Open a regular file for read/write at `path`. Accepts ext2/3/4 images
-/// provided any JBD2 journal is clean (`s_start == 0`, no
-/// `INCOMPAT_RECOVER`). Returns [`crate::Error::Unsupported`] if:
+/// Open a regular file for read/write at `path`. Accepts ext2/3/4 images.
+/// If the image has a JBD2 journal with committed-but-not-checkpointed
+/// transactions (`s_start != 0`), they are replayed onto the filesystem
+/// before the handle attaches. Returns [`crate::Error::Unsupported`] if:
 /// - the image is a journal device (`INCOMPAT_JOURNAL_DEV`)
-/// - the image has a journal that still has unreplayed work, or
-/// - the inode's extent tree has `depth > 0` (multi-level trees are not
-///   yet implemented; depth-0 inline trees are supported).
+/// - the inode's extent tree has `depth > 1` (depth-0 and depth-1 are
+///   supported; multi-level trees with two or more idx levels are not
+///   yet implemented).
 pub(crate) fn open_file_rw_ext<'a>(
     ext: &'a mut Ext,
     dev: &'a mut dyn BlockDevice,
@@ -1125,12 +1133,18 @@ pub(crate) fn open_file_rw_ext<'a>(
             "ext: image is an external journal device — partial writes not applicable".into(),
         ));
     }
-    // If the image has a journal, only proceed when it's clean. genfs
-    // doesn't emit JBD2 transactions yet, so a dirty journal would be
-    // mishandled (we'd leave unreplayed work in place while mutating
-    // the FS in-place).
+    // Replay any committed-but-not-checkpointed transactions before we
+    // start mutating in-place. A clean journal (s_start == 0) is a
+    // no-op replay; an interrupted commit leaves data blocks in the log
+    // ring that we apply here.
     if ext.sb.feature_compat & constants::feature::COMPAT_HAS_JOURNAL != 0 {
-        ensure_journal_clean(ext, dev)?;
+        let replayed = jbd2::replay_journal(ext, dev)?;
+        if replayed {
+            // Reload bitmaps and the in-memory group descriptors from
+            // disk: replay rewrote them on the device but our in-memory
+            // copy may have been stamped by an earlier flush.
+            ext.reload_groups_from_disk(dev)?;
+        }
     }
 
     let path_str = path
@@ -1206,72 +1220,4 @@ fn read_u32_le(buf: &[u8], off: usize) -> u32 {
 #[inline]
 fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
-}
-
-/// JBD2 v2 superblock magic at offset 0 of the journal's first block.
-const JBD2_MAGIC: u32 = 0xC03B_3998;
-/// JBD2 block-type for a superblock v1 record.
-const JBD2_BLOCKTYPE_SB_V1: u32 = 3;
-/// JBD2 block-type for a superblock v2 record.
-const JBD2_BLOCKTYPE_SB_V2: u32 = 4;
-
-/// Verify the on-disk JBD2 journal is in a clean state — no committed
-/// work needs replay. The kernel marks a journal clean by writing
-/// `s_start = 0` into its superblock at unmount time. While the image
-/// still has work to replay, `s_start` points at the head of the
-/// in-progress transaction list and the FS superblock carries
-/// `INCOMPAT_RECOVER`.
-///
-/// We require:
-/// - FS superblock: `INCOMPAT_RECOVER` is clear.
-/// - Journal SB at journal block 0: JBD2 magic, blocktype is v1 or v2,
-///   `s_start == 0`.
-fn ensure_journal_clean(ext: &Ext, dev: &mut dyn BlockDevice) -> Result<()> {
-    if ext.sb.feature_incompat & constants::feature::INCOMPAT_RECOVER != 0 {
-        return Err(crate::Error::Unsupported(
-            "ext: journal needs recovery (INCOMPAT_RECOVER set) — refusing in-place writes".into(),
-        ));
-    }
-    let jino = ext.sb.journal_inum;
-    if jino == 0 {
-        return Err(crate::Error::InvalidImage(
-            "ext: COMPAT_HAS_JOURNAL set but s_journal_inum is 0".into(),
-        ));
-    }
-    let inode = ext.read_inode(dev, jino)?;
-    let blk0 = ext.file_block(dev, &inode, 0)?;
-    if blk0 == 0 {
-        return Err(crate::Error::InvalidImage(
-            "ext: journal inode has no block 0".into(),
-        ));
-    }
-    let bs = ext.layout.block_size as usize;
-    let mut buf = vec![0u8; bs];
-    // Read straight from the device (not the staged-block cache): we
-    // want the on-disk journal state, which is what a future mount /
-    // e2fsck will see. Staged copies haven't been replayed onto the FS
-    // yet anyway.
-    dev.read_at(blk0 as u64 * bs as u64, &mut buf)?;
-    // JBD2 on-disk fields are big-endian.
-    let magic = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-    if magic != JBD2_MAGIC {
-        return Err(crate::Error::InvalidImage(format!(
-            "ext: bad JBD2 magic {magic:#010x} on journal block 0"
-        )));
-    }
-    let blocktype = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-    if blocktype != JBD2_BLOCKTYPE_SB_V1 && blocktype != JBD2_BLOCKTYPE_SB_V2 {
-        return Err(crate::Error::InvalidImage(format!(
-            "ext: journal block 0 has blocktype {blocktype} (expected v1=3 or v2=4 SB)"
-        )));
-    }
-    // s_start lives at offset 28 of the JBD2 superblock (after the 12-byte
-    // journal_header_s + s_blocksize + s_maxlen + s_first).
-    let s_start = u32::from_be_bytes(buf[28..32].try_into().unwrap());
-    if s_start != 0 {
-        return Err(crate::Error::Unsupported(format!(
-            "ext: journal is dirty (s_start={s_start}) — refusing in-place writes until JBD2 replay is implemented"
-        )));
-    }
-    Ok(())
 }

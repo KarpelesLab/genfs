@@ -41,6 +41,7 @@
 
 mod base64;
 mod codec;
+pub mod encrypted;
 mod mish;
 mod plist;
 
@@ -51,6 +52,10 @@ use std::path::Path;
 use crate::Result;
 use crate::block::BlockDevice;
 
+pub use encrypted::{
+    ENCRCDSA_MAGIC, ENCRCDSA_V2_HEADER_MIN_BYTES, EncryptedDmgBackend, EncryptedDmgHeader,
+    probe as probe_encrypted,
+};
 pub use mish::{Chunk, ChunkType, Mish};
 
 /// `koly` magic — first four bytes of the 512-byte UDIF trailer.

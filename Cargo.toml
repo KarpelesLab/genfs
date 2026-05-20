@@ -22,7 +22,7 @@ path = "src/bin/fstool/main.rs"
 # Compression codecs for SquashFS reads and `.tar.<algo>` streaming I/O.
 # Enabled by default; disable with `default-features = false` and pick
 # a subset if you want to slim the binary or avoid a C-bundled build.
-default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "dmg-bzip2", "dmg-lzfse"]
+default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
 gzip = ["dep:flate2"]
 xz = ["dep:lzma-rs"]
 lzma = ["dep:lzma-rs"]
@@ -34,6 +34,18 @@ lzo = ["dep:minilzo-rs"]
 # decoder; both gated so a slim build can drop them.
 dmg-bzip2 = ["dep:bzip2-rs"]
 dmg-lzfse = ["dep:lzfse_rust"]
+# Password-protected DMG read support (`encrcdsa` v2). Pulls in the
+# RustCrypto AES/DES/CBC/HMAC/SHA1/PBKDF2 crates — all pure Rust. Gated
+# so a slim build can drop them.
+dmg-encrypted = [
+    "dep:aes",
+    "dep:cbc",
+    "dep:cipher",
+    "dep:des",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:pbkdf2",
+]
 
 [dependencies]
 thiserror = "2"
@@ -67,6 +79,16 @@ zstd = { version = "0.13", optional = true }
 # dmg-lzfse features so a build without DMG support can drop them.
 bzip2-rs = { version = "0.1", optional = true }
 lzfse_rust = { version = "0.2", optional = true }
+
+# Encrypted DMG (encrcdsa v2) deps — all pure-Rust from the RustCrypto
+# organization. Opt-in via the `dmg-encrypted` feature.
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", optional = true, features = ["std"] }
+cipher = { version = "0.4", optional = true, features = ["block-padding"] }
+des = { version = "0.8", optional = true }
+hmac = { version = "0.12", optional = true }
+sha1 = { version = "0.10", optional = true }
+pbkdf2 = { version = "0.12", optional = true, default-features = false, features = ["hmac"] }
 
 # Needed on Unix for the BLKGETSIZE64 / DKIOCGETBLOCKCOUNT ioctls used to
 # query the size of a block device, plus the O_EXCL open flag that refuses

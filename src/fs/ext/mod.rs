@@ -2321,26 +2321,164 @@ mod tests {
 
     #[test]
     fn flex_bg_metadata_packed_in_first_group() {
-        // 128 MiB / 4 KiB = 32768 blocks total = 1 group of 32768 blocks
-        // → still single-group. Use 65536 blocks → 2 groups of 32768.
-        let mut dev = MemoryBackend::new(256u64 * 1024 * 1024);
+        // 4 groups of 32768 blocks (4 KiB blocks) with log_groups_per_flex=2
+        // packs every group's bitmap + inode-table into group 0. Reopen the
+        // image and assert that *every* non-leader group's bitmap_block and
+        // inode_table fall strictly inside the leader's metadata extent.
+        let mut dev = MemoryBackend::new(768u64 * 1024 * 1024);
+        let blocks_per_group = 8 * 4096u32;
         let opts = FormatOpts {
             kind: FsKind::Ext4,
             block_size: 4096,
-            blocks_count: 64 * 1024, // 2 groups of 32768 each
-            inodes_count: 2048,
-            log_groups_per_flex: 1,
+            blocks_count: 4 * blocks_per_group,
+            inodes_count: 4096,
+            log_groups_per_flex: 2,
             sparse_super: true,
             ..FormatOpts::default()
         };
         let ext = Ext::format_with(&mut dev, &opts).expect("format flex_bg");
-        assert_eq!(ext.layout.num_groups(), 2, "test setup must yield 2 groups");
+        assert_eq!(ext.layout.num_groups(), 4, "test setup must yield 4 groups");
         let g0 = ext.layout.groups[0];
-        let g1 = ext.layout.groups[1];
-        assert!(g1.block_bitmap < g1.start_block);
-        assert!(g1.block_bitmap > g0.start_block);
-        assert!(g1.inode_bitmap < g1.start_block);
-        assert!(g1.inode_table < g1.start_block);
+        // Leader's metadata range: [start_block + sb+gdt, data_start).
+        let leader_meta_start = g0.start_block + if g0.has_superblock { 1 + ext.layout.gdt_blocks } else { 0 };
+        let leader_meta_end = g0.data_start;
+        for gi in 1..ext.layout.num_groups() as usize {
+            let g = ext.layout.groups[gi];
+            assert!(
+                g.block_bitmap >= leader_meta_start && g.block_bitmap < leader_meta_end,
+                "group {gi} block_bitmap {} not inside leader metadata [{}, {})",
+                g.block_bitmap,
+                leader_meta_start,
+                leader_meta_end,
+            );
+            assert!(
+                g.inode_bitmap >= leader_meta_start && g.inode_bitmap < leader_meta_end,
+                "group {gi} inode_bitmap {} not inside leader metadata [{}, {})",
+                g.inode_bitmap,
+                leader_meta_start,
+                leader_meta_end,
+            );
+            assert!(
+                g.inode_table >= leader_meta_start
+                    && g.inode_table + ext.layout.inode_table_blocks <= leader_meta_end,
+                "group {gi} inode_table {} (+{} blocks) not inside leader metadata [{}, {})",
+                g.inode_table,
+                ext.layout.inode_table_blocks,
+                leader_meta_start,
+                leader_meta_end,
+            );
+        }
+
+        // Reopen and verify the same property survives an Ext::open
+        // (i.e. the on-disk group-descriptor pointers, not just the planner).
+        let reopened = Ext::open(&mut dev).expect("reopen flex_bg image");
+        assert!(
+            reopened.sb.feature_incompat & constants::feature::INCOMPAT_FLEX_BG != 0,
+            "INCOMPAT_FLEX_BG must round-trip through the superblock"
+        );
+        for gi in 1..reopened.layout.num_groups() as usize {
+            let g = reopened.layout.groups[gi];
+            assert!(
+                g.block_bitmap >= leader_meta_start && g.block_bitmap < leader_meta_end,
+                "reopened: group {gi} block_bitmap {} not in leader metadata",
+                g.block_bitmap,
+            );
+            assert!(
+                g.inode_table >= leader_meta_start
+                    && g.inode_table + reopened.layout.inode_table_blocks <= leader_meta_end,
+                "reopened: group {gi} inode_table {} not in leader metadata",
+                g.inode_table,
+            );
+        }
+    }
+
+    /// Format a small ext4 image with flex_bg enabled and run `e2fsck -fn`
+    /// on it. Skipped silently when e2fsck isn't installed on the host —
+    /// the in-memory checks above already pin the layout invariants.
+    #[test]
+    fn flex_bg_image_passes_e2fsck() {
+        use std::process::Command;
+        let e2fsck = match Command::new("sh")
+            .arg("-c")
+            .arg("command -v e2fsck")
+            .output()
+        {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+                String::from_utf8(o.stdout).unwrap().trim().to_string()
+            }
+            _ => {
+                eprintln!("skipping flex_bg_image_passes_e2fsck: e2fsck not installed");
+                return;
+            }
+        };
+
+        let blocks_per_group = 8 * 4096u32;
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 2 * blocks_per_group,
+            inodes_count: 2048,
+            log_groups_per_flex: 1,
+            sparse_super: true,
+            journal_blocks: 1024,
+            ..FormatOpts::default()
+        };
+        let size = opts.blocks_count as u64 * opts.block_size as u64;
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let mut dev =
+            crate::block::FileBackend::create(tmp.path(), size).expect("create FileBackend");
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format flex_bg");
+
+        // Plant a couple of files so e2fsck exercises the bitmaps + inode
+        // table in *both* flex members (not just the leader's slot 0).
+        let body = vec![b'A'; 8 * 1024];
+        ext.add_file_to_streaming(
+            &mut dev,
+            constants::INO_ROOT_DIR,
+            b"a.bin",
+            &mut body.as_slice(),
+            body.len() as u64,
+            FileMeta {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                atime: 0,
+                ctime: 0,
+            },
+        )
+        .expect("add file a.bin");
+        ext.add_file_to_streaming(
+            &mut dev,
+            constants::INO_ROOT_DIR,
+            b"b.bin",
+            &mut body.as_slice(),
+            body.len() as u64,
+            FileMeta {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                atime: 0,
+                ctime: 0,
+            },
+        )
+        .expect("add file b.bin");
+        ext.flush(&mut dev).expect("flush");
+        BlockDevice::sync(&mut dev).expect("sync");
+        drop(dev);
+
+        let out = Command::new(&e2fsck)
+            .arg("-fn")
+            .arg(tmp.path())
+            .output()
+            .expect("run e2fsck");
+        assert!(
+            out.status.success(),
+            "e2fsck failed on flex_bg image:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
     }
 
     #[test]

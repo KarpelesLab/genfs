@@ -192,9 +192,20 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
             squashfs_format_opts(fs),
         ),
         "xfs" => build_bare_via_trait::<crate::fs::xfs::Xfs>(fs, output, xfs_format_opts(fs)?),
+        "iso" | "iso9660" => {
+            build_bare_via_trait::<crate::fs::iso9660::Iso9660>(fs, output, iso9660_format_opts(fs))
+        }
         other => Err(crate::Error::InvalidArgument(format!(
             "spec: unknown filesystem type {other:?}"
         ))),
+    }
+}
+
+fn iso9660_format_opts(fs: &FilesystemSpec) -> crate::fs::iso9660::FormatOpts {
+    crate::fs::iso9660::FormatOpts {
+        volume_id: fs.volume_label.clone().unwrap_or_else(|| "FSTOOL".into()),
+        application_id: "fstool".into(),
+        ..crate::fs::iso9660::FormatOpts::default()
     }
 }
 

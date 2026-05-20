@@ -452,6 +452,13 @@ fn repack_cmd(
                     needed.div_ceil(512) * 512
                 }
                 "tar" => tar_size_upper_bound(src_dev, &src_fs)?,
+                "iso" | "iso9660" => {
+                    // ISO writer needs ~32 MiB headroom for a small tree.
+                    // Real sizing happens during flush; we just want enough
+                    // backing image to write into.
+                    let bytes = sum_source_file_bytes(src_dev, &src_fs)?;
+                    bytes.saturating_add(32 * 1024 * 1024)
+                }
                 other => {
                     return Err(fstool::Error::InvalidArgument(format!(
                         "repack: unknown --fs-type {other:?}"
@@ -463,6 +470,14 @@ fn repack_cmd(
             // we still upper-bound the destination from the source.
             (None, false) => match lower.as_str() {
                 "tar" => tar_size_upper_bound(src_dev, &src_fs)?,
+                "iso" | "iso9660" => {
+                    // ISO writer needs enough room for descriptors,
+                    // path tables, dir records, and file data. Use a
+                    // generous upper bound — the writer leaves the
+                    // unused tail of the backing file alone.
+                    let bytes = sum_source_file_bytes(src_dev, &src_fs).unwrap_or(0);
+                    bytes.saturating_add(32 * 1024 * 1024)
+                }
                 _ => src_total,
             },
         };
@@ -563,6 +578,14 @@ fn repack_cmd(
                     &fstool::fs::xfs::format::FormatOpts::default(),
                     src,
                 )?;
+            }
+            "iso" | "iso9660" => {
+                let opts = fstool::fs::iso9660::FormatOpts {
+                    volume_id: "FSTOOL".into(),
+                    application_id: "fstool".into(),
+                    ..fstool::fs::iso9660::FormatOpts::default()
+                };
+                repack_via_trait::<fstool::fs::iso9660::Iso9660>(dst_dev.as_mut(), &opts, src)?;
             }
             other => {
                 return Err(fstool::Error::InvalidArgument(format!(

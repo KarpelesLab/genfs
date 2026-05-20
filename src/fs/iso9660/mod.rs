@@ -79,11 +79,11 @@ pub fn probe(dev: &mut dyn BlockDevice) -> bool {
     &buf[1..6] == ISO_MAGIC
 }
 
-/// Top-level handle for an opened ISO 9660 volume. Owns the parsed
-/// descriptors but holds no `BlockDevice` reference — every operation
-/// takes one explicitly, matching the rest of the project.
-#[derive(Debug, Clone)]
+/// Top-level handle for an ISO 9660 volume. Holds either parsed
+/// descriptors (when opened from a device) or a buffered writer (when
+/// constructed via `format`) — `repack` flows through the writer side.
 pub struct Iso9660 {
+    /// PVD parsed from disk (defaults are zero-filled when in writer mode).
     pub pvd: PrimaryVolumeDescriptor,
     /// First Joliet SVD found, when present.
     pub joliet: Option<SupplementaryVolumeDescriptor>,
@@ -93,6 +93,9 @@ pub struct Iso9660 {
     /// root directory record. Decides whether we apply RR overrides on
     /// names / attrs during `list`.
     pub rock_ridge: bool,
+    /// Present when the handle was built via `format`; absorbs all
+    /// `create_*` calls until `flush()` lays out the image.
+    writer: Option<Iso9660Writer>,
 }
 
 impl Iso9660 {
@@ -157,6 +160,36 @@ impl Iso9660 {
             joliet,
             boot,
             rock_ridge,
+            writer: None,
+        })
+    }
+
+    /// Build a fresh, writable handle. Pass options through `opts`;
+    /// drive `create_*` to buffer entries; call `flush()` to lay out
+    /// the image. Used by `repack --fs-type iso`.
+    pub fn format(_dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Self> {
+        Ok(Self {
+            pvd: PrimaryVolumeDescriptor {
+                system_id: String::new(),
+                volume_id: opts.volume_id.clone(),
+                volume_space_size: 0,
+                logical_block_size: SECTOR_SIZE as u16,
+                path_table_size: 0,
+                l_path_table_lba: 0,
+                m_path_table_lba: 0,
+                root: DirRecord {
+                    len_dr: 34,
+                    extent_lba: 0,
+                    length: 0,
+                    flags: 0x02,
+                    identifier: vec![0u8],
+                    system_use: Vec::new(),
+                },
+            },
+            joliet: None,
+            boot: None,
+            rock_ridge: opts.rock_ridge,
+            writer: Some(Iso9660Writer::new(opts.clone())),
         })
     }
 
@@ -262,6 +295,131 @@ impl Iso9660 {
             rec.extent_lba,
             rec.length,
         )))
+    }
+}
+
+// ----------------------------------------------------------------------
+// `crate::fs::Filesystem` / `FilesystemFactory` impls — bridges ISO 9660
+// into the generic repack walker. ISO is repack-only on the write side:
+// every `create_*` buffers an entry, `flush()` lays out the image.
+// ----------------------------------------------------------------------
+
+impl crate::fs::FilesystemFactory for Iso9660 {
+    type FormatOpts = FormatOpts;
+
+    fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
+        Self::format(dev, opts)
+    }
+
+    fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        Self::open(dev)
+    }
+}
+
+impl crate::fs::Filesystem for Iso9660 {
+    fn create_file(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "iso9660: read-only handle (no in-place modification)".into(),
+                )
+            })?
+            .add_file(path, src, meta)
+    }
+
+    fn create_dir(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "iso9660: read-only handle (no in-place modification)".into(),
+                )
+            })?
+            .add_dir(path, meta)
+    }
+
+    fn create_symlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        target: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "iso9660: read-only handle (no in-place modification)".into(),
+                )
+            })?
+            .add_symlink(path, target, meta)
+    }
+
+    fn create_device(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "iso9660: read-only handle (no in-place modification)".into(),
+                )
+            })?
+            .add_device(path, kind, major, minor, meta)
+    }
+
+    fn remove(&mut self, _dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "iso9660: read-only handle (no in-place modification)".into(),
+                )
+            })?
+            .remove_entry(path)
+    }
+
+    fn list(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<Vec<DirEntry>> {
+        let p = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("iso9660: non-UTF-8 path".into()))?;
+        self.list_path(dev, p)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        let p = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("iso9660: non-UTF-8 path".into()))?;
+        self.open_file_reader(dev, p)
+    }
+
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if let Some(w) = self.writer.as_mut() {
+            w.flush(dev)?;
+        }
+        Ok(())
     }
 }
 

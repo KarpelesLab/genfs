@@ -47,6 +47,7 @@ pub mod file;
 pub mod format;
 pub mod inode;
 pub mod nat;
+pub mod rw;
 pub mod superblock;
 pub mod write;
 
@@ -452,6 +453,17 @@ impl crate::fs::Filesystem for F2fs {
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("f2fs: non-UTF-8 path".into()))?;
         self.open_file_reader(dev, s)
+    }
+
+    fn open_file_rw<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        meta: Option<crate::fs::FileMeta>,
+    ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
+        let handle = rw::F2fsFileHandle::open(self, dev, path, flags, meta)?;
+        Ok(Box::new(handle))
     }
 
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {

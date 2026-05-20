@@ -280,7 +280,7 @@ impl Writer {
     }
 
     /// Allocate one DATA block (CURSEG_HOT_DATA). Same spillover behavior.
-    fn alloc_data_block(&mut self) -> Result<u32> {
+    pub(crate) fn alloc_data_block(&mut self) -> Result<u32> {
         let active_seg = *self
             .data_segments
             .last()
@@ -421,8 +421,111 @@ impl Writer {
         Ok((total, blocks_alloc))
     }
 
+    /// Look up the currently-mapped physical block for the `idx`-th 4 KiB
+    /// block of `nid`'s body, consulting only in-memory writer state.
+    /// Returns `NULL_ADDR` (0) for unmapped indices and any non-zero
+    /// `i_addr` / direct-node / indirect-node / triple-indirect slot
+    /// value otherwise. Used by [`super::rw::F2fsFileHandle`] when it
+    /// needs to read a block whose pointer was just placed by
+    /// `place_data_block` but hasn't been flushed yet.
+    pub(crate) fn current_data_block(&self, nid: u32, idx: u64) -> Result<u32> {
+        if idx < ADDRS_PER_INODE as u64 {
+            let ino = self
+                .inodes
+                .get(&nid)
+                .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost nid".into()))?;
+            return Ok(ino.i_addr[idx as usize]);
+        }
+        let mut rel = idx - ADDRS_PER_INODE as u64;
+
+        for nid_slot in [NID_DIRECT_1, NID_DIRECT_2] {
+            let span = ADDRS_PER_BLOCK as u64;
+            if rel < span {
+                let ino = self
+                    .inodes
+                    .get(&nid)
+                    .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost nid".into()))?;
+                let dnid = ino.i_nid[nid_slot];
+                if dnid == 0 {
+                    return Ok(0);
+                }
+                let d = self.direct_nodes.get(&dnid).ok_or_else(|| {
+                    crate::Error::InvalidImage("f2fs: ghost direct node".into())
+                })?;
+                return Ok(d.addrs[rel as usize]);
+            }
+            rel -= span;
+        }
+
+        for nid_slot in [NID_INDIRECT_1, NID_INDIRECT_2] {
+            let span = (NIDS_PER_BLOCK as u64) * (ADDRS_PER_BLOCK as u64);
+            if rel < span {
+                let outer = (rel / ADDRS_PER_BLOCK as u64) as usize;
+                let inner = (rel % ADDRS_PER_BLOCK as u64) as usize;
+                let ino = self
+                    .inodes
+                    .get(&nid)
+                    .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost nid".into()))?;
+                let inid = ino.i_nid[nid_slot];
+                if inid == 0 {
+                    return Ok(0);
+                }
+                let ind = self.indirect_nodes.get(&inid).ok_or_else(|| {
+                    crate::Error::InvalidImage("f2fs: ghost indirect node".into())
+                })?;
+                let dnid = ind.nids[outer];
+                if dnid == 0 {
+                    return Ok(0);
+                }
+                let d = self.direct_nodes.get(&dnid).ok_or_else(|| {
+                    crate::Error::InvalidImage("f2fs: ghost direct node".into())
+                })?;
+                return Ok(d.addrs[inner]);
+            }
+            rel -= span;
+        }
+
+        let triple_span = (NIDS_PER_BLOCK as u64).pow(2) * (ADDRS_PER_BLOCK as u64);
+        if rel < triple_span {
+            let outer = (rel / ((NIDS_PER_BLOCK as u64) * (ADDRS_PER_BLOCK as u64))) as usize;
+            let mid = ((rel / (ADDRS_PER_BLOCK as u64)) % (NIDS_PER_BLOCK as u64)) as usize;
+            let inner = (rel % (ADDRS_PER_BLOCK as u64)) as usize;
+            let ino = self
+                .inodes
+                .get(&nid)
+                .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost nid".into()))?;
+            let top_nid = ino.i_nid[NID_TRIPLE_INDIRECT];
+            if top_nid == 0 {
+                return Ok(0);
+            }
+            let top = self.indirect_nodes.get(&top_nid).ok_or_else(|| {
+                crate::Error::InvalidImage("f2fs: ghost triple-top indirect node".into())
+            })?;
+            let mid_nid = top.nids[outer];
+            if mid_nid == 0 {
+                return Ok(0);
+            }
+            let mid_ind = self.indirect_nodes.get(&mid_nid).ok_or_else(|| {
+                crate::Error::InvalidImage("f2fs: ghost triple-mid indirect node".into())
+            })?;
+            let dnid = mid_ind.nids[mid];
+            if dnid == 0 {
+                return Ok(0);
+            }
+            let d = self
+                .direct_nodes
+                .get(&dnid)
+                .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost direct node".into()))?;
+            return Ok(d.addrs[inner]);
+        }
+
+        Err(crate::Error::Unsupported(format!(
+            "f2fs: logical block {idx} exceeds maximum file size"
+        )))
+    }
+
     /// Stamp `phys` into the right slot of `nid`'s pointer tree.
-    fn place_data_block(&mut self, nid: u32, idx: u64, phys: u32) -> Result<()> {
+    pub(crate) fn place_data_block(&mut self, nid: u32, idx: u64, phys: u32) -> Result<()> {
         if idx < ADDRS_PER_INODE as u64 {
             let ino = self
                 .inodes

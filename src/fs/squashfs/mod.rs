@@ -575,6 +575,43 @@ impl Squashfs {
         )))
     }
 
+    /// Open a regular file for random-access reads — same backend as
+    /// [`Self::open_file_reader`] but returning a `Read + Seek + len`
+    /// handle that caches the last decompressed block (cheap
+    /// re-reads after small seeks, single-block cost on a cross-block
+    /// jump).
+    pub fn open_file_read_handle<'a>(
+        &self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<file::SquashfsFileReadHandle<'a>> {
+        let resolved = directory::resolve_path(
+            dev,
+            self.sb.inode_table_start,
+            self.sb.directory_table_start,
+            self.sb.compression,
+            self.sb.root_inode,
+            self.sb.block_size,
+            path,
+        )?;
+        let file_inode = match resolved {
+            inode::Inode::File(f) => f,
+            _ => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "squashfs: {path:?} is not a regular file"
+                )));
+            }
+        };
+        Ok(file::SquashfsFileReadHandle::new(
+            dev,
+            &file_inode,
+            self.sb.compression,
+            self.sb.fragment_table_start,
+            self.sb.fragment_count,
+            self.sb.block_size,
+        ))
+    }
+
     /// Read a symbolic link's target. The target lives inline in the
     /// inode, so no data-block decompression is involved.
     pub fn read_symlink(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<String> {
@@ -719,6 +756,18 @@ impl crate::fs::Filesystem for Squashfs {
             .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
         let r = self.open_file_reader(dev, s)?;
         Ok(Box::new(r))
+    }
+
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        let h = self.open_file_read_handle(dev, s)?;
+        Ok(Box::new(h))
     }
 
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
@@ -1467,5 +1516,54 @@ mod tests {
         // Spot-check one to confirm the entry kind decoded correctly.
         assert!(listing.iter().any(|e| e.name == "sym_00000000"));
         assert!(listing.iter().any(|e| e.name == "sym_00003999"));
+    }
+
+    /// `open_file_ro` returns a Read+Seek+len handle backed by the
+    /// same block walker as `open_file_reader`, but with a single
+    /// decompressed-block cache so backward seeks within a block
+    /// reuse the work. The seek+read round-trip lands exact bytes.
+    #[test]
+    fn open_file_ro_random_seek_round_trip() {
+        use crate::fs::Filesystem;
+        use std::io::{Read, Seek, SeekFrom};
+        let body: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let mut s = Squashfs::format(&mut dev, &FormatOpts::default()).unwrap();
+        s.create_file(
+            &mut dev,
+            "/data.bin",
+            crate::fs::FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(body.clone())),
+                len: body.len() as u64,
+            },
+            EntryMeta::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        s.flush(&mut dev).unwrap();
+
+        let mut s = Squashfs::open(&mut dev).unwrap();
+        let mut h = s
+            .open_file_ro(&mut dev, std::path::Path::new("/data.bin"))
+            .unwrap();
+        assert_eq!(h.len(), body.len() as u64);
+        // Read from start.
+        let mut chunk = [0u8; 64];
+        h.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk[..], &body[..64]);
+        // Seek mid-file, read.
+        h.seek(SeekFrom::Start(1000)).unwrap();
+        let mut chunk = [0u8; 32];
+        h.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk[..], &body[1000..1032]);
+        // Backward seek + reread (exercises cache).
+        h.seek(SeekFrom::Current(-32)).unwrap();
+        h.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk[..], &body[1000..1032]);
+        // Seek past end caps at len.
+        let where_ = h.seek(SeekFrom::End(100)).unwrap();
+        assert_eq!(where_, body.len() as u64);
+        let n = h.read(&mut chunk).unwrap();
+        assert_eq!(n, 0);
     }
 }

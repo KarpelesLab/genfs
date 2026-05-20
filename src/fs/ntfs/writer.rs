@@ -167,7 +167,54 @@ impl super::Ntfs {
         let layout = format::format_volume(dev, opts)?;
         let mut ntfs = Self::open(dev)?;
         ntfs.writer = Some(WriterState::new(layout));
+        // Stamp the root directory's $I30 with entries for the canonical
+        // system files (records 0..=15 except the root itself). Real-world
+        // NTFS volumes index these in `$I30`; `ntfs-3g` refuses to mount a
+        // volume whose root index doesn't carry them.
+        ntfs.index_system_files_in_root(dev)?;
         Ok(ntfs)
+    }
+
+    /// Build $I30 index entries in the root directory for each system MFT
+    /// record (records 0..=15) so `ntfs-3g` and other drivers find them
+    /// under "/". The entries are pulled from each system record's own
+    /// `$FILE_NAME` attribute so the indexed name + size + flags match
+    /// exactly. Called once at the tail of `format()`.
+    ///
+    /// Skips:
+    /// * Record 5 (the root itself — avoids self-reference in `$I30`).
+    /// * Records whose MFT slot couldn't be located or doesn't carry a
+    ///   resident `$FILE_NAME` (defensive — shouldn't happen post-format).
+    fn index_system_files_in_root(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        // Records 0..=15 minus the root (5). Order matches the MFT
+        // record numbering; ntfs-3g doesn't require any particular order
+        // here — the file system sorts by name on first mount.
+        const SYSTEM_RECS: &[u64] = &[0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let (rec_size, sector_size) = {
+            let w = self.writer.as_ref().expect("writer present");
+            (
+                w.layout.mft_record_size as usize,
+                w.layout.bytes_per_sector as usize,
+            )
+        };
+        for &rec_no in SYSTEM_RECS {
+            let off = self
+                .writer
+                .as_ref()
+                .expect("writer present")
+                .mft_offset(rec_no)?;
+            let mut rec = vec![0u8; rec_size];
+            dev.read_at(off, &mut rec)?;
+            mft::apply_fixup(&mut rec, sector_size)?;
+            let Some(fn_value) = extract_resident_attr_value(&rec, TYPE_FILE_NAME, "") else {
+                continue;
+            };
+            let is_dir = mft::RecordHeader::parse(&rec)
+                .map(|h| h.is_directory())
+                .unwrap_or(false);
+            self.add_entry_to_dir(dev, REC_ROOT, &fn_value, rec_no, is_dir)?;
+        }
+        Ok(())
     }
 
     /// Create a regular file at `path` populated from `src` with metadata `meta`.

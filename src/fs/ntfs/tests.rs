@@ -1221,3 +1221,99 @@ fn writer_format_emits_upcase_table() {
     let hdr = mft::RecordHeader::parse(&buf).unwrap();
     assert!(hdr.is_in_use());
 }
+
+#[test]
+fn writer_root_index_contains_system_files() {
+    // `format()` populates the root's `$I30` with index entries for every
+    // canonical system MFT record (0..=15 minus the root itself). The
+    // cross-FS view filters `$`-names out of `list_path("/")`, but the
+    // on-disk index does carry them — verifies the layout that ntfs-3g
+    // expects.
+    let (mut dev, mut ntfs) = fresh_volume(16 * 1024 * 1024);
+    ntfs.flush(&mut dev).unwrap();
+
+    // Re-open and inspect the raw root directory entries.
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let raw = ntfs2.read_directory(&mut dev, MFT_RECORD_ROOT).unwrap();
+    let names: std::collections::HashSet<String> = raw
+        .iter()
+        .filter_map(|e| e.file_name.as_ref().map(|f| f.name.clone()))
+        .collect();
+
+    // Every canonical NTFS system file should be indexed in the root.
+    for expected in &[
+        "$MFT",
+        "$MFTMirr",
+        "$LogFile",
+        "$Volume",
+        "$AttrDef",
+        "$Bitmap",
+        "$Boot",
+        "$BadClus",
+        "$Secure",
+        "$UpCase",
+        "$Extend",
+    ] {
+        assert!(
+            names.contains(*expected),
+            "expected root $I30 to index {expected:?}, got {:?}",
+            names
+        );
+    }
+    // The root must NOT index itself.
+    assert!(
+        !raw.iter()
+            .any(|e| (e.file_ref & 0x0000_FFFF_FFFF_FFFF) == MFT_RECORD_ROOT),
+        "root must not self-reference in its own $I30"
+    );
+
+    // The cross-FS `list_path("/")` must hide these system files so the
+    // generic walker keeps seeing a clean user-facing view.
+    let user_view = ntfs2.list_path(&mut dev, "/").unwrap();
+    for entry in &user_view {
+        assert!(
+            !entry.name.starts_with('$'),
+            "list_path(\"/\") leaked system file {:?}",
+            entry.name
+        );
+    }
+}
+
+#[test]
+fn writer_root_index_keeps_system_files_after_user_files_added() {
+    // Add several user files to force an $INDEX_ROOT → $INDEX_ALLOCATION
+    // promotion. The system-file entries planted by `format()` must
+    // survive promotion and remain visible in the root's index.
+    let (mut dev, mut ntfs) = fresh_volume(16 * 1024 * 1024);
+    for i in 0..10 {
+        let path = format!("/u_{i}.txt");
+        ntfs.create_file(
+            &mut dev,
+            &path,
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    ntfs.flush(&mut dev).unwrap();
+
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let raw = ntfs2.read_directory(&mut dev, MFT_RECORD_ROOT).unwrap();
+    let names: std::collections::HashSet<String> = raw
+        .iter()
+        .filter_map(|e| e.file_name.as_ref().map(|f| f.name.clone()))
+        .collect();
+    for expected in &["$MFT", "$Volume", "$Bitmap", "$UpCase", "$Extend"] {
+        assert!(
+            names.contains(*expected),
+            "post-promotion root $I30 missing {expected:?}"
+        );
+    }
+    for i in 0..10 {
+        let want = format!("u_{i}.txt");
+        assert!(names.contains(&want), "user file {want:?} missing");
+    }
+}

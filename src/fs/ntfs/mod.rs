@@ -538,14 +538,18 @@ impl Ntfs {
     ) -> Result<Vec<crate::fs::DirEntry>> {
         let rec = self.lookup_path(dev, path)?;
         let entries = self.read_directory(dev, rec)?;
+        // At the root, `$I30` indexes the canonical system files
+        // (`$MFT`, `$Volume`, `$Bitmap`, …, `$Extend`, the reserved
+        // slots 12..15). Hide them from the cross-FS view so the
+        // generic walker only sees user-visible entries — they're
+        // still present on disk for `ntfs-3g` / chkdsk to find.
+        let is_root = rec == MFT_RECORD_ROOT;
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
             if let Some(fname) = entry.file_name {
-                // Skip the special "." / system files at root; the
-                // index walker doesn't synthesize "." or "..", but it
-                // does include reserved entries below 24 if you walk
-                // the root. Filter out names starting with a dollar
-                // sign at the root only to match the cross-FS view.
+                if is_root && fname.name.starts_with('$') {
+                    continue;
+                }
                 let kind = if fname.is_directory() {
                     crate::fs::EntryKind::Dir
                 } else {

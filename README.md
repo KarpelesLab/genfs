@@ -34,7 +34,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | XFS        | ✅    | ✅     | shortform + block / leaf / node dirs + BMBT; writer passes `xfs_repair -n` single + multi-AG; B-tree dirs deferred |
 | HFS+/HFSX  | ✅    | ✅     | inline + extents-overflow, symlinks, hard links; writer passes `fsck.hfsplus` with optional journal stub |
 | APFS       | ✅    | 🚧    | multi-level omap + fs-tree; writer is single-volume + stub spaceman (no snapshots / encryption); not yet `fsck_apfs` clean |
-| NTFS       | ✅    | 🚧    | MFT, attributes, $DATA + ADS, indexes; xattr map; writer passes `ntfsfix --no-action` but isn't `ntfs-3g`-mountable yet (system files in root `$I30` pending) |
+| NTFS       | ✅    | 🚧    | MFT, attributes, $DATA + ADS, indexes; xattr map; writer indexes system files (records 0..=15) in root `$I30`; `$Secure` indirection still empty so `ntfs-3g` mount remains blocked |
 | F2FS       | ✅    | ✅     | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs` |
 | SquashFS   | ✅    | ✅     | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs` |
 | ISO 9660   | ✅    | ✅     | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only writer (no in-place modify) |
@@ -326,8 +326,11 @@ Things explicitly out of scope today, in rough order of likely-to-change:
   (repack-only — `Filesystem::supports_mutation()` returns `false`,
   so `add`/`rm` fail fast with an actionable error); APFS isn't
   trait-wired at all (Builder pattern).
-- NTFS writer: produced image isn't `ntfs-3g`-mountable — root `$I30`
-  doesn't index the system files yet; `ntfsfix --no-action` is clean.
+- NTFS writer: produced image isn't `ntfs-3g`-mountable. Root `$I30`
+  now indexes the canonical system files (records 0..=15) on `format()`,
+  but the empty `$Secure:$SDS` / `$SDH` / `$SII` indexes still block
+  the `ntfs-3g` mount path (it opens `$Secure` early and refuses the
+  volume when the indexes are empty).
 - NTFS reader: compressed and encrypted `$DATA`, `$ATTRIBUTE_LIST`
   spill, and `$Secure` security-descriptor indirection beyond what
   the resident path handles all return `Unsupported`.

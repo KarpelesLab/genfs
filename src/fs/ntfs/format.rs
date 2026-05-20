@@ -22,6 +22,12 @@
 //! an empty directory; we do not populate `$ObjId / $Quota / $Reparse /
 //! $UsnJrnl` — Windows will treat that as a v3.0 volume.
 //!
+//! After the system records are written, `Ntfs::format` stages index
+//! entries for records 0..=15 (minus the root itself) into the root
+//! directory's `$I30`. That matches how real-world NTFS volumes are laid
+//! out — `ntfs-3g` and chkdsk walk `$I30` to discover the system files
+//! even though most users never list them directly.
+//!
 //! The internal helper objects defined here are also used by
 //! `super::writer::WriterState` for runtime mutations.
 

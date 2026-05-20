@@ -1049,6 +1049,22 @@ impl crate::fs::Filesystem for Apfs {
         Ok(Box::new(r))
     }
 
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
+        // `open_file_reader` already gates on `read_state()` — it
+        // returns `Unsupported` when we're in PendingWrite mode.
+        // The ApfsFileReader is Read+Seek+FileReadHandle by virtue
+        // of the impls just above.
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+        let h = self.open_file_reader(dev, s)?;
+        Ok(Box::new(h))
+    }
+
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         // Take ownership of the pending buffer so we can drop our
         // borrow on `self.state` before re-opening below.
@@ -1232,6 +1248,32 @@ pub struct ApfsFileReader<'a> {
     size: u64,
     /// Logical cursor in the file.
     cursor: u64,
+}
+
+impl<'a> std::io::Seek for ApfsFileReader<'a> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target_i128 = match pos {
+            std::io::SeekFrom::Start(n) => n as i128,
+            std::io::SeekFrom::Current(d) => self.cursor as i128 + d as i128,
+            std::io::SeekFrom::End(d) => self.size as i128 + d as i128,
+        };
+        if target_i128 < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "apfs: seek to negative offset",
+            ));
+        }
+        // Clamp past-EOF so subsequent reads return 0 instead of
+        // reading random bytes past the end of the file's extents.
+        self.cursor = (target_i128 as u128).min(self.size as u128) as u64;
+        Ok(self.cursor)
+    }
+}
+
+impl<'a> crate::fs::FileReadHandle for ApfsFileReader<'a> {
+    fn len(&self) -> u64 {
+        self.size
+    }
 }
 
 impl<'a> std::io::Read for ApfsFileReader<'a> {
@@ -1587,6 +1629,62 @@ mod tests {
             .read_to_end(&mut buf)
             .unwrap();
         assert_eq!(buf, b"top-level");
+    }
+
+    /// `open_file_ro` returns a Read+Seek+len handle in Read state;
+    /// seeking + reading lands the right bytes.
+    #[test]
+    fn open_file_ro_random_seek_round_trip() {
+        use crate::fs::{FileMeta, FileSource, Filesystem};
+        use std::io::{Read, Seek, SeekFrom};
+
+        let total_blocks = 128u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let body: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
+        let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Vol").unwrap();
+        apfs.create_file(
+            &mut dev,
+            std::path::Path::new("/data.bin"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(body.clone())),
+                len: body.len() as u64,
+            },
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        apfs.flush(&mut dev).unwrap();
+
+        let mut h = apfs
+            .open_file_ro(&mut dev, std::path::Path::new("/data.bin"))
+            .unwrap();
+        assert_eq!(h.len(), body.len() as u64);
+        // Seek mid-file + read.
+        h.seek(SeekFrom::Start(1000)).unwrap();
+        let mut chunk = [0u8; 32];
+        h.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk[..], &body[1000..1032]);
+        // SeekFrom::End past EOF clamps; read returns 0.
+        let where_ = h.seek(SeekFrom::End(100)).unwrap();
+        assert_eq!(where_, body.len() as u64);
+        let n = h.read(&mut chunk).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// `open_file_ro` in pending-write (pre-flush) mode is
+    /// Unsupported.
+    #[test]
+    fn open_file_ro_refused_pre_flush() {
+        use crate::fs::Filesystem;
+        let total_blocks = 64u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Vol").unwrap();
+        let err = match apfs.open_file_ro(&mut dev, std::path::Path::new("/x")) {
+            Ok(_) => panic!("open_file_ro must refuse in pending-write mode"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, crate::Error::Unsupported(_)));
     }
 
     /// Once flushed, further `create_*` calls return Unsupported (the

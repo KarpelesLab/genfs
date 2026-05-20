@@ -242,7 +242,7 @@ impl FsTreeCtx {
 
     /// Resolve a virtual oid to a physical block address by walking the
     /// volume omap.
-    fn resolve_vid<F>(&mut self, vid: u64, read_block: &mut F) -> crate::Result<u64>
+    pub(super) fn resolve_vid<F>(&mut self, vid: u64, read_block: &mut F) -> crate::Result<u64>
     where
         F: FnMut(u64, &mut [u8]) -> crate::Result<()>,
     {

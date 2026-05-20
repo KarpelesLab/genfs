@@ -78,6 +78,7 @@ pub mod fstree;
 pub mod jrec;
 pub mod obj;
 pub mod omap;
+pub(crate) mod rw;
 pub mod snap;
 pub(crate) mod spaceman;
 pub mod superblock;
@@ -137,10 +138,52 @@ enum ApfsState {
     /// Pending-write mode: buffered `create_*` ops waiting for
     /// [`crate::fs::Filesystem::flush`].
     PendingWrite(PendingWrite),
+    /// Reopen-and-write mode: the volume is parsed (read state nested
+    /// inside) and we additionally carry the checkpoint metadata
+    /// needed to write a new NXSB at the next xp_desc slot via
+    /// [`crate::fs::Filesystem::open_file_rw`] + `sync`.
+    Write(WriteState),
+}
+
+/// Reopen-and-write state: a parsed read state plus enough writer
+/// scaffolding to commit a fresh checkpoint.
+pub(crate) struct WriteState {
+    /// Underlying parsed volume — used for fs-tree reads inside the
+    /// rw handle and for the read APIs.
+    pub(crate) read: ReadState,
+    /// Volume name (mirrors the outer [`Apfs::volume_name`]). Recomputed
+    /// from the APSB at open time.
+    pub(crate) volume_name: String,
+    /// Container UUID from the live NXSB.
+    pub(crate) container_uuid: [u8; 16],
+    /// Volume UUID from the APSB.
+    pub(crate) volume_uuid: [u8; 16],
+    /// Total blocks in the container (`nx_block_count`).
+    pub(crate) total_blocks: u64,
+    /// `next_oid` to assign on the next mutation (mirrors APSB's value).
+    pub(crate) next_oid: u64,
+    /// `apfs_num_files` snapshotted at open time. Incremented locally
+    /// on each new create — currently not used because rw is read+write
+    /// on existing files only, but kept so future create paths can
+    /// inherit cleanly.
+    pub(crate) num_files: u64,
+    /// `apfs_num_directories` (excluding root) snapshotted at open.
+    pub(crate) num_directories: u64,
+    /// `apfs_num_symlinks` snapshotted at open.
+    pub(crate) num_symlinks: u64,
+    /// Current checkpoint xid (the one driving the read view).
+    pub(crate) cur_xid: u64,
+    /// Next free xp_desc slot inside the xp_desc area. The new NXSB
+    /// will be written here on sync; we then advance this pointer.
+    pub(crate) next_xp_desc_slot: u64,
+    /// High-water mark for bump allocation. Computed at open time from
+    /// the spaceman's used-block count and grown by every new metadata
+    /// or extent block.
+    pub(crate) bump_high_water: u64,
 }
 
 /// Read-mode caches: everything needed to walk the fs-tree.
-struct ReadState {
+pub(crate) struct ReadState {
     /// `apfs_snap_meta_tree_oid` — physical block of the snapshot
     /// metadata B-tree root, or zero when the volume has no snapshots.
     snap_meta_tree_oid: u64,
@@ -210,6 +253,7 @@ impl std::fmt::Debug for Apfs {
         let state_name = match &self.state {
             ApfsState::Read(_) => "Read",
             ApfsState::PendingWrite(_) => "PendingWrite",
+            ApfsState::Write(_) => "Write",
         };
         f.debug_struct("Apfs")
             .field("block_size", &self.block_size)
@@ -269,12 +313,13 @@ pub struct SnapshotInfo {
 }
 
 impl Apfs {
-    /// Return `&ReadState` if in read mode, else an error. Used by every
-    /// reader API to refuse cleanly when the [`Apfs`] is still buffering
-    /// writes.
+    /// Return `&ReadState` if in read or write mode, else an error.
+    /// Used by every reader API to refuse cleanly when the [`Apfs`]
+    /// is still buffering writes.
     fn read_state(&self) -> Result<&ReadState> {
         match &self.state {
             ApfsState::Read(r) => Ok(r),
+            ApfsState::Write(w) => Ok(&w.read),
             ApfsState::PendingWrite(_) => Err(crate::Error::Unsupported(
                 "apfs: filesystem is in pending-write mode; call flush() first".into(),
             )),
@@ -339,6 +384,89 @@ impl Apfs {
                 crate::Error::InvalidImage("apfs: container has no volumes in nx_fs_oid".into())
             })?;
         Self::open_volume_with_ctx(dev, &ctx, vol_index, None)
+    }
+
+    /// Open a previously-flushed APFS container for in-place mutation.
+    ///
+    /// Unlike [`Apfs::open`], the returned [`Apfs`] is in **write
+    /// state**: [`crate::fs::Filesystem::open_file_rw`] can be invoked
+    /// on existing files, and `sync()` on the returned handle commits
+    /// a new on-disk checkpoint (a fresh NXSB written into the next
+    /// xp_desc slot, leaving the previous valid checkpoint intact for
+    /// crash safety).
+    ///
+    /// Current scope: works on a freshly-formatted-then-flushed image
+    /// and supports up to `XP_DESC_BLOCKS - 2` subsequent checkpoint
+    /// commits before the xp_desc area fills up; create / remove are
+    /// still refused. See [`mod@rw`] for the per-feature limits.
+    pub fn open_writable(dev: &mut dyn BlockDevice) -> Result<Self> {
+        let read_only = Apfs::open(dev)?;
+        // Re-decode the container so we can pull the checkpoint
+        // metadata we need (xid, xp_desc_index, container UUID).
+        let ctx = load_container(dev)?;
+        let block_size = ctx.block_size;
+        let total_blocks = ctx.live_sb.block_count;
+        let total_bytes = ctx.total_bytes;
+        let container_uuid = ctx.live_sb.uuid;
+        let cur_xid = ctx.live_sb.obj.xid;
+
+        // The reader picks the highest-xid NXSB inside xp_desc, so we
+        // know which slot that lives at — that's `xp_desc_index +
+        // xp_desc_len - 1` modulo the ring. Because our writer keeps
+        // xp_desc_index = 0 and xp_desc_len strictly forward, the next
+        // free slot is `xp_desc_base + xp_desc_len`.
+        let next_xp_desc_slot = ctx.live_sb.xp_desc_base + ctx.live_sb.xp_desc_len as u64;
+        if next_xp_desc_slot >= ctx.live_sb.xp_desc_base + ctx.live_sb.xp_desc_blocks as u64 {
+            return Err(crate::Error::Unsupported(
+                "apfs: xp_desc area is full — checkpoint rotation isn't \
+                 implemented yet"
+                    .into(),
+            ));
+        }
+
+        // Read the APSB to capture volume_uuid + counters + next_oid.
+        let (vol_index, apsb_paddr) = find_volume_paddr(dev, &ctx)?;
+        let mut apsb_block = vec![0u8; block_size as usize];
+        dev.read_at(apsb_paddr * block_size as u64, &mut apsb_block)?;
+        let apsb = ApfsSuperblock::decode(&apsb_block)?;
+
+        // Extract next_obj_id from APSB (offset 176..184) — not on the
+        // pub struct, so peek directly.
+        let next_oid = u64::from_le_bytes(apsb_block[176..184].try_into().unwrap());
+
+        // Use the spaceman's used-block accounting as the bump-allocator
+        // high-water mark. Falling back to a conservative guess if the
+        // spaceman can't be parsed: assume the whole front half of the
+        // disk is in use. Honest: this means we lose half the capacity,
+        // but it's safe.
+        let bump_high_water = read_spaceman_high_water(dev, &ctx).unwrap_or(total_blocks / 2);
+
+        // Build the write state, embedding the read-mode bits we just
+        // parsed via Apfs::open above.
+        let read = match read_only.state {
+            ApfsState::Read(r) => r,
+            _ => unreachable!("Apfs::open always returns Read"),
+        };
+        let _ = vol_index;
+        Ok(Self {
+            block_size,
+            total_bytes,
+            volume_name: apsb.volname.clone(),
+            state: ApfsState::Write(WriteState {
+                read,
+                volume_name: apsb.volname.clone(),
+                container_uuid,
+                volume_uuid: apsb.vol_uuid,
+                total_blocks,
+                next_oid,
+                num_files: apsb.num_files,
+                num_directories: apsb.num_directories,
+                num_symlinks: apsb.num_symlinks,
+                cur_xid,
+                next_xp_desc_slot,
+                bump_high_water,
+            }),
+        })
     }
 
     /// List every populated `nx_fs_oid[]` slot. Encrypted volumes are
@@ -1073,10 +1201,17 @@ impl crate::fs::Filesystem for Apfs {
                 next_oid: 16,
             }),
         ) {
-            ApfsState::Read(_) => {
-                // Nothing to flush — restore an empty read view by
-                // re-reading the device. This is a no-op for read-mode
-                // images.
+            ApfsState::Read(r) => {
+                // Nothing to flush — restore the read view we just took
+                // out and return Ok.
+                self.state = ApfsState::Read(r);
+                return Ok(());
+            }
+            ApfsState::Write(w) => {
+                // Open-file handles have already sync'd on Drop; nothing
+                // to do here. Restore the write state we just swapped
+                // out and return Ok.
+                self.state = ApfsState::Write(w);
                 return Ok(());
             }
             ApfsState::PendingWrite(p) => p,
@@ -1136,10 +1271,37 @@ impl crate::fs::Filesystem for Apfs {
             // only with no remove or partial-write hooks. WholeFileOnly
             // is the closest fit ("can add whole files, can't patch").
             ApfsState::PendingWrite(_) => crate::fs::MutationCapability::WholeFileOnly,
-            // Once flushed, the image is sealed — the writer can't
-            // re-open and mutate. Mirrors ISO 9660 / SquashFS.
+            // Once flushed via `Apfs::open` the image is sealed — the
+            // writer can't re-open and mutate. Mirrors ISO 9660 / SquashFS.
             ApfsState::Read(_) => crate::fs::MutationCapability::Immutable,
+            // After `Apfs::open_writable` we can patch existing files'
+            // bytes via `open_file_rw`. Create / remove of whole files
+            // isn't wired yet, but partial writes work, so `Mutable`
+            // is the closest fit.
+            ApfsState::Write(_) => crate::fs::MutationCapability::Mutable,
         }
+    }
+
+    fn open_file_rw<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        meta: Option<crate::fs::FileMeta>,
+    ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
+        let _ = meta;
+        if flags.create {
+            return Err(crate::Error::Unsupported(
+                "apfs: open_file_rw with create=true is not supported (open_writable \
+                 only edits existing files)"
+                    .into(),
+            ));
+        }
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+        let h = rw::ApfsFileHandle::open(self, dev, s, flags)?;
+        Ok(Box::new(h))
     }
 }
 
@@ -1183,12 +1345,17 @@ impl Default for ApfsFormatOpts {
 }
 
 /// Borrow the [`PendingWrite`] inside `state`, or return an error if
-/// the [`Apfs`] is in read mode.
+/// the [`Apfs`] is in read or write mode.
 fn pending_write_mut(state: &mut ApfsState) -> Result<&mut PendingWrite> {
     match state {
         ApfsState::PendingWrite(p) => Ok(p),
         ApfsState::Read(_) => Err(crate::Error::Unsupported(
             "apfs: filesystem has already been flushed; mutation after flush is not supported"
+                .into(),
+        )),
+        ApfsState::Write(_) => Err(crate::Error::Unsupported(
+            "apfs: filesystem is open for in-place writes (open_file_rw); \
+             create_* / remove are not supported in this mode"
                 .into(),
         )),
     }
@@ -1374,6 +1541,54 @@ fn load_container(dev: &mut dyn BlockDevice) -> Result<ContainerCtx> {
         block_size,
         total_bytes,
     })
+}
+
+/// Resolve the first populated `nx_fs_oid[]` slot in `ctx` to its APSB
+/// physical block. Returns `(slot_index, paddr)`.
+fn find_volume_paddr(dev: &mut dyn BlockDevice, ctx: &ContainerCtx) -> Result<(usize, u64)> {
+    let vol_index = ctx
+        .live_sb
+        .fs_oid
+        .iter()
+        .position(|&o| o != 0)
+        .ok_or_else(|| crate::Error::InvalidImage("apfs: container has no volumes".into()))?;
+    let vol_oid = ctx.live_sb.fs_oid[vol_index];
+    let target_xid = ctx.live_sb.obj.xid;
+    let mut dev_reader = DevReader {
+        dev,
+        block_size: ctx.block_size,
+    };
+    let val = omap_lookup(&ctx.omap_root, vol_oid, target_xid, &mut |paddr, buf| {
+        dev_reader.read(paddr, buf)
+    })?
+    .ok_or_else(|| {
+        crate::Error::InvalidImage(format!(
+            "apfs: container omap has no entry for volume oid {vol_oid:#x}"
+        ))
+    })?;
+    Ok((vol_index, val.paddr))
+}
+
+/// Read the spaceman_phys_t and return the bump-allocator high-water mark
+/// (= `total_blocks - main_free_count`). Returns `None` if the spaceman
+/// can't be parsed, which is non-fatal because we have a conservative
+/// fallback.
+fn read_spaceman_high_water(dev: &mut dyn BlockDevice, ctx: &ContainerCtx) -> Option<u64> {
+    let mut block = vec![0u8; ctx.block_size as usize];
+    let off = write::SPACEMAN_PADDR * ctx.block_size as u64;
+    if dev.read_at(off, &mut block).is_err() {
+        return None;
+    }
+    // Inline decode of the relevant spaceman_phys_t fields. We avoid the
+    // full `decode_spaceman()` helper because it's gated behind `cfg(test)`.
+    // Verify the object type bits match spaceman before trusting the layout.
+    let otype = u32::from_le_bytes(block[24..28].try_into().ok()?);
+    if otype & 0x0000_ffff != spaceman::OBJECT_TYPE_SPACEMAN {
+        return None;
+    }
+    let main_block_count = u64::from_le_bytes(block[48..56].try_into().ok()?);
+    let main_free_count = u64::from_le_bytes(block[72..80].try_into().ok()?);
+    Some(main_block_count - main_free_count)
 }
 
 /// Walk the checkpoint descriptor area looking for an NXSB whose xid is
@@ -1739,5 +1954,163 @@ mod tests {
         let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Vol").unwrap();
         let e = apfs.list(&mut dev, std::path::Path::new("/")).unwrap_err();
         assert!(matches!(e, crate::Error::Unsupported(_)));
+    }
+
+    /// Format → flush → drop → re-`open_writable` succeeds and yields a
+    /// `Write`-mode `Apfs` whose capability is `Mutable`.
+    #[test]
+    fn open_writable_round_trip_basic() {
+        use crate::fs::{FileMeta, FileSource, Filesystem};
+        let total_blocks = 256u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Vol").unwrap();
+        apfs.create_file(
+            &mut dev,
+            std::path::Path::new("/note.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"hello".to_vec())),
+                len: 5,
+            },
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        apfs.flush(&mut dev).unwrap();
+        drop(apfs);
+
+        let apfs = Apfs::open_writable(&mut dev).unwrap();
+        assert!(matches!(apfs.state, ApfsState::Write(_)));
+        assert!(matches!(
+            apfs.mutation_capability(),
+            crate::fs::MutationCapability::Mutable
+        ));
+    }
+
+    /// End-to-end: format → flush → `open_writable` → `open_file_rw` →
+    /// write new bytes → `sync` → reopen → `read_file` returns identical
+    /// bytes.
+    #[test]
+    fn rw_round_trip_overwrite_existing_file() {
+        use crate::fs::{FileMeta, FileSource, Filesystem, OpenFlags};
+        use std::io::{Read, Write};
+        let total_blocks = 256u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Vol").unwrap();
+        // Original bytes.
+        let original: Vec<u8> = b"original-payload".to_vec();
+        apfs.create_file(
+            &mut dev,
+            std::path::Path::new("/note.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(original.clone())),
+                len: original.len() as u64,
+            },
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        apfs.flush(&mut dev).unwrap();
+        drop(apfs);
+
+        // Reopen for writes and overwrite via open_file_rw.
+        let mut apfs = Apfs::open_writable(&mut dev).unwrap();
+        let new_payload: Vec<u8> = b"REWRITTEN-PAYLOAD-DATA".to_vec();
+        {
+            let mut h = apfs
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/note.txt"),
+                    OpenFlags {
+                        truncate: true,
+                        ..OpenFlags::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            h.write_all(&new_payload).unwrap();
+            h.sync().unwrap();
+        }
+        drop(apfs);
+
+        // Reopen read-only and verify.
+        let mut apfs = Apfs::open(&mut dev).unwrap();
+        let mut buf = Vec::new();
+        apfs.read_file(&mut dev, std::path::Path::new("/note.txt"))
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
+        assert_eq!(buf, new_payload);
+    }
+
+    /// Multi-session write: each `open_writable` consumes exactly one
+    /// xp_desc slot, and the previous checkpoint stays intact for
+    /// crash-safety.
+    #[test]
+    fn rw_round_trip_two_consecutive_sessions() {
+        use crate::fs::{FileMeta, FileSource, Filesystem, OpenFlags};
+        use std::io::{Read, Write};
+        let total_blocks = 256u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Vol").unwrap();
+        apfs.create_file(
+            &mut dev,
+            std::path::Path::new("/log"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"v0".to_vec())),
+                len: 2,
+            },
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        apfs.flush(&mut dev).unwrap();
+        drop(apfs);
+
+        // Session 1.
+        let mut apfs = Apfs::open_writable(&mut dev).unwrap();
+        {
+            let mut h = apfs
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/log"),
+                    OpenFlags {
+                        truncate: true,
+                        ..OpenFlags::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            h.write_all(b"v1-after-first-commit").unwrap();
+            h.sync().unwrap();
+        }
+        drop(apfs);
+
+        // Session 2.
+        let mut apfs = Apfs::open_writable(&mut dev).unwrap();
+        {
+            let mut h = apfs
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/log"),
+                    OpenFlags {
+                        truncate: true,
+                        ..OpenFlags::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            h.write_all(b"v2-final-payload-here").unwrap();
+            h.sync().unwrap();
+        }
+        drop(apfs);
+
+        // Final check.
+        let mut apfs = Apfs::open(&mut dev).unwrap();
+        let mut buf = Vec::new();
+        apfs.read_file(&mut dev, std::path::Path::new("/log"))
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
+        assert_eq!(buf, b"v2-final-payload-here");
     }
 }

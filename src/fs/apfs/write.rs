@@ -12,18 +12,31 @@
 //!
 //! ```text
 //!   0      NXSB           container label
-//!   1      checkpoint_map (resolves spaceman ephemeral oid → block 3)
-//!   2      NXSB           live checkpoint
-//!   3      spaceman_phys  real header + inline single-CIB address array
-//!   4      omap_phys_t    container omap header
-//!   5      APSB           volume superblock
-//!   6      omap_phys_t    volume omap header
-//!   7..    bump area — fs-tree leaves, omap leaves/internal nodes,
+//!   1      checkpoint_map (resolves spaceman ephemeral oid → block 17)
+//!   2      NXSB           live checkpoint (xid=2)
+//!   3..16  reserved xp_desc slots for future NXSB checkpoints
+//!          (used by reopen-and-write — see [`crate::fs::apfs::Apfs::open_writable`])
+//!  17      spaceman_phys  real header + inline single-CIB address array
+//!  18      omap_phys_t    container omap header
+//!  19      APSB           volume superblock
+//!  20      omap_phys_t    volume omap header
+//!  21..    bump area — fs-tree leaves, omap leaves/internal nodes,
 //!          file-extent data blocks. The CIB and per-chunk allocation
 //!          bitmap(s) referenced by the spaceman are also bump-allocated
 //!          at the *end* of this area, after every other block address
 //!          has been pinned.
 //! ```
+//!
+//! ## xp_desc area sizing
+//!
+//! The writer reserves [`XP_DESC_BLOCKS`] (16) blocks for the checkpoint
+//! descriptor area instead of the bare minimum (2). The extra slots are
+//! never used by `finish()` — they stay zeroed and are valid "no-op"
+//! entries that the reader ignores when scanning for the latest-xid
+//! NXSB. The reopen-and-write path
+//! ([`crate::fs::apfs::Apfs::open_writable`]) consumes these slots one
+//! per `sync()` so each new checkpoint goes at a fresh xp_desc block,
+//! leaving the previous checkpoint's NXSB untouched (COW).
 //!
 //! Metadata and data blocks past the fixed prefix are bump-allocated:
 //! metadata first, then data. The on-disk locations of the various
@@ -130,7 +143,29 @@ const COPY_BUF: usize = 64 * 1024;
 /// Magic xid we use for every object we write. Larger than any plausible
 /// label-NXSB xid (1) so our blocks "win" the most-recent-checkpoint
 /// pick in the reader.
-const WRITE_XID: u64 = 2;
+pub(crate) const WRITE_XID: u64 = 2;
+
+/// Number of blocks reserved for the checkpoint descriptor area.
+/// Sized to hold the chkmap stub (1 block), the live NXSB
+/// (1 block), and 14 future-checkpoint NXSB slots for the
+/// reopen-and-write path.
+pub(crate) const XP_DESC_BLOCKS: u32 = 16;
+
+/// Physical block of the chkmap stub (first xp_desc slot).
+pub(crate) const CHKMAP_PADDR: u64 = 1;
+/// Physical block of the initial live NXSB (second xp_desc slot).
+pub(crate) const NXSB_LIVE_PADDR: u64 = 2;
+/// Physical block of the spaceman_phys (just past the xp_desc area).
+pub(crate) const SPACEMAN_PADDR: u64 = (XP_DESC_BLOCKS as u64) + 1;
+/// Physical block of the container omap_phys_t header.
+pub(crate) const CONT_OMAP_PADDR: u64 = SPACEMAN_PADDR + 1;
+/// Physical block of the volume superblock (APSB).
+pub(crate) const APSB_PADDR: u64 = CONT_OMAP_PADDR + 1;
+/// Physical block of the volume omap_phys_t header.
+pub(crate) const VOL_OMAP_PADDR: u64 = APSB_PADDR + 1;
+/// First bump-allocated block. Everything past this is COW-friendly
+/// scratch space for fs-tree leaves, omap leaves, and file extents.
+pub(crate) const BUMP_BLOCK_START: u64 = VOL_OMAP_PADDR + 1;
 
 /// Inode-2 default-data-stream object id constant. The fs-tree pairs
 /// every regular-file inode with a `private_id` pointing at the dstream
@@ -218,6 +253,17 @@ pub struct ApfsWriter<'a> {
     num_symlinks: u64,
     /// True once `finish()` has been called.
     finished: bool,
+    /// XID stamped on every emitted block. Defaults to [`WRITE_XID`] for
+    /// fresh `format`-driven writers; the reopen-and-write path bumps
+    /// this for each subsequent checkpoint via [`ApfsWriter::new_checkpoint`].
+    xid: u64,
+    /// Block address where the new NXSB will be written. The format
+    /// path uses [`NXSB_LIVE_PADDR`]; reopen-and-write picks the next
+    /// free slot in the xp_desc area.
+    nxsb_paddr: u64,
+    /// True when the label NXSB at block 0 should be refreshed (only on
+    /// format).
+    write_label_nxsb: bool,
 }
 
 impl<'a> ApfsWriter<'a> {
@@ -245,16 +291,20 @@ impl<'a> ApfsWriter<'a> {
                 dev.total_size()
             )));
         }
-        if total_blocks < 32 {
+        // The minimum (~32 blocks) accommodates the expanded
+        // xp_desc area plus the fixed-prefix metadata blocks plus
+        // enough bump room for a one-record fs-tree.
+        if total_blocks < 64 {
             return Err(crate::Error::InvalidArgument(
-                "apfs writer: need at least 32 blocks".into(),
+                "apfs writer: need at least 64 blocks".into(),
             ));
         }
         let container_uuid = derive_uuid(volume_name.as_bytes(), b"container");
         let volume_uuid = derive_uuid(volume_name.as_bytes(), b"volume");
 
-        // See module-level layout. Bump area begins at block 7.
-        let bump_block_start: u64 = 7;
+        // See module-level layout. Bump area begins at BUMP_BLOCK_START
+        // (block 21 at the default xp_desc sizing).
+        let bump_block_start: u64 = BUMP_BLOCK_START;
         let mut w = Self {
             dev,
             block_size,
@@ -270,10 +320,89 @@ impl<'a> ApfsWriter<'a> {
             num_directories: 0,
             num_symlinks: 0,
             finished: false,
+            xid: WRITE_XID,
+            nxsb_paddr: NXSB_LIVE_PADDR,
+            write_label_nxsb: true,
         };
         // Seed the root inode record (oid = 2).
         w.add_inode_record(2, 0, mode_dir(0o755), 0)?;
         Ok(w)
+    }
+
+    /// Construct a "checkpoint refresh" writer that emits a brand-new
+    /// NXSB + fs-tree + omap snapshot of the volume's state into fresh
+    /// blocks past `bump_block_start` and a new xp_desc slot at
+    /// `nxsb_paddr`. Used by the reopen-and-write path
+    /// ([`crate::fs::apfs::Apfs::open_writable`]).
+    ///
+    /// Unlike [`ApfsWriter::new`], this constructor does not seed any
+    /// records — the caller is expected to push the full record set
+    /// gathered from the existing fs-tree before calling
+    /// [`ApfsWriter::finish`]. The label NXSB at block 0 is left
+    /// untouched (only the new xp_desc slot is written), so a crash
+    /// part-way through a checkpoint leaves the previous valid
+    /// checkpoint discoverable.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_checkpoint(
+        dev: &'a mut dyn BlockDevice,
+        total_blocks: u64,
+        block_size: u32,
+        volume_name: &str,
+        container_uuid: [u8; 16],
+        volume_uuid: [u8; 16],
+        xid: u64,
+        nxsb_paddr: u64,
+        bump_block_start: u64,
+        next_oid: u64,
+        num_files: u64,
+        num_directories: u64,
+        num_symlinks: u64,
+    ) -> Result<Self> {
+        if !(512..=65_536).contains(&block_size) || !block_size.is_power_of_two() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "apfs writer: block_size {block_size} is not a sensible power of two"
+            )));
+        }
+        if bump_block_start < BUMP_BLOCK_START || bump_block_start >= total_blocks {
+            return Err(crate::Error::InvalidArgument(format!(
+                "apfs writer: bump_block_start {bump_block_start} out of range \
+                 [{BUMP_BLOCK_START}, {total_blocks})"
+            )));
+        }
+        if nxsb_paddr < (NXSB_LIVE_PADDR + 1) || nxsb_paddr >= (XP_DESC_BLOCKS as u64 + 1) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "apfs writer: nxsb_paddr {nxsb_paddr} not a spare xp_desc slot \
+                 (expected {} ≤ slot < {})",
+                NXSB_LIVE_PADDR + 1,
+                XP_DESC_BLOCKS as u64 + 1
+            )));
+        }
+        Ok(Self {
+            dev,
+            block_size,
+            total_blocks,
+            next_block: bump_block_start,
+            bump_block_start,
+            volume_name: volume_name.to_string(),
+            container_uuid,
+            volume_uuid,
+            records: Vec::new(),
+            next_oid,
+            num_files,
+            num_directories,
+            num_symlinks,
+            finished: false,
+            xid,
+            nxsb_paddr,
+            write_label_nxsb: false,
+        })
+    }
+
+    /// Push a pre-built fs-tree record into the writer's record buffer.
+    /// Used by the reopen-and-write path to inject the records dumped
+    /// from the existing fs-tree.
+    pub(crate) fn push_raw_record(&mut self, key: Vec<u8>, val: Vec<u8>) {
+        self.records.push(FsRecord { key, val });
     }
 
     /// Add an empty subdirectory under `parent_oid`. Returns the new
@@ -484,15 +613,36 @@ impl<'a> ApfsWriter<'a> {
         });
 
         let bs = self.block_size as usize;
+        let cur_xid = self.xid;
 
-        // ---- Fixed block addresses (see module-level layout) ----
+        // ---- Block addresses (see module-level layout) ----
+        // On format (write_label_nxsb = true) we use the fixed layout.
+        // On a checkpoint refresh we allocate cont_omap / APSB / vol_omap
+        // out of the bump area so the previous checkpoint's blocks remain
+        // intact (COW). The spaceman + chkmap aren't consulted by the
+        // reader on open, so we keep pointing the new NXSB at the same
+        // spaceman_paddr (and chkmap_paddr) — refreshing them would
+        // require allocating new xp_desc slots beyond what this v1
+        // implementation supports.
         let nxsb_label_paddr: u64 = 0;
-        let chkmap_paddr: u64 = 1;
-        let nxsb_live_paddr: u64 = 2;
-        let spaceman_paddr: u64 = 3;
-        let cont_omap_paddr: u64 = 4;
-        let apsb_paddr: u64 = 5;
-        let vol_omap_paddr: u64 = 6;
+        let chkmap_paddr: u64 = CHKMAP_PADDR;
+        let nxsb_live_paddr: u64 = self.nxsb_paddr;
+        let spaceman_paddr: u64 = SPACEMAN_PADDR;
+        let cont_omap_paddr: u64 = if self.write_label_nxsb {
+            CONT_OMAP_PADDR
+        } else {
+            self.alloc_block()?
+        };
+        let apsb_paddr: u64 = if self.write_label_nxsb {
+            APSB_PADDR
+        } else {
+            self.alloc_block()?
+        };
+        let vol_omap_paddr: u64 = if self.write_label_nxsb {
+            VOL_OMAP_PADDR
+        } else {
+            self.alloc_block()?
+        };
 
         // Virtual oids assigned to: container volume (=1024), spaceman
         // (=512), volume omap target -> fsroot (=fsroot_vid=2). The
@@ -532,7 +682,7 @@ impl<'a> ApfsWriter<'a> {
             let leaf_paddr = fs_leaf_paddrs.first().copied().unwrap_or(0);
             // If `leaves` is empty we'd never get here (we always have
             // at least one record), but be defensive.
-            (leaf_paddr, vec![(fsroot_vid, WRITE_XID, leaf_paddr)])
+            (leaf_paddr, vec![(fsroot_vid, cur_xid, leaf_paddr)])
         } else {
             // Multi-leaf: assign vids to each leaf and add an internal
             // root above them. The internal root itself gets fsroot_vid.
@@ -540,11 +690,11 @@ impl<'a> ApfsWriter<'a> {
             let mut child_vids = Vec::with_capacity(leaves.len());
             for (i, &paddr) in fs_leaf_paddrs.iter().enumerate() {
                 let vid = FS_LEAF_VID_BASE + i as u64;
-                entries.push((vid, WRITE_XID, paddr));
+                entries.push((vid, cur_xid, paddr));
                 child_vids.push(vid);
             }
             let root_paddr = self.alloc_block()?;
-            entries.push((fsroot_vid, WRITE_XID, root_paddr));
+            entries.push((fsroot_vid, cur_xid, root_paddr));
             entries.sort_by_key(|e| e.0);
             (root_paddr, entries)
         };
@@ -557,7 +707,7 @@ impl<'a> ApfsWriter<'a> {
             } else {
                 FS_LEAF_VID_BASE + i as u64
             };
-            let leaf_block = build_fs_leaf(leaf_records, bs, vid, is_root)?;
+            let leaf_block = build_fs_leaf(leaf_records, bs, vid, is_root, cur_xid)?;
             self.write_block(fs_leaf_paddrs[i], &leaf_block)?;
         }
         if leaves.len() > 1 {
@@ -569,14 +719,14 @@ impl<'a> ApfsWriter<'a> {
                 let vid = FS_LEAF_VID_BASE + i as u64;
                 sep_entries.push((sep_key, vid));
             }
-            let internal_block = build_fs_internal_root(&sep_entries, bs, fsroot_vid)?;
+            let internal_block = build_fs_internal_root(&sep_entries, bs, fsroot_vid, cur_xid)?;
             self.write_block(fsroot_paddr, &internal_block)?;
         }
 
         // ---- Volume omap (single- or multi-leaf) ----
         // vol_omap_entries is sorted by oid above.
         let vol_omap_root_paddr = self.write_omap_tree(&vol_omap_entries)?;
-        let vol_omap_phys = build_omap_phys(bs, vol_omap_paddr, vol_omap_root_paddr)?;
+        let vol_omap_phys = build_omap_phys(bs, vol_omap_paddr, vol_omap_root_paddr, cur_xid)?;
         self.write_block(vol_omap_paddr, &vol_omap_phys)?;
 
         // ---- APSB ----
@@ -585,8 +735,8 @@ impl<'a> ApfsWriter<'a> {
 
         // ---- Container omap (single entry, but goes through the same
         //      multi-leaf path so we exercise the writer uniformly) ----
-        let cont_omap_root_paddr = self.write_omap_tree(&[(volume_vid, WRITE_XID, apsb_paddr)])?;
-        let cont_omap_phys = build_omap_phys(bs, cont_omap_paddr, cont_omap_root_paddr)?;
+        let cont_omap_root_paddr = self.write_omap_tree(&[(volume_vid, cur_xid, apsb_paddr)])?;
+        let cont_omap_phys = build_omap_phys(bs, cont_omap_paddr, cont_omap_root_paddr, cur_xid)?;
         self.write_block(cont_omap_paddr, &cont_omap_phys)?;
 
         // ---- Spaceman: CIB + per-chunk bitmaps + spaceman_phys ----
@@ -608,82 +758,94 @@ impl<'a> ApfsWriter<'a> {
         // Every one of these blocks is bump-allocated here, so all of
         // them end up inside the `(0, self.next_block)` used-range and
         // the spaceman bitmap correctly marks them used.
-        let bpc = blocks_per_chunk(bs);
-        let chunks: u64 = self.total_blocks.div_ceil(bpc);
+        // The spaceman + chkmap are only rewritten on format. The reader
+        // doesn't consult them during open, so leaving the previous
+        // checkpoint's blocks intact keeps the previous checkpoint
+        // bootable until the new one is signed.
+        if self.write_label_nxsb {
+            let bpc = blocks_per_chunk(bs);
+            let chunks: u64 = self.total_blocks.div_ceil(bpc);
 
-        // IP ring: ip_bm_size_in_blocks bitmap block(s) followed by
-        // ip_block_count ring blocks. We use one bitmap block — at a
-        // 4 KiB block size that bitmap can track 32 768 blocks, vastly
-        // more than the ring needs.
-        let ip_bm_size_in_blocks: u32 = 1;
-        let ip_block_count = DEFAULT_IP_BLOCK_COUNT;
-        let ip_bm_base = self.alloc_block()?;
-        for _ in 1..ip_bm_size_in_blocks {
-            // Future-proof: if we ever want a larger ring's bitmap.
-            let _ = self.alloc_block()?;
+            // IP ring: ip_bm_size_in_blocks bitmap block(s) followed by
+            // ip_block_count ring blocks. We use one bitmap block — at a
+            // 4 KiB block size that bitmap can track 32 768 blocks, vastly
+            // more than the ring needs.
+            let ip_bm_size_in_blocks: u32 = 1;
+            let ip_block_count = DEFAULT_IP_BLOCK_COUNT;
+            let ip_bm_base = self.alloc_block()?;
+            for _ in 1..ip_bm_size_in_blocks {
+                // Future-proof: if we ever want a larger ring's bitmap.
+                let _ = self.alloc_block()?;
+            }
+            let ip_base = self.alloc_block()?;
+            for _ in 1..ip_block_count {
+                let _ = self.alloc_block()?;
+            }
+
+            // Three empty SFQ B-tree roots.
+            let free_queue_paddrs: [u64; 3] = [
+                self.alloc_block()?,
+                self.alloc_block()?,
+                self.alloc_block()?,
+            ];
+
+            let cib_paddr = self.alloc_block()?;
+            let mut bitmap_paddrs: Vec<u64> = Vec::with_capacity(chunks as usize);
+            for _ in 0..chunks {
+                bitmap_paddrs.push(self.alloc_block()?);
+            }
+
+            let used_ranges: Vec<(u64, u64)> = vec![(0, self.next_block)];
+            let layout = SpacemanLayout {
+                block_size: bs,
+                total_blocks: self.total_blocks,
+                xid: cur_xid,
+                spaceman_oid: spaceman_vid,
+                cib_paddr,
+                bitmap_paddrs: bitmap_paddrs.clone(),
+                used_ranges,
+                ip_base,
+                ip_block_count,
+                ip_bm_base,
+                ip_bm_size_in_blocks,
+                free_queue_paddrs,
+            };
+            let emitted = spaceman::build_spaceman(&layout)?;
+            self.write_block(spaceman_paddr, &emitted.spaceman_block)?;
+            self.write_block(cib_paddr, &emitted.cib_block)?;
+            for (paddr, bmap) in bitmap_paddrs.iter().zip(emitted.bitmap_blocks.iter()) {
+                self.write_block(*paddr, bmap)?;
+            }
+            // IP bitmap block (no obj_phys_t header per spec).
+            self.write_block(ip_bm_base, &emitted.ip_bm_block)?;
+            // Three empty free-queue B-tree roots.
+            for (paddr, fq_block) in free_queue_paddrs
+                .iter()
+                .zip(emitted.free_queue_blocks.iter())
+            {
+                self.write_block(*paddr, fq_block)?;
+            }
+
+            // ---- Checkpoint map: one entry resolving spaceman ephemeral oid
+            //      to its physical block. xp_desc readers (incl. fsck_apfs)
+            //      walk this to find the spaceman.
+            let chkmap = build_chkmap(
+                bs,
+                chkmap_paddr,
+                spaceman::OBJECT_TYPE_SPACEMAN | OBJ_EPHEMERAL,
+                spaceman_vid,
+                spaceman_paddr,
+                cur_xid,
+            )?;
+            self.write_block(chkmap_paddr, &chkmap)?;
         }
-        let ip_base = self.alloc_block()?;
-        for _ in 1..ip_block_count {
-            let _ = self.alloc_block()?;
-        }
 
-        // Three empty SFQ B-tree roots.
-        let free_queue_paddrs: [u64; 3] = [
-            self.alloc_block()?,
-            self.alloc_block()?,
-            self.alloc_block()?,
-        ];
-
-        let cib_paddr = self.alloc_block()?;
-        let mut bitmap_paddrs: Vec<u64> = Vec::with_capacity(chunks as usize);
-        for _ in 0..chunks {
-            bitmap_paddrs.push(self.alloc_block()?);
-        }
-
-        let used_ranges: Vec<(u64, u64)> = vec![(0, self.next_block)];
-        let layout = SpacemanLayout {
-            block_size: bs,
-            total_blocks: self.total_blocks,
-            xid: WRITE_XID,
-            spaceman_oid: spaceman_vid,
-            cib_paddr,
-            bitmap_paddrs: bitmap_paddrs.clone(),
-            used_ranges,
-            ip_base,
-            ip_block_count,
-            ip_bm_base,
-            ip_bm_size_in_blocks,
-            free_queue_paddrs,
-        };
-        let emitted = spaceman::build_spaceman(&layout)?;
-        self.write_block(spaceman_paddr, &emitted.spaceman_block)?;
-        self.write_block(cib_paddr, &emitted.cib_block)?;
-        for (paddr, bmap) in bitmap_paddrs.iter().zip(emitted.bitmap_blocks.iter()) {
-            self.write_block(*paddr, bmap)?;
-        }
-        // IP bitmap block (no obj_phys_t header per spec).
-        self.write_block(ip_bm_base, &emitted.ip_bm_block)?;
-        // Three empty free-queue B-tree roots.
-        for (paddr, fq_block) in free_queue_paddrs
-            .iter()
-            .zip(emitted.free_queue_blocks.iter())
-        {
-            self.write_block(*paddr, fq_block)?;
-        }
-
-        // ---- Checkpoint map: one entry resolving spaceman ephemeral oid
-        //      to its physical block. xp_desc readers (incl. fsck_apfs)
-        //      walk this to find the spaceman.
-        let chkmap = build_chkmap(
-            bs,
-            chkmap_paddr,
-            spaceman::OBJECT_TYPE_SPACEMAN | OBJ_EPHEMERAL,
-            spaceman_vid,
-            spaceman_paddr,
-        )?;
-        self.write_block(chkmap_paddr, &chkmap)?;
-
-        // ---- NXSB (live + label copy) ----
+        // ---- NXSB ----
+        // Live (or new-checkpoint) NXSB goes into the current xp_desc
+        // slot. The label copy at block 0 is only refreshed on format
+        // — it acts as a stable "where to find the xp_desc area"
+        // hint and must NOT be rewritten mid-checkpoint or readers may
+        // see a torn label.
         let nxsb = self.build_nxsb(
             bs,
             nxsb_live_paddr,
@@ -693,16 +855,17 @@ impl<'a> ApfsWriter<'a> {
             volume_vid,
         )?;
         self.write_block(nxsb_live_paddr, &nxsb)?;
-        // Label copy at block 0.
-        let nxsb_label = self.build_nxsb(
-            bs,
-            nxsb_label_paddr,
-            cont_omap_paddr,
-            spaceman_vid,
-            reaper_vid,
-            volume_vid,
-        )?;
-        self.write_block(nxsb_label_paddr, &nxsb_label)?;
+        if self.write_label_nxsb {
+            let nxsb_label = self.build_nxsb(
+                bs,
+                nxsb_label_paddr,
+                cont_omap_paddr,
+                spaceman_vid,
+                reaper_vid,
+                volume_vid,
+            )?;
+            self.write_block(nxsb_label_paddr, &nxsb_label)?;
+        }
 
         let _ = fsroot_paddr;
         Ok(())
@@ -885,12 +1048,13 @@ impl<'a> ApfsWriter<'a> {
     /// root (leaf for a single-leaf tree, internal node otherwise).
     fn write_omap_tree(&mut self, entries: &[(u64, u64, u64)]) -> Result<u64> {
         let bs = self.block_size as usize;
+        let xid = self.xid;
         let leaves = pack_omap_into_leaves(entries, omap_leaf_capacity(bs))?;
         if leaves.len() == 1 {
             // Single leaf: it's the root and carries the trailing
             // btree_info_t.
             let paddr = self.alloc_block()?;
-            let block = build_omap_leaf_node(bs, &leaves[0], true)?;
+            let block = build_omap_leaf_node(bs, &leaves[0], true, xid)?;
             self.write_block(paddr, &block)?;
             return Ok(paddr);
         }
@@ -900,13 +1064,13 @@ impl<'a> ApfsWriter<'a> {
         let mut sep_entries: Vec<((u64, u64), u64)> = Vec::with_capacity(leaves.len());
         for chunk in &leaves {
             let paddr = self.alloc_block()?;
-            let block = build_omap_leaf_node(bs, chunk, false)?;
+            let block = build_omap_leaf_node(bs, chunk, false, xid)?;
             self.write_block(paddr, &block)?;
             leaf_paddrs.push(paddr);
             sep_entries.push(((chunk[0].0, chunk[0].1), paddr));
         }
         let root_paddr = self.alloc_block()?;
-        let root_block = build_omap_internal_root(bs, &sep_entries)?;
+        let root_block = build_omap_internal_root(bs, &sep_entries, xid)?;
         self.write_block(root_paddr, &root_block)?;
         Ok(root_paddr)
     }
@@ -922,7 +1086,7 @@ impl<'a> ApfsWriter<'a> {
         let mut buf = vec![0u8; bs];
         // obj_phys
         buf[8..16].copy_from_slice(&apsb_paddr.to_le_bytes()); // oid (we'll override below)
-        buf[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.xid.to_le_bytes());
         // o_type = OBJECT_TYPE_FS | OBJ_VIRTUAL (default 0).
         buf[24..28].copy_from_slice(&OBJECT_TYPE_FS.to_le_bytes());
 
@@ -977,7 +1141,7 @@ impl<'a> ApfsWriter<'a> {
         let mut buf = vec![0u8; bs];
         // obj_phys
         buf[8..16].copy_from_slice(&paddr.to_le_bytes()); // oid (physical = block)
-        buf[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.xid.to_le_bytes());
         buf[24..28].copy_from_slice(&(OBJECT_TYPE_NX_SUPERBLOCK | OBJ_EPHEMERAL).to_le_bytes());
 
         buf[32..36].copy_from_slice(&NX_MAGIC.to_le_bytes());
@@ -986,18 +1150,24 @@ impl<'a> ApfsWriter<'a> {
         // features / ro_compat / incompat: 0 (we ship a vanilla container)
         buf[72..88].copy_from_slice(&self.container_uuid);
         buf[88..96].copy_from_slice(&(self.next_oid + 1024).to_le_bytes()); // next_oid
-        buf[96..104].copy_from_slice(&(WRITE_XID + 1).to_le_bytes()); // next_xid
-        // xp_desc area: 2 blocks (chkmap stub at block 1 + the live NXSB
-        // at block 2). xp_desc_base = 1; reader scans this range looking
-        // for the largest-xid NXSB.
-        buf[104..108].copy_from_slice(&2u32.to_le_bytes()); // xp_desc_blocks
+        buf[96..104].copy_from_slice(&(self.xid + 1).to_le_bytes()); // next_xid
+        // xp_desc area: XP_DESC_BLOCKS blocks (chkmap stub at block 1 +
+        // the live NXSB at block 2 + XP_DESC_BLOCKS-2 spare slots for
+        // future checkpoint rotation via Apfs::open_writable).
+        // xp_desc_base = 1; reader scans this range looking for the
+        // largest-xid NXSB.
+        buf[104..108].copy_from_slice(&XP_DESC_BLOCKS.to_le_bytes()); // xp_desc_blocks
         buf[108..112].copy_from_slice(&1u32.to_le_bytes()); // xp_data_blocks
-        buf[112..120].copy_from_slice(&1u64.to_le_bytes()); // xp_desc_base
-        buf[120..128].copy_from_slice(&3u64.to_le_bytes()); // xp_data_base = spaceman_paddr
-        buf[128..132].copy_from_slice(&2u32.to_le_bytes()); // xp_desc_next
+        buf[112..120].copy_from_slice(&CHKMAP_PADDR.to_le_bytes()); // xp_desc_base
+        buf[120..128].copy_from_slice(&SPACEMAN_PADDR.to_le_bytes()); // xp_data_base = spaceman_paddr
+        // xp_desc_next = paddr+1 (next free xp_desc slot after this NXSB).
+        // open_writable advances this on each checkpoint.
+        buf[128..132].copy_from_slice(&((paddr + 1) as u32).to_le_bytes());
         buf[132..136].copy_from_slice(&1u32.to_le_bytes()); // xp_data_next
         buf[136..140].copy_from_slice(&0u32.to_le_bytes()); // xp_desc_index
-        buf[140..144].copy_from_slice(&2u32.to_le_bytes()); // xp_desc_len
+        // xp_desc_len = number of slots used so far up to & including this
+        // NXSB (chkmap @ 1 + every NXSB written so far).
+        buf[140..144].copy_from_slice(&((paddr) as u32).to_le_bytes()); // xp_desc_len
         buf[144..148].copy_from_slice(&0u32.to_le_bytes()); // xp_data_index
         buf[148..152].copy_from_slice(&1u32.to_le_bytes()); // xp_data_len
         buf[152..160].copy_from_slice(&spaceman_vid.to_le_bytes());
@@ -1029,10 +1199,10 @@ fn sign_block(buf: &mut [u8]) {
 /// Build an omap_phys_t (header) block. `paddr` is the block this
 /// header lives at; `tree_paddr` is the physical block of the tree's
 /// root.
-fn build_omap_phys(bs: usize, paddr: u64, tree_paddr: u64) -> Result<Vec<u8>> {
+fn build_omap_phys(bs: usize, paddr: u64, tree_paddr: u64, xid: u64) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; bs];
     buf[8..16].copy_from_slice(&paddr.to_le_bytes()); // oid
-    buf[16..24].copy_from_slice(&WRITE_XID.to_le_bytes()); // xid
+    buf[16..24].copy_from_slice(&xid.to_le_bytes()); // xid
     buf[24..28].copy_from_slice(&(OBJECT_TYPE_OMAP | OBJ_PHYSICAL).to_le_bytes());
     // flags / snap_count / tree_type / snapshot_tree_type left zero
     // (snapshot_tree_type is u32 at offset 44).
@@ -1084,14 +1254,19 @@ fn pack_omap_into_leaves(
 
 /// Build an omap leaf node (fixed-KV 16/16). When `is_root` is true the
 /// node carries `BTNODE_ROOT` and a trailing `btree_info_t`.
-fn build_omap_leaf_node(bs: usize, entries: &[(u64, u64, u64)], is_root: bool) -> Result<Vec<u8>> {
+fn build_omap_leaf_node(
+    bs: usize,
+    entries: &[(u64, u64, u64)],
+    is_root: bool,
+    xid: u64,
+) -> Result<Vec<u8>> {
     let mut block = vec![0u8; bs];
     let obj_type = if is_root {
         OBJECT_TYPE_BTREE | OBJ_PHYSICAL
     } else {
         OBJECT_TYPE_BTREE_NODE | OBJ_PHYSICAL
     };
-    block[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+    block[16..24].copy_from_slice(&xid.to_le_bytes());
     block[24..28].copy_from_slice(&obj_type.to_le_bytes());
 
     let mut flags = BTNODE_LEAF | BTNODE_FIXED_KV_SIZE;
@@ -1142,9 +1317,9 @@ fn build_omap_leaf_node(bs: usize, entries: &[(u64, u64, u64)], is_root: bool) -
 /// `(oid, xid)` pairs and whose value slots hold 8-byte physical block
 /// addresses of child leaves. The root carries the trailing
 /// `btree_info_t`.
-fn build_omap_internal_root(bs: usize, entries: &[((u64, u64), u64)]) -> Result<Vec<u8>> {
+fn build_omap_internal_root(bs: usize, entries: &[((u64, u64), u64)], xid: u64) -> Result<Vec<u8>> {
     let mut block = vec![0u8; bs];
-    block[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+    block[16..24].copy_from_slice(&xid.to_le_bytes());
     block[24..28].copy_from_slice(&(OBJECT_TYPE_BTREE | OBJ_PHYSICAL).to_le_bytes());
 
     let flags = BTNODE_ROOT | BTNODE_FIXED_KV_SIZE;
@@ -1232,13 +1407,19 @@ fn pack_records_into_leaves(records: &[FsRecord], cap: usize) -> Result<Vec<Vec<
 /// `BTNODE_ROOT` and a trailing `btree_info_t`. Both root-leaf (depth 1)
 /// and non-root leaf (depth 2) callers use this builder; the root flag
 /// is set accordingly.
-fn build_fs_leaf(records: &[FsRecord], bs: usize, vid: u64, is_root: bool) -> Result<Vec<u8>> {
+fn build_fs_leaf(
+    records: &[FsRecord],
+    bs: usize,
+    vid: u64,
+    is_root: bool,
+    xid: u64,
+) -> Result<Vec<u8>> {
     let mut block = vec![0u8; bs];
     // obj_phys — real APFS fsroots are BTREE objects whose subtype is
     // FSTREE (the BTREE constant identifies the on-disk B-tree object;
     // FSTREE goes in the subtype slot to identify the tree's contents).
     block[8..16].copy_from_slice(&vid.to_le_bytes());
-    block[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+    block[16..24].copy_from_slice(&xid.to_le_bytes());
     let obj_type = if is_root {
         OBJECT_TYPE_BTREE
     } else {
@@ -1314,10 +1495,15 @@ fn build_fs_leaf(records: &[FsRecord], bs: usize, vid: u64, is_root: bool) -> Re
 /// via virtual oids. Each `(key_bytes, child_vid)` entry is laid out
 /// using the same kvloc_t-style ToC as a leaf, but the value bytes are
 /// always 8 (the child vid in little-endian).
-fn build_fs_internal_root(entries: &[(Vec<u8>, u64)], bs: usize, root_vid: u64) -> Result<Vec<u8>> {
+fn build_fs_internal_root(
+    entries: &[(Vec<u8>, u64)],
+    bs: usize,
+    root_vid: u64,
+    xid: u64,
+) -> Result<Vec<u8>> {
     let mut block = vec![0u8; bs];
     block[8..16].copy_from_slice(&root_vid.to_le_bytes());
-    block[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+    block[16..24].copy_from_slice(&xid.to_le_bytes());
     block[24..28].copy_from_slice(&OBJECT_TYPE_BTREE.to_le_bytes());
     block[28..32].copy_from_slice(&OBJECT_TYPE_FSTREE.to_le_bytes());
 
@@ -1395,6 +1581,7 @@ fn build_chkmap(
     entry_type: u32,
     entry_oid: u64,
     entry_paddr: u64,
+    xid: u64,
 ) -> Result<Vec<u8>> {
     if bs < 80 {
         return Err(crate::Error::Unsupported(format!(
@@ -1403,7 +1590,7 @@ fn build_chkmap(
     }
     let mut buf = vec![0u8; bs];
     buf[8..16].copy_from_slice(&paddr.to_le_bytes());
-    buf[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
+    buf[16..24].copy_from_slice(&xid.to_le_bytes());
     buf[24..28].copy_from_slice(&(OBJECT_TYPE_CHECKPOINT_MAP | OBJ_PHYSICAL).to_le_bytes());
     // cpm_flags = CHECKPOINT_MAP_LAST.
     buf[32..36].copy_from_slice(&1u32.to_le_bytes());
@@ -1752,8 +1939,8 @@ mod tests {
     /// free_count agrees with its bitmap's cleared-bit count, and the
     /// total free_count agrees with the spaceman header.
     fn assert_spaceman_consistent(dev: &mut dyn BlockDevice, bs: u32, total_blocks: u64) {
-        // Block 3 is the spaceman.
-        let sm = read_block(dev, 3, bs);
+        // Spaceman lives at SPACEMAN_PADDR.
+        let sm = read_block(dev, SPACEMAN_PADDR, bs);
         let dec = decode_spaceman(&sm).expect("decode spaceman_phys_t");
         assert_eq!(dec.block_size, bs);
         assert_eq!(dec.blocks_per_chunk, bs * 8);
@@ -1815,7 +2002,7 @@ mod tests {
         // wrote into. For the smoke check, just confirm block 0 (NXSB
         // label) is marked used and the last block of the container
         // (which the writer never touches) is marked free.
-        let sm = read_block(&mut dev, 3, bs);
+        let sm = read_block(&mut dev, SPACEMAN_PADDR, bs);
         let dec = decode_spaceman(&sm).unwrap();
         let cib = read_block(&mut dev, dec.cib_paddr, bs);
         let entries = decode_cib_entries(&cib).unwrap();
@@ -1842,7 +2029,7 @@ mod tests {
             let mut dev1 = MemoryBackend::new(total_blocks * bs as u64);
             let w1 = ApfsWriter::new(&mut dev1, total_blocks, bs, "V").unwrap();
             w1.finish().unwrap();
-            let sm1 = read_block(&mut dev1, 3, bs);
+            let sm1 = read_block(&mut dev1, SPACEMAN_PADDR, bs);
             let d1 = decode_spaceman(&sm1).unwrap();
             total_blocks - d1.main_free_count
         };
@@ -1854,7 +2041,7 @@ mod tests {
             w.finish().unwrap();
         }
         assert_spaceman_consistent(&mut dev, bs, total_blocks);
-        let sm = read_block(&mut dev, 3, bs);
+        let sm = read_block(&mut dev, SPACEMAN_PADDR, bs);
         let d = decode_spaceman(&sm).unwrap();
         let used_blocks_after = total_blocks - d.main_free_count;
         // Writing a 20 KiB file consumes at least 5 extra data blocks
@@ -1879,7 +2066,7 @@ mod tests {
             let w = ApfsWriter::new(&mut dev, total_blocks, bs, "Vol").unwrap();
             w.finish().unwrap();
         }
-        let sm = read_block(&mut dev, 3, bs);
+        let sm = read_block(&mut dev, SPACEMAN_PADDR, bs);
         let dec = decode_spaceman(&sm).expect("decode spaceman_phys_t");
 
         // sm_flags must publish SM_FLAG_VERSIONED so the reader trusts
@@ -1962,18 +2149,18 @@ mod tests {
     /// `nx_spaceman_oid` to the spaceman's physical block.
     #[test]
     fn checkpoint_map_resolves_spaceman_oid() {
-        let total_blocks = 32u64;
+        let total_blocks = 64u64;
         let bs = 4096u32;
         let mut dev = MemoryBackend::new(total_blocks * bs as u64);
         {
             let w = ApfsWriter::new(&mut dev, total_blocks, bs, "V").unwrap();
             w.finish().unwrap();
         }
-        // NXSB at block 2: nx_spaceman_oid is at offset 152..160.
-        let nxsb = read_block(&mut dev, 2, bs);
+        // NXSB at NXSB_LIVE_PADDR: nx_spaceman_oid is at offset 152..160.
+        let nxsb = read_block(&mut dev, NXSB_LIVE_PADDR, bs);
         let sm_oid = u64::from_le_bytes(nxsb[152..160].try_into().unwrap());
-        // Checkpoint map at block 1.
-        let chk = read_block(&mut dev, 1, bs);
+        // Checkpoint map at CHKMAP_PADDR.
+        let chk = read_block(&mut dev, CHKMAP_PADDR, bs);
         // cpm_count at offset 36, first entry at 40 with cpm_oid at +16
         // (within the entry), cpm_paddr at +24.
         let cpm_count = u32::from_le_bytes(chk[36..40].try_into().unwrap());
@@ -1985,7 +2172,10 @@ mod tests {
             cpm_oid, sm_oid,
             "chkmap oid must match NXSB nx_spaceman_oid"
         );
-        assert_eq!(cpm_paddr, 3, "spaceman lives at block 3");
+        assert_eq!(
+            cpm_paddr, SPACEMAN_PADDR,
+            "spaceman lives at SPACEMAN_PADDR"
+        );
     }
 
     /// External `fsck_apfs` smoke test — runs only when the binary is

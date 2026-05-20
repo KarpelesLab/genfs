@@ -16,7 +16,7 @@
 //! known total length.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub mod apfs;
@@ -132,6 +132,60 @@ impl FileSource {
 /// Combined Read + Seek trait used by [`FileSource::Reader`].
 pub trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
+
+/// Flags controlling how [`Filesystem::open_file_rw`] opens a file.
+///
+/// Defaults to "open existing file for read+write at offset 0." Each
+/// flag toggles a single Unix-style behaviour. `truncate` and
+/// `append` are mutually meaningful at open-time only — once the
+/// handle exists, the user can `seek` to any position freely.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenFlags {
+    /// Create the file if it does not already exist. Requires the
+    /// `meta` argument to [`Filesystem::open_file_rw`] to be `Some(_)`
+    /// (otherwise the implementation returns `InvalidArgument`).
+    pub create: bool,
+    /// Truncate to zero length on open.
+    pub truncate: bool,
+    /// Position the initial cursor at end-of-file (so the first
+    /// `write` appends). Equivalent to seeking to `len()` after open.
+    pub append: bool,
+}
+
+/// A handle into a regular file opened for in-place reads and writes
+/// via [`Filesystem::open_file_rw`]. Implementations are `Read + Write
+/// + Seek`; dropping the handle persists any pending writes (each
+/// implementation chooses whether `Write::write` is eager or buffered
+/// — `sync` forces a flush either way).
+///
+/// The handle borrows both the filesystem state and the block device
+/// for its full lifetime. A subsequent call to
+/// [`Filesystem::flush`] persists handle-side changes that haven't
+/// already been written, so consumers don't need to call `sync`
+/// explicitly when they're going to `flush` the whole FS anyway.
+pub trait FileHandle: Read + Write + Seek {
+    /// Logical length of the file (after any pending writes).
+    fn len(&self) -> u64;
+
+    /// Whether the file is currently zero bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Resize the file to `new_len`. Growing fills with zeroes;
+    /// shrinking discards trailing bytes (and frees underlying
+    /// blocks). May return an error if the filesystem can't allocate
+    /// enough space.
+    fn set_len(&mut self, new_len: u64) -> crate::Result<()>;
+
+    /// Persist this handle's writes to disk. Implementations should
+    /// also push any associated metadata changes (size, mtime, block
+    /// pointers). After `sync` returns Ok, the new bytes are durable
+    /// without needing a separate [`Filesystem::flush`] for the
+    /// file itself — though the FS as a whole may still need a
+    /// flush for unrelated dirty state.
+    fn sync(&mut self) -> crate::Result<()>;
+}
 
 /// Special-file class for [`Filesystem::create_device`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +341,32 @@ pub trait Filesystem {
         dev: &'a mut dyn crate::block::BlockDevice,
         path: &Path,
     ) -> crate::Result<Box<dyn Read + 'a>>;
+
+    /// Open a regular file for **in-place reads + writes** at byte
+    /// granularity. The returned handle is `Read + Write + Seek`;
+    /// dropping it persists any pending bytes (each implementation
+    /// chooses whether `Write::write` is eager or buffered).
+    ///
+    /// Filesystems whose on-disk format requires journaling to be
+    /// safe across crash boundaries should refuse this method until
+    /// their journal is wired — partial writes that bypass a journal
+    /// leave the FS in a "needs `fsck`" state on next mount, which
+    /// is a worse default than a clear `Unsupported` error.
+    ///
+    /// Default: returns `Unsupported`. Implementations override only
+    /// when they can produce a result that survives a clean unmount
+    /// without external repair.
+    fn open_file_rw<'a>(
+        &'a mut self,
+        _dev: &'a mut dyn crate::block::BlockDevice,
+        _path: &Path,
+        _flags: OpenFlags,
+        _meta: Option<FileMeta>,
+    ) -> crate::Result<Box<dyn FileHandle + 'a>> {
+        Err(crate::Error::Unsupported(
+            "this filesystem does not yet implement open_file_rw".into(),
+        ))
+    }
 
     /// Persist outstanding dirty state to the device.
     fn flush(&mut self, dev: &mut dyn crate::block::BlockDevice) -> crate::Result<()>;

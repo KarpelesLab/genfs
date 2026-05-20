@@ -26,6 +26,7 @@ pub mod boot;
 pub mod dir;
 pub mod fat;
 pub mod format;
+pub mod rw;
 pub mod upcase;
 
 use boot::BootSector;
@@ -1254,6 +1255,19 @@ impl crate::fs::Filesystem for Exfat {
         Ok(Box::new(r))
     }
 
+    fn open_file_rw<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        meta: Option<crate::fs::FileMeta>,
+    ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        Exfat::open_rw(self, dev, s, flags, meta)
+    }
+
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         Exfat::flush(self, dev)
     }
@@ -2067,5 +2081,324 @@ mod tests {
             fs2.bitmap[byte] & mask != 0,
             "bitmap bit for cluster {cluster} must be set"
         );
+    }
+
+    // ===================================================================
+    // open_file_rw tests — exercise the partial-write / set_len / grow /
+    // shrink paths added in P-exfat-rw.
+    // ===================================================================
+
+    use crate::fs::{FileHandle, FileMeta, Filesystem, OpenFlags};
+
+    fn read_file_contents(fs: &mut Exfat, dev: &mut MemoryBackend, path: &str) -> Vec<u8> {
+        use std::io::Read;
+        let mut r = fs.open_file_reader(dev, path).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn open_file_rw_partial_write_round_trip() {
+        use std::io::{Seek, SeekFrom, Write};
+        let (mut dev, mut fs) = fresh_volume("RW1");
+        let payload = b"AAAAAAAAAAAAAAAAAAAA"; // 20 bytes
+        let mut reader: &[u8] = payload;
+        fs.create_file(&mut dev, "/x.bin", &mut reader, payload.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                std::path::Path::new("/x.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(h.len(), 20);
+            h.seek(SeekFrom::Start(5)).unwrap();
+            h.write_all(b"ZZZZZ").unwrap();
+            h.sync().unwrap();
+        }
+
+        // Verify on a fresh open.
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/x.bin");
+        assert_eq!(bytes.len(), 20);
+        let mut expected = payload.to_vec();
+        expected[5..10].copy_from_slice(b"ZZZZZ");
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn open_file_rw_extends_file() {
+        use std::io::{Seek, SeekFrom, Write};
+        let (mut dev, mut fs) = fresh_volume("RW2");
+        let mut reader: &[u8] = b"hello";
+        fs.create_file(&mut dev, "/g.txt", &mut reader, 5, 0).unwrap();
+        fs.flush(&mut dev).unwrap();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                std::path::Path::new("/g.txt"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.seek(SeekFrom::End(0)).unwrap();
+            h.write_all(b", world!").unwrap();
+            h.sync().unwrap();
+            assert_eq!(h.len(), 13);
+        }
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/g.txt");
+        assert_eq!(bytes, b"hello, world!");
+    }
+
+    #[test]
+    fn open_file_rw_set_len_grow_and_shrink() {
+        let (mut dev, mut fs) = fresh_volume("RW3");
+        // Start with an 8-byte file.
+        let mut reader: &[u8] = b"ABCDEFGH";
+        fs.create_file(&mut dev, "/s.bin", &mut reader, 8, 0).unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                std::path::Path::new("/s.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            // Grow to 20 KiB (multi-cluster) — fills with zeros.
+            h.set_len(20 * 1024).unwrap();
+            assert_eq!(h.len(), 20 * 1024);
+            h.sync().unwrap();
+        }
+        {
+            let mut fs2 = Exfat::open(&mut dev).unwrap();
+            let bytes = read_file_contents(&mut fs2, &mut dev, "/s.bin");
+            assert_eq!(bytes.len(), 20 * 1024);
+            assert_eq!(&bytes[..8], b"ABCDEFGH");
+            assert!(bytes[8..].iter().all(|&b| b == 0));
+        }
+
+        // Now shrink back to 4 bytes.
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                std::path::Path::new("/s.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.set_len(4).unwrap();
+            assert_eq!(h.len(), 4);
+            h.sync().unwrap();
+        }
+        let mut fs3 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs3, &mut dev, "/s.bin");
+        assert_eq!(bytes, b"ABCD");
+    }
+
+    #[test]
+    fn open_file_rw_append() {
+        use std::io::Write;
+        let (mut dev, mut fs) = fresh_volume("RW4");
+        let mut reader: &[u8] = b"head ";
+        fs.create_file(&mut dev, "/a.txt", &mut reader, 5, 0).unwrap();
+        fs.flush(&mut dev).unwrap();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                std::path::Path::new("/a.txt"),
+                OpenFlags {
+                    create: false,
+                    truncate: false,
+                    append: true,
+                },
+                None,
+            )
+            .unwrap();
+            h.write_all(b"tail").unwrap();
+            h.sync().unwrap();
+        }
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/a.txt");
+        assert_eq!(bytes, b"head tail");
+    }
+
+    #[test]
+    fn open_file_rw_create_new() {
+        use std::io::Write;
+        let (mut dev, mut fs) = fresh_volume("RW5");
+        // /n.txt does not exist — open with create=true.
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                std::path::Path::new("/n.txt"),
+                OpenFlags {
+                    create: true,
+                    truncate: false,
+                    append: false,
+                },
+                Some(FileMeta::default()),
+            )
+            .unwrap();
+            assert_eq!(h.len(), 0);
+            h.write_all(b"freshly created").unwrap();
+            h.sync().unwrap();
+        }
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/n.txt");
+        assert_eq!(bytes, b"freshly created");
+    }
+
+    #[test]
+    fn open_file_rw_create_existing_with_truncate() {
+        use std::io::Write;
+        let (mut dev, mut fs) = fresh_volume("RW6");
+        let mut reader: &[u8] = b"old content";
+        fs.create_file(&mut dev, "/c.txt", &mut reader, 11, 0).unwrap();
+        fs.flush(&mut dev).unwrap();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                std::path::Path::new("/c.txt"),
+                OpenFlags {
+                    create: false,
+                    truncate: true,
+                    append: false,
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(h.len(), 0);
+            h.write_all(b"new").unwrap();
+            h.sync().unwrap();
+        }
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/c.txt");
+        assert_eq!(bytes, b"new");
+    }
+
+    #[test]
+    fn open_file_rw_grow_allocates_clusters() {
+        use std::io::Write;
+        // Cluster size = 4 KiB. Start with an empty file, write across a
+        // cluster boundary so the bitmap allocator gets exercised.
+        let (mut dev, mut fs) = fresh_volume("RW7");
+        let mut empty: &[u8] = &[];
+        fs.create_file(&mut dev, "/big.bin", &mut empty, 0, 0).unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let used_before: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        let mut payload = vec![0u8; 12 * 1024]; // 3 clusters worth
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                std::path::Path::new("/big.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.write_all(&payload).unwrap();
+            h.sync().unwrap();
+        }
+        let used_after: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        assert!(
+            used_after >= used_before + 3,
+            "grow should allocate at least 3 clusters \
+             (before={used_before}, after={used_after})"
+        );
+
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/big.bin");
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn open_file_rw_truncate_then_grow_reuses_clusters() {
+        use std::io::Write;
+        // Create a multi-cluster file, truncate it down, then grow back
+        // and verify the previously freed clusters get reused.
+        let (mut dev, mut fs) = fresh_volume("RW8");
+        let payload = vec![0xABu8; 20 * 1024]; // 5 clusters
+        let mut reader: &[u8] = &payload;
+        fs.create_file(&mut dev, "/t.bin", &mut reader, payload.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+        let used_full: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                std::path::Path::new("/t.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.set_len(0).unwrap();
+            h.sync().unwrap();
+        }
+        let used_empty: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        assert!(
+            used_empty < used_full,
+            "truncate to zero must free clusters (full={used_full}, empty={used_empty})"
+        );
+
+        // Grow again — bytes from the chunk written should match.
+        let new_payload = vec![0xCDu8; 16 * 1024]; // 4 clusters
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                std::path::Path::new("/t.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.write_all(&new_payload).unwrap();
+            h.sync().unwrap();
+        }
+        let used_regrown: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
+        // We should never exceed the original peak after a truncate + smaller grow.
+        assert!(used_regrown <= used_full);
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let bytes = read_file_contents(&mut fs2, &mut dev, "/t.bin");
+        assert_eq!(bytes, new_payload);
+    }
+
+    #[test]
+    fn open_file_rw_missing_without_create_errors() {
+        let (mut dev, mut fs) = fresh_volume("RW9");
+        let res = Filesystem::open_file_rw(
+            &mut fs,
+            &mut dev,
+            std::path::Path::new("/nope.bin"),
+            OpenFlags::default(),
+            None,
+        );
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("expected error opening a non-existent file"),
+        };
+        match err {
+            crate::Error::InvalidArgument(msg) => assert!(msg.contains("no such")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 }

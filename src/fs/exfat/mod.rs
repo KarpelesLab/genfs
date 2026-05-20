@@ -2088,7 +2088,7 @@ mod tests {
     // shrink paths added in P-exfat-rw.
     // ===================================================================
 
-    use crate::fs::{FileHandle, FileMeta, Filesystem, OpenFlags};
+    use crate::fs::{FileMeta, Filesystem, OpenFlags};
 
     fn read_file_contents(fs: &mut Exfat, dev: &mut MemoryBackend, path: &str) -> Vec<u8> {
         use std::io::Read;

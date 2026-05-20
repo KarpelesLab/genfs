@@ -46,9 +46,7 @@
 //! - `0xFFFFFFFF` — terminator (end of array)
 //!
 //! ADC (`0x80000004`), bzip2 (`0x80000006`), LZFSE (`0x80000007`) and
-//! LZMA (`0x80000008`) are recognised but return
-//! [`crate::Error::Unsupported`] from the decoder until follow-up work
-//! wires up the codecs.
+//! LZMA (`0x80000008`) are decoded by [`crate::block::dmg::codec`].
 
 use crate::Result;
 

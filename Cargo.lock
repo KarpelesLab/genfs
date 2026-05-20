@@ -92,6 +92,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "bzip2-rs"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beeb59e7e4c811ab37cc73680c798c7a5da77fc9989c62b09138e31ee740f735"
+dependencies = [
+ "crc32fast",
+ "tinyvec",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -268,6 +278,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 name = "fstool"
 version = "0.2.0"
 dependencies = [
+ "bzip2-rs",
  "clap",
  "crc32c",
  "crc32fast",
@@ -277,6 +288,7 @@ dependencies = [
  "libc",
  "log",
  "lz4_flex",
+ "lzfse_rust",
  "lzma-rs",
  "minilzo-rs",
  "serde",
@@ -465,6 +477,12 @@ checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 dependencies = [
  "twox-hash",
 ]
+
+[[package]]
+name = "lzfse_rust"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5edeac3ec657925dececc672bdd58fa2212291886ddcb3e08aa46924c78340c6"
 
 [[package]]
 name = "lzma-rs"
@@ -762,6 +780,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "tinyvec"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e61e67053d25a4e82c844e8424039d9745781b3fc4f32b8d55ed50f5f667ef3"
 
 [[package]]
 name = "toml"

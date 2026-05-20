@@ -22,13 +22,18 @@ path = "src/bin/fstool/main.rs"
 # Compression codecs for SquashFS reads and `.tar.<algo>` streaming I/O.
 # Enabled by default; disable with `default-features = false` and pick
 # a subset if you want to slim the binary or avoid a C-bundled build.
-default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo"]
+default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "dmg-bzip2", "dmg-lzfse"]
 gzip = ["dep:flate2"]
 xz = ["dep:lzma-rs"]
 lzma = ["dep:lzma-rs"]
 lz4 = ["dep:lz4_flex"]
 zstd = ["dep:zstd"]
 lzo = ["dep:minilzo-rs"]
+# DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set.
+# bzip2-rs is a pure-Rust decoder, lzfse_rust is a pure-Rust LZFSE
+# decoder; both gated so a slim build can drop them.
+dmg-bzip2 = ["dep:bzip2-rs"]
+dmg-lzfse = ["dep:lzfse_rust"]
 
 [dependencies]
 thiserror = "2"
@@ -56,6 +61,12 @@ lzma-rs = { version = "0.3", optional = true }
 lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["std", "safe-encode", "safe-decode", "frame"] }
 zstd = { version = "0.13", optional = true }
 "minilzo-rs" = { version = "0.6", optional = true }
+
+# DMG codec deps. bzip2-rs is decode-only pure Rust; lzfse_rust is a
+# pure-Rust LZFSE encoder + decoder. Both opt-in via dmg-bzip2 /
+# dmg-lzfse features so a build without DMG support can drop them.
+bzip2-rs = { version = "0.1", optional = true }
+lzfse_rust = { version = "0.2", optional = true }
 
 # Needed on Unix for the BLKGETSIZE64 / DKIOCGETBLOCKCOUNT ioctls used to
 # query the size of a block device, plus the O_EXCL open flag that refuses

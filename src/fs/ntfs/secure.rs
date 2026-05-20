@@ -21,6 +21,43 @@
 
 use crate::Result;
 
+/// Logical class of security descriptor a file or directory should be
+/// stamped with at format time. Real-world NTFS volumes carry many
+/// distinct SDs (one per unique ACL); we materialise a small fixed
+/// catalogue at format time and let each MFT record point at the right
+/// entry through `$STANDARD_INFORMATION.security_id`.
+///
+/// * `System` — tighter ACL applied to NTFS system files (records 0..=15
+///   on a fresh volume). DACL grants SYSTEM full control and Administrators
+///   full control; Everyone has no entries.
+/// * `User`   — looser ACL applied to user-visible files and directories
+///   created through the writer. DACL grants Everyone full control (this
+///   matches what `mkntfs` historically lays down for unowned files).
+/// * `Default` — alias for `User`. Reserved so future expansions
+///   (read-only, special-purpose ACLs) don't churn external call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SecurityClass {
+    /// User-facing files and directories.
+    Default,
+    /// NTFS system files (records 0..=15).
+    System,
+    /// Explicit alias for `Default`; reserved for future use.
+    User,
+}
+
+impl SecurityClass {
+    /// Stable index inside the volume's security catalogue. Used by the
+    /// formatter to lay out the SDS stream in a deterministic order so
+    /// the `security_id` for each class is reproducible.
+    pub fn catalogue_index(self) -> u32 {
+        match self {
+            // The User / Default classes share the same on-disk SD.
+            SecurityClass::Default | SecurityClass::User => 0,
+            SecurityClass::System => 1,
+        }
+    }
+}
+
 /// One row of the `$Secure:$SDS` data stream's "SDS entry" header. The
 /// stream is laid out as packed entries, padded so each starts on a 16-byte
 /// boundary within a 256 KiB block. Each entry's header occupies 0x14 bytes

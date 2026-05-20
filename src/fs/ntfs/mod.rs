@@ -871,9 +871,12 @@ impl Ntfs {
                             );
                             out.insert(xattr_keys::TIMES_RAW.into(), si.times_raw().to_vec());
                             // NTFS >= 3.0 extended $STANDARD_INFORMATION
-                            // includes a security_id at offset 0x54.
-                            if value.len() >= 0x58 {
-                                let id = u32::from_le_bytes(value[0x54..0x58].try_into().unwrap());
+                            // adds owner_id / security_id / quota / USN
+                            // starting at offset 0x30. security_id is at
+                            // 0x34 — a non-zero value points at $Secure:$SII
+                            // for the shared SD.
+                            if value.len() >= 0x38 {
+                                let id = u32::from_le_bytes(value[0x34..0x38].try_into().unwrap());
                                 if id != 0 {
                                     security_id = Some(id);
                                 }

@@ -1242,17 +1242,8 @@ fn writer_root_index_contains_system_files() {
 
     // Every canonical NTFS system file should be indexed in the root.
     for expected in &[
-        "$MFT",
-        "$MFTMirr",
-        "$LogFile",
-        "$Volume",
-        "$AttrDef",
-        "$Bitmap",
-        "$Boot",
-        "$BadClus",
-        "$Secure",
-        "$UpCase",
-        "$Extend",
+        "$MFT", "$MFTMirr", "$LogFile", "$Volume", "$AttrDef", "$Bitmap", "$Boot", "$BadClus",
+        "$Secure", "$UpCase", "$Extend",
     ] {
         assert!(
             names.contains(*expected),
@@ -1355,4 +1346,172 @@ fn open_file_ro_random_seek_ntfs() {
     let mut buf2 = [0u8; 100];
     h.read_exact(&mut buf2).unwrap();
     assert_eq!(&buf2[..], &data[50..150]);
+}
+
+/// Helper: extract the `security_id` from `$STANDARD_INFORMATION` of an
+/// MFT record. Returns `0` when the SI value isn't long enough to carry
+/// the NTFS 3.0+ extension (i.e. the file was stamped with the legacy
+/// 48-byte form).
+fn read_security_id_for_record(ntfs: &mut Ntfs, dev: &mut MemoryBackend, rec_no: u64) -> u32 {
+    let mut buf = vec![0u8; ntfs.mft_record_size() as usize];
+    ntfs.read_mft_record(dev, rec_no, &mut buf).unwrap();
+    let hdr = mft::RecordHeader::parse(&buf).unwrap();
+    for attr_res in AttributeIter::new(&buf, hdr.first_attribute_offset as usize) {
+        let attr = attr_res.unwrap();
+        if attr.type_code != TYPE_STANDARD_INFORMATION {
+            continue;
+        }
+        if let AttributeKind::Resident { value, .. } = attr.kind {
+            if value.len() >= 0x38 {
+                return u32::from_le_bytes(value[0x34..0x38].try_into().unwrap());
+            }
+            return 0;
+        }
+    }
+    panic!("record {rec_no} has no resident $STANDARD_INFORMATION");
+}
+
+#[test]
+fn writer_format_emits_multiple_security_descriptors() {
+    // Multi-SD verification:
+    //   * Format a fresh image.
+    //   * Add at least one user file.
+    //   * On reopen, $Secure:$SDS must carry >= 2 distinct (hash, security_id)
+    //     pairs (User vs. System).
+    //   * System records (e.g. $MFT at record 0) must have SI.security_id
+    //     pointing at the System SD (FIRST_SECURITY_ID + 1).
+    //   * User-visible files / directories (the root, and /u.txt) must
+    //     have SI.security_id pointing at the User SD (FIRST_SECURITY_ID).
+    use super::format::{FIRST_SECURITY_ID, security_id_for};
+    use super::secure::SecurityClass;
+
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_file(
+        &mut dev,
+        "/u.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi\n".to_vec())),
+            len: 3,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+
+    // Pull the entire $SDS stream and scan its SDS-entry headers (20 bytes
+    // each, padded to a 16-byte boundary). We expect at least two distinct
+    // entries with different (hash, security_id) pairs — one User, one
+    // System.
+    let mut sds = Vec::new();
+    {
+        let mut r = ntfs2
+            .open_stream_by_record(&mut dev, MFT_RECORD_SECURE, "$SDS")
+            .unwrap();
+        r.read_to_end(&mut sds).unwrap();
+    }
+
+    let mut entries: Vec<(u32, u32, u32)> = Vec::new(); // (hash, security_id, size)
+    let mut off = 0usize;
+    while off + 0x14 <= sds.len() {
+        let hash = u32::from_le_bytes(sds[off..off + 4].try_into().unwrap());
+        let sid = u32::from_le_bytes(sds[off + 4..off + 8].try_into().unwrap());
+        let _entry_off = u64::from_le_bytes(sds[off + 8..off + 16].try_into().unwrap());
+        let size = u32::from_le_bytes(sds[off + 16..off + 20].try_into().unwrap());
+        if size == 0 || (size as usize) < 0x14 {
+            break;
+        }
+        if sid == 0 {
+            // Padding region or trailing zeros — end of stream.
+            break;
+        }
+        entries.push((hash, sid, size));
+        // Advance by `size` and pad to 16-byte boundary.
+        let advance = ((size as usize) + 0x0F) & !0x0F;
+        off += advance;
+    }
+
+    assert!(
+        entries.len() >= 2,
+        "expected >= 2 SDS entries, got {}: {:?}",
+        entries.len(),
+        entries
+    );
+
+    // Collect distinct (hash, security_id) pairs and assert >= 2.
+    use std::collections::HashSet;
+    let distinct: HashSet<(u32, u32)> = entries.iter().map(|&(h, s, _)| (h, s)).collect();
+    assert!(
+        distinct.len() >= 2,
+        "expected >= 2 distinct (hash, security_id) pairs in $SDS, got {distinct:?}"
+    );
+
+    // The two ids we currently emit are User (0x100) and System (0x101).
+    let user_id = security_id_for(SecurityClass::User);
+    let system_id = security_id_for(SecurityClass::System);
+    assert_eq!(user_id, FIRST_SECURITY_ID);
+    assert_eq!(system_id, FIRST_SECURITY_ID + 1);
+    let ids: HashSet<u32> = entries.iter().map(|&(_, s, _)| s).collect();
+    assert!(
+        ids.contains(&user_id),
+        "expected User security_id {user_id:#x} in $SDS, got {ids:?}"
+    );
+    assert!(
+        ids.contains(&system_id),
+        "expected System security_id {system_id:#x} in $SDS, got {ids:?}"
+    );
+
+    // The two distinct ids must hash to different values — otherwise the
+    // catalogue collapsed back to a single descriptor.
+    let user_hash = entries
+        .iter()
+        .find(|(_, s, _)| *s == user_id)
+        .map(|(h, _, _)| *h)
+        .unwrap();
+    let system_hash = entries
+        .iter()
+        .find(|(_, s, _)| *s == system_id)
+        .map(|(h, _, _)| *h)
+        .unwrap();
+    assert_ne!(
+        user_hash, system_hash,
+        "User and System SDs unexpectedly share a hash — catalogue collapsed?"
+    );
+
+    // System records must point at the System SD.
+    let mft_sid = read_security_id_for_record(&mut ntfs2, &mut dev, MFT_RECORD_MFT);
+    assert_eq!(
+        mft_sid, system_id,
+        "$MFT (record 0) should carry System security_id"
+    );
+    let secure_sid = read_security_id_for_record(&mut ntfs2, &mut dev, MFT_RECORD_SECURE);
+    assert_eq!(
+        secure_sid, system_id,
+        "$Secure (record 9) should carry System security_id"
+    );
+
+    // Root and the user file must point at the User SD.
+    let root_sid = read_security_id_for_record(&mut ntfs2, &mut dev, MFT_RECORD_ROOT);
+    assert_eq!(
+        root_sid, user_id,
+        "root directory should carry User security_id"
+    );
+    let user_rec = ntfs2.lookup_path(&mut dev, "/u.txt").unwrap();
+    let user_sid = read_security_id_for_record(&mut ntfs2, &mut dev, user_rec);
+    assert_eq!(user_sid, user_id, "/u.txt should carry User security_id");
+
+    // Cross-check: the resolve_security_descriptor path through $SII must
+    // produce the same SD blob that build_security_descriptor(class) produces
+    // for the User class — we exercise it through read_xattrs on the user
+    // file.
+    let xa_user = ntfs2.read_xattrs(&mut dev, "/u.txt").unwrap();
+    let xa_user_sd = xa_user
+        .get(xattr_keys::SECURITY)
+        .expect("user file should carry a resolved security descriptor");
+    let expected_user_sd = super::format::build_security_descriptor(SecurityClass::User);
+    assert_eq!(
+        xa_user_sd, &expected_user_sd,
+        "resolved User SD differs from build_security_descriptor(User)"
+    );
 }

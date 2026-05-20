@@ -33,10 +33,12 @@ use super::attribute::{
 };
 use super::format::{
     self, FIRST_USER_RECORD, FormatOpts, LayoutResult, REC_ROOT, build_file_name_value,
-    build_non_resident_attr, build_resident_attr, build_si_value, emit_record, encode_single_run,
-    insert_into_index_root, pack_mft_ref, rewrite_resident_attr, unix_to_filetime,
+    build_non_resident_attr, build_resident_attr, build_si_value_with_security, emit_record,
+    encode_single_run, insert_into_index_root, pack_mft_ref, rewrite_resident_attr,
+    security_id_for, unix_to_filetime,
 };
 use super::mft;
+use super::secure::SecurityClass;
 
 /// Maximum bytes a directory's $INDEX_ROOT may grow to before we promote
 /// to $INDEX_ALLOCATION. The MFT record is 1024 bytes; subtract space
@@ -342,7 +344,11 @@ impl super::Ntfs {
         let si = build_resident_attr(
             TYPE_STANDARD_INFORMATION,
             &[],
-            &build_si_value(filetime, dos_attrs_from_mode(meta.mode, false)),
+            &build_si_value_with_security(
+                filetime,
+                dos_attrs_from_mode(meta.mode, false),
+                security_id_for(SecurityClass::User),
+            ),
             0,
             0,
         );
@@ -399,7 +405,11 @@ impl super::Ntfs {
         let si = build_resident_attr(
             TYPE_STANDARD_INFORMATION,
             &[],
-            &build_si_value(filetime, dos_attrs_from_mode(meta.mode, true)),
+            &build_si_value_with_security(
+                filetime,
+                dos_attrs_from_mode(meta.mode, true),
+                security_id_for(SecurityClass::User),
+            ),
             0,
             0,
         );
@@ -473,7 +483,11 @@ impl super::Ntfs {
         let si = build_resident_attr(
             TYPE_STANDARD_INFORMATION,
             &[],
-            &build_si_value(filetime, 0x400), // REPARSE_POINT attribute
+            &build_si_value_with_security(
+                filetime,
+                0x400, // REPARSE_POINT attribute
+                security_id_for(SecurityClass::User),
+            ),
             0,
             0,
         );

@@ -40,6 +40,7 @@ use super::attribute::{
 };
 use super::boot::NTFS_OEM;
 use super::mft;
+use super::secure;
 use super::upcase_gen::build_upcase_blob;
 
 /// Hard-coded MFT record numbers (matches what the read path expects).
@@ -547,14 +548,52 @@ pub fn build_empty_index_root() -> Vec<u8> {
 }
 
 /// Build a default `$STANDARD_INFORMATION` value (48 bytes). Times default
-/// to the supplied FILETIME; file_attributes default to `attrs`.
+/// to the supplied FILETIME; file_attributes default to `attrs`. Equivalent
+/// to [`build_si_value_with_security`] with a zero `security_id`.
 pub fn build_si_value(filetime: u64, attrs: u32) -> Vec<u8> {
-    let mut v = vec![0u8; 48];
+    build_si_value_with_security(filetime, attrs, 0)
+}
+
+/// Convenience wrapper around [`build_si_value_with_security`] for an
+/// NTFS system record (MFT records 0..=15). Stamps the canonical
+/// "System" security_id resolved through the format-time SD catalogue.
+pub fn build_system_si_value(filetime: u64, attrs: u32) -> Vec<u8> {
+    build_si_value_with_security(
+        filetime,
+        attrs,
+        security_id_for(secure::SecurityClass::System),
+    )
+}
+
+/// Build a `$STANDARD_INFORMATION` value, optionally with the NTFS 3.0+
+/// extended footer carrying `security_id`. A zero `security_id` produces
+/// the legacy 48-byte form (matches a freshly formatted v1.2 volume).
+/// Non-zero ids produce a 72-byte value with the standard layout:
+///
+/// ```text
+///   0x00..0x08  created  (FILETIME)
+///   0x08..0x10  modified (FILETIME)
+///   0x10..0x18  mft_changed (FILETIME)
+///   0x18..0x20  accessed (FILETIME)
+///   0x20..0x24  file_attributes
+///   0x24..0x30  reserved (max_versions / version / class_id)
+///   0x30..0x34  owner_id    (NTFS 3.0+)
+///   0x34..0x38  security_id (NTFS 3.0+)
+///   0x38..0x40  quota_charged (NTFS 3.0+)
+///   0x40..0x48  usn  (NTFS 3.0+)
+/// ```
+pub fn build_si_value_with_security(filetime: u64, attrs: u32, security_id: u32) -> Vec<u8> {
+    let len = if security_id != 0 { 72 } else { 48 };
+    let mut v = vec![0u8; len];
     v[0..8].copy_from_slice(&filetime.to_le_bytes());
     v[8..16].copy_from_slice(&filetime.to_le_bytes());
     v[16..24].copy_from_slice(&filetime.to_le_bytes());
     v[24..32].copy_from_slice(&filetime.to_le_bytes());
     v[32..36].copy_from_slice(&attrs.to_le_bytes());
+    if security_id != 0 {
+        // security_id at 0x34..0x38
+        v[0x34..0x38].copy_from_slice(&security_id.to_le_bytes());
+    }
     v
 }
 
@@ -610,7 +649,7 @@ pub fn build_attrdef_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -671,7 +710,7 @@ pub fn build_volume_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -700,13 +739,11 @@ pub fn build_volume_record(
 /// Build the root directory's MFT record (record 5). The index is empty
 /// initially — `Writer::add_entry_to_dir` mutates it as files are added.
 pub fn build_root_record(rec_buf: &mut [u8], rec_size: usize, filetime: u64, sector_size: usize) {
-    let si = build_resident_attr(
-        TYPE_STANDARD_INFORMATION,
-        &[],
-        &build_si_value(filetime, 0x06),
-        0,
-        0,
-    );
+    // Root carries the User-class SD (everyone full access) — it is the
+    // user-visible top-level directory, not a system file.
+    let root_si =
+        build_si_value_with_security(filetime, 0x06, security_id_for(secure::SecurityClass::User));
+    let si = build_resident_attr(TYPE_STANDARD_INFORMATION, &[], &root_si, 0, 0);
     // The root has a $FILE_NAME whose parent is itself.
     let root_ref = pack_mft_ref(REC_ROOT, 1);
     let fn_value = build_file_name_value(root_ref, ".", 0x10000006, 0, 0, filetime, 1); // dir | hidden | system
@@ -744,7 +781,7 @@ pub fn build_bitmap_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -794,7 +831,7 @@ pub fn build_boot_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -847,7 +884,7 @@ pub fn build_badclus_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -900,57 +937,117 @@ const SECURE_FILE_ATTRS: u32 = 0x2000_0006;
 const MFT_RECORD_FLAG_VIEW_INDEX: u16 = 0x0008;
 /// First security_id mkntfs hands out. We follow the same convention so
 /// downstream tools that special-case the low ids behave identically.
-const FIRST_SECURITY_ID: u32 = 0x100;
+pub const FIRST_SECURITY_ID: u32 = 0x100;
+
+/// The security id assigned to a given class on a fresh volume. The
+/// catalogue is fixed at format time (see [`build_security_catalogue`])
+/// so this is a small switch rather than a runtime lookup.
+pub fn security_id_for(class: secure::SecurityClass) -> u32 {
+    FIRST_SECURITY_ID + class.catalogue_index()
+}
+
+/// Build the catalogue of security descriptors a fresh volume carries.
+/// Each entry is `(security_id, sd_blob)`; the formatter feeds this
+/// list straight into [`build_sds_stream_multi`] / [`build_secure_record`].
+///
+/// We currently emit two distinct SDs:
+/// * `0x100` — the **User** SD (Everyone Full Access). Default for
+///   user-visible files / directories and for the root.
+/// * `0x101` — the **System** SD (SYSTEM + Administrators Full Access,
+///   no Everyone entry). Applied to records 0..=15 (`$MFT`, `$Secure`,
+///   `$LogFile`, ...).
+fn build_security_catalogue() -> Vec<(u32, Vec<u8>)> {
+    let classes = [secure::SecurityClass::User, secure::SecurityClass::System];
+    classes
+        .iter()
+        .map(|&c| (security_id_for(c), build_security_descriptor(c)))
+        .collect()
+}
 
 /// Build a default "everyone full access" SECURITY_DESCRIPTOR_RELATIVE.
 /// Owner = SYSTEM, Group = SYSTEM, DACL = single ACE granting Everyone
-/// FILE_ALL_ACCESS. 72 bytes on the wire. Enough to satisfy `ntfs-3g`'s
-/// `$Secure` consistency check (and any kernel-side ACL walker that
-/// happens to dereference a security_id of zero falls back to "use the
-/// default", so this SD doesn't even need to be reachable from a file —
-/// it just needs to exist).
+/// FILE_ALL_ACCESS. Equivalent to `build_security_descriptor(SecurityClass::User)`.
 pub fn build_default_security_descriptor() -> Vec<u8> {
-    // SID: S-1-1-0 (Everyone)
-    let mut everyone = vec![0u8; 12];
-    everyone[0] = 1; // revision
-    everyone[1] = 1; // sub_authority_count
-    everyone[2..8].copy_from_slice(&[0, 0, 0, 0, 0, 1]); // identifier_authority
-    everyone[8..12].copy_from_slice(&0u32.to_le_bytes()); // sub-authority 0
+    build_security_descriptor(secure::SecurityClass::User)
+}
 
-    // SID: S-1-5-18 (Local SYSTEM)
+/// Build a self-relative `SECURITY_DESCRIPTOR` blob for the given class.
+/// Each class produces a distinct DACL so the resulting SDs hash to
+/// different values and occupy independent slots in `$Secure:$SDS`.
+///
+/// All variants share Owner = Group = Local SYSTEM (S-1-5-18), revision 1,
+/// `SE_DACL_PRESENT | SE_SELF_RELATIVE = 0x8004` control flags, and the
+/// canonical header layout (DACL → owner → group). Only the DACL differs.
+pub fn build_security_descriptor(class: secure::SecurityClass) -> Vec<u8> {
+    // SID: S-1-1-0 (Everyone) — one sub-authority.
+    let mut everyone = vec![0u8; 12];
+    everyone[0] = 1;
+    everyone[1] = 1;
+    everyone[2..8].copy_from_slice(&[0, 0, 0, 0, 0, 1]);
+    everyone[8..12].copy_from_slice(&0u32.to_le_bytes());
+
+    // SID: S-1-5-18 (Local SYSTEM).
     let mut system = vec![0u8; 12];
     system[0] = 1;
     system[1] = 1;
     system[2..8].copy_from_slice(&[0, 0, 0, 0, 0, 5]);
     system[8..12].copy_from_slice(&18u32.to_le_bytes());
 
-    // Single ACE: ACCESS_ALLOWED, all-access mask, Everyone SID.
-    let mut ace = Vec::new();
-    ace.push(0u8); // ace_type = ACCESS_ALLOWED
-    ace.push(0u8); // ace_flags
-    let ace_size = 8u16 + everyone.len() as u16;
-    ace.extend_from_slice(&ace_size.to_le_bytes());
-    ace.extend_from_slice(&0x001F_01FFu32.to_le_bytes()); // FILE_ALL_ACCESS
-    ace.extend_from_slice(&everyone);
+    // SID: S-1-5-32-544 (BUILTIN\Administrators) — two sub-authorities.
+    let mut administrators = vec![0u8; 16];
+    administrators[0] = 1;
+    administrators[1] = 2;
+    administrators[2..8].copy_from_slice(&[0, 0, 0, 0, 0, 5]);
+    administrators[8..12].copy_from_slice(&32u32.to_le_bytes());
+    administrators[12..16].copy_from_slice(&544u32.to_le_bytes());
 
-    // ACL containing the single ACE.
+    fn ace_allowed(mask: u32, sid: &[u8]) -> Vec<u8> {
+        let mut ace = Vec::with_capacity(8 + sid.len());
+        ace.push(0u8); // ACCESS_ALLOWED
+        ace.push(0u8); // flags
+        let ace_size = 8u16 + sid.len() as u16;
+        ace.extend_from_slice(&ace_size.to_le_bytes());
+        ace.extend_from_slice(&mask.to_le_bytes());
+        ace.extend_from_slice(sid);
+        ace
+    }
+
+    // FILE_ALL_ACCESS = 0x001F01FF.
+    let all_access = 0x001F_01FFu32;
+
+    // DACL ACEs depend on the class.
+    let aces: Vec<Vec<u8>> = match class {
+        // Default / User: Everyone gets full access. Matches mkntfs's
+        // default DACL for unowned files and the legacy
+        // `build_default_security_descriptor` blob.
+        secure::SecurityClass::Default | secure::SecurityClass::User => {
+            vec![ace_allowed(all_access, &everyone)]
+        }
+        // System: SYSTEM + Administrators get full access; Everyone has
+        // no entries. This is the canonical DACL `mkntfs` applies to
+        // records 0..=15.
+        secure::SecurityClass::System => {
+            vec![
+                ace_allowed(all_access, &system),
+                ace_allowed(all_access, &administrators),
+            ]
+        }
+    };
+
+    // ACL header + ACEs.
     let mut acl = Vec::new();
     acl.push(2u8); // revision
     acl.push(0u8); // sbz1
-    let acl_size = 8u16 + ace.len() as u16;
+    let aces_bytes: usize = aces.iter().map(|a| a.len()).sum();
+    let acl_size = 8u16 + aces_bytes as u16;
     acl.extend_from_slice(&acl_size.to_le_bytes());
-    acl.extend_from_slice(&1u16.to_le_bytes()); // ace_count
+    acl.extend_from_slice(&(aces.len() as u16).to_le_bytes());
     acl.extend_from_slice(&0u16.to_le_bytes()); // sbz2
-    acl.extend_from_slice(&ace);
+    for ace in &aces {
+        acl.extend_from_slice(ace);
+    }
 
-    // SECURITY_DESCRIPTOR_RELATIVE layout:
-    //   0..1 revision
-    //   1..2 sbz
-    //   2..4 control flags (SE_DACL_PRESENT | SE_SELF_RELATIVE = 0x8004)
-    //   4..8 owner offset
-    //   8..12 group offset
-    //   12..16 sacl offset (0 — no SACL)
-    //   16..20 dacl offset
+    // SECURITY_DESCRIPTOR_RELATIVE layout (DACL first, then owner / group).
     let header_len = 20usize;
     let dacl_off = header_len as u32;
     let owner_off = dacl_off + acl.len() as u32;
@@ -961,7 +1058,7 @@ pub fn build_default_security_descriptor() -> Vec<u8> {
     sd[2..4].copy_from_slice(&0x8004u16.to_le_bytes()); // control
     sd[4..8].copy_from_slice(&owner_off.to_le_bytes());
     sd[8..12].copy_from_slice(&group_off.to_le_bytes());
-    sd[12..16].copy_from_slice(&0u32.to_le_bytes()); // sacl offset
+    sd[12..16].copy_from_slice(&0u32.to_le_bytes()); // sacl
     sd[16..20].copy_from_slice(&dacl_off.to_le_bytes());
     sd.extend_from_slice(&acl);
     sd.extend_from_slice(&system); // owner
@@ -983,38 +1080,78 @@ pub fn sd_hash(buf: &[u8]) -> u32 {
     h
 }
 
+/// Decoded view of one entry the formatter staged into `$Secure:$SDS`.
+/// `sds_offset` is the byte offset within `$SDS` where the 20-byte SDS
+/// entry header for this row begins; `sds_size` is the value stored in
+/// that header's `size` field (20 bytes header + SD blob length, **NOT**
+/// including the 16-byte alignment pad).
+#[derive(Debug, Clone, Copy)]
+pub struct SdsEntryLayout {
+    pub security_id: u32,
+    pub hash: u32,
+    pub sds_offset: u64,
+    pub sds_size: u32,
+}
+
 /// Build the bytes of `$Secure:$SDS` carrying a single SD with
 /// `security_id = FIRST_SECURITY_ID`. Returns `(stream, entry_size)`
 /// where `entry_size` is the size field stored inside the SDS entry
 /// header (header + SD blob, NOT including the 16-byte alignment pad).
 ///
-/// Layout:
-/// * 20-byte SDS entry header `(hash, security_id, offset_in_sds, size)`
-/// * `sd_blob` immediately after.
-/// * Zero-padding so the next entry would start on a 16-byte boundary.
+/// Single-entry shortcut used by tests and callers that want a minimal
+/// `$Secure`. Multi-entry callers should use
+/// [`build_sds_stream_multi`].
 pub fn build_sds_stream(sd_blob: &[u8]) -> (Vec<u8>, u32) {
-    let entry_size_no_pad = 20u32 + sd_blob.len() as u32;
-    let hash = sd_hash(sd_blob);
-    let mut out = Vec::with_capacity(entry_size_no_pad as usize + 16);
-    out.extend_from_slice(&hash.to_le_bytes());
-    out.extend_from_slice(&FIRST_SECURITY_ID.to_le_bytes());
-    out.extend_from_slice(&0u64.to_le_bytes()); // offset_in_sds = 0 (first entry)
-    out.extend_from_slice(&entry_size_no_pad.to_le_bytes());
-    out.extend_from_slice(sd_blob);
-    while out.len() % 16 != 0 {
-        out.push(0);
-    }
-    (out, entry_size_no_pad)
+    let (bytes, entries) = build_sds_stream_multi(&[(FIRST_SECURITY_ID, sd_blob)]);
+    let size = entries.first().map(|e| e.sds_size).unwrap_or(0);
+    (bytes, size)
 }
 
-/// Build $Secure (record 9) with a single default security descriptor.
+/// Build the bytes of `$Secure:$SDS` for `entries`, in order. Each SDS
+/// entry is laid out as:
 ///
-/// `sds_lcn` / `sds_clusters` describe the non-resident $DATA $SDS
+/// * 20-byte SDS entry header `(hash, security_id, offset_in_sds, size)`
+/// * `sd_blob` immediately after.
+/// * Zero-padding so the next entry starts on a 16-byte boundary.
+///
+/// Returns `(stream_bytes, layout)` where `layout[i]` describes where
+/// each input entry landed (the caller will use this to build `$SDH` and
+/// `$SII` entries pointing at the right `sds_offset` / `sds_size`).
+pub fn build_sds_stream_multi(entries: &[(u32, &[u8])]) -> (Vec<u8>, Vec<SdsEntryLayout>) {
+    let mut out = Vec::new();
+    let mut layouts = Vec::with_capacity(entries.len());
+    for &(security_id, sd_blob) in entries {
+        let sds_offset = out.len() as u64;
+        let entry_size_no_pad = 20u32 + sd_blob.len() as u32;
+        let hash = sd_hash(sd_blob);
+        out.extend_from_slice(&hash.to_le_bytes());
+        out.extend_from_slice(&security_id.to_le_bytes());
+        out.extend_from_slice(&sds_offset.to_le_bytes());
+        out.extend_from_slice(&entry_size_no_pad.to_le_bytes());
+        out.extend_from_slice(sd_blob);
+        while out.len() % 16 != 0 {
+            out.push(0);
+        }
+        layouts.push(SdsEntryLayout {
+            security_id,
+            hash,
+            sds_offset,
+            sds_size: entry_size_no_pad,
+        });
+    }
+    (out, layouts)
+}
+
+/// Build $Secure (record 9) carrying one or more security descriptors.
+///
+/// `sds_lcn` / `sds_clusters` describe the non-resident `$DATA:$SDS`
 /// extent allocated by [`format_volume`]; `sds_size` is the number of
-/// bytes actually used at the start of that extent (entry header + SD,
-/// 16-byte padded). The $SDH / $SII roots both point at
-/// `security_id = FIRST_SECURITY_ID` mapped to `(offset=0,
-/// size=sds_entry_size)`.
+/// bytes actually used at the start of that extent (sum of entry headers
+/// + SD blobs, 16-byte padded between entries).
+///
+/// Each entry in `sds_entries` becomes one row in `$SDH` (keyed by
+/// `(hash, id)`) and `$SII` (keyed by `id`). The order in `sds_entries`
+/// matters because `build_secure_index_root` does not re-sort.
 #[allow(clippy::too_many_arguments)]
 pub fn build_secure_record(
     rec_buf: &mut [u8],
@@ -1024,27 +1161,19 @@ pub fn build_secure_record(
     sds_lcn: u64,
     sds_clusters: u64,
     sds_size: u64,
-    sds_entry_hash: u32,
-    sds_entry_size: u32,
+    sds_entries: &[SdsEntryLayout],
     cluster_size: u64,
     sector_size: usize,
 ) {
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, SECURE_FILE_ATTRS),
+        &build_system_si_value(filetime, SECURE_FILE_ATTRS),
         0,
         0,
     );
-    let fn_value = build_file_name_value(
-        parent_ref,
-        "$Secure",
-        SECURE_FILE_ATTRS,
-        0,
-        0,
-        filetime,
-        1,
-    );
+    let fn_value =
+        build_file_name_value(parent_ref, "$Secure", SECURE_FILE_ATTRS, 0, 0, filetime, 1);
     let fname = build_resident_attr(TYPE_FILE_NAME, &[], &fn_value, 0, 0);
 
     // $SDS: non-resident $DATA stream named "$SDS".
@@ -1067,22 +1196,28 @@ pub fn build_secure_record(
         0,
     );
 
-    // $SDH index root: one real entry + terminator.
-    let sdh_root = build_secure_index_root(
-        0x12, // SDH collation
-        &build_sdh_entry(sds_entry_hash, FIRST_SECURITY_ID, 0, sds_entry_size),
-    );
+    // $SDH index root: one entry per SDS row (in input order), then a
+    // single terminator.
+    let sdh_entries: Vec<Vec<u8>> = sds_entries
+        .iter()
+        .map(|e| build_sdh_entry(e.hash, e.security_id, e.sds_offset, e.sds_size))
+        .collect();
+    let sdh_root = build_secure_index_root(0x12, &sdh_entries);
     let sdh_name: Vec<u8> = "$SDH"
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
     let sdh = build_resident_attr(TYPE_INDEX_ROOT, &sdh_name, &sdh_root, 0, 0);
 
-    // $SII index root: one real entry + terminator.
-    let sii_root = build_secure_index_root(
-        0x10, // SII collation
-        &build_sii_entry(sds_entry_hash, FIRST_SECURITY_ID, 0, sds_entry_size),
-    );
+    // $SII index root: one entry per SDS row, keyed by ascending
+    // security_id (`mkntfs` does the same so the leaf is collation-sorted).
+    let mut sorted: Vec<&SdsEntryLayout> = sds_entries.iter().collect();
+    sorted.sort_by_key(|e| e.security_id);
+    let sii_entries: Vec<Vec<u8>> = sorted
+        .iter()
+        .map(|e| build_sii_entry(e.hash, e.security_id, e.sds_offset, e.sds_size))
+        .collect();
+    let sii_root = build_secure_index_root(0x10, &sii_entries);
     let sii_name: Vec<u8> = "$SII"
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
@@ -1100,15 +1235,17 @@ pub fn build_secure_record(
     );
 }
 
-/// Build an `$INDEX_ROOT` value for `$SDH` / `$SII`. `entry` is the bytes
-/// of the single real index entry (the terminator is appended here). The
-/// indexed-attribute type is always 0 ("view index") for both streams;
-/// the caller passes the appropriate collation (0x12 for SDH by hash+id,
-/// 0x10 for SII by security_id alone).
-fn build_secure_index_root(collation: u32, entry: &[u8]) -> Vec<u8> {
+/// Build an `$INDEX_ROOT` value for `$SDH` / `$SII`. `entries` are the
+/// raw bytes of the real index entries in collation order; a 16-byte
+/// terminator entry is appended here. The indexed-attribute type is
+/// always 0 ("view index") for both streams; the caller passes the
+/// appropriate collation (0x12 for SDH by hash+id, 0x10 for SII by
+/// security_id alone).
+fn build_secure_index_root(collation: u32, entries: &[Vec<u8>]) -> Vec<u8> {
     let index_block_size = DEFAULT_INDEX_RECORD_SIZE;
     let cpib: i8 = 1;
-    let mut v = Vec::with_capacity(0x20 + entry.len() + 16);
+    let entries_total: usize = entries.iter().map(|e| e.len()).sum();
+    let mut v = Vec::with_capacity(0x20 + entries_total + 16);
     // INDEX_ROOT header (16 bytes).
     v.extend_from_slice(&0u32.to_le_bytes()); // indexed attribute type = 0 ("view index")
     v.extend_from_slice(&collation.to_le_bytes());
@@ -1118,14 +1255,16 @@ fn build_secure_index_root(collation: u32, entry: &[u8]) -> Vec<u8> {
     // Index header (16 bytes).
     let first_entry_offset = 16u32;
     let term_entry_len = 16u32;
-    let bytes_in_use = 16u32 + entry.len() as u32 + term_entry_len;
+    let bytes_in_use = 16u32 + entries_total as u32 + term_entry_len;
     let bytes_allocated = bytes_in_use;
     v.extend_from_slice(&first_entry_offset.to_le_bytes());
     v.extend_from_slice(&bytes_in_use.to_le_bytes());
     v.extend_from_slice(&bytes_allocated.to_le_bytes());
     v.push(0); // flags (SMALL_INDEX)
     v.extend_from_slice(&[0u8; 3]);
-    v.extend_from_slice(entry);
+    for e in entries {
+        v.extend_from_slice(e);
+    }
     // Terminator entry.
     let mut term = vec![0u8; 16];
     term[8..10].copy_from_slice(&16u16.to_le_bytes());
@@ -1198,7 +1337,7 @@ pub fn build_upcase_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -1247,7 +1386,7 @@ pub fn build_extend_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -1284,7 +1423,7 @@ pub fn build_reserved_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -1317,7 +1456,7 @@ pub fn build_logfile_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -1369,7 +1508,7 @@ pub fn build_mft_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -1439,7 +1578,7 @@ pub fn build_mftmirr_record(
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_system_si_value(filetime, 0x06),
         0,
         0,
     );
@@ -1758,11 +1897,16 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
     let upcase_clusters = ceil_div(upcase.len() as u64, cluster_size as u64);
     let upcase_lcn = bitmap.allocate(upcase_clusters)?;
     // Allocate $Secure:$SDS — one cluster is more than enough for the
-    // single default SD we plant (a single entry ≈ 92 bytes padded to 96).
-    let secure_sd = build_default_security_descriptor();
-    let (sds_stream, sds_entry_size) = build_sds_stream(&secure_sd);
+    // small SD catalogue we plant (≈ 100 bytes per entry, padded to 16).
+    // We emit one SD per concrete `SecurityClass` actually in use on a
+    // fresh volume: User (default) and System (records 0..=15).
+    let security_catalogue = build_security_catalogue();
+    let sds_entry_refs: Vec<(u32, &[u8])> = security_catalogue
+        .iter()
+        .map(|(id, sd)| (*id, sd.as_slice()))
+        .collect();
+    let (sds_stream, sds_layouts) = build_sds_stream_multi(&sds_entry_refs);
     let sds_used = sds_stream.len() as u64;
-    let sds_entry_hash = sd_hash(&secure_sd);
     let sds_clusters = ceil_div(sds_used.max(1), cluster_size as u64);
     let sds_lcn = bitmap.allocate(sds_clusters)?;
     // Allocate $Bitmap (will be rewritten on flush; size known now).
@@ -1935,8 +2079,7 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             sds_lcn,
             sds_clusters,
             sds_used,
-            sds_entry_hash,
-            sds_entry_size,
+            &sds_layouts,
             cluster_size as u64,
             bps as usize,
         );

@@ -658,7 +658,20 @@ pub(crate) fn encode_volume_header(
     b[40..44].copy_from_slice(&vh.block_size.to_be_bytes());
     b[44..48].copy_from_slice(&vh.total_blocks.to_be_bytes());
     b[48..52].copy_from_slice(&vh.free_blocks.to_be_bytes());
-    b[52..56].copy_from_slice(&next_allocation.to_be_bytes());
+    // `nextAllocation` is an *advisory hint* for where the next allocation
+    // search should start. fsck.hfsplus rejects any value ≥ `totalBlocks`
+    // ("invalid VHB nextAllocation"). The in-memory `next_alloc` can hit
+    // `total_blocks` (e.g. after `open_writable` deliberately sets it
+    // there to force first-fit on the next allocation, or after a `take`
+    // run that ends exactly at the volume tail). Clamp to a valid index
+    // — wrap to 0 when the bump pointer has run off the end, otherwise
+    // pass through unchanged.
+    let next_allocation_on_disk = if next_allocation >= vh.total_blocks {
+        0
+    } else {
+        next_allocation
+    };
+    b[52..56].copy_from_slice(&next_allocation_on_disk.to_be_bytes());
     // rsrcClumpSize / dataClumpSize: per-volume defaults inherited by
     // file forks that don't carry a custom clump size. fsck rejects
     // a zero value here as "Volume header needs minor repair" (its

@@ -129,7 +129,7 @@ pub struct Chunk {
 
 /// Decoded mish block — header fields the chunk router cares about,
 /// plus the resolved chunks. Comment / Terminator entries are filtered
-/// out by [`decode_mish`]; they exist on disk but have no bytes to map.
+/// out by `decode_mish`; they exist on disk but have no bytes to map.
 #[derive(Debug, Clone)]
 pub struct Mish {
     pub first_sector: u64,

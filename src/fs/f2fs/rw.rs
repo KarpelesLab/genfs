@@ -1,5 +1,5 @@
 //! F2FS in-place file handle — [`crate::fs::FileHandle`] for
-//! [`super::F2fs::open_file_rw`].
+//! `F2fs::open_file_rw`.
 //!
 //! ## Log-structured write semantics
 //!
@@ -14,7 +14,7 @@
 //!   `place_data_block` placements visible there) and falls back to
 //!   the on-disk block.
 //! - `sync()` walks every dirty block, allocates a fresh data block
-//!   via [`super::write::Writer::alloc_data_block`], writes the merged
+//!   via `write::Writer::alloc_data_block`, writes the merged
 //!   bytes there, repoints the inode's pointer tree at the new block,
 //!   and emits a fresh checkpoint by calling [`super::F2fs::flush`].
 //!   The old block address is simply abandoned (the next checkpoint

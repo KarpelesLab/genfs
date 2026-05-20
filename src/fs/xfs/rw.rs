@@ -5,11 +5,11 @@
 //! This implementation now implements that pattern (Path A) for the
 //! single-inode-update transactions emitted by `persist()`:
 //!
-//! 1. On open, [`prepare_log_for_rw`] inspects the on-disk log header at
+//! 1. On open, `prepare_log_for_rw` inspects the on-disk log header at
 //!    `sb_logstart`:
 //!    - If it's the clean-unmount stub we emit, proceed.
 //!    - If it's the 4-op inode-update transaction this crate emits,
-//!      [`crate::fs::xfs::journal::replay_log`] re-applies the logged
+//!      `journal::replay_log` re-applies the logged
 //!      inode bytes (recovering a crash between log-write and in-place
 //!      inode-write) and restamps the clean stub.
 //!    - Any other log content — including a real kernel log — yields
@@ -17,11 +17,11 @@
 //! 2. Walk the file's BMBT extents; partial in-place writes patch existing
 //!    extent bytes; growth allocates new blocks through the existing AGF
 //!    free-extent machinery (`alloc_blocks_fsb`).
-//! 3. On `sync` / `Drop`, [`XfsFileHandle::persist`] runs five steps in
+//! 3. On `sync` / `Drop`, `XfsFileHandle::persist` runs five steps in
 //!    order: (a) build the new on-disk inode buffer; (b) write a
 //!    single-inode-update transaction (op header + trans hdr +
 //!    inode_log_format + inode buffer + commit op) to BB 0 of the log via
-//!    [`crate::fs::xfs::journal::write_inode_update_transaction`];
+//!    `journal::write_inode_update_transaction`;
 //!    (c) write the new inode buffer to its in-place location (the
 //!    "checkpoint" step); (d) call `flush_writes` to refresh
 //!    AGF/AGI/BNO/CNT/INOBT; (e) restamp the clean-unmount stub so the

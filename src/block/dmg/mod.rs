@@ -7,7 +7,7 @@
 //! - Per-chunk reader for every compressed type real `.dmg` images
 //!   use in the wild: zero-fill, raw / uncompressed, zlib, bzip2,
 //!   LZFSE, LZMA, and ADC. The four compressed codecs are split out
-//!   into [`codec`] so each one's wiring (and feature gate, when it
+//!   into the private `codec` module so each one's wiring (and feature gate, when it
 //!   has one) sits in a single place.
 //!
 //! [`DmgBackend`] satisfies the [`BlockDevice`] trait, so dropping it

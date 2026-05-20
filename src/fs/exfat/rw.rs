@@ -12,7 +12,7 @@
 //!
 //! Truncation walks the tail of the chain, frees those clusters in the
 //! bitmap + FAT, and rewrites the entry-set in memory; the on-disk
-//! entry-set bytes are flushed on [`super::ExfatFileHandle::sync`] (or
+//! entry-set bytes are flushed on `ExfatFileHandle::sync` (or
 //! when the handle is dropped).
 //!
 //! exFAT has no journal — partial writes are safe at single-sector

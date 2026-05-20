@@ -940,7 +940,7 @@ const MFT_RECORD_FLAG_VIEW_INDEX: u16 = 0x0008;
 pub const FIRST_SECURITY_ID: u32 = 0x100;
 
 /// The security id assigned to a given class on a fresh volume. The
-/// catalogue is fixed at format time (see [`build_security_catalogue`])
+/// catalogue is fixed at format time (see `build_security_catalogue`)
 /// so this is a small switch rather than a runtime lookup.
 pub fn security_id_for(class: secure::SecurityClass) -> u32 {
     FIRST_SECURITY_ID + class.catalogue_index()

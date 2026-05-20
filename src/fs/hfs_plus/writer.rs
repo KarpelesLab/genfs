@@ -2249,14 +2249,13 @@ pub(crate) fn remove_entry(writer: &mut Writer, parent_id: u32, name: &UniStr) -
 /// entry — i.e. a re-opened, journaled HFS+ image — the metadata writes
 /// (catalog B-tree pages, extents-overflow pages, allocation bitmap
 /// blocks, primary VH at offset 1024, alternate VH near end-of-volume)
-/// are collected into a single [`super::journal::FlushSink::Buffered`]
-/// batch and committed through [`super::journal::JournalLog::commit`].
-/// The journal-commit sequence (write tx body → advance `end` → apply
-/// blocks → advance `start = end`) means a crash mid-flush leaves the
-/// transaction on disk and the next [`super::journal::replay`] re-applies
-/// it.
+/// are collected into a single `FlushSink::Buffered` batch and committed
+/// through `JournalLog::commit`. The journal-commit sequence (write tx
+/// body → advance `end` → apply blocks → advance `start = end`) means a
+/// crash mid-flush leaves the transaction on disk and the next
+/// `journal::replay` re-applies it.
 ///
-/// On a fresh-build flush — when [`super::journal::JournalLog::load`]
+/// On a fresh-build flush — when `JournalLog::load`
 /// returns `None` because the on-disk journal header doesn't exist yet —
 /// writes go straight through. The journal stub itself, including the
 /// initial journal header, is written in this same flush pass (its

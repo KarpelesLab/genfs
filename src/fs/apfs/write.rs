@@ -32,7 +32,7 @@
 //!
 //! ## Space manager
 //!
-//! [`crate::fs::apfs::spaceman`] emits a structurally-correct
+//! The `spaceman` module emits a structurally-correct
 //! `spaceman_phys_t` describing the entire container as a single
 //! device. A single chunk-info-block (CIB) lists one `chunk_info_t` per
 //! container chunk (`blocks_per_chunk = 8 * block_size`); each non-empty

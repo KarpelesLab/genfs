@@ -5,7 +5,7 @@
 //! ## Journal handling — Path A (real transactions)
 //!
 //! On a journaled volume, user-data writes are buffered in an in-memory
-//! [`super::journal::JournalLog`] until `sync()`. On sync we emit one
+//! `journal::JournalLog` until `sync()`. On sync we emit one
 //! journal transaction holding every modified disk block:
 //!
 //!   1. Write the block-list-header + block_info array + block data
@@ -16,7 +16,7 @@
 //!
 //! A crash between steps 2 and 4 leaves a valid journal entry that
 //! the next open replays. Replay is idempotent. On open we always
-//! drain any unreplayed work via [`super::journal::replay`] before
+//! drain any unreplayed work via `journal::replay` before
 //! attaching the handle, so the caller never sees a half-applied
 //! transaction.
 //!

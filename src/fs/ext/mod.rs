@@ -27,6 +27,7 @@ pub mod extent;
 pub mod group;
 pub mod inode;
 pub mod layout;
+pub mod rw;
 pub mod superblock;
 pub mod xattr;
 
@@ -197,11 +198,11 @@ pub struct Ext {
     next_inode: u32,
     /// Inodes allocated so far during this build session. Written to the
     /// on-disk inode table during [`flush_metadata`].
-    inodes: Vec<(u32, Inode)>,
+    pub(crate) inodes: Vec<(u32, Inode)>,
     /// Data blocks staged for write (typically directory data blocks and
     /// indirect-block tables, which we assemble in memory). Regular file
     /// data is NOT staged here — it streams straight to the device.
-    data_blocks: Vec<(u32, Vec<u8>)>,
+    pub(crate) data_blocks: Vec<(u32, Vec<u8>)>,
     /// Directory data blocks staged in `data_blocks`, tagged with their
     /// owning directory inode. Used at flush time to stamp the per-block
     /// CRC32C checksum tail when `metadata_csum` is active.
@@ -697,7 +698,11 @@ impl Ext {
 
     /// Ensure inode `ino` is in the staged write set, fetching from disk if
     /// not. No-op if already staged.
-    fn ensure_inode_staged(&mut self, dev: &mut dyn BlockDevice, ino: u32) -> Result<()> {
+    pub(crate) fn ensure_inode_staged(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u32,
+    ) -> Result<()> {
         if self.inodes.iter().any(|(i, _)| *i == ino) {
             return Ok(());
         }
@@ -741,7 +746,7 @@ impl Ext {
     /// first free data block, so callers get contiguous runs within a group
     /// (good for extent coalescing) and spill into later groups when a group
     /// fills up.
-    fn alloc_data_block(&mut self) -> Result<u32> {
+    pub(crate) fn alloc_data_block(&mut self) -> Result<u32> {
         for gi in 0..self.layout.groups.len() {
             let layout_g = self.layout.groups[gi];
             let start_rel = layout_g.data_start - layout_g.start_block;
@@ -1240,7 +1245,7 @@ impl Ext {
     }
 
     /// Clear the block-bitmap bit for an absolute block number.
-    fn free_block(&mut self, blk: u32) {
+    pub(crate) fn free_block(&mut self, blk: u32) {
         for (gi, g) in self.layout.groups.iter().enumerate() {
             if blk >= g.start_block && blk <= g.end_block {
                 group::clear_bit(&mut self.groups[gi].block_bitmap, blk - g.start_block);
@@ -1622,7 +1627,12 @@ impl Ext {
     /// Read a single block's contents into `out`. Consults staged data
     /// blocks first (dir blocks built up during writes) and falls back to
     /// the device.
-    fn read_block(&self, dev: &mut dyn BlockDevice, blk: u32, out: &mut [u8]) -> Result<()> {
+    pub(crate) fn read_block(
+        &self,
+        dev: &mut dyn BlockDevice,
+        blk: u32,
+        out: &mut [u8],
+    ) -> Result<()> {
         for (b, bytes) in &self.data_blocks {
             if *b == blk {
                 out.copy_from_slice(bytes);
@@ -2013,7 +2023,7 @@ fn build_jbd2_superblock(block_size: u32, journal_blocks: u32) -> Vec<u8> {
 /// Split an absolute path into (parent path, last component). Errors for
 /// paths that don't start with '/', that ARE just '/', or whose last
 /// component contains a slash (defensive).
-fn split_path(path: &std::path::Path) -> Result<(std::path::PathBuf, String)> {
+pub(crate) fn split_path(path: &std::path::Path) -> Result<(std::path::PathBuf, String)> {
     let s = path
         .to_str()
         .ok_or_else(|| crate::Error::InvalidArgument(format!("ext: non-UTF-8 path {path:?}")))?;
@@ -2145,6 +2155,16 @@ impl crate::fs::Filesystem for Ext {
         let ino = self.path_to_inode(dev, s)?;
         let reader = self.open_file_reader(dev, ino)?;
         Ok(Box::new(reader))
+    }
+
+    fn open_file_rw<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        meta: Option<FileMeta>,
+    ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
+        rw::open_file_rw_ext2(self, dev, path, flags, meta)
     }
 
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
@@ -2743,5 +2763,307 @@ mod tests {
         back.sort_by_key(&key);
         want.sort_by_key(&key);
         assert_eq!(back, want);
+    }
+
+    // ───────────────────── open_file_rw (ext2 only) ─────────────────────
+
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    /// Build a fresh ext2 image, write one regular file via the populate
+    /// API, flush, and return the live `Ext` + backing device. Block size
+    /// is fixed at 1 KiB so most data lives in direct pointers; tests
+    /// that want to exercise indirect blocks size the file accordingly.
+    fn ext2_with_file(name: &[u8], payload: &[u8]) -> (Ext, MemoryBackend) {
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext2,
+            block_size: 1024,
+            blocks_count: 8192,
+            inodes_count: 256,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext2");
+        if !payload.is_empty() {
+            ext.add_file_to_streaming(
+                &mut dev,
+                constants::INO_ROOT_DIR,
+                name,
+                &mut std::io::Cursor::new(payload.to_vec()),
+                payload.len() as u64,
+                FileMeta::default(),
+            )
+            .expect("add file");
+        }
+        ext.flush(&mut dev).expect("flush");
+        (ext, dev)
+    }
+
+    fn read_full_via_handle(ext: &mut Ext, dev: &mut MemoryBackend, path: &str) -> Vec<u8> {
+        let p = std::path::Path::new(path);
+        let mut h = ext
+            .open_file_rw(dev, p, OpenFlags::default(), None)
+            .expect("open_file_rw");
+        let mut out = Vec::new();
+        h.read_to_end(&mut out).expect("read");
+        out
+    }
+
+    #[test]
+    fn open_file_rw_partial_write_round_trip_ext2() {
+        let payload = vec![b'a'; 4096]; // 4 blocks at 1 KiB
+        let (mut ext, mut dev) = ext2_with_file(b"hello.bin", &payload);
+
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/hello.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open_file_rw");
+            assert_eq!(h.len(), 4096);
+            // Patch 4 bytes at offset 1000 (block 0) and 4 bytes at
+            // offset 2500 (block 2).
+            h.seek(SeekFrom::Start(1000)).unwrap();
+            h.write_all(b"XXXX").unwrap();
+            h.seek(SeekFrom::Start(2500)).unwrap();
+            h.write_all(b"YYYY").unwrap();
+            h.sync().expect("sync");
+        }
+
+        // Reopen the FS from disk to verify the writes survived flush.
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let got = read_full_via_handle(&mut reopened, &mut dev, "/hello.bin");
+        assert_eq!(got.len(), 4096);
+        for (i, b) in got.iter().enumerate() {
+            let expected = if (1000..1004).contains(&i) {
+                b'X'
+            } else if (2500..2504).contains(&i) {
+                b'Y'
+            } else {
+                b'a'
+            };
+            assert_eq!(*b, expected, "mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn open_file_rw_extends_file_ext2() {
+        let payload = b"abcd".to_vec();
+        let (mut ext, mut dev) = ext2_with_file(b"grow.bin", &payload);
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/grow.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open");
+            h.seek(SeekFrom::End(0)).unwrap();
+            h.write_all(b"EFGH").unwrap();
+            h.sync().unwrap();
+            assert_eq!(h.len(), 8);
+        }
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let got = read_full_via_handle(&mut reopened, &mut dev, "/grow.bin");
+        assert_eq!(got, b"abcdEFGH");
+    }
+
+    #[test]
+    fn open_file_rw_set_len_grow_and_shrink_ext2() {
+        // Big enough to spill into the single-indirect range (>12 KiB at
+        // 1 KiB blocks). Start with a 4 KiB payload, then grow well past
+        // 12 blocks, then shrink back to 100 bytes.
+        let payload = vec![b'q'; 4096];
+        let (mut ext, mut dev) = ext2_with_file(b"flex.bin", &payload);
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/flex.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            // Grow to 20 KiB (forces indirect-block allocation).
+            h.set_len(20 * 1024).unwrap();
+            assert_eq!(h.len(), 20 * 1024);
+            // Bytes beyond the original 4 KiB must read as zero.
+            let mut buf = vec![0u8; 16 * 1024];
+            h.seek(SeekFrom::Start(4096)).unwrap();
+            h.read_exact(&mut buf).unwrap();
+            assert!(buf.iter().all(|&b| b == 0), "grown region must be zero");
+            // Now shrink to 100 bytes.
+            h.set_len(100).unwrap();
+            assert_eq!(h.len(), 100);
+            h.sync().unwrap();
+        }
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let got = read_full_via_handle(&mut reopened, &mut dev, "/flex.bin");
+        assert_eq!(got.len(), 100);
+        assert!(got.iter().all(|&b| b == b'q'));
+        // The indirect block should be freed too — free count must be
+        // back where it was before the grow (or higher, since shrinking
+        // past the original size also frees the data blocks we just
+        // allocated). Sanity-check: at least one free block exists.
+        assert!(reopened.sb.free_blocks_count > 0);
+    }
+
+    #[test]
+    fn open_file_rw_append_ext2() {
+        let payload = b"first".to_vec();
+        let (mut ext, mut dev) = ext2_with_file(b"app.bin", &payload);
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/app.bin"),
+                    OpenFlags {
+                        append: true,
+                        ..OpenFlags::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            h.write_all(b"-second").unwrap();
+            h.sync().unwrap();
+        }
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let got = read_full_via_handle(&mut reopened, &mut dev, "/app.bin");
+        assert_eq!(got, b"first-second");
+    }
+
+    #[test]
+    fn open_file_rw_create_new_ext2() {
+        let (mut ext, mut dev) = ext2_with_file(b"_unused.bin", b"x");
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/fresh.txt"),
+                    OpenFlags {
+                        create: true,
+                        ..OpenFlags::default()
+                    },
+                    Some(FileMeta::with_mode(0o644)),
+                )
+                .expect("open create");
+            h.write_all(b"hello world").unwrap();
+            h.sync().unwrap();
+        }
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let got = read_full_via_handle(&mut reopened, &mut dev, "/fresh.txt");
+        assert_eq!(got, b"hello world");
+    }
+
+    #[test]
+    fn open_file_rw_truncate_ext2() {
+        let payload = vec![b'k'; 4096];
+        let (mut ext, mut dev) = ext2_with_file(b"trunc.bin", &payload);
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/trunc.bin"),
+                    OpenFlags {
+                        truncate: true,
+                        ..OpenFlags::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(h.len(), 0);
+            h.write_all(b"short").unwrap();
+            h.sync().unwrap();
+        }
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let got = read_full_via_handle(&mut reopened, &mut dev, "/trunc.bin");
+        assert_eq!(got, b"short");
+    }
+
+    #[test]
+    fn open_file_rw_refused_on_ext3() {
+        // ext3 image carries COMPAT_HAS_JOURNAL → open_file_rw must
+        // refuse with Unsupported before touching any data block.
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext3,
+            block_size: 1024,
+            blocks_count: 8192,
+            inodes_count: 256,
+            journal_blocks: 1024,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext3");
+        ext.add_file_to_streaming(
+            &mut dev,
+            constants::INO_ROOT_DIR,
+            b"foo.bin",
+            &mut std::io::Cursor::new(b"hi".to_vec()),
+            2,
+            FileMeta::default(),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+        let res = ext.open_file_rw(
+            &mut dev,
+            std::path::Path::new("/foo.bin"),
+            OpenFlags::default(),
+            None,
+        );
+        let err = match res {
+            Ok(_) => panic!("must refuse on ext3"),
+            Err(e) => e,
+        };
+        match err {
+            crate::Error::Unsupported(msg) => {
+                assert!(msg.contains("JBD2"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Unsupported, got {other}"),
+        }
+    }
+
+    #[test]
+    fn open_file_rw_refused_on_ext4() {
+        let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
+        ext.add_file_to_streaming(
+            &mut dev,
+            constants::INO_ROOT_DIR,
+            b"foo.bin",
+            &mut std::io::Cursor::new(b"hi".to_vec()),
+            2,
+            FileMeta::default(),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+        let res = ext.open_file_rw(
+            &mut dev,
+            std::path::Path::new("/foo.bin"),
+            OpenFlags::default(),
+            None,
+        );
+        let err = match res {
+            Ok(_) => panic!("must refuse on ext4"),
+            Err(e) => e,
+        };
+        match err {
+            crate::Error::Unsupported(msg) => {
+                assert!(msg.contains("JBD2"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Unsupported, got {other}"),
+        }
     }
 }

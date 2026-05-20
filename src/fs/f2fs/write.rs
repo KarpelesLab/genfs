@@ -449,9 +449,10 @@ impl Writer {
                 if dnid == 0 {
                     return Ok(0);
                 }
-                let d = self.direct_nodes.get(&dnid).ok_or_else(|| {
-                    crate::Error::InvalidImage("f2fs: ghost direct node".into())
-                })?;
+                let d = self
+                    .direct_nodes
+                    .get(&dnid)
+                    .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost direct node".into()))?;
                 return Ok(d.addrs[rel as usize]);
             }
             rel -= span;
@@ -477,9 +478,10 @@ impl Writer {
                 if dnid == 0 {
                     return Ok(0);
                 }
-                let d = self.direct_nodes.get(&dnid).ok_or_else(|| {
-                    crate::Error::InvalidImage("f2fs: ghost direct node".into())
-                })?;
+                let d = self
+                    .direct_nodes
+                    .get(&dnid)
+                    .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost direct node".into()))?;
                 return Ok(d.addrs[inner]);
             }
             rel -= span;

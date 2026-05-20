@@ -1327,11 +1327,7 @@ fn unix_to_exfat_timestamp(unix_secs: u32) -> u32 {
     const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut month: u32 = 1;
     for (i, m_days) in MONTH_DAYS.iter().enumerate() {
-        let dim = if i == 1 && is_leap(year) {
-            29
-        } else {
-            *m_days
-        };
+        let dim = if i == 1 && is_leap(year) { 29 } else { *m_days };
         if days < dim {
             break;
         }
@@ -2026,14 +2022,8 @@ mod tests {
             reader: Box::new(std::io::Cursor::new(b"trait-wired!".to_vec())),
             len: 12,
         };
-        Filesystem::create_file(
-            &mut fs,
-            &mut dev,
-            std::path::Path::new("/t.txt"),
-            src,
-            meta,
-        )
-        .unwrap();
+        Filesystem::create_file(&mut fs, &mut dev, std::path::Path::new("/t.txt"), src, meta)
+            .unwrap();
         Filesystem::flush(&mut fs, &mut dev).unwrap();
 
         let mut fs2 = Exfat::open(&mut dev).unwrap();
@@ -2148,7 +2138,8 @@ mod tests {
         use std::io::{Seek, SeekFrom, Write};
         let (mut dev, mut fs) = fresh_volume("RW2");
         let mut reader: &[u8] = b"hello";
-        fs.create_file(&mut dev, "/g.txt", &mut reader, 5, 0).unwrap();
+        fs.create_file(&mut dev, "/g.txt", &mut reader, 5, 0)
+            .unwrap();
         fs.flush(&mut dev).unwrap();
         {
             let mut h = Filesystem::open_file_rw(
@@ -2174,7 +2165,8 @@ mod tests {
         let (mut dev, mut fs) = fresh_volume("RW3");
         // Start with an 8-byte file.
         let mut reader: &[u8] = b"ABCDEFGH";
-        fs.create_file(&mut dev, "/s.bin", &mut reader, 8, 0).unwrap();
+        fs.create_file(&mut dev, "/s.bin", &mut reader, 8, 0)
+            .unwrap();
         fs.flush(&mut dev).unwrap();
 
         {
@@ -2223,7 +2215,8 @@ mod tests {
         use std::io::Write;
         let (mut dev, mut fs) = fresh_volume("RW4");
         let mut reader: &[u8] = b"head ";
-        fs.create_file(&mut dev, "/a.txt", &mut reader, 5, 0).unwrap();
+        fs.create_file(&mut dev, "/a.txt", &mut reader, 5, 0)
+            .unwrap();
         fs.flush(&mut dev).unwrap();
         {
             let mut h = Filesystem::open_file_rw(
@@ -2278,7 +2271,8 @@ mod tests {
         use std::io::Write;
         let (mut dev, mut fs) = fresh_volume("RW6");
         let mut reader: &[u8] = b"old content";
-        fs.create_file(&mut dev, "/c.txt", &mut reader, 11, 0).unwrap();
+        fs.create_file(&mut dev, "/c.txt", &mut reader, 11, 0)
+            .unwrap();
         fs.flush(&mut dev).unwrap();
         {
             let mut h = Filesystem::open_file_rw(
@@ -2309,7 +2303,8 @@ mod tests {
         // cluster boundary so the bitmap allocator gets exercised.
         let (mut dev, mut fs) = fresh_volume("RW7");
         let mut empty: &[u8] = &[];
-        fs.create_file(&mut dev, "/big.bin", &mut empty, 0, 0).unwrap();
+        fs.create_file(&mut dev, "/big.bin", &mut empty, 0, 0)
+            .unwrap();
         fs.flush(&mut dev).unwrap();
 
         let used_before: u32 = fs.bitmap.iter().map(|b| b.count_ones()).sum();
@@ -2425,12 +2420,8 @@ mod tests {
             .unwrap();
         fs.flush(&mut dev).unwrap();
 
-        let mut h = Filesystem::open_file_ro(
-            &mut fs,
-            &mut dev,
-            std::path::Path::new("/ro.bin"),
-        )
-        .expect("open_file_ro");
+        let mut h = Filesystem::open_file_ro(&mut fs, &mut dev, std::path::Path::new("/ro.bin"))
+            .expect("open_file_ro");
         assert_eq!(h.len(), data.len() as u64);
         assert!(!h.is_empty());
 

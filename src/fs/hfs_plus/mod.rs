@@ -1435,23 +1435,13 @@ mod tests {
         // Reopen, verify.
         {
             let hfs = HfsPlus::open(&mut dev).unwrap();
-            let mut r = hfs
-                .open_file_reader(&mut dev, "/edit.bin")
-                .unwrap();
+            let mut r = hfs.open_file_reader(&mut dev, "/edit.bin").unwrap();
             let mut got = Vec::new();
             r.read_to_end(&mut got).unwrap();
             assert_eq!(got.len(), payload.len());
             assert_eq!(&got[..4096], &payload[..4096], "head unchanged");
-            assert_eq!(
-                &got[4096..4096 + 13],
-                b"PATCHED_RANGE",
-                "patch is present"
-            );
-            assert_eq!(
-                &got[4096 + 13..],
-                &payload[4096 + 13..],
-                "tail unchanged"
-            );
+            assert_eq!(&got[4096..4096 + 13], b"PATCHED_RANGE", "patch is present");
+            assert_eq!(&got[4096 + 13..], &payload[4096 + 13..], "tail unchanged");
         }
     }
 
@@ -1757,8 +1747,7 @@ mod tests {
                     name: catalog::UniStr::from_str_lossy("x.bin"),
                 })
                 .expect("catalog body");
-            let sb =
-                u32::from_be_bytes(body[88 + 16..88 + 20].try_into().unwrap()); // first ext start
+            let sb = u32::from_be_bytes(body[88 + 16..88 + 20].try_into().unwrap()); // first ext start
             assert!(sb > 0, "file must have a real data block");
             let _ = f;
             u64::from(sb) * u64::from(hfs.volume_header.block_size)

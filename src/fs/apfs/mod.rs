@@ -636,10 +636,9 @@ impl Apfs {
         let block_size = self.block_size;
         let mut ctx = rs.fs_ctx.borrow_mut();
         let mut out = std::collections::HashMap::new();
-        let mut scan =
-            RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
-                read_at_paddr(dev, paddr, block_size, buf)
-            })?;
+        let mut scan = RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })?;
         while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
             read_at_paddr(dev, paddr, block_size, buf)
         })? {
@@ -742,10 +741,9 @@ impl Apfs {
         };
         let block_size = self.block_size;
         let mut ctx = rs.fs_ctx.borrow_mut();
-        let mut scan =
-            RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
-                read_at_paddr(dev, paddr, block_size, buf)
-            })?;
+        let mut scan = RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })?;
         while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
             read_at_paddr(dev, paddr, block_size, buf)
         })? {
@@ -784,10 +782,9 @@ impl Apfs {
         let block_size = self.block_size;
         let mut ctx = rs.fs_ctx.borrow_mut();
         let mut out = Vec::new();
-        let mut scan =
-            RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
-                read_at_paddr(dev, paddr, block_size, buf)
-            })?;
+        let mut scan = RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })?;
         while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
             read_at_paddr(dev, paddr, block_size, buf)
         })? {
@@ -843,10 +840,9 @@ impl Apfs {
         };
         let block_size = self.block_size;
         let mut ctx = rs.fs_ctx.borrow_mut();
-        let mut scan =
-            RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
-                read_at_paddr(dev, paddr, block_size, buf)
-            })?;
+        let mut scan = RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })?;
         if let Some((_kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
             read_at_paddr(dev, paddr, block_size, buf)
         })? {
@@ -893,10 +889,9 @@ impl Apfs {
         let block_size = self.block_size;
         let mut ctx = rs.fs_ctx.borrow_mut();
         let mut out = Vec::new();
-        let mut scan =
-            RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
-                read_at_paddr(dev, paddr, block_size, buf)
-            })?;
+        let mut scan = RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })?;
         while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
             read_at_paddr(dev, paddr, block_size, buf)
         })? {
@@ -1615,7 +1610,10 @@ mod tests {
 
         let sub = apfs.list(&mut dev, std::path::Path::new("/sub")).unwrap();
         let sub_names: Vec<&str> = sub.iter().map(|e| e.name.as_str()).collect();
-        assert!(sub_names.contains(&"hello.txt"), "/sub listing: {sub_names:?}");
+        assert!(
+            sub_names.contains(&"hello.txt"),
+            "/sub listing: {sub_names:?}"
+        );
 
         let mut buf = Vec::new();
         apfs.read_file(&mut dev, std::path::Path::new("/sub/hello.txt"))
@@ -1739,9 +1737,7 @@ mod tests {
         let bs = 4096u32;
         let mut dev = MemoryBackend::new(total_blocks * bs as u64);
         let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Vol").unwrap();
-        let e = apfs
-            .list(&mut dev, std::path::Path::new("/"))
-            .unwrap_err();
+        let e = apfs.list(&mut dev, std::path::Path::new("/")).unwrap_err();
         assert!(matches!(e, crate::Error::Unsupported(_)));
     }
 }

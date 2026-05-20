@@ -1136,8 +1136,11 @@ mod tests {
         // Root extent LBA from the PVD's embedded root dir record.
         let root_lba = iso.pvd.root.extent_lba;
         let mut buf = vec![0u8; super::super::SECTOR_SIZE as usize];
-        dev.read_at(u64::from(root_lba) * u64::from(super::super::SECTOR_SIZE), &mut buf)
-            .unwrap();
+        dev.read_at(
+            u64::from(root_lba) * u64::from(super::super::SECTOR_SIZE),
+            &mut buf,
+        )
+        .unwrap();
         let len_dr = buf[0] as usize;
         let dot = super::super::directory::DirRecord::decode(&buf[..len_dr]).unwrap();
         // Identifier is the single 0x00 byte for "." per ECMA-119.
@@ -1159,10 +1162,9 @@ mod tests {
         // with NM (or anything else but SP).
         let second_off = len_dr;
         let len2 = buf[second_off] as usize;
-        let dotdot = super::super::directory::DirRecord::decode(
-            &buf[second_off..second_off + len2],
-        )
-        .unwrap();
+        let dotdot =
+            super::super::directory::DirRecord::decode(&buf[second_off..second_off + len2])
+                .unwrap();
         assert!(
             dotdot.system_use.len() < 2 || &dotdot.system_use[..2] != b"SP",
             "'..' record unexpectedly carries an SP entry",

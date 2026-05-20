@@ -22,8 +22,7 @@
 use crate::Result;
 
 /// Standard base64 alphabet. Index = 6-bit value, value = ASCII byte.
-const ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Decode a base64 string. Whitespace (space, tab, CR, LF) inside the
 /// input is silently skipped — Apple's plist serialiser splits long

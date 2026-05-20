@@ -294,9 +294,7 @@ impl DmgBackend {
         // boundaries that look like duplicates), but adjacent chunks
         // should be monotonic.
         for w in chunks.windows(2) {
-            let prev_end = w[0]
-                .virtual_sector_start
-                .saturating_add(w[0].sector_count);
+            let prev_end = w[0].virtual_sector_start.saturating_add(w[0].sector_count);
             if w[1].virtual_sector_start < prev_end {
                 log::warn!(
                     "dmg: chunk overlap detected: chunk ending at sector {} > next chunk start {}",

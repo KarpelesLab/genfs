@@ -168,11 +168,12 @@ pub fn decode_mish(buf: &[u8]) -> Result<Mish> {
     let number_of_blocks = u32::from_be_bytes(buf[0x0C8..0x0CC].try_into().unwrap()) as usize;
 
     let chunk_array_start = MISH_HEADER_LEN;
-    let need = chunk_array_start
-        .checked_add(number_of_blocks.checked_mul(CHUNK_LEN).ok_or_else(|| {
-            crate::Error::InvalidImage("dmg: mish chunk count overflow".into())
-        })?)
-        .ok_or_else(|| crate::Error::InvalidImage("dmg: mish chunk extent overflow".into()))?;
+    let need =
+        chunk_array_start
+            .checked_add(number_of_blocks.checked_mul(CHUNK_LEN).ok_or_else(|| {
+                crate::Error::InvalidImage("dmg: mish chunk count overflow".into())
+            })?)
+            .ok_or_else(|| crate::Error::InvalidImage("dmg: mish chunk extent overflow".into()))?;
     if buf.len() < need {
         return Err(crate::Error::InvalidImage(format!(
             "dmg: mish block truncated (need {need} bytes, got {})",

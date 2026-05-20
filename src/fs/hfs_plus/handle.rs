@@ -307,9 +307,10 @@ impl<'a> HfsPlusFileHandle<'a> {
             crate::Error::InvalidArgument("hfs+ handle: shrink-target overflows u32 blocks".into())
         })?;
         let mut have: u32 = self.total_blocks();
-        let writer = self.fs.writer.as_mut().ok_or_else(|| {
-            crate::Error::InvalidArgument("hfs+: volume opened read-only".into())
-        })?;
+        let writer =
+            self.fs.writer.as_mut().ok_or_else(|| {
+                crate::Error::InvalidArgument("hfs+: volume opened read-only".into())
+            })?;
         while have > needed_blocks {
             let last = self
                 .runs
@@ -395,7 +396,8 @@ impl<'a> HfsPlusFileHandle<'a> {
             let old_len = self.file_size;
             self.ensure_capacity(new_len)?;
             self.file_size = new_len;
-            self.zero_range(old_len, new_len).map_err(crate::Error::Io)?;
+            self.zero_range(old_len, new_len)
+                .map_err(crate::Error::Io)?;
         } else if new_len < self.file_size {
             self.shrink_to(new_len)?;
             self.file_size = new_len;
@@ -428,9 +430,10 @@ impl<'a> HfsPlusFileHandle<'a> {
         } else {
             Vec::new()
         };
-        let writer = self.fs.writer.as_mut().ok_or_else(|| {
-            crate::Error::InvalidArgument("hfs+: volume opened read-only".into())
-        })?;
+        let writer =
+            self.fs.writer.as_mut().ok_or_else(|| {
+                crate::Error::InvalidArgument("hfs+: volume opened read-only".into())
+            })?;
         let new_fork = ForkData {
             logical_size,
             clump_size: writer.block_size,
@@ -441,10 +444,9 @@ impl<'a> HfsPlusFileHandle<'a> {
         // 1. Patch the file record's data-fork bytes inside the
         //    encoded body. Data fork starts at offset 88, length
         //    FORK_DATA_SIZE (= 80).
-        let body = writer
-            .catalog
-            .get_mut(&self.cat_key)
-            .ok_or_else(|| crate::Error::InvalidImage("hfs+ handle: catalog entry vanished".into()))?;
+        let body = writer.catalog.get_mut(&self.cat_key).ok_or_else(|| {
+            crate::Error::InvalidImage("hfs+ handle: catalog entry vanished".into())
+        })?;
         if body.len() < 88 + FORK_DATA_SIZE {
             return Err(crate::Error::InvalidImage(
                 "hfs+ handle: short catalog file body".into(),
@@ -538,7 +540,8 @@ impl<'a> Write for HfsPlusFileHandle<'a> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.sync_inner().map_err(|e| io::Error::other(e.to_string()))
+        self.sync_inner()
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 }
 
@@ -656,18 +659,17 @@ pub(super) fn open_file_rw<'a>(
 
     // Read the catalog body and assemble the merged run list.
     let (file_id, file_size, runs) = {
-        let writer = fs.writer.as_ref().ok_or_else(|| {
-            crate::Error::InvalidArgument("hfs+: volume opened read-only".into())
-        })?;
+        let writer = fs
+            .writer
+            .as_ref()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume opened read-only".into()))?;
         let body = writer.catalog.get(&owned_key).ok_or_else(|| {
             crate::Error::InvalidArgument(format!(
                 "hfs+: no entry {:?} under CNID {parent_id}",
                 name.to_string_lossy()
             ))
         })?;
-        if body.len() < 88 + FORK_DATA_SIZE
-            || i16::from_be_bytes([body[0], body[1]]) != REC_FILE
-        {
+        if body.len() < 88 + FORK_DATA_SIZE || i16::from_be_bytes([body[0], body[1]]) != REC_FILE {
             return Err(crate::Error::InvalidArgument(format!(
                 "hfs+: {path_str} is not a regular file"
             )));
@@ -783,9 +785,7 @@ fn split_parent_and_name(fs: &HfsPlus, path_str: &str) -> Result<(u32, UniStr)> 
     for part in prefix {
         let name = UniStr::from_str_lossy(part);
         let (_, child_cnid, rec_type) = writer.lookup(cnid, &name).ok_or_else(|| {
-            crate::Error::InvalidArgument(format!(
-                "hfs+: parent component {part:?} does not exist"
-            ))
+            crate::Error::InvalidArgument(format!("hfs+: parent component {part:?} does not exist"))
         })?;
         if rec_type != super::catalog::REC_FOLDER {
             return Err(crate::Error::InvalidArgument(format!(

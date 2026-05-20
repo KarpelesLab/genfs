@@ -2156,10 +2156,7 @@ mod tests {
                     ca.startino_ag, cb.startino_ag,
                     "ag {i} chunk {j}: startino mismatch"
                 );
-                assert_eq!(
-                    ca.ir_free, cb.ir_free,
-                    "ag {i} chunk {j}: ir_free mismatch"
-                );
+                assert_eq!(ca.ir_free, cb.ir_free, "ag {i} chunk {j}: ir_free mismatch");
             }
         }
     }

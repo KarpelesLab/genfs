@@ -366,7 +366,10 @@ impl<'a> SquashfsFileReadHandle<'a> {
             crate::compression::decompress(algo, &frag_buf, self.full_block_size as usize)?
         };
         let off = self.fragment_offset as usize;
-        if off.checked_add(tail_len).is_none_or(|end| end > frag_buf.len()) {
+        if off
+            .checked_add(tail_len)
+            .is_none_or(|end| end > frag_buf.len())
+        {
             return Err(crate::Error::InvalidImage(format!(
                 "squashfs: fragment tail [{off}..{}] exceeds fragment block size {}",
                 off + tail_len,
@@ -407,9 +410,7 @@ impl<'a> Read for SquashfsFileReadHandle<'a> {
             let off_in_tail = (self.pos - frag_start) as usize;
             let avail = self.cached_fragment_tail.len() - off_in_tail;
             let n = avail.min(out.len());
-            out[..n].copy_from_slice(
-                &self.cached_fragment_tail[off_in_tail..off_in_tail + n],
-            );
+            out[..n].copy_from_slice(&self.cached_fragment_tail[off_in_tail..off_in_tail + n]);
             self.pos += n as u64;
             Ok(n)
         }

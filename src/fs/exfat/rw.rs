@@ -89,8 +89,7 @@ impl<'a> ExfatFileHandle<'a> {
         self.entry_bytes[stream_off + 1] = flags;
 
         // ValidDataLength (8 bytes at offset 8).
-        self.entry_bytes[stream_off + 8..stream_off + 16]
-            .copy_from_slice(&self.len.to_le_bytes());
+        self.entry_bytes[stream_off + 8..stream_off + 16].copy_from_slice(&self.len.to_le_bytes());
         // FirstCluster (4 bytes at offset 20).
         let first_cluster = if self.chain.is_empty() {
             0
@@ -101,8 +100,7 @@ impl<'a> ExfatFileHandle<'a> {
             .copy_from_slice(&first_cluster.to_le_bytes());
         // DataLength (8 bytes at offset 24). exFAT requires
         // DataLength >= ValidDataLength; we keep them equal here.
-        self.entry_bytes[stream_off + 24..stream_off + 32]
-            .copy_from_slice(&self.len.to_le_bytes());
+        self.entry_bytes[stream_off + 24..stream_off + 32].copy_from_slice(&self.len.to_le_bytes());
 
         // Recompute SetChecksum over the whole set (skipping primary[2..4]).
         let csum = dir::set_checksum(&self.entry_bytes);
@@ -255,8 +253,7 @@ impl<'a> ExfatFileHandle<'a> {
             let mut written: u64 = 0;
             while written < in_cluster {
                 let n = (in_cluster - written).min(zero.len() as u64) as usize;
-                let disk_off =
-                    self.cluster_disk_offset(cluster) + cluster_off + written;
+                let disk_off = self.cluster_disk_offset(cluster) + cluster_off + written;
                 self.dev.write_at(disk_off, &zero[..n])?;
                 written += n as u64;
             }
@@ -344,8 +341,7 @@ impl<'a> Read for ExfatFileHandle<'a> {
 
 impl<'a> Write for ExfatFileHandle<'a> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_internal(buf)
-            .map_err(std::io::Error::other)
+        self.write_internal(buf).map_err(std::io::Error::other)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -473,19 +469,10 @@ impl Exfat {
                     )));
                 }
                 // Build the handle on the existing entry.
-                let chain = self.build_data_chain(
-                    set.first_cluster,
-                    set.no_fat_chain(),
-                    set.data_length,
-                )?;
-                let mut handle = self.handle_from_existing(
-                    dev,
-                    parent_cluster,
-                    pos,
-                    total,
-                    set,
-                    chain,
-                )?;
+                let chain =
+                    self.build_data_chain(set.first_cluster, set.no_fat_chain(), set.data_length)?;
+                let mut handle =
+                    self.handle_from_existing(dev, parent_cluster, pos, total, set, chain)?;
                 if flags.truncate {
                     handle.set_len(0)?;
                 }
@@ -507,14 +494,8 @@ impl Exfat {
                 })?;
                 let ts = super::unix_to_exfat_timestamp(m.mtime);
                 // Create empty file via existing path.
-                let _ = self.create_file_in(
-                    dev,
-                    parent_cluster,
-                    leaf,
-                    &mut std::io::empty(),
-                    0,
-                    ts,
-                )?;
+                let _ =
+                    self.create_file_in(dev, parent_cluster, leaf, &mut std::io::empty(), 0, ts)?;
                 // Re-find the entry we just wrote — its position is the
                 // first free slot in the parent, but it's simplest to
                 // look it up by name.
@@ -525,19 +506,10 @@ impl Exfat {
                             "exfat: created file vanished from parent directory".into(),
                         )
                     })?;
-                let chain = self.build_data_chain(
-                    set.first_cluster,
-                    set.no_fat_chain(),
-                    set.data_length,
-                )?;
-                let mut handle = self.handle_from_existing(
-                    dev,
-                    parent_cluster,
-                    pos,
-                    total,
-                    set,
-                    chain,
-                )?;
+                let chain =
+                    self.build_data_chain(set.first_cluster, set.no_fat_chain(), set.data_length)?;
+                let mut handle =
+                    self.handle_from_existing(dev, parent_cluster, pos, total, set, chain)?;
                 if flags.append {
                     handle.pos = handle.len;
                 }

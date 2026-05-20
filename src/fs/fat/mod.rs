@@ -943,9 +943,7 @@ impl crate::fs::Filesystem for Fat32 {
         let (parent_cluster, leaf) = self.resolve_parent(dev, s)?;
         let found = self
             .find_entry(dev, parent_cluster, &leaf)?
-            .ok_or_else(|| {
-                crate::Error::InvalidArgument(format!("fat32: {s:?} not found"))
-            })?;
+            .ok_or_else(|| crate::Error::InvalidArgument(format!("fat32: {s:?} not found")))?;
         if found.entry.attr & dir::ATTR_DIRECTORY != 0 {
             return Err(crate::Error::InvalidArgument(format!(
                 "fat32: {s:?} is a directory, not a file"
@@ -957,8 +955,7 @@ impl crate::fs::Filesystem for Fat32 {
             entry,
             ..
         } = found;
-        let inner =
-            handle::FatFileHandle::open_existing(self, dev, dir_chain, entry_pos, entry)?;
+        let inner = handle::FatFileHandle::open_existing(self, dev, dir_chain, entry_pos, entry)?;
         Ok(Box::new(handle::ReadOnlyFatHandle::new(inner)))
     }
 
@@ -1013,7 +1010,8 @@ impl crate::fs::Filesystem for Fat32 {
             entry,
             ..
         } = found;
-        let mut handle = handle::FatFileHandle::open_existing(self, dev, dir_chain, entry_pos, entry)?;
+        let mut handle =
+            handle::FatFileHandle::open_existing(self, dev, dir_chain, entry_pos, entry)?;
         if flags.truncate {
             crate::fs::FileHandle::set_len(&mut handle, 0)?;
         }
@@ -1126,12 +1124,7 @@ mod tests {
         let patch = [0x55u8; 16];
         {
             let mut h = fs
-                .open_file_rw(
-                    &mut dev,
-                    Path::new("hello.bin"),
-                    OpenFlags::default(),
-                    None,
-                )
+                .open_file_rw(&mut dev, Path::new("hello.bin"), OpenFlags::default(), None)
                 .unwrap();
             h.seek(SeekFrom::Start(100)).unwrap();
             h.write_all(&patch).unwrap();
@@ -1301,12 +1294,7 @@ mod tests {
         assert_eq!(got, b"hello from rw create");
 
         // Without `create`, a non-existent path is an error.
-        match fs.open_file_rw(
-            &mut dev,
-            Path::new("never.bin"),
-            OpenFlags::default(),
-            None,
-        ) {
+        match fs.open_file_rw(&mut dev, Path::new("never.bin"), OpenFlags::default(), None) {
             Ok(_) => panic!("expected error for non-existent path with create=false"),
             Err(crate::Error::InvalidArgument(_)) => {}
             Err(e) => panic!("unexpected error: {e:?}"),

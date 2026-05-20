@@ -134,9 +134,10 @@ impl<'a> F2fsFileHandle<'a> {
 
         let (inline, inline_buf, mut size) = {
             let w = fs.writer.as_ref().expect("writer live");
-            let ino = w.inodes.get(&nid).ok_or_else(|| {
-                crate::Error::InvalidImage(format!("f2fs: ghost nid {nid}"))
-            })?;
+            let ino = w
+                .inodes
+                .get(&nid)
+                .ok_or_else(|| crate::Error::InvalidImage(format!("f2fs: ghost nid {nid}")))?;
             let inline = ino.inline_flags & F2FS_INLINE_DATA != 0;
             (inline, ino.inline_payload.clone(), ino.size)
         };
@@ -533,10 +534,7 @@ impl<'a> Drop for F2fsFileHandle<'a> {
 /// Resolve a posix-style path to its nid via the writer's in-memory
 /// tree. Returns `None` for a path whose leaf doesn't exist (the parent
 /// must still resolve — otherwise we error).
-fn resolve_in_writer(
-    w: &super::write::Writer,
-    path: &std::path::Path,
-) -> Result<Option<u32>> {
+fn resolve_in_writer(w: &super::write::Writer, path: &std::path::Path) -> Result<Option<u32>> {
     let s = path
         .to_str()
         .ok_or_else(|| crate::Error::InvalidArgument("f2fs: non-UTF-8 path".into()))?;
@@ -597,9 +595,7 @@ mod tests {
     /// and return its bytes.
     fn read_all_from_reopened(dev: &mut MemoryBackend, name: &str) -> Vec<u8> {
         let mut fs2 = super::F2fs::open(dev).unwrap();
-        let mut r = fs2
-            .open_file_reader(dev, &format!("/{name}"))
-            .unwrap();
+        let mut r = fs2.open_file_reader(dev, &format!("/{name}")).unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         out
@@ -856,4 +852,3 @@ mod tests {
         assert_eq!(got, expected);
     }
 }
-

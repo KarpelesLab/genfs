@@ -139,7 +139,8 @@ mod tests {
 
     #[test]
     fn errors_when_data_unclosed() {
-        let plist = r#"<plist><dict><key>blkx</key><array><dict><data>oops</dict></array></dict></plist>"#;
+        let plist =
+            r#"<plist><dict><key>blkx</key><array><dict><data>oops</dict></array></dict></plist>"#;
         assert!(extract_blkx_data_entries(plist).is_err());
     }
 }

@@ -156,8 +156,7 @@ impl<'a> NtfsFileHandle<'a> {
         // Zero the newly-allocated region on disk so reading past
         // initialized_size sees clean data.
         let zero = vec![0u8; (extra_clusters * self.cluster_size) as usize];
-        self.dev
-            .write_at(start * self.cluster_size, &zero)?;
+        self.dev.write_at(start * self.cluster_size, &zero)?;
 
         // Try to merge with the last existing run.
         if let Some(last) = self.runs.last_mut() {
@@ -231,9 +230,11 @@ impl<'a> NtfsFileHandle<'a> {
             // Empty resident -> empty non-resident. Nothing to do.
             return Ok(());
         }
-        let w = self.fs.writer.as_mut().ok_or_else(|| {
-            crate::Error::Unsupported("ntfs: writer not initialised".into())
-        })?;
+        let w = self
+            .fs
+            .writer
+            .as_mut()
+            .ok_or_else(|| crate::Error::Unsupported("ntfs: writer not initialised".into()))?;
         let lcn = w.alloc_clusters(clusters)?;
         // Pad bytes to a full cluster boundary.
         let mut padded = bytes;
@@ -319,9 +320,7 @@ impl<'a> NtfsFileHandle<'a> {
                 let off = (p % cs) as usize;
                 let in_cluster = ((cs as usize) - off).min(buf.len() - written);
                 let disk = self.vcn_to_disk(vcn).ok_or_else(|| {
-                    crate::Error::InvalidImage(format!(
-                        "ntfs: write past run list at VCN {vcn}"
-                    ))
+                    crate::Error::InvalidImage(format!("ntfs: write past run list at VCN {vcn}"))
                 })?;
                 self.dev
                     .write_at(disk + off as u64, &buf[written..written + in_cluster])?;
@@ -462,9 +461,10 @@ impl<'a> NtfsFileHandle<'a> {
 
         // Write the record back to its MFT slot.
         let off = {
-            let w = self.fs.writer.as_ref().ok_or_else(|| {
-                crate::Error::Unsupported("ntfs: writer not initialised".into())
-            })?;
+            let w =
+                self.fs.writer.as_ref().ok_or_else(|| {
+                    crate::Error::Unsupported("ntfs: writer not initialised".into())
+                })?;
             w.mft_offset(self.rec_no)?
         };
         self.dev.write_at(off, &rec_buf)?;
@@ -540,17 +540,17 @@ impl<'a> NtfsFileHandle<'a> {
             };
             if attr_name == "$I30" {
                 if tc == super::attribute::TYPE_INDEX_ROOT && !non_resident {
-                    let value_off = u16::from_le_bytes(
-                        rec[cursor + 0x14..cursor + 0x16].try_into().unwrap(),
-                    ) as usize;
-                    let value_len = u32::from_le_bytes(
-                        rec[cursor + 0x10..cursor + 0x14].try_into().unwrap(),
-                    ) as usize;
+                    let value_off =
+                        u16::from_le_bytes(rec[cursor + 0x14..cursor + 0x16].try_into().unwrap())
+                            as usize;
+                    let value_len =
+                        u32::from_le_bytes(rec[cursor + 0x10..cursor + 0x14].try_into().unwrap())
+                            as usize;
                     root_off_in_rec = Some((cursor, value_off, value_len));
                 } else if tc == super::attribute::TYPE_INDEX_ALLOCATION && non_resident {
-                    let runs_off = u16::from_le_bytes(
-                        rec[cursor + 0x20..cursor + 0x22].try_into().unwrap(),
-                    ) as usize;
+                    let runs_off =
+                        u16::from_le_bytes(rec[cursor + 0x20..cursor + 0x22].try_into().unwrap())
+                            as usize;
                     let runs_bytes = &rec[cursor + runs_off..cursor + len];
                     if let Ok(rs) = super::run_list::decode(runs_bytes) {
                         alloc_runs = Some(rs);
@@ -606,8 +606,7 @@ impl<'a> NtfsFileHandle<'a> {
         if block.len() < 0x20 {
             return Ok(());
         }
-        let first_entry_offset =
-            u32::from_le_bytes(block[0x18..0x1C].try_into().unwrap()) as usize;
+        let first_entry_offset = u32::from_le_bytes(block[0x18..0x1C].try_into().unwrap()) as usize;
         let entries_start = 0x18 + first_entry_offset;
         if patch_entries_for_record(&mut block, entries_start, self.rec_no, self.len) {
             mft::install_fixup(&mut block, self.sector_size, 1);
@@ -1262,10 +1261,7 @@ mod tests {
 
         // Dump the image to a temp file and call ntfsfix on it.
         let mut tmp = std::env::temp_dir();
-        tmp.push(format!(
-            "fstool-ntfs-rw-{}.img",
-            std::process::id()
-        ));
+        tmp.push(format!("fstool-ntfs-rw-{}.img", std::process::id()));
         let buf = dev.as_slice().to_vec();
         std::fs::write(&tmp, &buf).unwrap();
         let out = std::process::Command::new("ntfsfix")

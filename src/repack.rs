@@ -412,6 +412,9 @@ fn read_symlink_via_anyfs(
         AnyFs::Exfat(_) => Err(crate::Error::Unsupported(
             "repack: exFAT source has no symlinks".into(),
         )),
+        AnyFs::Iso9660(_) => Err(crate::Error::Unsupported(
+            "repack: ISO9660 symlink reading via repack not yet wired".into(),
+        )),
     }
 }
 

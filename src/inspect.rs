@@ -47,6 +47,9 @@ pub enum FsKind {
     F2fs,
     /// SquashFS — scaffold; detection only.
     Squashfs,
+    /// ISO 9660 (optical media). Read-only on this trait surface;
+    /// writing happens through `repack` to a fresh image.
+    Iso9660,
 }
 
 /// Probe `dev` to decide which filesystem it carries. Reads only sector 0
@@ -84,6 +87,18 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     // Tar: "ustar\0" or "ustar " magic at offset 257 of the first block.
     if &bs[257..262] == b"ustar" {
         return Ok(FsKind::Tar);
+    }
+
+    // ISO 9660: PVD at LBA 16 (byte 32768) starts with type=0x01,
+    // standard identifier "CD001", version=0x01. The PVD is the
+    // canonical entry point regardless of Joliet / Rock Ridge / boot
+    // record presence.
+    if dev.total_size() >= 32768 + 7 {
+        let mut iso = [0u8; 7];
+        dev.read_at(32768, &mut iso)?;
+        if &iso[1..6] == b"CD001" {
+            return Ok(FsKind::Iso9660);
+        }
     }
 
     // APFS: container superblock magic "NXSB" at offset 32 of block 0.
@@ -152,6 +167,8 @@ pub enum AnyFs {
     F2fs(Box<F2fs>),
     /// SquashFS — scaffold; only `info` returns useful data, list/read error.
     Squashfs(Box<Squashfs>),
+    /// ISO 9660 — read-only (PVD + Joliet + Rock Ridge + El Torito).
+    Iso9660(Box<crate::fs::iso9660::Iso9660>),
 }
 
 impl AnyFs {
@@ -168,6 +185,9 @@ impl AnyFs {
             FsKind::Ntfs => Ok(Self::Ntfs(Box::new(Ntfs::open(dev)?))),
             FsKind::F2fs => Ok(Self::F2fs(Box::new(F2fs::open(dev)?))),
             FsKind::Squashfs => Ok(Self::Squashfs(Box::new(Squashfs::open(dev)?))),
+            FsKind::Iso9660 => Ok(Self::Iso9660(Box::new(crate::fs::iso9660::Iso9660::open(
+                dev,
+            )?))),
         }
     }
 
@@ -184,6 +204,7 @@ impl AnyFs {
             Self::Ntfs(_) => FsKind::Ntfs,
             Self::F2fs(_) => FsKind::F2fs,
             Self::Squashfs(_) => FsKind::Squashfs,
+            Self::Iso9660(_) => FsKind::Iso9660,
         }
     }
 
@@ -205,6 +226,7 @@ impl AnyFs {
             Self::Ntfs(ntfs) => ntfs.list_path(dev, path),
             Self::F2fs(f2) => f2.list_path(dev, path),
             Self::Squashfs(sq) => sq.list_path(dev, path),
+            Self::Iso9660(iso) => iso.list_path(dev, path),
         }
     }
 
@@ -258,6 +280,10 @@ impl AnyFs {
             }
             Self::Squashfs(sq) => {
                 let mut r = sq.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
+            Self::Iso9660(iso) => {
+                let mut r = iso.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
         }
@@ -344,6 +370,7 @@ impl AnyFs {
             Self::Tar(_) => Err(read_only_fs("tar")),
             Self::Apfs(_) => Err(read_only_fs("apfs")),
             Self::Exfat(_) => Err(read_only_fs("exfat")),
+            Self::Iso9660(_) => Err(read_only_fs("iso9660")),
         }
     }
 
@@ -380,7 +407,8 @@ impl AnyFs {
             | Self::Apfs(_)
             | Self::Ntfs(_)
             | Self::F2fs(_)
-            | Self::Squashfs(_) => Ok(()),
+            | Self::Squashfs(_)
+            | Self::Iso9660(_) => Ok(()),
         }
     }
 
@@ -409,6 +437,9 @@ impl AnyFs {
         if let Self::Squashfs(_) = self {
             return "squashfs";
         }
+        if let Self::Iso9660(_) = self {
+            return "iso9660";
+        }
         match self {
             Self::Ext(ext) => match ext.kind {
                 crate::fs::ext::FsKind::Ext2 => "ext2",
@@ -424,7 +455,8 @@ impl AnyFs {
             | Self::Apfs(_)
             | Self::Ntfs(_)
             | Self::F2fs(_)
-            | Self::Squashfs(_) => unreachable!(),
+            | Self::Squashfs(_)
+            | Self::Iso9660(_) => unreachable!(),
         }
     }
 }

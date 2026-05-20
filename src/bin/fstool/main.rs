@@ -2613,6 +2613,7 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         fstool::inspect::AnyFs::Ntfs(ntfs) => print_ntfs_info(ntfs),
         fstool::inspect::AnyFs::F2fs(f2) => print_f2fs_info(f2),
         fstool::inspect::AnyFs::Squashfs(sq) => print_squashfs_info(sq),
+        fstool::inspect::AnyFs::Iso9660(iso) => print_iso9660_info(iso),
     }
     println!();
     println!("/ listing:");
@@ -2719,6 +2720,24 @@ fn print_squashfs_info(sq: &fstool::fs::squashfs::Squashfs) {
     println!("version:           {}.{}", sb.major, sb.minor);
     println!("inode count:       {}", sb.inode_count);
     println!("note:              read support is scaffold-only");
+}
+
+fn print_iso9660_info(iso: &fstool::fs::iso9660::Iso9660) {
+    println!("volume id:         {}", iso.volume_id());
+    println!("system id:         {}", iso.pvd.system_id);
+    println!(
+        "volume space (B):  {}",
+        u64::from(iso.pvd.volume_space_size) * 2048
+    );
+    println!("logical block:     {}", iso.pvd.logical_block_size);
+    println!("joliet:            {}", iso.joliet.is_some());
+    println!("rock ridge:        {}", iso.rock_ridge);
+    println!("bootable:          {}", iso.boot.is_some());
+    if let Some(boot) = iso.boot.as_ref() {
+        println!("  boot platform:   0x{:02x}", boot.default_entry.platform);
+        println!("  boot lba:        {}", boot.default_entry.load_rba);
+        println!("  boot sectors:    {}", boot.default_entry.sector_count);
+    }
 }
 
 fn format_uuid(bytes: &[u8; 16]) -> String {

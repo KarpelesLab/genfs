@@ -900,4 +900,112 @@ mod tests {
         block[0..4].copy_from_slice(&XFS_DIR2_BLOCK_MAGIC.to_be_bytes());
         assert!(is_block_format(&block).unwrap());
     }
+
+    /// `xfs_da_hashname` regression: the leaf-array hash values our writer
+    /// emits (`encode_v5_block_dir`) must match what `xfs_repair`
+    /// recomputes from each name. A silent algorithm drift here would
+    /// pass every reader test (we never re-hash on read) yet make every
+    /// written image fail `xfs_repair -n` with "bad hash ordering".
+    ///
+    /// The empty-name and "."/".." values are canonical: xfsprogs hard-
+    /// codes them in `fs/xfs/libxfs/xfs_dir2_data.c` (the synthetic "."
+    /// and ".." entries that every directory block starts with). The
+    /// remaining vectors exercise each of the four length-mod-4 branches
+    /// (0, 1, 2, 3 bytes remaining after the 4-byte loop) with simple
+    /// ASCII inputs so the expected values can be derived directly from
+    /// the algorithm in the doc comment.
+    #[test]
+    fn dahashname_known_vectors() {
+        // Empty name — no loop iterations, no remainder branch hit → 0.
+        assert_eq!(dahashname(b""), 0);
+
+        // "." — remainder = 1 → `n0 ^ 0.rotate_left(7) = 0x2e`.
+        // This is the canonical hash of the synthetic "." entry.
+        assert_eq!(dahashname(b"."), 0x2e);
+
+        // ".." — remainder = 2 → `(0x2e << 7) ^ 0x2e ^ 0.rotate_left(14)`
+        //                      = 0x1700 ^ 0x2e = 0x172e.
+        // Canonical hash of the synthetic ".." entry.
+        assert_eq!(dahashname(b".."), 0x172e);
+
+        // 3-byte name "abc" exercises the remainder = 3 branch:
+        //   (0x61<<14) ^ (0x62<<7) ^ 0x63 ^ 0.rotate_left(21)
+        //   = 0x184000 ^ 0x3100 ^ 0x63 = 0x187163.
+        assert_eq!(dahashname(b"abc"), 0x0018_7163);
+
+        // 4-byte name "abcd" — one full 4-byte iteration, remainder = 0:
+        //   (0x61<<21) ^ (0x62<<14) ^ (0x63<<7) ^ 0x64 ^ 0.rotate_left(28)
+        //   = 0xC200000 ^ 0x188000 ^ 0x3180 ^ 0x64 = 0xC38B1E4.
+        assert_eq!(dahashname(b"abcd"), 0x0C38_B1E4);
+
+        // Same bytes, distinct ordering → distinct hash (sanity: the
+        // algorithm is order-sensitive, not a commutative XOR).
+        assert_ne!(dahashname(b"abcd"), dahashname(b"dcba"));
+
+        // Determinism: identical input → identical output across calls.
+        assert_eq!(dahashname(b"hello world"), dahashname(b"hello world"));
+    }
+
+    /// `encode_v5_block_dir` must produce a leaf array whose hash values
+    /// are non-decreasing — `xfs_repair` validates this invariant and
+    /// rejects the directory otherwise. Cover the path by encoding a
+    /// directory with names chosen so the implicit "." / ".." synthetic
+    /// entries land in different positions of the sorted output than the
+    /// user-supplied ones.
+    #[test]
+    fn encode_v5_block_dir_leaf_array_is_sorted() {
+        let entries = vec![
+            ("zzz".to_string(), 100u64, XFS_DIR3_FT_REG_FILE),
+            ("aaa".to_string(), 101, XFS_DIR3_FT_REG_FILE),
+            ("mid".to_string(), 102, XFS_DIR3_FT_DIR),
+        ];
+        let block = encode_v5_block_dir(4096, 64, 64, &entries, &[0u8; 16], 0).unwrap();
+
+        // Tail: last 8 bytes are __be32 count, __be32 stale.
+        let count = u32::from_be_bytes(block[4096 - 8..4096 - 4].try_into().unwrap()) as usize;
+        assert_eq!(count, entries.len() + 2, "must include . and ..");
+
+        // Leaf array sits immediately before the tail. Each entry is
+        // (__be32 hashval, __be32 address); hashvals must be non-decreasing.
+        let leaf_start = 4096 - 8 - count * 8;
+        let mut prev_hash: u32 = 0;
+        for i in 0..count {
+            let off = leaf_start + i * 8;
+            let h = u32::from_be_bytes(block[off..off + 4].try_into().unwrap());
+            assert!(
+                h >= prev_hash,
+                "leaf hash array out of order at index {i}: {h:#x} < {prev_hash:#x}"
+            );
+            prev_hash = h;
+        }
+    }
+
+    /// Shortform directories where the parent inode (or any child) exceeds
+    /// 32 bits use `i8count != 0` and store every inode number as 8 bytes.
+    /// This is the path mkfs.xfs picks on large filesystems and was not
+    /// previously exercised by the test suite.
+    #[test]
+    fn decode_shortform_with_i8_inodes() {
+        // Layout: count(1) i8count(1) parent(8) [namelen(1) off(2) name ftype(1) inum(8)]
+        let parent: u64 = 0x1_0000_0080; // > 2^32
+        let child: u64 = 0x1_0000_0200;
+        let name = "big";
+        let namelen = name.len();
+        let mut buf = Vec::new();
+        buf.push(1u8); // count
+        buf.push(1u8); // i8count != 0 → 8-byte inodes
+        buf.extend_from_slice(&parent.to_be_bytes());
+        buf.push(namelen as u8);
+        buf.extend_from_slice(&[0, 0]); // offset placeholder
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(XFS_DIR3_FT_REG_FILE); // ftype (v5)
+        buf.extend_from_slice(&child.to_be_bytes());
+
+        let (parsed_parent, entries) = decode_shortform(&buf, true).unwrap();
+        assert_eq!(parsed_parent, parent);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "big");
+        assert_eq!(entries[0].inumber, child);
+        assert_eq!(entries[0].ftype, XFS_DIR3_FT_REG_FILE);
+    }
 }

@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/KarpelesLab/fstool/compare/v0.2.0...v0.3.0) - 2026-05-20
+
+### Added
+
+- *(hfs+)* route flush metadata writes through journal (Path A)
+- *(ntfs)* multi-SD $Secure (User + System); defer $LogFile Path A
+- *(xfs)* multi-level B-tree dirs + Path A log transactions
+- *(ext4)* open_file_rw on depth-1 extent trees
+- *(apfs)* populate IP ring, SFQ free-queues, and main-device alloc zone
+- *(dmg)* implement ADC, bzip2, LZFSE, and LZMA chunk codecs
+- *(hfs+)* real journal transactions (Path A) for open_file_rw
+- *(ntfs)* populate $Secure ($SDS/$SDH/$SII) + sort root $I30
+- *(xfs)* single-level B-tree directory reader (di_format=BTREE)
+- *(ext4)* open_file_rw on depth-0 inline extent trees
+- *(dmg)* chunk decoder — zero / raw / zlib over UDIF v4
+- *(apfs)* emit a real spaceman bitmap + checkpoint map
+- *(fs)* implement open_file_ro for ext/FAT/exFAT/F2FS/HFS+/NTFS/XFS
+- *(apfs)* implement Filesystem::open_file_ro
+- *(squashfs)* implement Filesystem::open_file_ro
+- *(grf)* implement Filesystem::open_file_ro
+- *(iso9660)* implement Filesystem::open_file_ro for random-access reads
+- *(fs)* add Filesystem::open_file_ro + FileReadHandle
+- *(xfs)* implement Filesystem::open_file_rw via clean-unmount bypass
+- *(ntfs)* implement Filesystem::open_file_rw for in-place edits
+- *(ext3/4)* accept clean-journal images in open_file_rw
+- *(hfs+)* implement Filesystem::open_file_rw for in-place edits
+- *(f2fs)* implement Filesystem::open_file_rw for in-place edits
+- *(ext2)* implement Filesystem::open_file_rw for in-place edits
+- *(fat)* implement Filesystem::open_file_rw for in-place edits
+- *(exfat)* implement Filesystem::open_file_rw for in-place edits
+- *(fs)* add Filesystem::open_file_rw + FileHandle for in-place edits
+- *(apfs)* wire library writer through Filesystem trait
+- *(hfs+)* make open() return a writable handle for add/rm round-trips
+- *(ntfs)* index system files (records 0..=15) in root $I30 on format
+- *(exfat)* wire writer into the Filesystem trait
+- *(grf)* GRF (Gravity Ragnarok File) read + write + add/rm
+- *(fs)* add MutationCapability::WholeFileOnly for future formats
+- *(error)* typed Error::RepackOnly for sequential-by-design FSes
+
+### Fixed
+
+- *(hfs+)* clamp VH nextAllocation < totalBlocks for fsck.hfsplus
+- *(exfat)* drop unused FileHandle import in open_file_rw tests
+- *(iso9660)* emit SUSP SP marker on root's "." dir record
+- *(repack)* Source::detect mishandled Windows drive letters
+
+### Other
+
+- replace links to private items with plain backticks
+- cargo fmt across drifted files
+- *(ext/flex_bg)* tighten leader/follower mapping check + e2fsck-clean
+- resume writes from on-disk AGF/AGI/INOBT/BNO after reopen
+- *(hfs+)* lock down create_hardlink link-inode invariant
+- *(xfs/dir)* cover dahashname, leaf sort, and i8 shortform decode
+- *(squashfs)* cover fragment table reader
+- *(ext)* end-to-end xattr round-trip through set_xattrs + read_xattrs
+- fix broken intra-doc links from public items into pub(crate)
+- rustfmt across the tree
+- *(error)* split Streaming vs Immutable instead of one RepackOnly
+- collapse build-plan walkers through Filesystem::read_symlink
+
 ## [0.2.0](https://github.com/KarpelesLab/fstool/compare/v0.1.0...v0.2.0) - 2026-05-20
 
 ### Added

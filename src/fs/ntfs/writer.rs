@@ -186,10 +186,33 @@ impl super::Ntfs {
     /// * Records whose MFT slot couldn't be located or doesn't carry a
     ///   resident `$FILE_NAME` (defensive — shouldn't happen post-format).
     fn index_system_files_in_root(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
-        // Records 0..=15 minus the root (5). Order matches the MFT
-        // record numbering; ntfs-3g doesn't require any particular order
-        // here — the file system sorts by name on first mount.
-        const SYSTEM_RECS: &[u64] = &[0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        // Records 0..=15 minus the root (5). `ntfs-3g` and the kernel use
+        // a binary search keyed by the $UpCase-folded name when looking
+        // entries up in $I30, so the entries MUST be stored in collation
+        // order — inserting in MFT-record order produces an unsorted
+        // index and lookups for late-alphabet names (`$Secure`,
+        // `$UpCase`, `$Volume`) silently fail to find them.
+        //
+        // The well-known system file names are pure ASCII, so $UpCase
+        // collation degenerates to ASCII-uppercase ordering. The list
+        // below is pre-sorted on the uppercase form of each name.
+        const SYSTEM_RECS: &[u64] = &[
+            4,  // $AttrDef
+            8,  // $BadClus
+            6,  // $Bitmap
+            7,  // $Boot
+            11, // $Extend
+            2,  // $LogFile
+            0,  // $MFT
+            1,  // $MFTMirr
+            12, // $Reserved12
+            13, // $Reserved13
+            14, // $Reserved14
+            15, // $Reserved15
+            9,  // $Secure
+            10, // $UpCase
+            3,  // $Volume
+        ];
         let (rec_size, sector_size) = {
             let w = self.writer.as_ref().expect("writer present");
             (

@@ -100,10 +100,11 @@ fn writer_image_is_mountable(path: &std::path::Path) -> bool {
     out.status.success()
 }
 
-/// `ntfsfix --no-action /path` must run cleanly and print its diagnostic
-/// banner against an fstool-written image. The banner appears even when
-/// ntfs-3g later refuses to remount the volume because of writer gaps,
-/// so we assert on the banner text rather than the exit code.
+/// `ntfsfix --no-action /path` must run cleanly and report a clean
+/// mount on an fstool-written image. Once `$Secure` is populated and the
+/// root `$I30` is stored in collation order, `ntfs-3g`'s mount succeeds
+/// and the report ends with "NTFS partition ... was processed
+/// successfully."
 #[test]
 fn writer_passes_ntfsfix_no_action() {
     let Some(_) = which("ntfsfix") else {
@@ -121,14 +122,49 @@ fn writer_passes_ntfsfix_no_action() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let combined = format!("{stdout}\n{stderr}");
-    // The "Mounting volume" / "Processing $MFT" banner is what ntfs-3g
-    // prints when it recognises the volume as NTFS at all. That alone
-    // confirms our boot sector + MFT layout are sound.
+    // Earlier writer revisions left `$Secure` empty, which caused
+    // ntfs-3g to abort with "Failed to open $Secure: No such file or
+    // directory". Guard against that regressing alongside the positive
+    // mount assertion.
     assert!(
-        combined.contains("Mounting volume")
-            || combined.contains("Processing $MFT")
-            || combined.contains("Reading $MFT"),
-        "ntfsfix produced no recognisable diagnostic output:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        !combined.contains("Failed to open $Secure"),
+        "ntfsfix reports $Secure missing:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("Mounting volume... OK"),
+        "ntfsfix did not cleanly mount the writer image:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// `ntfs-3g`-style mount probe: we can't actually loopback-mount inside
+/// `cargo test` (CAP_SYS_ADMIN required) but `ntfsls --force` walks the
+/// same `$Secure` open + root-directory traversal the kernel mount path
+/// uses. Skipped when `ntfsls` isn't installed.
+#[test]
+fn writer_image_ntfs3g_mountable() {
+    let Some(_) = which("ntfsls") else {
+        eprintln!("skipping: ntfsls not installed");
+        return;
+    };
+    let img = build_image_with_tree(16 * 1024 * 1024);
+    let out = Command::new("ntfsls")
+        .arg("--force")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "ntfsls (ntfs-3g userspace) failed to walk the writer image:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Failed to open $Secure"),
+        "ntfsls reports $Secure missing:\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("hello.txt"),
+        "ntfsls did not list /hello.txt:\n{stdout}"
     );
 }
 

@@ -889,76 +889,297 @@ pub fn build_badclus_record(
     );
 }
 
-/// Build $Secure (record 9): empty $SDS data + empty $SDH/$SII indexes.
+/// File-attribute bits for `$Secure`: HIDDEN | SYSTEM | VIEW_INDEX.
+/// `ntfs-3g` cross-checks `$STANDARD_INFORMATION.file_attributes` against
+/// the MFT record's `VIEW_INDEX` flag on mount, so we keep the two in
+/// sync at format time.
+const SECURE_FILE_ATTRS: u32 = 0x2000_0006;
+/// MFT record flag bit for "VIEW_INDEX" (the same flag that `$Secure`,
+/// `$Extend/$ObjId`, etc. carry on real volumes). Combined with
+/// `FLAG_IN_USE` it yields the canonical 0x0009 record header flags.
+const MFT_RECORD_FLAG_VIEW_INDEX: u16 = 0x0008;
+/// First security_id mkntfs hands out. We follow the same convention so
+/// downstream tools that special-case the low ids behave identically.
+const FIRST_SECURITY_ID: u32 = 0x100;
+
+/// Build a default "everyone full access" SECURITY_DESCRIPTOR_RELATIVE.
+/// Owner = SYSTEM, Group = SYSTEM, DACL = single ACE granting Everyone
+/// FILE_ALL_ACCESS. 72 bytes on the wire. Enough to satisfy `ntfs-3g`'s
+/// `$Secure` consistency check (and any kernel-side ACL walker that
+/// happens to dereference a security_id of zero falls back to "use the
+/// default", so this SD doesn't even need to be reachable from a file —
+/// it just needs to exist).
+pub fn build_default_security_descriptor() -> Vec<u8> {
+    // SID: S-1-1-0 (Everyone)
+    let mut everyone = vec![0u8; 12];
+    everyone[0] = 1; // revision
+    everyone[1] = 1; // sub_authority_count
+    everyone[2..8].copy_from_slice(&[0, 0, 0, 0, 0, 1]); // identifier_authority
+    everyone[8..12].copy_from_slice(&0u32.to_le_bytes()); // sub-authority 0
+
+    // SID: S-1-5-18 (Local SYSTEM)
+    let mut system = vec![0u8; 12];
+    system[0] = 1;
+    system[1] = 1;
+    system[2..8].copy_from_slice(&[0, 0, 0, 0, 0, 5]);
+    system[8..12].copy_from_slice(&18u32.to_le_bytes());
+
+    // Single ACE: ACCESS_ALLOWED, all-access mask, Everyone SID.
+    let mut ace = Vec::new();
+    ace.push(0u8); // ace_type = ACCESS_ALLOWED
+    ace.push(0u8); // ace_flags
+    let ace_size = 8u16 + everyone.len() as u16;
+    ace.extend_from_slice(&ace_size.to_le_bytes());
+    ace.extend_from_slice(&0x001F_01FFu32.to_le_bytes()); // FILE_ALL_ACCESS
+    ace.extend_from_slice(&everyone);
+
+    // ACL containing the single ACE.
+    let mut acl = Vec::new();
+    acl.push(2u8); // revision
+    acl.push(0u8); // sbz1
+    let acl_size = 8u16 + ace.len() as u16;
+    acl.extend_from_slice(&acl_size.to_le_bytes());
+    acl.extend_from_slice(&1u16.to_le_bytes()); // ace_count
+    acl.extend_from_slice(&0u16.to_le_bytes()); // sbz2
+    acl.extend_from_slice(&ace);
+
+    // SECURITY_DESCRIPTOR_RELATIVE layout:
+    //   0..1 revision
+    //   1..2 sbz
+    //   2..4 control flags (SE_DACL_PRESENT | SE_SELF_RELATIVE = 0x8004)
+    //   4..8 owner offset
+    //   8..12 group offset
+    //   12..16 sacl offset (0 — no SACL)
+    //   16..20 dacl offset
+    let header_len = 20usize;
+    let dacl_off = header_len as u32;
+    let owner_off = dacl_off + acl.len() as u32;
+    let group_off = owner_off + system.len() as u32;
+    let mut sd = vec![0u8; header_len];
+    sd[0] = 1; // revision
+    sd[1] = 0; // sbz
+    sd[2..4].copy_from_slice(&0x8004u16.to_le_bytes()); // control
+    sd[4..8].copy_from_slice(&owner_off.to_le_bytes());
+    sd[8..12].copy_from_slice(&group_off.to_le_bytes());
+    sd[12..16].copy_from_slice(&0u32.to_le_bytes()); // sacl offset
+    sd[16..20].copy_from_slice(&dacl_off.to_le_bytes());
+    sd.extend_from_slice(&acl);
+    sd.extend_from_slice(&system); // owner
+    sd.extend_from_slice(&system); // group
+    sd
+}
+
+/// Trivial 32-bit hash for `$SDH`. Real NTFS uses a specific polynomial
+/// (each byte folded with `h = h*0x67 + b`) but our readers index by
+/// security_id via `$SII`, not by hash; mkntfs and the kernel only need
+/// `$SDH` to be self-consistent (the hash stored in the key must match
+/// what `$SDS` says). We compute a stable hash so the entry-and-key pair
+/// agrees with itself.
+pub fn sd_hash(buf: &[u8]) -> u32 {
+    let mut h: u32 = 0;
+    for &b in buf {
+        h = h.wrapping_mul(0x67).wrapping_add(b as u32);
+    }
+    h
+}
+
+/// Build the bytes of `$Secure:$SDS` carrying a single SD with
+/// `security_id = FIRST_SECURITY_ID`. Returns `(stream, entry_size)`
+/// where `entry_size` is the size field stored inside the SDS entry
+/// header (header + SD blob, NOT including the 16-byte alignment pad).
+///
+/// Layout:
+/// * 20-byte SDS entry header `(hash, security_id, offset_in_sds, size)`
+/// * `sd_blob` immediately after.
+/// * Zero-padding so the next entry would start on a 16-byte boundary.
+pub fn build_sds_stream(sd_blob: &[u8]) -> (Vec<u8>, u32) {
+    let entry_size_no_pad = 20u32 + sd_blob.len() as u32;
+    let hash = sd_hash(sd_blob);
+    let mut out = Vec::with_capacity(entry_size_no_pad as usize + 16);
+    out.extend_from_slice(&hash.to_le_bytes());
+    out.extend_from_slice(&FIRST_SECURITY_ID.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes()); // offset_in_sds = 0 (first entry)
+    out.extend_from_slice(&entry_size_no_pad.to_le_bytes());
+    out.extend_from_slice(sd_blob);
+    while out.len() % 16 != 0 {
+        out.push(0);
+    }
+    (out, entry_size_no_pad)
+}
+
+/// Build $Secure (record 9) with a single default security descriptor.
+///
+/// `sds_lcn` / `sds_clusters` describe the non-resident $DATA $SDS
+/// extent allocated by [`format_volume`]; `sds_size` is the number of
+/// bytes actually used at the start of that extent (entry header + SD,
+/// 16-byte padded). The $SDH / $SII roots both point at
+/// `security_id = FIRST_SECURITY_ID` mapped to `(offset=0,
+/// size=sds_entry_size)`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_secure_record(
     rec_buf: &mut [u8],
     rec_size: usize,
     parent_ref: u64,
     filetime: u64,
+    sds_lcn: u64,
+    sds_clusters: u64,
+    sds_size: u64,
+    sds_entry_hash: u32,
+    sds_entry_size: u32,
+    cluster_size: u64,
     sector_size: usize,
 ) {
     let si = build_resident_attr(
         TYPE_STANDARD_INFORMATION,
         &[],
-        &build_si_value(filetime, 0x06),
+        &build_si_value(filetime, SECURE_FILE_ATTRS),
         0,
         0,
     );
-    let fn_value = build_file_name_value(parent_ref, "$Secure", 0x06, 0, 0, filetime, 1);
+    let fn_value = build_file_name_value(
+        parent_ref,
+        "$Secure",
+        SECURE_FILE_ATTRS,
+        0,
+        0,
+        filetime,
+        1,
+    );
     let fname = build_resident_attr(TYPE_FILE_NAME, &[], &fn_value, 0, 0);
-    // $SDS data stream (named) — resident, empty.
+
+    // $SDS: non-resident $DATA stream named "$SDS".
     let sds_name: Vec<u8> = "$SDS"
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
-    let sds = build_resident_attr(TYPE_DATA, &sds_name, &[], 0, 0);
-    // $SDH index root (collation = security_hash, type 0).
-    let sdh_root = build_empty_secure_index_root();
+    let allocated = sds_clusters * cluster_size;
+    let runs = encode_single_run(sds_lcn, sds_clusters);
+    let sds = build_non_resident_attr(
+        TYPE_DATA,
+        &sds_name,
+        &runs,
+        0,
+        sds_clusters.saturating_sub(1),
+        allocated,
+        sds_size,
+        sds_size,
+        0,
+        0,
+    );
+
+    // $SDH index root: one real entry + terminator.
+    let sdh_root = build_secure_index_root(
+        0x12, // SDH collation
+        &build_sdh_entry(sds_entry_hash, FIRST_SECURITY_ID, 0, sds_entry_size),
+    );
     let sdh_name: Vec<u8> = "$SDH"
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
     let sdh = build_resident_attr(TYPE_INDEX_ROOT, &sdh_name, &sdh_root, 0, 0);
-    let sii_root = build_empty_secure_index_root();
+
+    // $SII index root: one real entry + terminator.
+    let sii_root = build_secure_index_root(
+        0x10, // SII collation
+        &build_sii_entry(sds_entry_hash, FIRST_SECURITY_ID, 0, sds_entry_size),
+    );
     let sii_name: Vec<u8> = "$SII"
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
     let sii = build_resident_attr(TYPE_INDEX_ROOT, &sii_name, &sii_root, 0, 0);
+
     emit_record(
         rec_buf,
         rec_size,
         REC_SECURE,
-        mft::RecordHeader::FLAG_IN_USE,
+        mft::RecordHeader::FLAG_IN_USE | MFT_RECORD_FLAG_VIEW_INDEX,
         &[si, fname, sds, sdh, sii],
         sector_size,
         1,
     );
 }
 
-/// Empty `$INDEX_ROOT` for $SDH / $SII (indexed_attr_type = 0, collation = anything).
-fn build_empty_secure_index_root() -> Vec<u8> {
-    let mut v = Vec::with_capacity(0x20);
-    v.extend_from_slice(&0u32.to_le_bytes());
-    v.extend_from_slice(&0u32.to_le_bytes());
-    v.extend_from_slice(&DEFAULT_INDEX_RECORD_SIZE.to_le_bytes());
-    v.push(1); // cpib
+/// Build an `$INDEX_ROOT` value for `$SDH` / `$SII`. `entry` is the bytes
+/// of the single real index entry (the terminator is appended here). The
+/// indexed-attribute type is always 0 ("view index") for both streams;
+/// the caller passes the appropriate collation (0x12 for SDH by hash+id,
+/// 0x10 for SII by security_id alone).
+fn build_secure_index_root(collation: u32, entry: &[u8]) -> Vec<u8> {
+    let index_block_size = DEFAULT_INDEX_RECORD_SIZE;
+    let cpib: i8 = 1;
+    let mut v = Vec::with_capacity(0x20 + entry.len() + 16);
+    // INDEX_ROOT header (16 bytes).
+    v.extend_from_slice(&0u32.to_le_bytes()); // indexed attribute type = 0 ("view index")
+    v.extend_from_slice(&collation.to_le_bytes());
+    v.extend_from_slice(&index_block_size.to_le_bytes());
+    v.push(cpib as u8);
     v.extend_from_slice(&[0u8; 3]);
+    // Index header (16 bytes).
     let first_entry_offset = 16u32;
     let term_entry_len = 16u32;
-    let bytes_in_use = 16u32 + term_entry_len;
+    let bytes_in_use = 16u32 + entry.len() as u32 + term_entry_len;
     let bytes_allocated = bytes_in_use;
-    let flags: u8 = 0;
     v.extend_from_slice(&first_entry_offset.to_le_bytes());
     v.extend_from_slice(&bytes_in_use.to_le_bytes());
     v.extend_from_slice(&bytes_allocated.to_le_bytes());
-    v.push(flags);
+    v.push(0); // flags (SMALL_INDEX)
     v.extend_from_slice(&[0u8; 3]);
+    v.extend_from_slice(entry);
+    // Terminator entry.
     let mut term = vec![0u8; 16];
     term[8..10].copy_from_slice(&16u16.to_le_bytes());
     term[12..16].copy_from_slice(&0x02u32.to_le_bytes());
     v.extend_from_slice(&term);
     v
+}
+
+/// Build a single `$SDH` index entry: 48 bytes carrying an 8-byte key
+/// `(hash, security_id)`, a 20-byte data payload mirroring the SDS entry
+/// header, and a trailing 4-byte "II" tag (Unicode 'I','I').
+fn build_sdh_entry(hash: u32, security_id: u32, sds_offset: u64, sds_size: u32) -> Vec<u8> {
+    let entry_len: u16 = 48;
+    let key_len: u16 = 8;
+    let data_off: u16 = 0x18;
+    let data_size: u16 = 20;
+    let mut e = vec![0u8; entry_len as usize];
+    e[0..2].copy_from_slice(&data_off.to_le_bytes());
+    e[2..4].copy_from_slice(&data_size.to_le_bytes());
+    e[8..10].copy_from_slice(&entry_len.to_le_bytes());
+    e[10..12].copy_from_slice(&key_len.to_le_bytes());
+    // Key at 16..24: hash + security_id.
+    e[16..20].copy_from_slice(&hash.to_le_bytes());
+    e[20..24].copy_from_slice(&security_id.to_le_bytes());
+    // Data at 24..44: SDS-entry-header copy.
+    e[24..28].copy_from_slice(&hash.to_le_bytes());
+    e[28..32].copy_from_slice(&security_id.to_le_bytes());
+    e[32..40].copy_from_slice(&sds_offset.to_le_bytes());
+    e[40..44].copy_from_slice(&sds_size.to_le_bytes());
+    // Trailing "II" tag at 44..48.
+    e[44..46].copy_from_slice(&0x0049u16.to_le_bytes());
+    e[46..48].copy_from_slice(&0x0049u16.to_le_bytes());
+    e
+}
+
+/// Build a single `$SII` index entry: 40 bytes carrying a 4-byte key
+/// (security_id) and a 20-byte data payload mirroring the SDS entry
+/// header. Unlike `$SDH`, `$SII` entries have no trailing tag.
+fn build_sii_entry(hash: u32, security_id: u32, sds_offset: u64, sds_size: u32) -> Vec<u8> {
+    let entry_len: u16 = 40;
+    let key_len: u16 = 4;
+    let data_off: u16 = 0x14;
+    let data_size: u16 = 20;
+    let mut e = vec![0u8; entry_len as usize];
+    e[0..2].copy_from_slice(&data_off.to_le_bytes());
+    e[2..4].copy_from_slice(&data_size.to_le_bytes());
+    e[8..10].copy_from_slice(&entry_len.to_le_bytes());
+    e[10..12].copy_from_slice(&key_len.to_le_bytes());
+    e[16..20].copy_from_slice(&security_id.to_le_bytes());
+    e[20..24].copy_from_slice(&hash.to_le_bytes());
+    e[24..28].copy_from_slice(&security_id.to_le_bytes());
+    e[28..36].copy_from_slice(&sds_offset.to_le_bytes());
+    e[36..40].copy_from_slice(&sds_size.to_le_bytes());
+    e
 }
 
 /// Build $UpCase (record 10) with non-resident $DATA.
@@ -1536,6 +1757,14 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
     let upcase = build_upcase_blob();
     let upcase_clusters = ceil_div(upcase.len() as u64, cluster_size as u64);
     let upcase_lcn = bitmap.allocate(upcase_clusters)?;
+    // Allocate $Secure:$SDS — one cluster is more than enough for the
+    // single default SD we plant (a single entry ≈ 92 bytes padded to 96).
+    let secure_sd = build_default_security_descriptor();
+    let (sds_stream, sds_entry_size) = build_sds_stream(&secure_sd);
+    let sds_used = sds_stream.len() as u64;
+    let sds_entry_hash = sd_hash(&secure_sd);
+    let sds_clusters = ceil_div(sds_used.max(1), cluster_size as u64);
+    let sds_lcn = bitmap.allocate(sds_clusters)?;
     // Allocate $Bitmap (will be rewritten on flush; size known now).
     let bitmap_bytes = bitmap.bytes.len() as u64;
     let bitmap_clusters = ceil_div(bitmap_bytes, cluster_size as u64);
@@ -1703,6 +1932,12 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
             rec_size as usize,
             parent_root_ref,
             filetime,
+            sds_lcn,
+            sds_clusters,
+            sds_used,
+            sds_entry_hash,
+            sds_entry_size,
+            cluster_size as u64,
             bps as usize,
         );
     }
@@ -1798,6 +2033,16 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
         if (upcase.len() as u64) < padded_len {
             let pad = vec![0u8; (padded_len - upcase.len() as u64) as usize];
             dev.write_at(off + upcase.len() as u64, &pad)?;
+        }
+    }
+    // Write $Secure:$SDS payload (one cluster, one entry).
+    {
+        let off = sds_lcn * cluster_size as u64;
+        dev.write_at(off, &sds_stream)?;
+        let padded_len = sds_clusters * cluster_size as u64;
+        if (sds_stream.len() as u64) < padded_len {
+            let pad = vec![0u8; (padded_len - sds_stream.len() as u64) as usize];
+            dev.write_at(off + sds_stream.len() as u64, &pad)?;
         }
     }
     // Write $Bitmap (we'll re-stamp on flush; for now stamp current state).

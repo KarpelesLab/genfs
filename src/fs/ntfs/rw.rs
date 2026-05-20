@@ -1276,16 +1276,19 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        // ntfs-3g userspace refuses to fully remount images this writer
-        // produces (it expects every system file in the root $I30 index,
-        // which we only partially populate). The MFT/MFTMirr cross-check
-        // and journal pass still run, and that's what we assert on —
-        // matches the convention in tests/ntfs_external.rs.
+        // `ntfsfix` prints one of two report styles depending on whether
+        // it had to repair anything:
+        //
+        //   * If the volume mounts cleanly (post-$Secure population), it
+        //     reports "Mounting volume... OK" / "Processing of $MFT and
+        //     $MFTMirr completed successfully." / "NTFS partition ...
+        //     was processed successfully."
+        //   * If something forced the journal-rebuild / MFT-mirror
+        //     compare path, it prints "Comparing $MFTMirr to $MFT... OK"
+        //     followed by the same "completed successfully" line.
+        //
+        // Either output indicates a structurally sound image.
         let combined = format!("{stdout}\n{stderr}");
-        assert!(
-            combined.contains("Comparing $MFTMirr to $MFT... OK"),
-            "ntfsfix MFT/MFTMirr compare missing: stdout={stdout}, stderr={stderr}"
-        );
         assert!(
             combined.contains("Processing of $MFT and $MFTMirr completed successfully."),
             "ntfsfix MFT processing failed: stdout={stdout}, stderr={stderr}"

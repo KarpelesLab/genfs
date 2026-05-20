@@ -111,13 +111,26 @@ impl UniStr {
     }
 }
 
-/// Case-insensitive folding of a single Basic-Multilingual-Plane code unit,
-/// using the simplified ASCII rule plus the common Latin-1 letters. The
-/// real HFS+ folding table is far larger (TN1150 "Case-Insensitive String
-/// Comparison Algorithm") — we approximate it adequately for ASCII path
-/// components, which is the only case the path-resolver is asked to handle.
+/// Case-insensitive folding for a single Basic-Multilingual-Plane code
+/// unit, per HFS+ "H+" case-folding rules (TN1150 §"Case-Insensitive
+/// String Comparison Algorithm"). Returns the folded code unit; the
+/// special value `0xFFFF` is the in-tree "sort-as-maximum" marker the
+/// catalog comparator uses for code units the spec treats as
+/// non-sortable (NUL and other ignorables that appear only in
+/// synthesised internal names such as `\0\0\0\0HFS+ Private Data`).
+///
+/// We carry the upper / lower case mappings that actually occur in
+/// path components used by ASCII + Latin-1 callers, plus the explicit
+/// NUL→`0xFFFF` mapping that makes fsck.hfsplus happy when it walks
+/// the catalog: Apple's tool empirically expects NUL-prefixed names
+/// to sort *after* every printable sibling under the same parent, so
+/// the `HFS+ Private Data` directory lands at the end of the root's
+/// children rather than the start. (Routing NUL through verbatim
+/// compare or a TN1150-style "skip ignorable" both produce orderings
+/// fsck rejects with "b-tree key … is out of order".)
 fn fold_case(c: u16) -> u16 {
     match c {
+        0x0000 => 0xFFFF,
         0x41..=0x5A => c + 0x20,
         // Latin-1 uppercase A-O with diacritics and OE-equivalent
         0xC0..=0xD6 => c + 0x20,
@@ -127,13 +140,10 @@ fn fold_case(c: u16) -> u16 {
     }
 }
 
-/// Lexicographic compare of two HFSUniStr255 values using case-insensitive
-/// folding for the "H+" variant. For "HX" we'd compare verbatim; the
-/// catalog driver hands a flag. NULs are NOT ignored — fsck.hfsplus's
-/// fold table treats them as ordinary code units, which is exactly why
-/// Apple's `HFS+ Private Data` directory is named with 4 leading NULs:
-/// they sort before any printable character, placing the hidden
-/// directory at the very front of the root's children.
+/// Lexicographic compare of two HFSUniStr255 values. With
+/// `case_sensitive == false` (plain HFS+) each code unit is mapped
+/// through [`fold_case`] before comparison; `case_sensitive == true`
+/// (HFSX binary mode) keeps the verbatim u16 values.
 pub fn compare_unistr(a: &UniStr, b: &UniStr, case_sensitive: bool) -> Ordering {
     let n = a.code_units.len().min(b.code_units.len());
     for i in 0..n {

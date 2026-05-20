@@ -217,11 +217,6 @@ pub struct Writer {
     /// on the first `create_hardlink` call. `None` on volumes that
     /// have never seen a hard link.
     pub(crate) private_dir_cnid: Option<u32>,
-    /// Next link-inode number for `iNode<N>` file names inside the
-    /// private-data directory. The on-disk hard-link record stores `N`
-    /// in `HFSPlusBSDInfo.special`; the catalog file inside the
-    /// private directory is keyed by the literal text `iNode<N>`.
-    pub(crate) next_link_inode: u32,
 
     /// Journal-info block (allocation-block number) and journal-buffer
     /// start + length (also in allocation blocks), set on a journaled
@@ -659,8 +654,14 @@ pub(crate) fn encode_volume_header(
     b[44..48].copy_from_slice(&vh.total_blocks.to_be_bytes());
     b[48..52].copy_from_slice(&vh.free_blocks.to_be_bytes());
     b[52..56].copy_from_slice(&next_allocation.to_be_bytes());
-    b[56..60].copy_from_slice(&0u32.to_be_bytes()); // rsrcClumpSize
-    b[60..64].copy_from_slice(&0u32.to_be_bytes()); // dataClumpSize
+    // rsrcClumpSize / dataClumpSize: per-volume defaults inherited by
+    // file forks that don't carry a custom clump size. fsck rejects
+    // a zero value here as "Volume header needs minor repair" (its
+    // own default is 16 KiB but it will silently use 64 KiB if we
+    // pre-populate). Use 64 KiB — matches `newfs_hfs` for the same
+    // block-size range and keeps clump arithmetic on power-of-two.
+    b[56..60].copy_from_slice(&65536u32.to_be_bytes()); // rsrcClumpSize
+    b[60..64].copy_from_slice(&65536u32.to_be_bytes()); // dataClumpSize
     b[64..68].copy_from_slice(&vh.next_catalog_id.to_be_bytes());
     b[68..72].copy_from_slice(&0u32.to_be_bytes()); // writeCount
     b[72..80].copy_from_slice(&1u64.to_be_bytes()); // encodingsBitmap (MacRoman bit)
@@ -1196,7 +1197,6 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         attributes_file,
         startup_file,
         private_dir_cnid: None,
-        next_link_inode: 1,
         journal_info_block,
         journal_buffer_start,
         journal_buffer_blocks,
@@ -1225,6 +1225,24 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         },
         root_folder_body,
     );
+
+    // Journaled volumes carry the journal-info block + journal buffer
+    // as in-volume allocation blocks reserved at format time. fsck
+    // walks the catalog to validate the bitmap and treats any
+    // bitmap-allocated block not owned by a catalog file as an
+    // orphan ("Volume bitmap needs minor repair for orphaned
+    // blocks"). The standard fix is to create two hidden files under
+    // the root — `.journal_info_block` and `.journal` — whose data
+    // forks exactly cover those reserved blocks, giving fsck a
+    // catalog owner for every bit we set.
+    if opts.journaled {
+        insert_journal_files(
+            &mut writer,
+            journal_info_block,
+            journal_buffer_start,
+            journal_buffer_blocks,
+        )?;
+    }
 
     // Build the in-memory VolumeHeader we'll keep alongside the writer.
     let vh = VolumeHeader {
@@ -1578,6 +1596,125 @@ pub(crate) fn private_data_dir_name() -> UniStr {
 
 /// Ensure the HFS+ private-data directory exists under the root and
 /// return its CNID. Created lazily on the first hard-link insert.
+/// Create the two hidden catalog files that a journaled HFS+ volume
+/// uses to give the journal-info block + journal buffer a catalog
+/// owner. Without them, fsck reports the journal blocks as orphans
+/// (their bits are set in the bitmap but nothing in the catalog
+/// claims them).
+///
+/// Naming + tagging follow what Apple writes on a journaled volume:
+/// * `.journal` — covers the `journal_buffer_blocks` blocks starting
+///   at `buffer_start`.
+/// * `.journal_info_block` — covers the single block at `info_block`.
+/// * Both have `fileType = "jrnl"`, `creator = "hfs+"`, and Finder
+///   `finderFlags = 0x5000` (kIsInvisible + kNameLocked) so the
+///   names never surface in user-facing listings.
+/// * `fileMode = S_IFREG` only (mode 0 — system-only access).
+/// * `BSDInfo.special = 1` (Apple convention; not the link-inode
+///   field — these aren't hlnk records).
+pub(crate) fn insert_journal_files(
+    writer: &mut Writer,
+    info_block: u32,
+    buffer_start: u32,
+    buffer_blocks: u32,
+) -> Result<()> {
+    if buffer_blocks == 0 {
+        return Ok(());
+    }
+    let bs = writer.block_size;
+    // .journal first — Apple lays it down at CNID 16 (first user CNID).
+    let journal_cnid = writer.next_cnid;
+    writer.next_cnid = writer
+        .next_cnid
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+    let journal_fork = ForkData {
+        logical_size: u64::from(buffer_blocks) * u64::from(bs),
+        clump_size: bs,
+        total_blocks: buffer_blocks,
+        extents: {
+            let mut ex = [ExtentDescriptor::default(); FORK_EXTENT_COUNT];
+            ex[0] = ExtentDescriptor {
+                start_block: buffer_start,
+                block_count: buffer_blocks,
+            };
+            ex
+        },
+    };
+    insert_journal_entry(writer, ".journal", journal_cnid, &journal_fork)?;
+
+    // .journal_info_block — 1 block.
+    let info_cnid = writer.next_cnid;
+    writer.next_cnid = writer
+        .next_cnid
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+    let info_fork = ForkData {
+        logical_size: u64::from(bs),
+        clump_size: bs,
+        total_blocks: 1,
+        extents: {
+            let mut ex = [ExtentDescriptor::default(); FORK_EXTENT_COUNT];
+            ex[0] = ExtentDescriptor {
+                start_block: info_block,
+                block_count: 1,
+            };
+            ex
+        },
+    };
+    insert_journal_entry(writer, ".journal_info_block", info_cnid, &info_fork)?;
+    Ok(())
+}
+
+fn insert_journal_entry(
+    writer: &mut Writer,
+    name: &str,
+    cnid: u32,
+    fork: &ForkData,
+) -> Result<()> {
+    let name_uni = UniStr::from_str_lossy(name);
+    let key = OwnedKey {
+        parent_id: ROOT_FOLDER_ID,
+        name: name_uni.clone(),
+    };
+    let mut body = Vec::with_capacity(248);
+    body.extend_from_slice(&REC_FILE.to_be_bytes());
+    // flags = kHFSThreadExistsMask only.
+    body.extend_from_slice(&0x0002u16.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes()); // reserved1
+    body.extend_from_slice(&cnid.to_be_bytes());
+    for _ in 0..5 {
+        body.extend_from_slice(&writer.create_date.to_be_bytes());
+    }
+    // BSDInfo: owner=0, group=0, ownerFlags=0, fileMode = S_IFREG (no
+    // permission bits — the journal files are system-private),
+    // special=1 (Apple convention).
+    body.extend_from_slice(&0u32.to_be_bytes()); // ownerID
+    body.extend_from_slice(&0u32.to_be_bytes()); // groupID
+    body.push(0); // adminFlags
+    body.push(0); // ownerFlags
+    body.extend_from_slice(&m::S_IFREG.to_be_bytes()); // fileMode
+    body.extend_from_slice(&1u32.to_be_bytes()); // special
+    // FileInfo: fileType = "jrnl", creator = "hfs+", finderFlags = 0x5000.
+    body.extend_from_slice(b"jrnl");
+    body.extend_from_slice(b"hfs+");
+    body.extend_from_slice(&0x5000u16.to_be_bytes()); // finderFlags
+    body.extend_from_slice(&[0u8; 6]); // location + reservedField
+    body.extend_from_slice(&[0u8; 16]); // ExtendedFileInfo
+    body.extend_from_slice(&0u32.to_be_bytes()); // textEncoding
+    body.extend_from_slice(&0u32.to_be_bytes()); // reserved2
+    encode_fork(fork, &mut body);
+    encode_fork(&ForkData::default(), &mut body); // empty resource fork
+    debug_assert_eq!(body.len(), 248);
+    writer.catalog.insert(key, body);
+    writer.catalog.insert(
+        OwnedKey::thread(cnid),
+        encode_thread_body(REC_FILE_THREAD, ROOT_FOLDER_ID, &name_uni),
+    );
+    writer.bump_valence(ROOT_FOLDER_ID, 1)?;
+    Ok(())
+}
+
 pub(crate) fn ensure_private_dir(writer: &mut Writer) -> Result<u32> {
     if let Some(cnid) = writer.private_dir_cnid {
         return Ok(cnid);
@@ -1635,21 +1772,19 @@ pub(crate) fn extract_file_perms(body: &[u8]) -> Result<(u32, u32, u16)> {
     Ok((uid, gid, mode))
 }
 
-/// Insert a hard-link "indirect node" record. Same on-disk shape as a
-/// regular file record but with `fileType == 'hlnk'`,
-/// `creator == 'hfs+'` and `bsd.special == link_inode_number`. The
-/// data fork is left empty: the actual bytes live in the `iNode<N>`
-/// file stored in the HFS+ private-data directory.
+/// Insert a hard-link "indirect node" record. See [`encode_hardlink_body`]
+/// for the on-disk shape and chain semantics. `prev_link_cnid` /
+/// `next_link_cnid` are CNIDs of the surrounding hlnk records in the
+/// chain; `0` marks the head/tail.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_hardlink_entry(
     writer: &mut Writer,
     parent_id: u32,
     name: &UniStr,
     file_id: u32,
-    mode: u16,
-    uid: u32,
-    gid: u32,
-    link_inode: u32,
+    inode_cnid: u32,
+    prev_link_cnid: u32,
+    next_link_cnid: u32,
 ) -> Result<()> {
     if name.code_units.is_empty() {
         return Err(crate::Error::InvalidArgument(
@@ -1671,7 +1806,13 @@ pub(crate) fn insert_hardlink_entry(
             name.to_string_lossy()
         )));
     }
-    let body = encode_hardlink_body(file_id, mode, uid, gid, link_inode, writer.create_date);
+    let body = encode_hardlink_body(
+        file_id,
+        inode_cnid,
+        prev_link_cnid,
+        next_link_cnid,
+        writer.create_date,
+    );
     writer.catalog.insert(key, body);
     let thread = encode_thread_body(REC_FILE_THREAD, parent_id, name);
     writer.catalog.insert(OwnedKey::thread(file_id), thread);
@@ -1680,36 +1821,53 @@ pub(crate) fn insert_hardlink_entry(
 }
 
 /// Encode a hard-link "indirect node" catalog file body. Same 248-byte
-/// shape as `encode_file_body`, but with the FileInfo tags fixed at
-/// (`'hlnk'`, `'hfs+'`) and `HFSPlusBSDInfo.special` carrying the
-/// link-inode number.
+/// shape as `encode_file_body`, with these hardlink-specific values:
+/// * FileInfo tags: (`'hlnk'`, `'hfs+'`)
+/// * `HFSPlusBSDInfo.special` = the iNode file's CNID
+/// * `HFSPlusBSDInfo.ownerID` = previous link CNID (0 if first in chain)
+/// * `HFSPlusBSDInfo.groupID` = next link CNID (0 if last in chain)
+/// * `HFSPlusBSDInfo.ownerFlags` = `UF_IMMUTABLE` (`0x02`) — Apple
+///   marks hlnks immutable since their bytes are owned by the iNode.
+/// * `HFSPlusBSDInfo.fileMode` = `S_IFREG | 0o444` — the hlnk record
+///   itself reports read-only; the real mode lives on the iNode.
+/// * `FileInfo.finderFlags` = `kHasBeenInited` (`0x0100`)
+///
+/// fsck.hfsplus walks the chain through `ownerID` / `groupID`, not by
+/// scanning siblings, so missing or zeroed chain pointers cause it
+/// to under-count links and report "Incorrect number of file hard
+/// links". The owner/group fields are not the file's real uid/gid —
+/// userspace pulls those from the iNode.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_hardlink_body(
     file_id: u32,
-    file_mode: u16,
-    uid: u32,
-    gid: u32,
-    link_inode: u32,
+    inode_cnid: u32,
+    prev_link_cnid: u32,
+    next_link_cnid: u32,
     create_date: u32,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(248);
     out.extend_from_slice(&REC_FILE.to_be_bytes());
-    // kHFSHasLinkChainMask = 0x0020 — marks this record as part of
-    // a hardlink chain. Apple's HFS+ driver and fsck.hfsplus walk the
-    // chain only when this bit is set; without it the entry is
-    // treated as a regular file with bogus FileInfo, and the implicit
-    // child→parent verification ("HFS+ Private Data directory is out
-    // of order") fires.
-    out.extend_from_slice(&0x0020u16.to_be_bytes()); // flags
+    // flags = kHFSHasLinkChainMask (0x0020) | kHFSThreadExistsMask
+    // (0x0002). Apple sets both on every hlnk record — fsck uses
+    // ThreadExists to skip the lookup when walking the chain.
+    out.extend_from_slice(&0x0022u16.to_be_bytes()); // flags
     out.extend_from_slice(&0u32.to_be_bytes()); // reserved1
     out.extend_from_slice(&file_id.to_be_bytes());
     for _ in 0..5 {
         out.extend_from_slice(&create_date.to_be_bytes());
     }
-    encode_bsd(&mut out, file_mode | m::S_IFREG, uid, gid, link_inode);
-    // FileInfo: fileType = "hlnk", creator = "hfs+", remainder zero.
+    // BSDInfo: hijacked layout for hlnk records (see fn doc).
+    out.extend_from_slice(&prev_link_cnid.to_be_bytes()); // ownerID
+    out.extend_from_slice(&next_link_cnid.to_be_bytes()); // groupID
+    out.push(0); // adminFlags
+    out.push(0x02); // ownerFlags = UF_IMMUTABLE
+    out.extend_from_slice(&(m::S_IFREG | 0o444u16).to_be_bytes()); // fileMode
+    out.extend_from_slice(&inode_cnid.to_be_bytes()); // special = iNode CNID
+    // FileInfo: fileType "hlnk", creator "hfs+", finderFlags = kHasBeenInited.
     out.extend_from_slice(b"hlnk");
     out.extend_from_slice(b"hfs+");
-    out.extend_from_slice(&[0u8; 8]);
+    out.extend_from_slice(&0x0100u16.to_be_bytes()); // finderFlags
+    out.extend_from_slice(&[0u8; 6]); // location(4) + reservedField(2)
     // ExtendedFileInfo
     out.extend_from_slice(&[0u8; 16]);
     out.extend_from_slice(&0u32.to_be_bytes()); // textEncoding
@@ -1804,13 +1962,16 @@ pub(crate) fn promote_to_hardlink(
     // directory's CNID is in `writer.private_dir_cnid`.
     let private_dir = ensure_private_dir(writer)?;
 
-    // Allocate the link-inode number and the iNode catalog file's CNID.
-    let link_inode = writer.next_link_inode;
-    writer.next_link_inode = writer
-        .next_link_inode
-        .checked_add(1)
-        .ok_or_else(|| crate::Error::Unsupported("hfs+: link-inode space exhausted".into()))?;
+    // Allocate the iNode catalog file's CNID. Per Apple's hardlink
+    // convention (visible from a native HFS+ volume with hardlinks),
+    // the iNode "number" carried by each `hlnk` record in
+    // `HFSPlusBSDInfo.special` is the iNode file's CNID, and its
+    // catalog name is `iNode<CNID>` — *not* a parallel counter. fsck
+    // walks PD's children, parses the name suffix back into a CNID,
+    // and cross-checks the special field. A separate counter desyncs
+    // the two and fsck under-counts the chain.
     let inode_cnid = writer.next_cnid;
+    let link_inode = inode_cnid;
     writer.next_cnid = writer
         .next_cnid
         .checked_add(1)
@@ -1818,33 +1979,46 @@ pub(crate) fn promote_to_hardlink(
 
     // Build the iNode<N> file. Re-use the source's data fork verbatim —
     // no bytes change on disk — but rebuild the body with the new
-    // file_id so the catalog stays consistent. Reset Finder tags to
-    // zero since the iNode is just storage, not a user-facing file.
+    // file_id so the catalog stays consistent.
+    //
+    // Apple's hardlink convention (verified against a native HFS+
+    // image with hardlinks):
+    // * iNode file name = `iNode<CNID>` (decimal CNID of this very
+    //   file). fsck parses the suffix back to find the iNode and
+    //   cross-check against the `special` field of each hlnk.
+    // * `FileInfo.fileType` / `FileInfo.creator` are ZEROED — the
+    //   iNode is not a user-facing file and carries no Finder tags.
+    //   ('iNod'/'hfs+' tags would mark it as a Finder-recognised
+    //   document type, which it isn't.)
+    // * Flags: `kHFSHasLinkChainMask (0x0020)` + `kHFSThreadExistsMask
+    //   (0x0002)` + Apple's iNode-marker bit `0x0080`. fsck rejects
+    //   the iNode as "not a real hardlink target" if the marker bit
+    //   is missing and reports "Incorrect number of file hard links".
+    // * `BSDInfo.special` = link count (= number of hlnk records
+    //   pointing at this iNode).
     let inode_name_str = format!("iNode{link_inode}");
     let inode_name = UniStr::from_str_lossy(&inode_name_str);
-    // Per Apple's hardlink convention: the iNode storage file in
-    // the Private Data directory must carry fileType='iNod' and
-    // creator='hfs+' so fsck.hfsplus / the kernel driver recognise
-    // it. BSDInfo.special holds the link count (= number of hlnk
-    // references pointing at this iNode); we start at 2 since the
-    // promotion always creates a (src + dst) pair.
     let mut inode_body = encode_file_body(
         inode_cnid,
         mode_full,
         uid,
         gid,
         writer.create_date,
-        *b"iNod",
-        *b"hfs+",
+        [0u8; 4], // fileType (zero — Apple convention)
+        [0u8; 4], // creator
         &src_fork,
     );
-    // Patch flags = kHFSHasLinkChainMask (0x0020). The iNode storage
-    // file participates in the same hardlink chain as the hlnk records
-    // referencing it. Flags live at byte 2..4 of the 248-byte file body.
-    inode_body[2..4].copy_from_slice(&0x0020u16.to_be_bytes());
-    // Patch BSDInfo.special = link_count (2 = src + dst). BSDInfo
-    // starts at byte 32 of the 248-byte file body; `special` is the
-    // last u32 of the 16-byte BSDInfo struct, so byte 32+12 = 44.
+    inode_body[2..4].copy_from_slice(&0x00a2u16.to_be_bytes());
+    // The "reserved1" slot at body[4..8] in HFSPlusCatalogFile is
+    // overloaded by Apple's hardlink convention as `firstLinkChainID`
+    // — the CNID of the first hlnk in the chain. fsck reads this
+    // when verifying iNodes ("Error getting first link ID for inode
+    // = N" / "first link ID = 0 is < 16" debug output if missing).
+    // src_file_id is our head hlnk (chain prev = 0).
+    inode_body[4..8].copy_from_slice(&src_file_id.to_be_bytes());
+    // BSDInfo starts at byte 32; `special` is the last u32 of the
+    // 16-byte BSDInfo struct (byte 32+12 = 44). Set link count = 2
+    // (one for the src hlnk, one for the dst).
     inode_body[44..48].copy_from_slice(&2u32.to_be_bytes());
     writer.catalog.insert(
         OwnedKey {
@@ -1876,32 +2050,42 @@ pub(crate) fn promote_to_hardlink(
         }
     }
 
-    // Replace the source entry with an hlnk record. We do this in place
-    // (same catalog key) by overwriting the stored body — preserves the
-    // existing source file_id (its CNID), which keeps any open thread
-    // record under that CNID valid. Drop the file's thread record though,
-    // since callers shouldn't be able to resolve the old src_file_id
-    // back to a regular file anymore.
-    let _ = src_body_clone; // anchored for safety; no longer needed.
-    let src_hlnk = encode_hardlink_body(
-        src_file_id,
-        mode_full,
-        uid,
-        gid,
-        link_inode,
-        writer.create_date,
-    );
-    writer.catalog.insert(src_key, src_hlnk);
-
-    // Create the destination hlnk record under a fresh CNID (every
-    // catalog file needs a unique fileID).
+    // Allocate the destination's CNID up-front so we can wire the
+    // chain pointers symmetrically. Chain order: src → dst (src is the
+    // head, dst is the tail). The iNode itself doesn't sit in the
+    // doubly-linked chain; it just carries the link count.
     let dst_cnid = writer.next_cnid;
     writer.next_cnid = writer
         .next_cnid
         .checked_add(1)
         .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+
+    // Replace the source entry with an hlnk record (head of chain:
+    // prev=0, next=dst_cnid). We do this in place (same catalog key)
+    // by overwriting the stored body — preserves the existing source
+    // file_id (its CNID), which keeps any open thread record under
+    // that CNID valid.
+    let _ = src_body_clone; // anchored for safety; no longer needed.
+    let _ = (mode_full, uid, gid); // permissions live on the iNode, not the hlnks.
+    let src_hlnk = encode_hardlink_body(
+        src_file_id,
+        inode_cnid,
+        0,        // prev: head of chain
+        dst_cnid, // next: dst hlnk
+        writer.create_date,
+    );
+    writer.catalog.insert(src_key, src_hlnk);
+
+    // Create the destination hlnk record (tail of chain: prev=src,
+    // next=0).
     insert_hardlink_entry(
-        writer, dst_parent, dst_name, dst_cnid, mode_full, uid, gid, link_inode,
+        writer,
+        dst_parent,
+        dst_name,
+        dst_cnid,
+        inode_cnid,
+        src_file_id, // prev: src hlnk
+        0,           // next: tail
     )?;
 
     // Mark every directory that now contains a hardlink-chain entry
@@ -2739,7 +2923,12 @@ mod tests {
         hfs.create_file(&mut dev, "/src", &mut src, data.len() as u64, 0o644, 0, 0)
             .unwrap();
         let link_inode = hfs.create_hardlink(&mut dev, "/src", "/dst").unwrap();
-        assert_eq!(link_inode, 1, "first hard link gets iNode number 1");
+        // The iNode "number" returned by `create_hardlink` is the CNID
+        // of the iNode file in PD — Apple uses the CNID as the link
+        // number, so the value depends on how many CNIDs have been
+        // handed out before. With `/src` taking the first user CNID
+        // (16) and PD taking 17, the iNode lands at 18.
+        assert_eq!(link_inode, 18, "first user file occupies CNIDs 16+");
         hfs.flush(&mut dev).unwrap();
 
         // Re-open from disk and verify both names yield the same bytes.

@@ -32,12 +32,17 @@ use std::io::Read;
 use crate::Result;
 use crate::block::BlockDevice;
 
-use super::btree::{HEADER_REC_SIZE, KIND_HEADER, KIND_INDEX, KIND_LEAF, NODE_DESCRIPTOR_SIZE};
-use super::catalog::{
-    REC_FILE, REC_FILE_THREAD, REC_FOLDER, REC_FOLDER_THREAD, ROOT_FOLDER_ID, ROOT_PARENT_ID,
-    UniStr, compare_unistr,
+use super::btree::{
+    BTreeHeader, ForkReader, HEADER_REC_SIZE, KIND_HEADER, KIND_INDEX, KIND_LEAF,
+    NODE_DESCRIPTOR_SIZE, NodeDescriptor, read_node, record_bytes, record_offsets,
 };
-use super::extents::{EXTENT_KEY_PAYLOAD_LEN, EXTENT_RECORD_SIZE, FORK_DATA};
+use super::catalog::{
+    CatalogKey, REC_FILE, REC_FILE_THREAD, REC_FOLDER, REC_FOLDER_THREAD, ROOT_FOLDER_ID,
+    ROOT_PARENT_ID, UniStr, compare_unistr,
+};
+use super::extents::{
+    EXTENT_KEY_PAYLOAD_LEN, EXTENT_RECORD_SIZE, ExtentKey, FORK_DATA, decode_extent_record,
+};
 use super::volume_header::{
     ExtentDescriptor, FORK_DATA_SIZE, FORK_EXTENT_COUNT, ForkData, SIG_HFS_PLUS,
     VOLUME_HEADER_OFFSET, VolumeHeader,
@@ -2470,6 +2475,227 @@ fn write_btree_to_fork(
         )));
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Open-as-writable
+// ----------------------------------------------------------------------
+
+/// Rebuild an in-memory [`Writer`] from an existing on-disk HFS+ volume,
+/// so subsequent `create_*` / `remove` calls mutate the live image
+/// instead of erroring out as read-only.
+///
+/// The reconstruction is faithful: every catalog leaf record is copied
+/// verbatim into `writer.catalog`, every extents-overflow leaf record is
+/// copied into `writer.overflow_extents`, and the on-disk allocation
+/// bitmap is loaded byte-for-byte into `writer.bitmap`. On the next
+/// [`flush`] the catalog and extents-overflow trees are rebuilt from
+/// these in-memory maps, exactly the same code path the format-then-flush
+/// flow uses.
+///
+/// `next_cnid` comes from `vh.next_catalog_id`. `next_alloc` is
+/// conservatively reset to `total_blocks`, which forces the first
+/// allocation after re-open through the first-fit scan path; later
+/// allocations resume bump behaviour normally.
+///
+/// Journal stub: the writer reads back nothing journal-specific. If the
+/// volume was originally formatted journaled, the on-disk JournalInfoBlock
+/// and journal buffer remain untouched, and the `kHFSVolumeJournaledMask`
+/// bit survives via `vh.attributes` (which the caller passes through
+/// from `read_volume_header`). The writer's `journal_*` fields stay zero
+/// so [`flush`] will not rewrite the journal stub — but the existing on-
+/// disk stub is still consistent because it was clean to begin with.
+pub fn open_writable(
+    dev: &mut dyn BlockDevice,
+    vh: &VolumeHeader,
+    volume_name: String,
+) -> Result<Writer> {
+    let block_size = vh.block_size;
+    let total_blocks = vh.total_blocks;
+
+    // ---- 1. Load the allocation bitmap.
+    let bitmap_bytes = (total_blocks as u64).div_ceil(8) as usize;
+    let mut bitmap = vec![0u8; bitmap_bytes];
+    if let Some(first) = vh.allocation_file.extents.first() {
+        if first.block_count > 0 {
+            let off = u64::from(first.start_block) * u64::from(block_size);
+            // The on-disk bitmap may span more bytes than the live size
+            // (rounded up to a whole block); only read what we need.
+            dev.read_at(off, &mut bitmap)?;
+        }
+    }
+    let free_blocks = count_free_bits(&bitmap, total_blocks);
+
+    // ---- 2. Open the catalog B-tree and walk every leaf.
+    let cat_fork =
+        ForkReader::from_inline(&vh.catalog_file, block_size, "catalog (writable open)")?;
+    let cat_header = read_btree_header(dev, &cat_fork)?;
+    let node_size = u32::from(cat_header.node_size);
+
+    let mut catalog: BTreeMap<OwnedKey, Vec<u8>> = BTreeMap::new();
+    let mut node_idx = cat_header.first_leaf_node;
+    while node_idx != 0 {
+        let node = read_node(dev, &cat_fork, node_idx, node_size)?;
+        let desc = NodeDescriptor::decode(&node)?;
+        if desc.kind != KIND_LEAF {
+            return Err(crate::Error::InvalidImage(format!(
+                "hfs+ open_writable: catalog leaf chain node {node_idx} has kind {}",
+                desc.kind
+            )));
+        }
+        let offs = record_offsets(&node, desc.num_records)?;
+        for i in 0..desc.num_records as usize {
+            let rec = record_bytes(&node, &offs, i);
+            let key = CatalogKey::decode(rec)?;
+            if key.encoded_len > rec.len() {
+                return Err(crate::Error::InvalidImage(
+                    "hfs+ open_writable: catalog key overruns record".into(),
+                ));
+            }
+            let body = rec[key.encoded_len..].to_vec();
+            catalog.insert(
+                OwnedKey {
+                    parent_id: key.parent_id,
+                    name: key.name,
+                },
+                body,
+            );
+        }
+        node_idx = desc.f_link;
+    }
+
+    // ---- 3. Extents-overflow tree: walk leaves only if the file exists.
+    let mut overflow_extents: BTreeMap<(u8, u32, u32), [ExtentDescriptor; FORK_EXTENT_COUNT]> =
+        BTreeMap::new();
+    if vh.extents_file.total_blocks > 0 {
+        let ext_fork = ForkReader::from_inline(
+            &vh.extents_file,
+            block_size,
+            "extents-overflow (writable open)",
+        )?;
+        let ext_header = read_btree_header(dev, &ext_fork)?;
+        let ext_node_size = u32::from(ext_header.node_size);
+        let mut idx = ext_header.first_leaf_node;
+        while idx != 0 {
+            let node = read_node(dev, &ext_fork, idx, ext_node_size)?;
+            let desc = NodeDescriptor::decode(&node)?;
+            if desc.kind != KIND_LEAF {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+ open_writable: extents leaf chain node {idx} has kind {}",
+                    desc.kind
+                )));
+            }
+            let offs = record_offsets(&node, desc.num_records)?;
+            for i in 0..desc.num_records as usize {
+                let rec = record_bytes(&node, &offs, i);
+                let key = ExtentKey::decode(rec)?;
+                let body_start = key.encoded_len();
+                if body_start + EXTENT_RECORD_SIZE > rec.len() {
+                    return Err(crate::Error::InvalidImage(
+                        "hfs+ open_writable: extents body truncated".into(),
+                    ));
+                }
+                let body = &rec[body_start..body_start + EXTENT_RECORD_SIZE];
+                let group = decode_extent_record(body)?;
+                overflow_extents.insert((key.fork_type, key.file_id, key.start_block), group);
+            }
+            idx = desc.f_link;
+        }
+    }
+
+    // ---- 4. Locate the HFS+ Private Data directory (if it exists), so
+    // a later create_hardlink reuses it instead of trying to insert a
+    // duplicate.
+    let private_dir_cnid = {
+        let key = OwnedKey {
+            parent_id: ROOT_FOLDER_ID,
+            name: private_data_dir_name(),
+        };
+        catalog.get(&key).and_then(|body| {
+            if body.len() >= 12 && i16::from_be_bytes([body[0], body[1]]) == REC_FOLDER {
+                Some(u32::from_be_bytes(body[8..12].try_into().unwrap()))
+            } else {
+                None
+            }
+        })
+    };
+
+    // next_cnid: per TN1150, vh.nextCatalogID always names the next
+    // unused CNID. Fall back to 16 (the first user CNID) if the header
+    // value is below that, just in case.
+    let next_cnid = if vh.next_catalog_id >= 16 {
+        vh.next_catalog_id
+    } else {
+        16
+    };
+
+    Ok(Writer {
+        block_size,
+        node_size,
+        total_blocks,
+        volume_name,
+        create_date: 0,
+        next_cnid,
+        bitmap,
+        // Force first-fit on the next alloc; subsequent allocs resume
+        // bump-pointer behaviour automatically.
+        next_alloc: total_blocks,
+        free_blocks,
+        catalog,
+        overflow_extents,
+        allocation_file: vh.allocation_file,
+        extents_file: vh.extents_file,
+        catalog_file: vh.catalog_file,
+        attributes_file: vh.attributes_file,
+        startup_file: vh.startup_file,
+        private_dir_cnid,
+        // We deliberately leave the journal fields zero on re-open: the
+        // on-disk journal stub is preserved as-is, and flush() will skip
+        // re-writing it because journal_buffer_blocks == 0.
+        journal_info_block: 0,
+        journal_buffer_start: 0,
+        journal_buffer_blocks: 0,
+        flushed: false,
+    })
+}
+
+/// Read a B-tree's header record from node 0 of `fork`. Caller has
+/// already verified the fork covers at least one node's worth of bytes
+/// inline (the writable-open path only fires when the fork has > 0
+/// blocks declared in the volume header).
+fn read_btree_header(dev: &mut dyn BlockDevice, fork: &ForkReader) -> Result<BTreeHeader> {
+    // 512 bytes is enough to cover both the BTNodeDescriptor and the
+    // 106-byte BTHeaderRec that follows it.
+    let mut bootstrap = vec![0u8; 512];
+    fork.read(dev, 0, &mut bootstrap)?;
+    let desc = NodeDescriptor::decode(&bootstrap)?;
+    if desc.kind != KIND_HEADER {
+        return Err(crate::Error::InvalidImage(format!(
+            "hfs+ open_writable: B-tree node 0 has kind {} (expected header)",
+            desc.kind
+        )));
+    }
+    let hdr_buf = &bootstrap[NODE_DESCRIPTOR_SIZE..NODE_DESCRIPTOR_SIZE + HEADER_REC_SIZE];
+    BTreeHeader::decode(hdr_buf)
+}
+
+/// Count zero bits in the first `total_blocks` bits of `bitmap`. Bits
+/// outside `[0, total_blocks)` (the byte-padding tail) are ignored —
+/// they are conventionally marked used by `format()` so they never
+/// collide with the live allocator, and we preserve that on re-open.
+fn count_free_bits(bitmap: &[u8], total_blocks: u32) -> u32 {
+    let mut free = 0u32;
+    for b in 0..total_blocks {
+        let by = (b / 8) as usize;
+        if by >= bitmap.len() {
+            break;
+        }
+        let mask = 1u8 << (7 - (b & 7));
+        if bitmap[by] & mask == 0 {
+            free += 1;
+        }
+    }
+    free
 }
 
 #[cfg(test)]

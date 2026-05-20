@@ -84,7 +84,10 @@ pub struct HfsPlus {
 }
 
 impl HfsPlus {
-    /// Open an existing HFS+ volume on `dev`.
+    /// Open an existing HFS+ volume on `dev`. The returned handle is
+    /// writable: subsequent `create_*` / `remove` calls mutate the live
+    /// image, and [`flush`](Self::flush) persists the rewritten catalog,
+    /// extents-overflow tree, allocation bitmap, and volume header.
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         let vh = read_volume_header(dev)?;
         let case_sensitive = vh.is_hfsx();
@@ -107,6 +110,12 @@ impl HfsPlus {
         let volume_name = lookup_thread_name(dev, &catalog, ROOT_FOLDER_ID)?
             .unwrap_or_else(|| "Untitled".to_string());
 
+        // Reconstruct the in-memory writer state by walking the catalog
+        // leaves and the extents-overflow leaves and loading the on-disk
+        // bitmap. After this, create_* / remove / flush all work on the
+        // live image exactly as they do post-format.
+        let writer = writer::open_writable(dev, &vh, volume_name.clone())?;
+
         Ok(Self {
             volume_header: vh,
             catalog,
@@ -114,7 +123,7 @@ impl HfsPlus {
             private_dir_cnid: std::cell::Cell::new(None),
             private_dir_resolved: std::cell::Cell::new(false),
             volume_name,
-            writer: None,
+            writer: Some(writer),
         })
     }
 
@@ -910,8 +919,10 @@ fn split_path(path: &str) -> Vec<&str> {
 
 // ----------------------------------------------------------------------
 // `crate::fs::Filesystem` trait impl — bridges HfsPlus into the generic
-// walker. Note: `open()` returns a read-only handle (writer = None),
-// so the mutating trait methods only work after `format()` for now.
+// walker. `open()` returns a writable handle (the writer state is
+// reconstructed from the on-disk catalog + bitmap), so the mutating
+// trait methods work on already-flushed images the same way they do
+// post-format.
 // ----------------------------------------------------------------------
 
 impl crate::fs::FilesystemFactory for HfsPlus {
@@ -1150,5 +1161,165 @@ mod tests {
                 "{path:?} hlnk record's own data fork must be empty"
             );
         }
+    }
+
+    /// Round-trip: format + populate + flush, then `HfsPlus::open` the
+    /// flushed image and add a *second* file via `create_file`, flush
+    /// again, and reopen a third time. The second file must be visible
+    /// at its path with byte-exact contents, and the original file must
+    /// still be intact. Locks down the open-as-writable path used by
+    /// `fstool add` on an already-flushed HFS+ image.
+    #[test]
+    fn reopen_writable_round_trip_add_file() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+
+        // 1. Format + write one file + flush.
+        let first = b"first file from format() pass\n".repeat(4);
+        {
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let mut src = std::io::Cursor::new(&first);
+            hfs.create_file(
+                &mut dev,
+                "/first.txt",
+                &mut src,
+                first.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        // 2. Re-open the flushed image and verify the existing file is
+        //    readable AND that the handle reports mutation capability.
+        //    Then add a second file and flush.
+        let second = b"second file added after reopen\n".repeat(7);
+        {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            // Default Filesystem::mutation_capability is Mutable; verify
+            // HFS+ doesn't override to a more restrictive value.
+            let cap = <HfsPlus as crate::fs::Filesystem>::mutation_capability(&hfs);
+            assert_eq!(
+                cap,
+                crate::fs::MutationCapability::Mutable,
+                "freshly-opened HFS+ must advertise Mutable"
+            );
+
+            // Existing file still readable.
+            let mut r = hfs.open_file_reader(&mut dev, "/first.txt").unwrap();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+            assert_eq!(buf, first, "existing file content survives reopen");
+            drop(r);
+
+            // Add a second file via the writer state reconstructed in open().
+            let mut src = std::io::Cursor::new(&second);
+            hfs.create_file(
+                &mut dev,
+                "/second.txt",
+                &mut src,
+                second.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        // 3. Re-open again and verify BOTH files exist with correct bytes.
+        let hfs = HfsPlus::open(&mut dev).unwrap();
+        let entries = hfs.list_path(&mut dev, "/").unwrap();
+        let names: std::collections::BTreeSet<&str> =
+            entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains("first.txt"),
+            "first.txt missing after reopen; got {names:?}"
+        );
+        assert!(
+            names.contains("second.txt"),
+            "second.txt missing after reopen; got {names:?}"
+        );
+
+        let size = hfs.file_size(&mut dev, "/second.txt").unwrap();
+        assert_eq!(size, second.len() as u64);
+        let mut r = hfs.open_file_reader(&mut dev, "/second.txt").unwrap();
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+        assert_eq!(got, second, "second.txt bytes survive a second reopen");
+
+        let mut r = hfs.open_file_reader(&mut dev, "/first.txt").unwrap();
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+        assert_eq!(got, first, "first.txt bytes still intact");
+    }
+
+    /// Round-trip: reopen a flushed image, `remove` an existing entry,
+    /// flush, reopen — the entry must be gone and its blocks freed. Locks
+    /// down the open-as-writable path used by `fstool rm`.
+    #[test]
+    fn reopen_writable_round_trip_remove_file() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+
+        let payload = b"goodbye, cruel world\n".repeat(16);
+        {
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let mut src = std::io::Cursor::new(&payload);
+            hfs.create_file(
+                &mut dev,
+                "/doomed.txt",
+                &mut src,
+                payload.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.create_file(
+                &mut dev,
+                "/keeper.txt",
+                &mut std::io::Cursor::new(b"keep me\n"),
+                8,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        let free_before;
+        {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            free_before = hfs.volume_header.free_blocks;
+            hfs.remove(&mut dev, "/doomed.txt").unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        let hfs = HfsPlus::open(&mut dev).unwrap();
+        let entries = hfs.list_path(&mut dev, "/").unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            !names.contains(&"doomed.txt"),
+            "doomed.txt should be gone after remove + reopen, got {names:?}"
+        );
+        assert!(
+            names.contains(&"keeper.txt"),
+            "keeper.txt should still exist, got {names:?}"
+        );
+
+        // The data blocks the removed file owned should be reclaimed.
+        // payload is len-bytes spread across ceil(len / block_size) blocks.
+        let bs = hfs.block_size() as u64;
+        let freed_blocks = (payload.len() as u64).div_ceil(bs) as u32;
+        assert!(
+            hfs.volume_header.free_blocks >= free_before + freed_blocks,
+            "expected at least {freed_blocks} more free blocks after remove \
+             (before={free_before}, after={})",
+            hfs.volume_header.free_blocks
+        );
     }
 }

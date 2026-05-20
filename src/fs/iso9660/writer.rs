@@ -464,7 +464,7 @@ fn walk_files<F: FnMut(&Node)>(root: &Node, f: &mut F) {
 }
 
 fn sectors_for(bytes: u64) -> u32 {
-    ((bytes + SECTOR - 1) / SECTOR) as u32
+    bytes.div_ceil(SECTOR) as u32
 }
 
 /// Compute the byte length of an ECMA-119 path table (sum of every

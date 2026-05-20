@@ -128,23 +128,18 @@ fn parse_block(
                     *any = true;
                 }
             }
-            b"PX" => {
-                if body.len() >= 32 {
-                    if let Ok(mode) = super::vd::decode_both_endian_u32(&body[0..8], "PX.mode") {
-                        attrs.mode = Some(mode);
-                    }
-                    if let Ok(_nlink) = super::vd::decode_both_endian_u32(&body[8..16], "PX.nlink")
-                    {
-                        // nlink not surfaced today.
-                    }
-                    if let Ok(uid) = super::vd::decode_both_endian_u32(&body[16..24], "PX.uid") {
-                        attrs.uid = Some(uid);
-                    }
-                    if let Ok(gid) = super::vd::decode_both_endian_u32(&body[24..32], "PX.gid") {
-                        attrs.gid = Some(gid);
-                    }
-                    *any = true;
+            b"PX" if body.len() >= 32 => {
+                if let Ok(mode) = super::vd::decode_both_endian_u32(&body[0..8], "PX.mode") {
+                    attrs.mode = Some(mode);
                 }
+                // nlink (body[8..16]) is parsed by the spec but not surfaced today.
+                if let Ok(uid) = super::vd::decode_both_endian_u32(&body[16..24], "PX.uid") {
+                    attrs.uid = Some(uid);
+                }
+                if let Ok(gid) = super::vd::decode_both_endian_u32(&body[24..32], "PX.gid") {
+                    attrs.gid = Some(gid);
+                }
+                *any = true;
             }
             b"SL" => {
                 // body[0] = flags, body[1..] = component records.
@@ -179,17 +174,15 @@ fn parse_block(
                 let _ = cont;
                 *any = true;
             }
-            b"CE" => {
-                if body.len() >= 24 {
-                    let ce_lba = super::vd::decode_both_endian_u32(&body[0..8], "CE.lba").ok();
-                    let ce_off = super::vd::decode_both_endian_u32(&body[8..16], "CE.offset").ok();
-                    let ce_len = super::vd::decode_both_endian_u32(&body[16..24], "CE.len").ok();
-                    if let (Some(lba), Some(off), Some(clen)) = (ce_lba, ce_off, ce_len) {
-                        let mut buf = vec![0u8; clen as usize];
-                        let abs = u64::from(lba) * u64::from(SECTOR_SIZE) + u64::from(off);
-                        if dev.read_at(abs, &mut buf).is_ok() {
-                            parse_block(&buf, dev, attrs, name_acc, symlink_acc, any);
-                        }
+            b"CE" if body.len() >= 24 => {
+                let ce_lba = super::vd::decode_both_endian_u32(&body[0..8], "CE.lba").ok();
+                let ce_off = super::vd::decode_both_endian_u32(&body[8..16], "CE.offset").ok();
+                let ce_len = super::vd::decode_both_endian_u32(&body[16..24], "CE.len").ok();
+                if let (Some(lba), Some(off), Some(clen)) = (ce_lba, ce_off, ce_len) {
+                    let mut buf = vec![0u8; clen as usize];
+                    let abs = u64::from(lba) * u64::from(SECTOR_SIZE) + u64::from(off);
+                    if dev.read_at(abs, &mut buf).is_ok() {
+                        parse_block(&buf, dev, attrs, name_acc, symlink_acc, any);
                     }
                 }
             }
@@ -241,7 +234,7 @@ fn decode_iso_short_time(buf: &[u8]) -> i64 {
     // Days-from-civil — Howard Hinnant.
     let y = 1900 + years - if month <= 2 { 1 } else { 0 };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64;
+    let yoe = y - era * 400;
     let m_shift = if month > 2 { month - 3 } else { month + 9 };
     let doy = (153 * m_shift + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;

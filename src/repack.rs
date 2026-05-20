@@ -42,11 +42,17 @@ pub enum Source {
     TarArchive { path: PathBuf, codec: Option<Algo> },
     /// An existing image, optionally with a `:N` partition selector.
     Image(crate::inspect::Target),
+    /// Multiple sources stacked bottom→top. Upper layers override
+    /// files of the same path; tombstones (`.wh.*` files, character
+    /// device 0/0) delete paths from lower layers. See
+    /// [`crate::merge`] for the fold semantics.
+    Layered(Vec<Source>),
 }
 
 impl Source {
     /// Auto-detect what kind of source `spec` points at.
     ///
+    /// * `a+b+c` (`+`-separated specs) → `Layered`, applied bottom→top.
     /// * An existing directory path → `HostDir`.
     /// * A recognised tar extension (`.tar`, `.tar.gz`, `.tgz`,
     ///   `.tar.xz`, `.txz`, `.tar.zst`, `.tar.lz4`, `.tar.lzma`,
@@ -54,6 +60,22 @@ impl Source {
     /// * Anything else, including a `path:N` partition selector
     ///   → `Image`. Parsed by [`crate::inspect::Target::parse`].
     pub fn detect(spec: &str) -> Result<Self> {
+        // Layered: `a+b+c` (bottom=a, top=c). The single `+` separator
+        // never collides with real paths in practice — `+` is rare in
+        // filenames and `path:partition` syntax uses `:` not `+`.
+        if spec.contains('+') {
+            let parts: Vec<_> = spec
+                .split('+')
+                .filter(|p| !p.is_empty())
+                .map(Self::detect)
+                .collect::<Result<_>>()?;
+            if parts.len() > 1 {
+                return Ok(Self::Layered(parts));
+            }
+            if let Some(single) = parts.into_iter().next() {
+                return Ok(single);
+            }
+        }
         let bare = spec.split(':').next().unwrap_or(spec);
         let bare_path = Path::new(bare);
         if bare == spec
@@ -132,6 +154,19 @@ pub fn populate_ext_from_source(
             copy_image_into_ext(&target, dst_dev, dst)
         }
         Source::Image(target) => copy_image_into_ext(target, dst_dev, dst),
+        Source::Layered(layers) => {
+            // Flatten the stack to a tempfile (applying whiteouts +
+            // opaque-dir semantics), then recurse with the tempfile as
+            // a plain tar source. The tempfile must outlive the call.
+            let tmp = crate::merge::flatten_to_tempfile(layers)?;
+            let merged = Source::TarArchive {
+                path: tmp.path().to_path_buf(),
+                codec: None,
+            };
+            let res = populate_ext_from_source(dst_dev, dst, &merged);
+            drop(tmp);
+            res
+        }
     }
 }
 
@@ -157,6 +192,16 @@ pub fn populate_fat32_from_source(
             copy_image_into_fat32(&target, dst_dev, dst)
         }
         Source::Image(target) => copy_image_into_fat32(target, dst_dev, dst),
+        Source::Layered(layers) => {
+            let tmp = crate::merge::flatten_to_tempfile(layers)?;
+            let merged = Source::TarArchive {
+                path: tmp.path().to_path_buf(),
+                codec: None,
+            };
+            let res = populate_fat32_from_source(dst_dev, dst, &merged);
+            drop(tmp);
+            res
+        }
     }
 }
 
@@ -192,6 +237,18 @@ pub fn ext_build_plan_for_source(
                 let src_fs = crate::inspect::AnyFs::open(src_dev)?;
                 build_ext_plan_inner(src_dev, &src_fs, &mut plan)
             })?;
+        }
+        Source::Layered(layers) => {
+            // Plan from the flattened tar; the tempfile lifetime
+            // brackets the scan, after which it's dropped.
+            let tmp = crate::merge::flatten_to_tempfile(layers)?;
+            let merged_path = tmp.path().to_string_lossy().into_owned();
+            let target = crate::inspect::Target::parse(&merged_path);
+            crate::inspect::with_target_device(&target, |src_dev| {
+                let src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                build_ext_plan_inner(src_dev, &src_fs, &mut plan)
+            })?;
+            drop(tmp);
         }
     }
     Ok(plan)
@@ -241,6 +298,7 @@ pub fn populate_fs_from_source_dyn(
             populate_image_via_trait(&target, dst_dev, dst)
         }
         Source::Image(target) => populate_image_via_trait(target, dst_dev, dst),
+        Source::Layered(layers) => crate::merge::populate_from_layered(dst_dev, dst, layers),
     }
 }
 
@@ -472,6 +530,21 @@ pub fn fat32_min_bytes_for_source(source: &Source) -> Result<u64> {
                 sum = sum_source_file_bytes(src_dev, &src_fs)?;
                 Ok(())
             })?;
+            sum
+        }
+        Source::Layered(layers) => {
+            // Flatten the layers to a tar, then size from the tar
+            // contents (post-whiteout). Tempfile drops at scope end.
+            let tmp = crate::merge::flatten_to_tempfile(layers)?;
+            let merged_path = tmp.path().to_string_lossy().into_owned();
+            let target = crate::inspect::Target::parse(&merged_path);
+            let mut sum = 0u64;
+            crate::inspect::with_target_device(&target, |src_dev| {
+                let src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                sum = sum_source_file_bytes(src_dev, &src_fs)?;
+                Ok(())
+            })?;
+            drop(tmp);
             sum
         }
     };

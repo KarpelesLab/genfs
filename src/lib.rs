@@ -16,6 +16,7 @@ pub mod compression;
 pub mod error;
 pub mod fs;
 pub mod inspect;
+pub mod merge;
 pub mod part;
 pub mod repack;
 pub mod spec;

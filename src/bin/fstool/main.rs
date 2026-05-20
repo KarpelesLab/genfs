@@ -388,6 +388,32 @@ fn repack_cmd(
     cluster_size: &str,
 ) -> fstool::Result<()> {
     let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
+
+    // Layered source: spec contains `+`. Flatten all layers to a
+    // single uncompressed tar in a tempfile, then recurse with that
+    // tempfile as the source. The tempfile lives until repack
+    // completes; the recursive call inherits the same `dst` and
+    // options, so the merged tar drives the rest of the pipeline
+    // exactly as a single tar source would.
+    if src.contains('+') {
+        let source = fstool::repack::Source::detect(src)?;
+        if let fstool::repack::Source::Layered(layers) = source {
+            let tmp = fstool::merge::flatten_to_tempfile(&layers)?;
+            let merged = tmp.path().to_string_lossy().into_owned();
+            let res = repack_cmd(
+                &merged,
+                dst,
+                size_arg,
+                shrink,
+                fs_type_override,
+                block_size,
+                cluster_size,
+            );
+            drop(tmp);
+            return res;
+        }
+    }
+
     let src_target = fstool::inspect::Target::parse(src);
 
     // Compressed-tar source: stream the archive directly into the

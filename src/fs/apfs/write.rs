@@ -12,14 +12,17 @@
 //!
 //! ```text
 //!   0      NXSB           container label
-//!   1      checkpoint_map (zero entries; just a placeholder)
+//!   1      checkpoint_map (resolves spaceman ephemeral oid → block 3)
 //!   2      NXSB           live checkpoint
-//!   3      spaceman_phys  stub (we don't track allocation in v1)
+//!   3      spaceman_phys  real header + inline single-CIB address array
 //!   4      omap_phys_t    container omap header
 //!   5      APSB           volume superblock
 //!   6      omap_phys_t    volume omap header
-//!   7..    metadata blocks (omap leaves / fs-tree leaves & internal roots),
-//!          followed by data blocks for file extents.
+//!   7..    bump area — fs-tree leaves, omap leaves/internal nodes,
+//!          file-extent data blocks. The CIB and per-chunk allocation
+//!          bitmap(s) referenced by the spaceman are also bump-allocated
+//!          at the *end* of this area, after every other block address
+//!          has been pinned.
 //! ```
 //!
 //! Metadata and data blocks past the fixed prefix are bump-allocated:
@@ -27,10 +30,23 @@
 //! omap/fsroot roots are recorded by [`ApfsWriter::finish`] and stamped
 //! into the NXSB/APSB before they're written.
 //!
-//! The spaceman entry is intentionally a stub: we don't maintain the
-//! container's free-space bitmaps. This is fine for read-only consumers
-//! (our reader doesn't touch the spaceman) but means mounting this
-//! image on macOS would refuse to write to it.
+//! ## Space manager
+//!
+//! [`crate::fs::apfs::spaceman`] emits a structurally-correct
+//! `spaceman_phys_t` describing the entire container as a single
+//! device. A single chunk-info-block (CIB) lists one `chunk_info_t` per
+//! container chunk (`blocks_per_chunk = 8 * block_size`); each non-empty
+//! chunk points at its own allocation-bitmap block where set bits mean
+//! "used". The bitmaps reflect every block the writer touched (NXSB
+//! copies, checkpoint map, spaceman/CIB/bitmaps themselves, omap and
+//! fs-tree nodes, and file-extent data blocks).
+//!
+//! What's still missing: a real internal-pool ring (the `sm_ip_*`
+//! fields are left zero), the three space-manager free queues (`SFQ_IP`,
+//! `SFQ_MAIN`, `SFQ_TIER2` are empty), and the allocation zone arrays.
+//! `fsck_apfs` implementations that strictly validate the internal pool
+//! may still complain; the bitmap-vs-allocations cross-check is the
+//! piece that's now consistent.
 //!
 //! ## Multi-leaf fs-tree
 //!
@@ -95,11 +111,8 @@ use super::obj::{
     OBJECT_TYPE_BTREE, OBJECT_TYPE_BTREE_NODE, OBJECT_TYPE_CHECKPOINT_MAP, OBJECT_TYPE_FS,
     OBJECT_TYPE_FSTREE, OBJECT_TYPE_NX_SUPERBLOCK, OBJECT_TYPE_OMAP,
 };
+use super::spaceman::{self, SpacemanLayout, blocks_per_chunk};
 use super::superblock::{APFS_MAGIC, NX_MAGIC, NX_MAX_FILE_SYSTEMS};
-
-/// `OBJECT_TYPE_SPACEMAN` — we only emit this constant for the stub
-/// block; not otherwise used.
-const OBJECT_TYPE_SPACEMAN: u32 = 0x0000_0005;
 
 /// `OBJ_VIRTUAL = 0` (the default flag); `OBJ_PHYSICAL = 0x4000_0000`;
 /// `OBJ_EPHEMERAL = 0x8000_0000`. We use OBJ_PHYSICAL for everything
@@ -567,18 +580,54 @@ impl<'a> ApfsWriter<'a> {
         let apsb_block = self.build_apsb(bs, apsb_paddr, vol_omap_paddr, fsroot_vid)?;
         self.write_block(apsb_paddr, &apsb_block)?;
 
-        // ---- Spaceman stub ----
-        let spaceman_block = build_spaceman_stub(bs, spaceman_vid)?;
-        self.write_block(spaceman_paddr, &spaceman_block)?;
-
         // ---- Container omap (single entry, but goes through the same
         //      multi-leaf path so we exercise the writer uniformly) ----
         let cont_omap_root_paddr = self.write_omap_tree(&[(volume_vid, WRITE_XID, apsb_paddr)])?;
         let cont_omap_phys = build_omap_phys(bs, cont_omap_paddr, cont_omap_root_paddr)?;
         self.write_block(cont_omap_paddr, &cont_omap_phys)?;
 
-        // ---- Checkpoint map (placeholder, 0 entries) ----
-        let chkmap = build_chkmap_stub(bs)?;
+        // ---- Spaceman: CIB + per-chunk bitmaps + spaceman_phys ----
+        //
+        // The CIB and bitmap blocks are bump-allocated AFTER every other
+        // metadata/data block so they themselves can be marked "used"
+        // in their own bitmap without circular reasoning. Pre-reserve
+        // their addresses, then build the spaceman over the closed
+        // set of allocations.
+        let bpc = blocks_per_chunk(bs);
+        let chunks: u64 = self.total_blocks.div_ceil(bpc);
+        let cib_paddr = self.alloc_block()?;
+        let mut bitmap_paddrs: Vec<u64> = Vec::with_capacity(chunks as usize);
+        for _ in 0..chunks {
+            bitmap_paddrs.push(self.alloc_block()?);
+        }
+
+        let used_ranges: Vec<(u64, u64)> = vec![(0, self.next_block)];
+        let layout = SpacemanLayout {
+            block_size: bs,
+            total_blocks: self.total_blocks,
+            xid: WRITE_XID,
+            spaceman_oid: spaceman_vid,
+            cib_paddr,
+            bitmap_paddrs: bitmap_paddrs.clone(),
+            used_ranges,
+        };
+        let emitted = spaceman::build_spaceman(&layout)?;
+        self.write_block(spaceman_paddr, &emitted.spaceman_block)?;
+        self.write_block(cib_paddr, &emitted.cib_block)?;
+        for (paddr, bmap) in bitmap_paddrs.iter().zip(emitted.bitmap_blocks.iter()) {
+            self.write_block(*paddr, bmap)?;
+        }
+
+        // ---- Checkpoint map: one entry resolving spaceman ephemeral oid
+        //      to its physical block. xp_desc readers (incl. fsck_apfs)
+        //      walk this to find the spaceman.
+        let chkmap = build_chkmap(
+            bs,
+            chkmap_paddr,
+            spaceman::OBJECT_TYPE_SPACEMAN | OBJ_EPHEMERAL,
+            spaceman_vid,
+            spaceman_paddr,
+        )?;
         self.write_block(chkmap_paddr, &chkmap)?;
 
         // ---- NXSB (live + label copy) ----
@@ -891,13 +940,13 @@ impl<'a> ApfsWriter<'a> {
         buf[104..108].copy_from_slice(&2u32.to_le_bytes()); // xp_desc_blocks
         buf[108..112].copy_from_slice(&1u32.to_le_bytes()); // xp_data_blocks
         buf[112..120].copy_from_slice(&1u64.to_le_bytes()); // xp_desc_base
-        buf[120..128].copy_from_slice(&3u64.to_le_bytes()); // xp_data_base (unused)
+        buf[120..128].copy_from_slice(&3u64.to_le_bytes()); // xp_data_base = spaceman_paddr
         buf[128..132].copy_from_slice(&2u32.to_le_bytes()); // xp_desc_next
         buf[132..136].copy_from_slice(&1u32.to_le_bytes()); // xp_data_next
         buf[136..140].copy_from_slice(&0u32.to_le_bytes()); // xp_desc_index
         buf[140..144].copy_from_slice(&2u32.to_le_bytes()); // xp_desc_len
         buf[144..148].copy_from_slice(&0u32.to_le_bytes()); // xp_data_index
-        buf[148..152].copy_from_slice(&0u32.to_le_bytes()); // xp_data_len
+        buf[148..152].copy_from_slice(&1u32.to_le_bytes()); // xp_data_len
         buf[152..160].copy_from_slice(&spaceman_vid.to_le_bytes());
         buf[160..168].copy_from_slice(&cont_omap_paddr.to_le_bytes()); // omap_oid
         buf[168..176].copy_from_slice(&reaper_vid.to_le_bytes()); // reaper_oid
@@ -1274,26 +1323,53 @@ fn build_fs_internal_root(entries: &[(Vec<u8>, u64)], bs: usize, root_vid: u64) 
     Ok(block)
 }
 
-/// Build a spaceman stub block — minimal `spaceman_phys_t` with the
-/// fields our reader doesn't consume. APFS readers that don't enforce
-/// allocation policy ignore the contents.
-fn build_spaceman_stub(bs: usize, oid: u64) -> Result<Vec<u8>> {
+/// Build a `checkpoint_map_phys_t` with a single `checkpoint_mapping_t`
+/// entry. Fsck walks this map to resolve the NXSB's ephemeral
+/// `nx_spaceman_oid` to the physical block where `spaceman_phys_t` was
+/// written.
+///
+/// On-disk layout (per Apple File System Reference):
+///
+/// ```text
+///   0..32   obj_phys_t
+///  32..36   cpm_flags (CHECKPOINT_MAP_LAST = 0x1)
+///  36..40   cpm_count (number of entries, here 1)
+///  40..80   checkpoint_mapping_t (40 bytes per entry)
+/// ```
+fn build_chkmap(
+    bs: usize,
+    paddr: u64,
+    entry_type: u32,
+    entry_oid: u64,
+    entry_paddr: u64,
+) -> Result<Vec<u8>> {
+    if bs < 80 {
+        return Err(crate::Error::Unsupported(format!(
+            "apfs: block size {bs} too small for a checkpoint map"
+        )));
+    }
     let mut buf = vec![0u8; bs];
-    buf[8..16].copy_from_slice(&oid.to_le_bytes());
+    buf[8..16].copy_from_slice(&paddr.to_le_bytes());
     buf[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
-    buf[24..28].copy_from_slice(&(OBJECT_TYPE_SPACEMAN | OBJ_EPHEMERAL).to_le_bytes());
-    sign_block(&mut buf);
-    Ok(buf)
-}
-
-/// Build a stub checkpoint_map_phys_t with zero entries. Only present so
-/// the xp_desc area has a well-formed companion block for the live
-/// NXSB.
-fn build_chkmap_stub(bs: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; bs];
     buf[24..28].copy_from_slice(&(OBJECT_TYPE_CHECKPOINT_MAP | OBJ_PHYSICAL).to_le_bytes());
-    buf[16..24].copy_from_slice(&WRITE_XID.to_le_bytes());
-    // flags (u32) at offset 32, count (u32) at 36 — both zero is fine.
+    // cpm_flags = CHECKPOINT_MAP_LAST.
+    buf[32..36].copy_from_slice(&1u32.to_le_bytes());
+    // cpm_count = 1.
+    buf[36..40].copy_from_slice(&1u32.to_le_bytes());
+
+    // checkpoint_mapping_t (40 bytes) at offset 40.
+    // cpm_type / cpm_subtype mirror the target object's o_type/o_subtype.
+    buf[40..44].copy_from_slice(&entry_type.to_le_bytes());
+    buf[44..48].copy_from_slice(&0u32.to_le_bytes()); // cpm_subtype
+    // cpm_size = block size (we copy one block at this paddr).
+    buf[48..52].copy_from_slice(&(bs as u32).to_le_bytes());
+    // cpm_pad = 0 (already)
+    // cpm_fs_oid = 0 (not a volume-scoped object)
+    // cpm_oid = ephemeral oid of the target
+    buf[56..64].copy_from_slice(&entry_oid.to_le_bytes());
+    // cpm_paddr = physical address of the target
+    buf[64..72].copy_from_slice(&entry_paddr.to_le_bytes());
+    // cpm_offset (at offset 72..80) stays zero
     sign_block(&mut buf);
     Ok(buf)
 }
@@ -1597,5 +1673,207 @@ mod tests {
         assert_eq!(leaves.len(), 2);
         assert_eq!(leaves[0].len(), 2);
         assert_eq!(leaves[1].len(), 1);
+    }
+
+    // ---- Spaceman tests ----
+    //
+    // `fsck_apfs` is not packaged for Linux (no `apt`/`brew` binary is
+    // available on this host or in CI), so we can't run it directly.
+    // Instead we round-trip a tiny image through the writer and verify
+    // that the emitted `spaceman_phys_t` + CIB + bitmap blocks are
+    // internally consistent and agree with the writer's known
+    // allocations. If a host ever does have `fsck_apfs`, see the
+    // separate `apfs_fsck_external` ignored test for the wiring.
+
+    use crate::block::BlockDevice;
+    use crate::fs::apfs::spaceman::{
+        count_used_bits, decode_cib_entries, decode_spaceman,
+    };
+
+    /// Read the `paddr`-th 4 KiB block off `dev` as a Vec<u8>.
+    fn read_block(dev: &mut dyn BlockDevice, paddr: u64, bs: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; bs as usize];
+        dev.read_at(paddr * bs as u64, &mut buf).unwrap();
+        buf
+    }
+
+    /// Verify spaceman+CIB+bitmap consistency: every chunk_info entry's
+    /// free_count agrees with its bitmap's cleared-bit count, and the
+    /// total free_count agrees with the spaceman header.
+    fn assert_spaceman_consistent(dev: &mut dyn BlockDevice, bs: u32, total_blocks: u64) {
+        // Block 3 is the spaceman.
+        let sm = read_block(dev, 3, bs);
+        let dec = decode_spaceman(&sm).expect("decode spaceman_phys_t");
+        assert_eq!(dec.block_size, bs);
+        assert_eq!(dec.blocks_per_chunk, bs * 8);
+        assert_eq!(dec.main_block_count, total_blocks);
+        assert_eq!(dec.main_cab_count, 0);
+        assert_eq!(dec.main_cib_count, 1);
+        assert_eq!(
+            dec.main_chunk_count,
+            total_blocks.div_ceil((bs * 8) as u64)
+        );
+
+        // CIB block (decoded from sm.cib_paddr).
+        let cib = read_block(dev, dec.cib_paddr, bs);
+        let entries = decode_cib_entries(&cib).expect("decode CIB");
+        assert_eq!(entries.len() as u64, dec.main_chunk_count);
+
+        let mut free_total: u64 = 0;
+        let bpc = bs * 8;
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.addr, (i as u64) * bpc as u64, "chunk addr off");
+            let expected_blocks =
+                ((i as u64 + 1) * bpc as u64).min(total_blocks) - (i as u64) * bpc as u64;
+            assert_eq!(
+                e.block_count as u64, expected_blocks,
+                "chunk {} block_count off",
+                i
+            );
+            // Cross-check free_count vs bitmap cleared bits.
+            let bmap = read_block(dev, e.bitmap_addr, bs);
+            let used = count_used_bits(&bmap, e.block_count);
+            let free = e.block_count - used;
+            assert_eq!(
+                free, e.free_count,
+                "chunk {} free_count {} disagrees with bitmap (used={})",
+                i, e.free_count, used
+            );
+            free_total += free as u64;
+        }
+        assert_eq!(
+            free_total, dec.main_free_count,
+            "spaceman free_count disagrees with sum of chunk free counts",
+        );
+    }
+
+    /// Smoke test: the spaceman emitted for a tiny image accurately
+    /// reflects the writer's allocations.
+    #[test]
+    fn spaceman_reflects_bump_allocations() {
+        let total_blocks = 64u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        {
+            let mut w = ApfsWriter::new(&mut dev, total_blocks, bs, "Vol").unwrap();
+            let data = b"abc";
+            let mut r = Cursor::new(data);
+            w.add_file_from_reader(2, "f", 0o644, &mut r, data.len() as u64)
+                .unwrap();
+            w.finish().unwrap();
+        }
+        assert_spaceman_consistent(&mut dev, bs, total_blocks);
+        // Every used block in our bitmap must actually be a block we
+        // wrote into. For the smoke check, just confirm block 0 (NXSB
+        // label) is marked used and the last block of the container
+        // (which the writer never touches) is marked free.
+        let sm = read_block(&mut dev, 3, bs);
+        let dec = decode_spaceman(&sm).unwrap();
+        let cib = read_block(&mut dev, dec.cib_paddr, bs);
+        let entries = decode_cib_entries(&cib).unwrap();
+        let bmap = read_block(&mut dev, entries[0].bitmap_addr, bs);
+        assert!(bmap[0] & 0x01 != 0, "block 0 (NXSB label) must be used");
+        let last_bit = (total_blocks - 1) as usize;
+        assert!(
+            bmap[last_bit / 8] & (1 << (last_bit % 8)) == 0,
+            "last block of container must be free"
+        );
+    }
+
+    /// Larger image: multi-block file, still inside chunk 0. The
+    /// spaceman bitmap must report the file's extent as "used".
+    #[test]
+    fn spaceman_marks_file_extent_used() {
+        let total_blocks = 256u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let payload: Vec<u8> = (0..(20 * 1024)).map(|i| (i % 256) as u8).collect();
+        // First pass: write *just* metadata (empty image) to see how
+        // many blocks the writer naturally consumes.
+        let used_blocks_before = {
+            let mut dev1 = MemoryBackend::new(total_blocks * bs as u64);
+            let w1 = ApfsWriter::new(&mut dev1, total_blocks, bs, "V").unwrap();
+            w1.finish().unwrap();
+            let sm1 = read_block(&mut dev1, 3, bs);
+            let d1 = decode_spaceman(&sm1).unwrap();
+            total_blocks - d1.main_free_count
+        };
+        {
+            let mut w = ApfsWriter::new(&mut dev, total_blocks, bs, "V").unwrap();
+            let mut r = Cursor::new(payload.clone());
+            w.add_file_from_reader(2, "blob", 0o644, &mut r, payload.len() as u64)
+                .unwrap();
+            w.finish().unwrap();
+        }
+        assert_spaceman_consistent(&mut dev, bs, total_blocks);
+        let sm = read_block(&mut dev, 3, bs);
+        let d = decode_spaceman(&sm).unwrap();
+        let used_blocks_after = total_blocks - d.main_free_count;
+        // Writing a 20 KiB file consumes at least 5 extra data blocks
+        // (plus its fs-tree-record bookkeeping). The bitmap must
+        // reflect that growth.
+        assert!(
+            used_blocks_after >= used_blocks_before + 5,
+            "expected at least 5 more used blocks after adding 20 KiB file \
+             (was {used_blocks_before}, now {used_blocks_after})"
+        );
+    }
+
+    /// The checkpoint map at block 1 must resolve the NXSB's
+    /// `nx_spaceman_oid` to the spaceman's physical block.
+    #[test]
+    fn checkpoint_map_resolves_spaceman_oid() {
+        let total_blocks = 32u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        {
+            let w = ApfsWriter::new(&mut dev, total_blocks, bs, "V").unwrap();
+            w.finish().unwrap();
+        }
+        // NXSB at block 2: nx_spaceman_oid is at offset 152..160.
+        let nxsb = read_block(&mut dev, 2, bs);
+        let sm_oid = u64::from_le_bytes(nxsb[152..160].try_into().unwrap());
+        // Checkpoint map at block 1.
+        let chk = read_block(&mut dev, 1, bs);
+        // cpm_count at offset 36, first entry at 40 with cpm_oid at +16
+        // (within the entry), cpm_paddr at +24.
+        let cpm_count = u32::from_le_bytes(chk[36..40].try_into().unwrap());
+        assert_eq!(cpm_count, 1, "expected one checkpoint-map entry");
+        let entry = 40usize;
+        let cpm_oid = u64::from_le_bytes(chk[entry + 16..entry + 24].try_into().unwrap());
+        let cpm_paddr = u64::from_le_bytes(chk[entry + 24..entry + 32].try_into().unwrap());
+        assert_eq!(cpm_oid, sm_oid, "chkmap oid must match NXSB nx_spaceman_oid");
+        assert_eq!(cpm_paddr, 3, "spaceman lives at block 3");
+    }
+
+    /// External `fsck_apfs` smoke test — runs only when the binary is
+    /// installed (typically on macOS). Builds a tiny image to a temp
+    /// file, then shells out and asserts a clean exit. Linux hosts skip
+    /// this test gracefully.
+    #[test]
+    #[ignore = "requires fsck_apfs (macOS host); see test body"]
+    fn apfs_fsck_external() {
+        use std::process::Command;
+        if Command::new("fsck_apfs").arg("-h").output().is_err() {
+            // Tool unavailable — skip without failing.
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join("genfs-apfs-spaceman-fsck.img");
+        let total_blocks = 256u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        {
+            let mut w = ApfsWriter::new(&mut dev, total_blocks, bs, "FsckVol").unwrap();
+            let mut r = Cursor::new(b"hello");
+            w.add_file_from_reader(2, "f.txt", 0o644, &mut r, 5).unwrap();
+            w.finish().unwrap();
+        }
+        // Drain memory backend to file.
+        let mut buf = vec![0u8; (total_blocks * bs as u64) as usize];
+        dev.read_at(0, &mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+        let status = Command::new("fsck_apfs").arg("-n").arg(&path).status().unwrap();
+        assert!(status.success(), "fsck_apfs reported errors");
     }
 }

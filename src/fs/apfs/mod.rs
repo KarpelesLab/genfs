@@ -79,6 +79,7 @@ pub mod jrec;
 pub mod obj;
 pub mod omap;
 pub mod snap;
+pub(crate) mod spaceman;
 pub mod superblock;
 pub mod write;
 

@@ -33,7 +33,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | tar        | ✅    | ✅     | ustar + PAX, `SCHILY.xattr.*` for xattrs                             |
 | XFS        | ✅    | ✅     | shortform + block / leaf / node dirs + BMBT; writer passes `xfs_repair -n` single + multi-AG; B-tree dirs deferred |
 | HFS+/HFSX  | ✅    | ✅     | inline + extents-overflow, symlinks, hard links; writer passes `fsck.hfsplus` with optional journal stub |
-| APFS       | ✅    | 🚧    | multi-level omap + fs-tree; writer is single-volume + stub spaceman (no snapshots / encryption); not yet `fsck_apfs` clean |
+| APFS       | ✅    | 🚧    | multi-level omap + fs-tree; writer is single-volume with a structurally-correct spaceman bitmap (no internal-pool ring / free-queues, no snapshots / encryption); not yet `fsck_apfs` clean |
 | NTFS       | ✅    | 🚧    | MFT, attributes, $DATA + ADS, indexes; xattr map; writer indexes system files (records 0..=15) in root `$I30`; `$Secure` indirection still empty so `ntfs-3g` mount remains blocked |
 | F2FS       | ✅    | ✅     | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs` |
 | SquashFS   | ✅    | ✅     | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs` |
@@ -334,8 +334,12 @@ Things explicitly out of scope today, in rough order of likely-to-change:
 - NTFS reader: compressed and encrypted `$DATA`, `$ATTRIBUTE_LIST`
   spill, and `$Secure` security-descriptor indirection beyond what
   the resident path handles all return `Unsupported`.
-- APFS writer: single volume, stub space-manager → `fsck_apfs`
-  flags the spaceman; `mount_apfs` typically refuses the image.
+- APFS writer: single volume. The space manager now emits a real
+  `spaceman_phys_t` + chunk-info-block + per-chunk allocation bitmap
+  that agrees with the writer's allocations, and the checkpoint map
+  resolves the ephemeral spaceman oid. The internal-pool ring and
+  free-queue B-trees are still empty, so a strict `fsck_apfs` may
+  still flag those areas; `mount_apfs` typically refuses the image.
 - APFS reader: snapshots, encryption, and sealed-volume integrity
   are out of scope.
 - XFS reader: B-tree-format directories (block / leaf / node formats

@@ -249,10 +249,10 @@ impl Xfs {
         self.decode_dir_entries_from_extents(dev, &extents)
     }
 
-    /// Walk a `di_format == BTREE` directory inode: decode its bmbt root
-    /// via [`bmbt::read_btree_dir_extents`] (restricted to single-level
-    /// trees), then enumerate every data block the resulting extent list
-    /// covers using the same decoder as the `block` / `leaf` paths.
+    /// Walk a `di_format == BTREE` directory inode: decode its bmbt
+    /// root via [`bmbt::read_btree_dir_extents`] (any depth), then
+    /// enumerate every data block the resulting extent list covers
+    /// using the same decoder as the `block` / `leaf` paths.
     fn read_btree_dir_entries(
         &self,
         dev: &mut dyn BlockDevice,
@@ -397,10 +397,9 @@ impl Xfs {
             // BTREE-format directories — the inode-fork holds a bmbt root
             // (same shape as for files); leaves still contain XDD3/XDB3
             // data blocks plus a LEAFN / NODE index above the
-            // XFS_DIR2_LEAF_OFFSET boundary. We walk the bmbt with the
-            // dedicated single-level-restricted reader so deeper trees
-            // surface a typed `Unsupported` error citing the limit
-            // rather than silently working through `walk_btree`.
+            // XFS_DIR2_LEAF_OFFSET boundary. The reader walks the bmbt
+            // through arbitrary depth (root → internal → leaves) and
+            // returns the union of data-fork extents.
             DiFormat::Btree => self.read_btree_dir_entries(dev, ino_buf, core),
             DiFormat::Dev => Err(crate::Error::InvalidImage(
                 "xfs: directory inode has di_format=dev".into(),
@@ -1150,41 +1149,176 @@ mod tests {
         assert_eq!(beta.kind, crate::fs::EntryKind::Dir);
     }
 
-    /// Companion to [`list_root_btree_dir_single_level`]: a BTREE root
-    /// at level 2 (one beyond the single-level cap) must surface
-    /// `Error::Unsupported` carrying a depth-aware message rather than
-    /// the previous blanket "btree dirs not implemented" error.
+    /// Multi-level B-tree directory: a synthetic root inode in BTREE
+    /// di_format whose bmbt root sits at level 2 (root → 2 internal
+    /// nodes → 4 leaf nodes). The leaves point at 20 directory data
+    /// blocks, each holding ~252 entries; the test injects 4200 user
+    /// entries total (above the 4096 threshold called out in the
+    /// issue) and asserts every name surfaces through `list_path`.
     #[test]
-    fn list_root_btree_dir_two_level_is_unsupported() {
-        let mut dev = minimal_image();
-        let xfs = Xfs::open(&mut dev).unwrap();
-        let rootino = xfs.sb.rootino;
-        let inodesize = xfs.sb.inodesize as usize;
+    fn list_root_btree_dir_multi_level() {
+        // Larger image: 4 AGs of 64 4-KiB blocks = 1 MiB.
+        let blocksize = 4096u32;
+        let agblocks = 64u32;
+        let agcount = 4u32;
+        let inodesize = 256u16;
+        let inopblock = (blocksize as u16) / inodesize;
+        let dblocks = (agblocks as u64) * (agcount as u64);
+        let rootino = 128u64;
+        let sb_buf = superblock::synth_sb_for_tests(
+            blocksize,
+            dblocks,
+            agblocks,
+            agcount,
+            inodesize,
+            inopblock,
+            rootino,
+            superblock::XFS_SB_VERSION_5,
+        );
+        let total = dblocks * (blocksize as u64);
+        let mut dev = MemoryBackend::new(total);
+        dev.write_at(0, &sb_buf).unwrap();
 
+        let xfs = Xfs::open(&mut dev).unwrap();
+
+        // Hand out FSBs in AG 2 for the dir data blocks and the bmbt
+        // nodes (AG 1 holds the root-inode chunk in this layout).
+        // FSBs are global indices: ag*64 + agblk.
+        let ag2_base: u64 = 2 * (agblocks as u64);
+        let data_fsbs: Vec<u64> = (0..20).map(|i| ag2_base + i).collect();
+        // Leaves at FSBs ag2+30..34 (4 leaves), internals at ag2+40..42
+        // (2 nodes). Root sits in the inode literal area itself.
+        let leaf_fsbs: [u64; 4] = [ag2_base + 30, ag2_base + 31, ag2_base + 32, ag2_base + 33];
+        let intern_fsbs: [u64; 2] = [ag2_base + 40, ag2_base + 41];
+
+        // Layout the directory entries across 20 data blocks. The first
+        // data block also carries the synthetic "." and "..".
+        let dir_block_size = xfs.sb.dir_block_size() as usize;
+        // Generate 4200 user entries with 4-char hex names ("0000" .. "1067")
+        // so each padded record is exactly 16 bytes (252/block at 4 KiB).
+        let mut all_user: Vec<(String, u64, u8)> = Vec::with_capacity(4200);
+        for i in 0..4200u32 {
+            let name = format!("{i:04x}");
+            let inum = 1_000 + i as u64;
+            all_user.push((name, inum, dir::XFS_DIR3_FT_REG_FILE));
+        }
+        // Distribute roughly evenly across the 20 blocks.
+        let per_block = all_user.len().div_ceil(data_fsbs.len());
+        let uuid = [0u8; 16];
+        for (i, fsb) in data_fsbs.iter().enumerate() {
+            let slice_lo = i * per_block;
+            let slice_hi = ((i + 1) * per_block).min(all_user.len());
+            let mut block_entries: Vec<(String, u64, u8)> = if i == 0 {
+                // First data block also carries "." and "..".
+                vec![
+                    (".".to_string(), rootino, dir::XFS_DIR3_FT_DIR),
+                    ("..".to_string(), rootino, dir::XFS_DIR3_FT_DIR),
+                ]
+            } else {
+                Vec::new()
+            };
+            block_entries.extend(all_user[slice_lo..slice_hi].iter().cloned());
+            let block_basic_blkno = xfs.fsb_to_byte(*fsb) / 512;
+            let block = dir::encode_v5_data_block(
+                dir_block_size,
+                &block_entries,
+                &uuid,
+                block_basic_blkno,
+                rootino,
+            )
+            .unwrap();
+            dev.write_at(xfs.fsb_to_byte(*fsb), &block).unwrap();
+        }
+
+        // Build 4 BMBT leaf blocks, each mapping 5 consecutive dir
+        // logical blocks to physical FSBs from `data_fsbs`. Leaf 0:
+        // dir-block 0..4 → data_fsbs[0..5]; leaf 1: 5..9; etc.
+        let hdr = 72; // v5 bmbt block header
+        for (li, leaf_fsb) in leaf_fsbs.iter().enumerate() {
+            let mut leaf = vec![0u8; blocksize as usize];
+            leaf[0..4].copy_from_slice(&bmbt::XFS_BMAP_CRC_MAGIC.to_be_bytes());
+            leaf[4..6].copy_from_slice(&0u16.to_be_bytes()); // level=0
+            leaf[6..8].copy_from_slice(&5u16.to_be_bytes()); // numrecs=5
+            for j in 0..5 {
+                let logical_blk = (li * 5 + j) as u64;
+                let phys_fsb = data_fsbs[li * 5 + j];
+                let e = bmbt::Extent {
+                    offset: logical_blk,
+                    startblock: phys_fsb,
+                    blockcount: 1,
+                    unwritten: false,
+                };
+                leaf[hdr + j * 16..hdr + (j + 1) * 16].copy_from_slice(&e.encode());
+            }
+            dev.write_at(xfs.fsb_to_byte(*leaf_fsb), &leaf).unwrap();
+        }
+
+        // Build 2 BMBT internal (level-1) blocks, each pointing at 2 leaves.
+        let max_recs = (blocksize as usize - hdr) / (bmbt::BMBT_KEY_SIZE + bmbt::BMBT_PTR_SIZE);
+        for (ni, intern_fsb) in intern_fsbs.iter().enumerate() {
+            let mut node = vec![0u8; blocksize as usize];
+            node[0..4].copy_from_slice(&bmbt::XFS_BMAP_CRC_MAGIC.to_be_bytes());
+            node[4..6].copy_from_slice(&1u16.to_be_bytes()); // level=1
+            node[6..8].copy_from_slice(&2u16.to_be_bytes()); // numrecs=2
+            // keys = the logical-block start of each child leaf.
+            // Leaf li covers logical blocks [li*5, li*5+5).
+            let l0 = ni * 2;
+            let l1 = ni * 2 + 1;
+            let key0 = (l0 * 5) as u64;
+            let key1 = (l1 * 5) as u64;
+            node[hdr..hdr + 8].copy_from_slice(&key0.to_be_bytes());
+            node[hdr + 8..hdr + 16].copy_from_slice(&key1.to_be_bytes());
+            let ptrs_start = hdr + max_recs * bmbt::BMBT_KEY_SIZE;
+            node[ptrs_start..ptrs_start + 8].copy_from_slice(&leaf_fsbs[l0].to_be_bytes());
+            node[ptrs_start + 8..ptrs_start + 16].copy_from_slice(&leaf_fsbs[l1].to_be_bytes());
+            dev.write_at(xfs.fsb_to_byte(*intern_fsb), &node).unwrap();
+        }
+
+        // Carve the root inode in BTREE di_format with a level-2 bmbt root.
         let off = xfs.ino_byte_offset(rootino).unwrap();
-        let mut ino_buf = vec![0u8; inodesize];
+        let mut ino_buf = vec![0u8; inodesize as usize];
         ino_buf[0..2].copy_from_slice(&inode::XFS_DINODE_MAGIC.to_be_bytes());
         ino_buf[2..4].copy_from_slice(&(inode::S_IFDIR | 0o755).to_be_bytes());
         ino_buf[4] = 3; // v3
         ino_buf[5] = 3; // BTREE
-        ino_buf[16..20].copy_from_slice(&2u32.to_be_bytes());
-        ino_buf[152..160].copy_from_slice(&rootino.to_be_bytes());
-        // bmbt root: level=2 (one above the supported cap), numrecs=0.
+        ino_buf[16..20].copy_from_slice(&2u32.to_be_bytes()); // nlink
+        ino_buf[152..160].copy_from_slice(&rootino.to_be_bytes()); // di_ino
+
+        // bmbt root: level=2, numrecs=2.
         let lit_off = 176;
+        let lit_end = inodesize as usize;
         ino_buf[lit_off..lit_off + 2].copy_from_slice(&2u16.to_be_bytes());
-        ino_buf[lit_off + 2..lit_off + 4].copy_from_slice(&0u16.to_be_bytes());
+        ino_buf[lit_off + 2..lit_off + 4].copy_from_slice(&2u16.to_be_bytes());
+        ino_buf[lit_off + 4..lit_off + 12].copy_from_slice(&0u64.to_be_bytes()); // key 0
+        ino_buf[lit_off + 12..lit_off + 20].copy_from_slice(&((2 * 5) as u64).to_be_bytes()); // key 1
+        // tail layout for ptrs.
+        ino_buf[lit_end - 16..lit_end - 8].copy_from_slice(&intern_fsbs[0].to_be_bytes());
+        ino_buf[lit_end - 8..lit_end].copy_from_slice(&intern_fsbs[1].to_be_bytes());
         dev.write_at(off, &ino_buf).unwrap();
 
+        // List and validate.
         let xfs = Xfs::open(&mut dev).unwrap();
-        let err = xfs
-            .list_path(&mut dev, "/")
-            .expect_err("level=2 btree dir must surface Unsupported");
-        match err {
-            crate::Error::Unsupported(msg) => assert!(
-                msg.contains("level") && msg.contains("btree"),
-                "Unsupported should mention level + btree: {msg:?}"
-            ),
-            other => panic!("expected Unsupported, got {other:?}"),
+        let listed = xfs.list_path(&mut dev, "/").unwrap();
+        // Must surface every user entry plus "." and "..".
+        assert!(
+            listed.len() >= all_user.len() + 2,
+            "expected >= {} entries, got {}",
+            all_user.len() + 2,
+            listed.len()
+        );
+        let names: std::collections::HashSet<&str> =
+            listed.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains("."), "missing '.'");
+        assert!(names.contains(".."), "missing '..'");
+        for (name, _, _) in &all_user {
+            assert!(names.contains(name.as_str()), "missing user entry {name:?}");
         }
+        // Spot-check that 4096+ entries came through, as the issue
+        // explicitly calls out.
+        assert!(
+            listed.len() >= 4096,
+            "multi-level dir should yield ≥ 4096 entries, got {}",
+            listed.len()
+        );
     }
 }

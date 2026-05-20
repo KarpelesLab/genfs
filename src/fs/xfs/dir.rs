@@ -16,9 +16,9 @@
 //! di_format) directories are read by walking the inode-fork
 //! `xfs_bmbt_block` root via [`super::bmbt::read_btree_dir_extents`]; the
 //! resulting extent list is then enumerated by the same per-data-block
-//! decoder used by the `block` / `leaf` paths. Only single-level trees
-//! (one root + one level of leaves) are supported — deeper trees surface
-//! `Error::Unsupported` with a depth-aware message.
+//! decoder used by the `block` / `leaf` paths. Trees of any depth are
+//! supported: the walker descends recursively through every internal
+//! node until it reaches level-0 leaf blocks.
 //!
 //! ## Shortform header (v5 / v3 inodes)
 //!
@@ -587,6 +587,82 @@ pub fn encode_v5_block_dir(
     }
     block[dir_block_size - 8..dir_block_size - 4].copy_from_slice(&leaf_count.to_be_bytes());
     block[dir_block_size - 4..dir_block_size].copy_from_slice(&0u32.to_be_bytes());
+
+    stamp_v5_dir_block_crc(&mut block);
+    Ok(block)
+}
+
+/// Encode a v5 data-format (XDD3) directory block holding `entries`.
+/// Unlike [`encode_v5_block_dir`] this is for the data blocks of a
+/// leaf-format / node-format / btree-format directory: no synthetic
+/// `.` / `..` are inserted, and there is no trailing leaf-entry array.
+/// The block is filled with `entries` followed by a single
+/// `data_unused` region covering the remaining slack.
+///
+/// `block_basic_blkno` is the device-sector address of this block in
+/// 512-byte basic-block units (matches `dir3_blk_hdr.blkno`).
+///
+/// This helper exists primarily to drive multi-data-block directory
+/// regression tests; the production writer doesn't currently emit
+/// multi-block leaf-format directories on its own.
+pub fn encode_v5_data_block(
+    dir_block_size: usize,
+    entries: &[(String, u64, u8)],
+    uuid: &[u8; 16],
+    block_basic_blkno: u64,
+    owner: u64,
+) -> Result<Vec<u8>> {
+    if dir_block_size < V5_DATA_HDR_SIZE + 8 {
+        return Err(crate::Error::InvalidArgument(format!(
+            "xfs: dir block size {dir_block_size} too small for v5 data header"
+        )));
+    }
+    let mut block = vec![0u8; dir_block_size];
+    block[0..4].copy_from_slice(&XFS_DIR3_DATA_MAGIC.to_be_bytes());
+    block[8..16].copy_from_slice(&block_basic_blkno.to_be_bytes());
+    // lsn at [16..24] zero
+    block[24..40].copy_from_slice(uuid);
+    block[40..48].copy_from_slice(&owner.to_be_bytes());
+    // bestfree[3] at [48..60] filled below; pad (60..64) zero
+
+    let mut pos = V5_DATA_HDR_SIZE;
+    for (name, inum, ft) in entries {
+        let namelen = name.len();
+        if namelen == 0 || namelen > 255 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: encode_v5_data_block: bad namelen {namelen}"
+            )));
+        }
+        let raw_len = 8 + 1 + namelen + 1 + 2;
+        let padded = (raw_len + 7) & !7;
+        if pos + padded > dir_block_size {
+            return Err(crate::Error::InvalidArgument(
+                "xfs: encode_v5_data_block: too many entries for block".into(),
+            ));
+        }
+        block[pos..pos + 8].copy_from_slice(&inum.to_be_bytes());
+        block[pos + 8] = namelen as u8;
+        block[pos + 9..pos + 9 + namelen].copy_from_slice(name.as_bytes());
+        block[pos + 9 + namelen] = *ft;
+        let tag = (pos as u16).to_be_bytes();
+        block[pos + padded - 2..pos + padded].copy_from_slice(&tag);
+        pos += padded;
+    }
+    // Fill the rest with one big data_unused region.
+    if pos < dir_block_size {
+        let slack = dir_block_size - pos;
+        if slack < 8 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: encode_v5_data_block: trailing slack {slack} < 8"
+            )));
+        }
+        block[pos..pos + 2].copy_from_slice(&XFS_DIR2_DATA_FREE_TAG.to_be_bytes());
+        block[pos + 2..pos + 4].copy_from_slice(&(slack as u16).to_be_bytes());
+        let tag_off = pos + slack - 2;
+        block[tag_off..tag_off + 2].copy_from_slice(&(pos as u16).to_be_bytes());
+        block[48..50].copy_from_slice(&(pos as u16).to_be_bytes());
+        block[50..52].copy_from_slice(&(slack as u16).to_be_bytes());
+    }
 
     stamp_v5_dir_block_crc(&mut block);
     Ok(block)

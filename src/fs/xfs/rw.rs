@@ -1,23 +1,37 @@
-//! `Filesystem::open_file_rw` for XFS — clean-unmount-bypass file handle.
+//! `Filesystem::open_file_rw` for XFS — write-ahead-log file handle (Path A).
 //!
-//! XFS's on-disk update model is journalled: every metadata change is meant
-//! to land in the log first, with the kernel replaying the log on mount.
-//! This implementation does NOT write log records. Instead it follows the
-//! "clean unmount" bypass:
+//! XFS's on-disk update model is journalled: every metadata change must
+//! land in the log first, with the kernel replaying the log on mount.
+//! This implementation now implements that pattern (Path A) for the
+//! single-inode-update transactions emitted by `persist()`:
 //!
-//! 1. On open, refuse the operation unless the on-disk log header at
-//!    `sb_logstart` matches the clean-unmount signature this crate's
-//!    formatter writes (`XLOG_HEADER_MAGIC_NUM` + `XLOG_UNMOUNT_TYPE`
-//!    payload). If the log is dirty, return `Error::Unsupported` so the
-//!    caller can't observe partial-update corruption.
+//! 1. On open, [`prepare_log_for_rw`] inspects the on-disk log header at
+//!    `sb_logstart`:
+//!    - If it's the clean-unmount stub we emit, proceed.
+//!    - If it's the 4-op inode-update transaction this crate emits,
+//!      [`crate::fs::xfs::journal::replay_log`] re-applies the logged
+//!      inode bytes (recovering a crash between log-write and in-place
+//!      inode-write) and restamps the clean stub.
+//!    - Any other log content — including a real kernel log — yields
+//!      `Error::Unsupported`.
 //! 2. Walk the file's BMBT extents; partial in-place writes patch existing
 //!    extent bytes; growth allocates new blocks through the existing AGF
 //!    free-extent machinery (`alloc_blocks_fsb`).
-//! 3. On `sync` / `Drop`, re-emit a fresh clean-unmount log header so the
-//!    image still parses as "cleanly unmounted" to a kernel mount or to
-//!    `xfs_repair -n`.
+//! 3. On `sync` / `Drop`, [`XfsFileHandle::persist`] runs five steps in
+//!    order: (a) build the new on-disk inode buffer; (b) write a
+//!    single-inode-update transaction (op header + trans hdr +
+//!    inode_log_format + inode buffer + commit op) to BB 0 of the log via
+//!    [`crate::fs::xfs::journal::write_inode_update_transaction`];
+//!    (c) write the new inode buffer to its in-place location (the
+//!    "checkpoint" step); (d) call `flush_writes` to refresh
+//!    AGF/AGI/BNO/CNT/INOBT; (e) restamp the clean-unmount stub so the
+//!    on-disk log parses as cleanly unmounted.
 //!
-//! Limitations the handle refuses cleanly:
+//! A crash between (b) and (c) leaves a dirty log; the next call to
+//! `prepare_log_for_rw` replays the logged inode bytes back to disk and
+//! the file is recovered.
+//!
+//! Limitations the handle still refuses cleanly:
 //!
 //! - Inodes in `BTREE` di_format (extent list spilled out of the literal
 //!   area). The writer never emits this, so the only way to observe it is
@@ -25,14 +39,8 @@
 //! - Files with `unwritten` extents. Returns `Unsupported`.
 //! - Grow that would overflow the literal-area extent budget (more extents
 //!   than can fit). Returns `Unsupported`.
-//!
-//! ## Why this is safe
-//!
-//! XFS log replay only fires on a dirty log. A clean log (head == tail,
-//! unmount record on top) tells the kernel "no replay needed, mount me as
-//! is." Because we never dirty the log between open + sync, and we restamp
-//! the clean-unmount record at sync time, the image survives the round
-//! trip without needing journal-aware code.
+//! - Logs containing more than one record, or any non-inode-update record
+//!   shape. Returns `Unsupported`.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -45,14 +53,53 @@ use super::bmbt::Extent;
 use super::format::{XFS_INODESIZE, stamp_v5_superblock_crc};
 use super::inode::{DiFormat, S_IFREG, V3DinodeBuilder, XfsTimestamp, stamp_v3_inode_crc};
 use super::journal::{
-    BBSIZE, XFS_LOG_CLIENTID, XLOG_DEFAULT_H_SIZE, XLOG_FMT_LINUX_LE, XLOG_HEADER_MAGIC_NUM,
-    XLOG_OP_UNMOUNT_FLAGS, XLOG_UNMOUNT_TYPE, XLOG_VERSION_2, write_empty_log,
+    BBSIZE, ReplayOutcome, XLOG_DEFAULT_H_SIZE, XLOG_FMT_LINUX_LE, XLOG_HEADER_MAGIC_NUM,
+    XLOG_VERSION_2, replay_log, write_empty_log, write_inode_update_transaction,
 };
+#[cfg(test)]
+use super::journal::{XFS_LOG_CLIENTID, XLOG_OP_UNMOUNT_FLAGS, XLOG_UNMOUNT_TYPE};
 use super::write::EntryMeta;
 
 /// Maximum extent count we can store inline in a v3 inode's literal area
 /// when no xattr fork is present: 336 / 16 = 21. Stay conservative.
 const MAX_INLINE_EXTENTS: usize = 20;
+
+/// Prepare the log for read+write access.
+///
+/// - If the on-disk log header at `sb_logstart` is the clean-unmount
+///   stub this crate emits, return `Ok(ReplayOutcome::AlreadyClean)`.
+/// - If it's a 4-op inode-update transaction (this crate's only
+///   non-clean shape), apply the logged inode bytes to disk via
+///   [`crate::fs::xfs::journal::replay_log`] and restamp the clean stub.
+///   Return `Ok(ReplayOutcome::Replayed)` (or `PartialDiscarded` if
+///   the commit op was missing).
+/// - Anything else: `Err(Unsupported)` — we don't touch foreign log
+///   content.
+pub(crate) fn prepare_log_for_rw(xfs: &Xfs, dev: &mut dyn BlockDevice) -> Result<ReplayOutcome> {
+    let log_off = xfs.sb.logstart_byte_offset();
+    let log_bytes = xfs.sb.log_bytes();
+    if log_off == 0 || log_bytes < 2 * BBSIZE {
+        return Err(crate::Error::Unsupported(format!(
+            "xfs: no internal log present (logstart={}, logblocks={}) — \
+             refusing open_file_rw without a writable journal",
+            xfs.sb.logstart, xfs.sb.logblocks
+        )));
+    }
+    // Peek the header magic. If unrecognised, refuse — we don't touch a
+    // foreign log.
+    let mut hdr = vec![0u8; BBSIZE as usize];
+    dev.read_at(log_off, &mut hdr)?;
+    let magic = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+    if magic != XLOG_HEADER_MAGIC_NUM {
+        return Err(crate::Error::Unsupported(format!(
+            "xfs: log head magic {magic:#010x} doesn't match XLOG_HEADER_MAGIC_NUM — \
+             unrecognised log; refusing open_file_rw"
+        )));
+    }
+    // Delegate to the journal module: it knows the clean / 4-op /
+    // partial / foreign shapes.
+    replay_log(dev, log_off, log_bytes, &xfs.sb.uuid)
+}
 
 /// Validate the on-disk log header at `sb_logstart` matches the clean
 /// unmount layout this crate's formatter emits. Returns:
@@ -62,8 +109,9 @@ const MAX_INLINE_EXTENTS: usize = 20;
 ///   driver (different magic, more than one logop, non-unmount payload,
 ///   etc.).
 ///
-/// This is the gate that prevents the rw path from clobbering a journal
-/// that contains uncommitted transactions.
+/// Kept for test assertions: production code calls
+/// [`prepare_log_for_rw`] which also handles replay.
+#[cfg(test)]
 pub(crate) fn assert_log_clean(xfs: &Xfs, dev: &mut dyn BlockDevice) -> Result<()> {
     let log_off = xfs.sb.logstart_byte_offset();
     let log_bytes = xfs.sb.log_bytes();
@@ -225,10 +273,7 @@ impl<'a> XfsFileHandle<'a> {
             if let Some(tail) = self.extents.last_mut() {
                 let tail_end_fsb = tail.startblock + tail.blockcount as u64;
                 let tail_end_logical = tail.offset + tail.blockcount as u64;
-                if tail_end_fsb == fsb
-                    && tail_end_logical == new_offset
-                    && !tail.unwritten
-                {
+                if tail_end_fsb == fsb && tail_end_logical == new_offset && !tail.unwritten {
                     tail.blockcount = tail.blockcount.checked_add(want).ok_or_else(|| {
                         crate::Error::Unsupported(
                             "xfs: extent blockcount overflow during grow".into(),
@@ -375,7 +420,8 @@ impl<'a> XfsFileHandle<'a> {
             let extent_bytes_left = extent_blocks_left * bs - pos_off;
             let in_extent = ((buf.len() - written) as u64).min(extent_bytes_left) as usize;
             let phys = self.fsb_to_byte(ext.startblock + (pos_blk - ext.offset)) + pos_off;
-            self.dev.write_at(phys, &buf[written..written + in_extent])?;
+            self.dev
+                .write_at(phys, &buf[written..written + in_extent])?;
             written += in_extent;
         }
 
@@ -485,11 +531,39 @@ impl<'a> XfsFileHandle<'a> {
         }
         stamp_v3_inode_crc(&mut buf);
         let ino_off = self.fs.ino_byte_offset(self.ino)?;
+
+        // ---- write-ahead log step (Path A) ----
+        // Stamp a single-inode-update transaction at the head of the log
+        // BEFORE we touch the on-disk inode. A crash between this point
+        // and the in-place write below leaves a dirty log; the next open
+        // calls `prepare_log_for_rw` which re-applies the logged inode
+        // bytes and restamps the unmount stub.
+        let log_off = self.fs.sb.logstart_byte_offset();
+        let log_bytes = self.fs.sb.log_bytes();
+        if log_off != 0 && log_bytes >= 2 * BBSIZE {
+            // The cycle bumps by 1 every wrap; we never wrap (single-pass
+            // log) so cycle = 2 distinguishes a dirty record from the
+            // cycle-1 clean stub.
+            write_inode_update_transaction(
+                self.dev,
+                log_off,
+                log_bytes,
+                /* tid    */ 1,
+                /* cycle  */ 2,
+                /* ino    */ self.ino,
+                /* target */ ino_off,
+                &buf,
+                &self.fs.sb.uuid,
+            )?;
+        }
+
+        // ---- checkpoint: write the inode in place ----
         self.dev.write_at(ino_off, &buf)?;
 
         // Refresh AGF/AGI/BNO/CNT/INOBT roots.
         self.fs.flush_writes(self.dev)?;
-        // Re-stamp the clean unmount log header.
+        // Restamp the clean unmount log header. With the inode in place
+        // the logged record is no longer needed.
         rewrite_clean_unmount(self.fs, self.dev)?;
         // flush_writes already restamps the primary superblock; nothing
         // else needs touching here.
@@ -593,8 +667,9 @@ impl Xfs {
         flags: crate::fs::OpenFlags,
         meta: Option<crate::fs::FileMeta>,
     ) -> Result<Box<dyn FileHandle + 'a>> {
-        // Guard 1: refuse on a dirty log.
-        assert_log_clean(self, dev)?;
+        // Guard 1: ensure log is clean / replay if a Path-A transaction
+        // is pending. Foreign log content is refused here.
+        prepare_log_for_rw(self, dev)?;
         // Guard 2: ensure write_state is loaded.
         if self.write_state.is_none() {
             self.resume_writes(dev)?;
@@ -1027,5 +1102,208 @@ mod tests {
         h.read_exact(&mut buf2).unwrap();
         assert_eq!(&buf2[..], &data[13..109]);
     }
-}
 
+    /// End-to-end XLOG Path A round-trip: format → write file → manually
+    /// stamp a single-inode-update transaction into the log, leaving the
+    /// on-disk inode untouched (simulating a crash between log-write and
+    /// checkpoint) → reopen → verify the inode was replayed from the log.
+    ///
+    /// We bypass the rw write path's own log-stamping so the test
+    /// pre-/post-conditions are unambiguous: we know exactly what bytes
+    /// we wanted replay to apply.
+    #[test]
+    fn xlog_round_trip_replays_on_open() {
+        use super::super::format::XFS_INODESIZE;
+        use super::super::inode::stamp_v3_inode_crc;
+        use super::super::journal::write_inode_update_transaction;
+
+        let (mut dev, mut xfs) = fresh_image();
+        // Create a tiny file with known content.
+        let original = b"AAAAAAAAAAAAAAAA"; // 16 bytes
+        let mut src: &[u8] = original;
+        xfs.add_file_path(
+            &mut dev,
+            "/replay.bin",
+            EntryMeta::default(),
+            original.len() as u64,
+            &mut src,
+        )
+        .unwrap();
+        xfs.flush_writes(&mut dev).unwrap();
+
+        // Snapshot the on-disk inode bytes (this is what disk will retain
+        // after the "crash" — i.e. the pre-modification version).
+        let xfs = Xfs::open(&mut dev).unwrap();
+        let (ino, _, _) = xfs.resolve_path(&mut dev, "/replay.bin").unwrap();
+        let ino_off = xfs.ino_byte_offset(ino).unwrap();
+        let mut pre_inode = vec![0u8; XFS_INODESIZE as usize];
+        dev.read_at(ino_off, &mut pre_inode).unwrap();
+
+        // Build the "new" inode payload by patching just the di_size
+        // field of the pre-inode (offset 56..64, big-endian per the v3
+        // layout) and re-stamping the CRC. We log it but never write it
+        // in place — that's what replay must do for us.
+        let new_size = 32u64;
+        let mut new_inode = pre_inode.clone();
+        new_inode[56..64].copy_from_slice(&new_size.to_be_bytes());
+        stamp_v3_inode_crc(&mut new_inode);
+
+        // Stamp the transaction directly. Crucially, do NOT touch the
+        // in-place inode — replay's job.
+        let log_off = xfs.sb.logstart_byte_offset();
+        let log_bytes = xfs.sb.log_bytes();
+        write_inode_update_transaction(
+            &mut dev,
+            log_off,
+            log_bytes,
+            /* tid    */ 0xC0FFEEu32,
+            /* cycle  */ 2,
+            /* ino    */ ino,
+            /* target */ ino_off,
+            &new_inode,
+            &xfs.sb.uuid,
+        )
+        .unwrap();
+        // On-disk inode is still `pre_inode`. Confirm.
+        let mut now = vec![0u8; XFS_INODESIZE as usize];
+        dev.read_at(ino_off, &mut now).unwrap();
+        assert_eq!(now, pre_inode, "no checkpoint write should have happened");
+        // The log header reports a 4-op transaction (dirty).
+        let mut log_hdr = vec![0u8; 512];
+        dev.read_at(log_off, &mut log_hdr).unwrap();
+        let num_logops = u32::from_be_bytes(log_hdr[40..44].try_into().unwrap());
+        assert_eq!(num_logops, 4, "log must be dirty before reopen");
+
+        // Reopen + open_file_rw — this calls prepare_log_for_rw, which
+        // calls replay_log. After replay, the inode bytes match
+        // `new_inode` and the log is clean.
+        let mut xfs2 = Xfs::open(&mut dev).unwrap();
+        {
+            let _h = Filesystem::open_file_rw(
+                &mut xfs2,
+                &mut dev,
+                Path::new("/replay.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .expect("open after replay");
+            // Drop the handle without writing; no checkpoint expected.
+        }
+        // Inode at disk now reflects the replayed payload.
+        let mut after = vec![0u8; XFS_INODESIZE as usize];
+        dev.read_at(ino_off, &mut after).unwrap();
+        let after_size = u64::from_be_bytes(after[56..64].try_into().unwrap());
+        assert_eq!(
+            after_size, new_size,
+            "replay should have written the logged inode bytes to disk"
+        );
+        // Log restamped clean.
+        let xfs3 = Xfs::open(&mut dev).unwrap();
+        assert_log_clean(&xfs3, &mut dev).unwrap();
+    }
+
+    /// Two successive `sync` calls must each round-trip cleanly. Guards
+    /// against the log getting stuck dirty after the first commit.
+    #[test]
+    fn xlog_round_trip_multiple_syncs() {
+        let (mut dev, mut xfs) = fresh_image();
+        let mut src: &[u8] = b"first";
+        xfs.add_file_path(&mut dev, "/m.bin", EntryMeta::default(), 5, &mut src)
+            .unwrap();
+        xfs.flush_writes(&mut dev).unwrap();
+
+        let mut xfs = Xfs::open(&mut dev).unwrap();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut xfs,
+                &mut dev,
+                Path::new("/m.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.write_all(b"XXXXX").unwrap();
+            h.sync().unwrap();
+            h.seek(SeekFrom::Start(2)).unwrap();
+            h.write_all(b"YY").unwrap();
+            h.sync().unwrap();
+        }
+        let mut xfs2 = Xfs::open(&mut dev).unwrap();
+        let bytes = read_file(&mut xfs2, &mut dev, "/m.bin");
+        assert_eq!(bytes, b"XXYYX");
+        assert_log_clean(&xfs2, &mut dev).unwrap();
+    }
+
+    /// A torn / partial transaction (record header present but commit op
+    /// missing) must be discarded by replay; the open should still
+    /// succeed and the on-disk inode keep its pre-crash bytes.
+    #[test]
+    fn xlog_partial_transaction_is_discarded() {
+        use super::super::format::XFS_INODESIZE;
+        use super::super::journal::write_inode_update_transaction;
+
+        let (mut dev, mut xfs) = fresh_image();
+        let mut src: &[u8] = b"keep me";
+        xfs.add_file_path(&mut dev, "/p.bin", EntryMeta::default(), 7, &mut src)
+            .unwrap();
+        xfs.flush_writes(&mut dev).unwrap();
+
+        let xfs = Xfs::open(&mut dev).unwrap();
+        let (ino, _, _) = xfs.resolve_path(&mut dev, "/p.bin").unwrap();
+        let ino_off = xfs.ino_byte_offset(ino).unwrap();
+        let mut pre_inode = vec![0u8; XFS_INODESIZE as usize];
+        dev.read_at(ino_off, &mut pre_inode).unwrap();
+        let log_off = xfs.sb.logstart_byte_offset();
+        let log_bytes = xfs.sb.log_bytes();
+        // Stamp a valid transaction, then corrupt the commit op (op 4) by
+        // clearing its flags byte — replay should detect "no commit" and
+        // discard.
+        write_inode_update_transaction(
+            &mut dev,
+            log_off,
+            log_bytes,
+            1,
+            2,
+            ino,
+            ino_off,
+            &pre_inode,
+            &xfs.sb.uuid,
+        )
+        .unwrap();
+        // Layout inside the payload buffer (after BB0 record header):
+        //   op1 (12 B) at 0
+        //   trans_hdr (16 B) at 12
+        //   op2 (12 B) at 28
+        //   inode_log_fmt (56 B) at 40
+        //   op3 (12 B) at 96
+        //   inode_bytes (XFS_INODESIZE = 512 B) at 108
+        //   op4 (12 B) at 620
+        // The flag byte of op4 (oh_flags) lives at op-header offset 9.
+        // Cycle stamping only touches bytes 0..4 of each BB inside the
+        // payload, so 629 is safely untouched.
+        let op4_off_in_payload = 12 * 3 + 16 + 56 + (XFS_INODESIZE as usize);
+        assert_eq!(op4_off_in_payload, 620);
+        let flag_addr = log_off + 512 + op4_off_in_payload as u64 + 9;
+        dev.write_at(flag_addr, &[0u8]).unwrap();
+
+        // Reopen — open_file_rw should succeed; replay discards the
+        // partial transaction and restamps the log clean; inode keeps
+        // its pre-crash bytes.
+        let mut xfs2 = Xfs::open(&mut dev).unwrap();
+        {
+            let _h = Filesystem::open_file_rw(
+                &mut xfs2,
+                &mut dev,
+                Path::new("/p.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .expect("open after torn-transaction discard");
+        }
+        let mut after = vec![0u8; XFS_INODESIZE as usize];
+        dev.read_at(ino_off, &mut after).unwrap();
+        assert_eq!(after, pre_inode, "on-disk inode unchanged");
+        let xfs3 = Xfs::open(&mut dev).unwrap();
+        assert_log_clean(&xfs3, &mut dev).unwrap();
+    }
+}

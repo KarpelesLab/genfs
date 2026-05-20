@@ -66,6 +66,7 @@ pub mod format;
 pub mod index;
 pub mod mft;
 pub mod run_list;
+pub mod rw;
 pub mod secure;
 pub mod upcase_gen;
 pub mod writer;
@@ -1437,6 +1438,19 @@ impl crate::fs::Filesystem for Ntfs {
             .ok_or_else(|| crate::Error::InvalidArgument("ntfs: non-UTF-8 path".into()))?;
         let r = self.open_file_reader(dev, s)?;
         Ok(Box::new(r))
+    }
+
+    fn open_file_rw<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        meta: Option<crate::fs::FileMeta>,
+    ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ntfs: non-UTF-8 path".into()))?;
+        self.open_rw(dev, s, flags, meta)
     }
 
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {

@@ -376,6 +376,62 @@ pub fn walk_btree(
     Ok(out)
 }
 
+/// Walk a directory's `xfs_bmbt_block` tree (`di_format == BTREE`) and
+/// return the data-fork extents that map directory logical block
+/// numbers to physical FS blocks. Restricted to the single-level case:
+/// the inode-fork root must be at level 1 (or the degenerate level-0
+/// inline case), with all children being leaf blocks (level 0).
+///
+/// Deeper trees (root level > 1) are rejected with
+/// [`Error::Unsupported`](crate::Error::Unsupported) so callers can
+/// distinguish "format known but currently capped" from
+/// "image looks malformed".
+///
+/// The returned vector mirrors the shape of `Vec<Extent>` already used
+/// by [`walk_btree`] for files: each [`Extent`] records the logical
+/// block offset, physical FSB, block count, and the unwritten flag.
+/// Callers then map each `e.offset` (directory logical block) through
+/// `e.startblock + (target - e.offset)` to find the physical block,
+/// just like the existing dir-data-block reader in `mod.rs`.
+///
+/// `lit` is the inode literal area holding the bmbt root.
+pub fn read_btree_dir_extents(
+    dev: &mut dyn BlockDevice,
+    layout: &BmbtLayout,
+    lit: &[u8],
+) -> Result<Vec<Extent>> {
+    let (root_level, root_numrecs, _root_keys, root_ptrs) = decode_root(lit)?;
+    if root_level == 0 {
+        // Degenerate case: root is itself a leaf. Equivalent to the
+        // EXTENTS form; treat it as such for symmetry with `walk_btree`.
+        return decode_extents(&lit[4..], root_numrecs as u32);
+    }
+    if root_level > 1 {
+        return Err(crate::Error::Unsupported(format!(
+            "xfs: btree-format directory has root level {root_level}; \
+             only single-level trees (root + one level of leaves) are \
+             currently supported"
+        )));
+    }
+    // root_level == 1: every child pointer must address a level-0 leaf.
+    let mut out = Vec::new();
+    for child_fsb in root_ptrs {
+        let node = read_node_block(dev, layout, child_fsb)?;
+        if node.level != 0 {
+            // The single-level invariant says every immediate child of
+            // the root is a leaf. If it isn't, the tree is deeper than
+            // we promised to handle.
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: btree-format directory has child at level {} (FSB {child_fsb}); \
+                 only single-level trees supported",
+                node.level
+            )));
+        }
+        out.extend(node.recs);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +589,171 @@ mod tests {
         // ag1_start = 1 AG * 8 blocks/AG * 4096 B/block = 32768
         // offset = ag1_start + 1 block * 4096 B = 36864.
         assert_eq!(b, 32768 + 4096);
+    }
+
+    /// Construct a single-level v5 bmbt root + two level-0 leaves and
+    /// verify `read_btree_dir_extents` returns every leaf extent in
+    /// logical-offset order. Mirrors `walk_two_level_v5_btree` but
+    /// exercises the directory-specific entry point.
+    #[test]
+    fn read_btree_dir_extents_single_level_v5() {
+        let blocksize = 4096u32;
+        let agblocks = 256u32;
+        let agblklog = 8u8;
+        let layout = BmbtLayout {
+            blocksize,
+            agblocks,
+            agblklog,
+            is_v5: true,
+        };
+        let total = (agblocks as u64) * 4 * blocksize as u64;
+        let mut dev = MemoryBackend::new(total);
+
+        // Two leaves with two extents each.
+        let mut leaf0 = vec![0u8; blocksize as usize];
+        leaf0[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
+        leaf0[6..8].copy_from_slice(&2u16.to_be_bytes());
+        let e0 = Extent {
+            offset: 0,
+            startblock: 100,
+            blockcount: 4,
+            unwritten: false,
+        };
+        let e1 = Extent {
+            offset: 4,
+            startblock: 200,
+            blockcount: 8,
+            unwritten: false,
+        };
+        leaf0[72..72 + 16].copy_from_slice(&e0.encode());
+        leaf0[72 + 16..72 + 32].copy_from_slice(&e1.encode());
+        dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 10), &leaf0)
+            .unwrap();
+
+        let mut leaf1 = vec![0u8; blocksize as usize];
+        leaf1[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
+        leaf1[6..8].copy_from_slice(&2u16.to_be_bytes());
+        let e2 = Extent {
+            offset: 12,
+            startblock: 300,
+            blockcount: 2,
+            unwritten: false,
+        };
+        let e3 = Extent {
+            offset: 20,
+            startblock: 400,
+            blockcount: 1,
+            unwritten: false,
+        };
+        leaf1[72..72 + 16].copy_from_slice(&e2.encode());
+        leaf1[72 + 16..72 + 32].copy_from_slice(&e3.encode());
+        dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 11), &leaf1)
+            .unwrap();
+
+        // Root: level=1, two child pointers at FSBs 10 and 11.
+        let mut root = vec![0u8; 64];
+        root[0..2].copy_from_slice(&1u16.to_be_bytes()); // level
+        root[2..4].copy_from_slice(&2u16.to_be_bytes()); // numrecs
+        root[4..12].copy_from_slice(&0u64.to_be_bytes());
+        root[12..20].copy_from_slice(&12u64.to_be_bytes());
+        root[48..56].copy_from_slice(&10u64.to_be_bytes());
+        root[56..64].copy_from_slice(&11u64.to_be_bytes());
+
+        let extents = read_btree_dir_extents(&mut dev, &layout, &root).unwrap();
+        assert_eq!(extents, vec![e0, e1, e2, e3]);
+    }
+
+    /// Degenerate root (level == 0) — should fall through to a direct
+    /// extent decode of the inline records, identical to `walk_btree`'s
+    /// handling.
+    #[test]
+    fn read_btree_dir_extents_degenerate_root_is_inline() {
+        let layout = BmbtLayout {
+            blocksize: 4096,
+            agblocks: 256,
+            agblklog: 8,
+            is_v5: true,
+        };
+        let mut dev = MemoryBackend::new(64 * 1024);
+        // Root: level=0, one record. Then 16 bytes of packed extent.
+        let mut root = vec![0u8; 4 + 16];
+        root[0..2].copy_from_slice(&0u16.to_be_bytes()); // level
+        root[2..4].copy_from_slice(&1u16.to_be_bytes()); // numrecs
+        let e = Extent {
+            offset: 7,
+            startblock: 42,
+            blockcount: 3,
+            unwritten: false,
+        };
+        root[4..20].copy_from_slice(&e.encode());
+        let got = read_btree_dir_extents(&mut dev, &layout, &root).unwrap();
+        assert_eq!(got, vec![e]);
+    }
+
+    /// A two-level tree (root level == 2) must be refused with
+    /// `Error::Unsupported`. The error text must mention "level" so the
+    /// user sees the depth-cap reason.
+    #[test]
+    fn read_btree_dir_extents_rejects_two_level_tree() {
+        let layout = BmbtLayout {
+            blocksize: 4096,
+            agblocks: 256,
+            agblklog: 8,
+            is_v5: true,
+        };
+        let mut dev = MemoryBackend::new(64 * 1024);
+        // Synthesise just enough root that we get past the structural
+        // checks in `decode_root` — level=2, numrecs=0.
+        let mut root = vec![0u8; 64];
+        root[0..2].copy_from_slice(&2u16.to_be_bytes()); // level
+        root[2..4].copy_from_slice(&0u16.to_be_bytes()); // numrecs
+        let err = read_btree_dir_extents(&mut dev, &layout, &root)
+            .expect_err("level=2 root must surface Unsupported");
+        match err {
+            crate::Error::Unsupported(msg) => {
+                assert!(
+                    msg.contains("level"),
+                    "Unsupported message must cite tree depth: {msg:?}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// A root that claims level=1 but whose child points at a non-leaf
+    /// block (an internal node) must also be refused — the cap holds
+    /// even if the root advertises the supported depth but the children
+    /// don't actually behave like leaves.
+    #[test]
+    fn read_btree_dir_extents_rejects_when_child_is_not_leaf() {
+        let blocksize = 4096u32;
+        let agblocks = 256u32;
+        let agblklog = 8u8;
+        let layout = BmbtLayout {
+            blocksize,
+            agblocks,
+            agblklog,
+            is_v5: true,
+        };
+        let total = (agblocks as u64) * 4 * blocksize as u64;
+        let mut dev = MemoryBackend::new(total);
+        // Write a "child" block at FSB 10 that claims level=1 (i.e. it's
+        // itself an internal node), violating the single-level invariant.
+        let mut child = vec![0u8; blocksize as usize];
+        child[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
+        child[4..6].copy_from_slice(&1u16.to_be_bytes()); // level = 1
+        child[6..8].copy_from_slice(&0u16.to_be_bytes()); // numrecs
+        dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 10), &child)
+            .unwrap();
+
+        let mut root = vec![0u8; 64];
+        root[0..2].copy_from_slice(&1u16.to_be_bytes()); // level=1
+        root[2..4].copy_from_slice(&1u16.to_be_bytes()); // numrecs=1
+        root[4..12].copy_from_slice(&0u64.to_be_bytes()); // key
+        root[56..64].copy_from_slice(&10u64.to_be_bytes()); // ptr (tail)
+
+        let err = read_btree_dir_extents(&mut dev, &layout, &root)
+            .expect_err("non-leaf child must surface Unsupported");
+        assert!(matches!(err, crate::Error::Unsupported(_)));
     }
 }

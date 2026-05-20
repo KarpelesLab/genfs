@@ -31,7 +31,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | FAT32      | ✅    | ✅     | VFAT LFN entries, 8.3 short-name aliases                             |
 | exFAT      | ✅    | ✅     | format + create + remove + flush                                     |
 | tar        | ✅    | ✅     | ustar + PAX, `SCHILY.xattr.*` for xattrs                             |
-| XFS        | ✅    | ✅     | shortform + block / leaf / node dirs + BMBT; writer passes `xfs_repair -n` single + multi-AG; B-tree dirs deferred |
+| XFS        | ✅    | ✅     | shortform + block / leaf / node + single-level B-tree dirs + BMBT; writer passes `xfs_repair -n` single + multi-AG |
 | HFS+/HFSX  | ✅    | ✅     | inline + extents-overflow, symlinks, hard links; writer passes `fsck.hfsplus` with optional journal stub |
 | APFS       | ✅    | 🚧    | multi-level omap + fs-tree; writer is single-volume with a structurally-correct spaceman bitmap (no internal-pool ring / free-queues, no snapshots / encryption); not yet `fsck_apfs` clean |
 | NTFS       | ✅    | 🚧    | MFT, attributes, $DATA + ADS, indexes; xattr map; writer indexes system files (records 0..=15) in root `$I30`; `$Secure` indirection still empty so `ntfs-3g` mount remains blocked |
@@ -342,8 +342,10 @@ Things explicitly out of scope today, in rough order of likely-to-change:
   still flag those areas; `mount_apfs` typically refuses the image.
 - APFS reader: snapshots, encryption, and sealed-volume integrity
   are out of scope.
-- XFS reader: B-tree-format directories (block / leaf / node formats
-  are covered); writer assumes shortform / extent dirs.
+- XFS reader: B-tree-format (`di_format=BTREE`) directories deeper
+  than one level above the leaves return `Error::Unsupported`
+  (shortform / block / leaf / node and single-level B-tree dirs are
+  covered); writer assumes shortform / extent dirs.
 - ext4 `flex_bg` on the *write* path (the reader handles it).
 - Partial-file rewrites — in-place modification is whole-file granularity.
 - DMG chunk decoder: zero-fill / raw / zlib only. ADC, bzip2, LZFSE,

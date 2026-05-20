@@ -446,3 +446,18 @@ fn open_file_rw_round_trip_passes_xfs_repair() {
 
     assert_xfs_repair_clean(tmp.path());
 }
+
+// `mkfs.xfs` + populating with enough entries to force the root
+// directory into `di_format=BTREE` would be the canonical fixture for
+// the new B-tree-directory reader, but neither `xfs_io` (no `creat`
+// against an unmounted image) nor `mount(8)` (needs root) gives us a
+// way to populate an XFS image from host userspace.
+//
+// The hand-crafted equivalent — a synthetic v3 inode in BTREE format
+// whose bmbt root points at a known leaf — lives in
+// `src/fs/xfs/mod.rs` as `list_root_btree_dir_single_level` and the
+// depth-cap regression test as
+// `list_root_btree_dir_two_level_is_unsupported`. Together those
+// cover the same surface this integration test would have: a real
+// `list_path("/")` walk against a BTREE-format directory, plus the
+// typed `Unsupported` error citing the single-level depth limit.

@@ -2,12 +2,13 @@
 //!
 //! Implements enough of XFS v4/v5 to inspect the volume and stream files
 //! out of it: the superblock, inodes with the v3 (CRC) and v2 cores,
-//! shortform / block / leaf / node directories, the linear extent list
-//! and B-tree extent maps (`BTREE` di_format) for regular files, and both
-//! inline and remote symlinks. B-tree-format directories, realtime files,
-//! encryption, reverse-mapping btrees, and the journal are out of scope
-//! — encountering any of them returns `Error::Unsupported` with a message
-//! naming the feature.
+//! shortform / block / leaf / node directories, single-level B-tree
+//! (`BTREE` di_format) directories (deeper trees surface
+//! `Error::Unsupported`), the linear extent list and B-tree extent maps
+//! (`BTREE` di_format) for regular files, and both inline and remote
+//! symlinks. Realtime files, encryption, reverse-mapping btrees, and the
+//! journal are out of scope — encountering any of them returns
+//! `Error::Unsupported` with a message naming the feature.
 //!
 //! ## Inode-number arithmetic
 //!
@@ -245,6 +246,35 @@ impl Xfs {
         core: &DinodeCore,
     ) -> Result<Vec<DataEntry>> {
         let extents = self.read_extent_list(dev, ino_buf, core)?;
+        self.decode_dir_entries_from_extents(dev, &extents)
+    }
+
+    /// Walk a `di_format == BTREE` directory inode: decode its bmbt root
+    /// via [`bmbt::read_btree_dir_extents`] (restricted to single-level
+    /// trees), then enumerate every data block the resulting extent list
+    /// covers using the same decoder as the `block` / `leaf` paths.
+    fn read_btree_dir_entries(
+        &self,
+        dev: &mut dyn BlockDevice,
+        ino_buf: &[u8],
+        core: &DinodeCore,
+    ) -> Result<Vec<DataEntry>> {
+        let lit = core.literal_area(ino_buf, self.sb.inodesize as usize);
+        let layout = self.bmbt_layout();
+        let extents = bmbt::read_btree_dir_extents(dev, &layout, lit)?;
+        self.decode_dir_entries_from_extents(dev, &extents)
+    }
+
+    /// Shared back-end for [`read_extent_dir_entries`] and
+    /// [`read_btree_dir_entries`]. Given an extent list (in `dir-FSB`
+    /// units), decide between block-format (single dir block carrying
+    /// data + a trailing leaf array) and data-block iteration (leaf /
+    /// node / btree formats), then decode every data block.
+    fn decode_dir_entries_from_extents(
+        &self,
+        dev: &mut dyn BlockDevice,
+        extents: &[Extent],
+    ) -> Result<Vec<DataEntry>> {
         // First, read logical block 0 to decide between block- and leaf-
         // format. Block format: a single dir block, contains both data
         // records and a trailing leaf-entry array.
@@ -259,7 +289,7 @@ impl Xfs {
         let leaf_dir_block_addr_fsblk = dir::XFS_DIR2_LEAF_FIRSTDB_BYTES / self.sb.blocksize as u64;
 
         // Read the very first block to peek at the magic.
-        let first = self.read_dir_block_at_logical(dev, &extents, 0, dir_block_size as usize)?;
+        let first = self.read_dir_block_at_logical(dev, extents, 0, dir_block_size as usize)?;
         let is_v5 = self.sb.is_v5();
         if dir::is_block_format(&first)? {
             // Block format: a single directory block.
@@ -286,7 +316,7 @@ impl Xfs {
                 .any(|e| lblk >= e.offset && lblk < e.offset + e.blockcount as u64);
             if covered {
                 let block =
-                    self.read_dir_block_at_logical(dev, &extents, lblk, dir_block_size as usize)?;
+                    self.read_dir_block_at_logical(dev, extents, lblk, dir_block_size as usize)?;
                 if block.len() >= 4 {
                     let magic = u32::from_be_bytes(block[0..4].try_into().unwrap());
                     if magic == dir::XFS_DIR3_DATA_MAGIC || magic == dir::XFS_DIR2_DATA_MAGIC {
@@ -367,11 +397,11 @@ impl Xfs {
             // BTREE-format directories — the inode-fork holds a bmbt root
             // (same shape as for files); leaves still contain XDD3/XDB3
             // data blocks plus a LEAFN / NODE index above the
-            // XFS_DIR2_LEAF_OFFSET boundary. `read_extent_dir_entries`
-            // walks the extent list and scans every data-block-aligned
-            // logical address it covers, so it works unmodified once
-            // `read_extent_list` returns the bmbt-walked extents.
-            DiFormat::Btree => self.read_extent_dir_entries(dev, ino_buf, core),
+            // XFS_DIR2_LEAF_OFFSET boundary. We walk the bmbt with the
+            // dedicated single-level-restricted reader so deeper trees
+            // surface a typed `Unsupported` error citing the limit
+            // rather than silently working through `walk_btree`.
+            DiFormat::Btree => self.read_btree_dir_entries(dev, ino_buf, core),
             DiFormat::Dev => Err(crate::Error::InvalidImage(
                 "xfs: directory inode has di_format=dev".into(),
             )),
@@ -1012,5 +1042,149 @@ mod tests {
         let xfs = Xfs::open(&mut dev).unwrap();
         let got = xfs.read_symlink(&mut dev, "/lnk").unwrap();
         assert_eq!(got, target);
+    }
+
+    /// Hand-craft a v3 root inode in `BTREE` di_format whose bmbt root
+    /// (in the inode's literal area) points at a single-level-0 leaf
+    /// block, which in turn maps directory logical block 0 to a single
+    /// physical block holding a v5 XDB3 block-format directory with two
+    /// user entries (plus the synthetic `.` / `..`). This regression
+    /// test asserts that `list_path("/")` no longer returns
+    /// `Error::Unsupported` for BTREE-format directory inodes, and that
+    /// every entry decoded by `decode_block_dir` is surfaced in the
+    /// resulting `Vec<DirEntry>`.
+    #[test]
+    fn list_root_btree_dir_single_level() {
+        let mut dev = minimal_image();
+        let xfs = Xfs::open(&mut dev).unwrap();
+        let rootino = xfs.sb.rootino;
+        let inodesize = xfs.sb.inodesize as usize;
+        assert_eq!(inodesize, 256, "minimal_image is fixed at 256-byte inodes");
+
+        // Pick two free FSBs in AG 2: FSB 16 = (ag=2, blk=0) for the
+        // BMBT leaf node, FSB 18 = (ag=2, blk=2) for the directory data
+        // block. AG 1 is reserved for the root-inode chunk in this image
+        // layout; AG 2 has nothing carved into it.
+        let leaf_fsb: u64 = 16;
+        let data_fsb: u64 = 18;
+
+        // ----- Step 1: dir data block at FSB `data_fsb`. -----
+        // Use the production encoder so we hit the same XDB3 layout
+        // (header + per-entry leaf array + bestfree) that mkfs.xfs and
+        // xfs_repair recognise. Two user entries: "alpha" and "beta".
+        let block_basic_blkno = xfs.fsb_to_byte(data_fsb) / 512;
+        let entries = vec![
+            ("alpha".to_string(), 300u64, dir::XFS_DIR3_FT_REG_FILE),
+            ("beta".to_string(), 301u64, dir::XFS_DIR3_FT_DIR),
+        ];
+        let dir_block = dir::encode_v5_block_dir(
+            xfs.sb.dir_block_size() as usize,
+            rootino,
+            rootino,
+            &entries,
+            &[0u8; 16],
+            block_basic_blkno,
+        )
+        .unwrap();
+        let data_byte = xfs.fsb_to_byte(data_fsb);
+        dev.write_at(data_byte, &dir_block).unwrap();
+
+        // ----- Step 2: BMBT leaf block at FSB `leaf_fsb`. -----
+        // v5 BMA3 header (72 B) + one packed extent record (16 B):
+        //   offset = 0, startblock = data_fsb, blockcount = 1.
+        let mut leaf = vec![0u8; xfs.sb.blocksize as usize];
+        leaf[0..4].copy_from_slice(&bmbt::XFS_BMAP_CRC_MAGIC.to_be_bytes());
+        leaf[4..6].copy_from_slice(&0u16.to_be_bytes()); // level
+        leaf[6..8].copy_from_slice(&1u16.to_be_bytes()); // numrecs
+        let extent = bmbt::Extent {
+            offset: 0,
+            startblock: data_fsb,
+            blockcount: 1,
+            unwritten: false,
+        };
+        leaf[72..72 + 16].copy_from_slice(&extent.encode());
+        let leaf_byte = xfs.fsb_to_byte(leaf_fsb);
+        dev.write_at(leaf_byte, &leaf).unwrap();
+
+        // ----- Step 3: root inode at di_format = BTREE. -----
+        let off = xfs.ino_byte_offset(rootino).unwrap();
+        let mut ino_buf = vec![0u8; inodesize];
+        ino_buf[0..2].copy_from_slice(&inode::XFS_DINODE_MAGIC.to_be_bytes());
+        ino_buf[2..4].copy_from_slice(&(inode::S_IFDIR | 0o755).to_be_bytes());
+        ino_buf[4] = 3; // v3
+        ino_buf[5] = 3; // BTREE
+        ino_buf[16..20].copy_from_slice(&2u32.to_be_bytes()); // nlink
+        ino_buf[152..160].copy_from_slice(&rootino.to_be_bytes()); // di_ino
+
+        // bmbt root in the literal area at offset 176, length 80 bytes:
+        //   [0..2]  level    = 1
+        //   [2..4]  numrecs  = 1
+        //   [4..12] keys[0]  = 0      (br_startoff)
+        //   [72..80] ptrs[0] = leaf_fsb   (tail layout — decode_root prefers it)
+        let lit_off = 176;
+        let lit_end = inodesize;
+        let lit_len = lit_end - lit_off;
+        assert_eq!(lit_len, 80, "literal area for 256-byte v3 inode is 80 B");
+        ino_buf[lit_off..lit_off + 2].copy_from_slice(&1u16.to_be_bytes());
+        ino_buf[lit_off + 2..lit_off + 4].copy_from_slice(&1u16.to_be_bytes());
+        ino_buf[lit_off + 4..lit_off + 12].copy_from_slice(&0u64.to_be_bytes());
+        ino_buf[lit_end - 8..lit_end].copy_from_slice(&leaf_fsb.to_be_bytes());
+
+        dev.write_at(off, &ino_buf).unwrap();
+
+        // ----- Step 4: list and validate. -----
+        let xfs = Xfs::open(&mut dev).unwrap();
+        let listed = xfs.list_path(&mut dev, "/").unwrap();
+        // encode_v5_block_dir injects synthetic "." and "..", so the
+        // dir block has 4 entries total.
+        let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "missing 'alpha' in {names:?}");
+        assert!(names.contains(&"beta"), "missing 'beta' in {names:?}");
+        assert!(names.contains(&"."), "missing '.' in {names:?}");
+        assert!(names.contains(&".."), "missing '..' in {names:?}");
+        let alpha = listed.iter().find(|e| e.name == "alpha").unwrap();
+        assert_eq!(alpha.inode, 300);
+        assert_eq!(alpha.kind, crate::fs::EntryKind::Regular);
+        let beta = listed.iter().find(|e| e.name == "beta").unwrap();
+        assert_eq!(beta.inode, 301);
+        assert_eq!(beta.kind, crate::fs::EntryKind::Dir);
+    }
+
+    /// Companion to [`list_root_btree_dir_single_level`]: a BTREE root
+    /// at level 2 (one beyond the single-level cap) must surface
+    /// `Error::Unsupported` carrying a depth-aware message rather than
+    /// the previous blanket "btree dirs not implemented" error.
+    #[test]
+    fn list_root_btree_dir_two_level_is_unsupported() {
+        let mut dev = minimal_image();
+        let xfs = Xfs::open(&mut dev).unwrap();
+        let rootino = xfs.sb.rootino;
+        let inodesize = xfs.sb.inodesize as usize;
+
+        let off = xfs.ino_byte_offset(rootino).unwrap();
+        let mut ino_buf = vec![0u8; inodesize];
+        ino_buf[0..2].copy_from_slice(&inode::XFS_DINODE_MAGIC.to_be_bytes());
+        ino_buf[2..4].copy_from_slice(&(inode::S_IFDIR | 0o755).to_be_bytes());
+        ino_buf[4] = 3; // v3
+        ino_buf[5] = 3; // BTREE
+        ino_buf[16..20].copy_from_slice(&2u32.to_be_bytes());
+        ino_buf[152..160].copy_from_slice(&rootino.to_be_bytes());
+        // bmbt root: level=2 (one above the supported cap), numrecs=0.
+        let lit_off = 176;
+        ino_buf[lit_off..lit_off + 2].copy_from_slice(&2u16.to_be_bytes());
+        ino_buf[lit_off + 2..lit_off + 4].copy_from_slice(&0u16.to_be_bytes());
+        dev.write_at(off, &ino_buf).unwrap();
+
+        let xfs = Xfs::open(&mut dev).unwrap();
+        let err = xfs
+            .list_path(&mut dev, "/")
+            .expect_err("level=2 btree dir must surface Unsupported");
+        match err {
+            crate::Error::Unsupported(msg) => assert!(
+                msg.contains("level") && msg.contains("btree"),
+                "Unsupported should mention level + btree: {msg:?}"
+            ),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }

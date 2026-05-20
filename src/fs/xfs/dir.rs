@@ -13,7 +13,12 @@
 //! parsed (we read every data block) but full node-btree traversal is not
 //! required for correctness because all data blocks have logical addresses
 //! < `XFS_DIR2_LEAF_OFFSET` and we can scan them in order. B-tree (`btree`
-//! di_format) directories return `Error::Unsupported`.
+//! di_format) directories are read by walking the inode-fork
+//! `xfs_bmbt_block` root via [`super::bmbt::read_btree_dir_extents`]; the
+//! resulting extent list is then enumerated by the same per-data-block
+//! decoder used by the `block` / `leaf` paths. Only single-level trees
+//! (one root + one level of leaves) are supported — deeper trees surface
+//! `Error::Unsupported` with a depth-aware message.
 //!
 //! ## Shortform header (v5 / v3 inodes)
 //!

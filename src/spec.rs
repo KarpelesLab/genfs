@@ -195,10 +195,15 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
         "iso" | "iso9660" => {
             build_bare_via_trait::<crate::fs::iso9660::Iso9660>(fs, output, iso9660_format_opts(fs))
         }
+        "grf" => build_bare_via_trait::<crate::fs::grf::Grf>(fs, output, grf_format_opts(fs)),
         other => Err(crate::Error::InvalidArgument(format!(
             "spec: unknown filesystem type {other:?}"
         ))),
     }
+}
+
+fn grf_format_opts(_fs: &FilesystemSpec) -> crate::fs::grf::FormatOpts {
+    crate::fs::grf::FormatOpts::default()
 }
 
 fn iso9660_format_opts(fs: &FilesystemSpec) -> crate::fs::iso9660::FormatOpts {

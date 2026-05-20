@@ -57,6 +57,8 @@ pub enum FsKind {
     /// ISO 9660 (optical media). Read-only on this trait surface;
     /// writing happens through `repack` to a fresh image.
     Iso9660,
+    /// GRF — Gravity Ragnarok Online archive. Read + write + add/rm.
+    Grf,
 }
 
 /// Probe `dev` to decide which filesystem it carries. Reads only sector 0
@@ -89,6 +91,11 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     // SquashFS: little-endian "hsqs" at offset 0.
     if &bs[0..4] == b"hsqs" {
         return Ok(FsKind::Squashfs);
+    }
+
+    // GRF: "Master of Magic\0" at offset 0 (16-byte magic header).
+    if &bs[0..16] == b"Master of Magic\0" {
+        return Ok(FsKind::Grf);
     }
 
     // Tar: "ustar\0" or "ustar " magic at offset 257 of the first block.
@@ -144,7 +151,7 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     }
 
     Err(crate::Error::InvalidImage(
-        "inspect: no recognised filesystem (ext2/3/4, FAT32, exFAT, XFS, HFS+, APFS, tar, NTFS, F2FS, SquashFS, ISO 9660) on this image".into(),
+        "inspect: no recognised filesystem (ext2/3/4, FAT32, exFAT, XFS, HFS+, APFS, tar, NTFS, F2FS, SquashFS, ISO 9660, GRF) on this image".into(),
     ))
 }
 
@@ -178,6 +185,8 @@ pub enum AnyFs {
     Squashfs(Box<Squashfs>),
     /// ISO 9660 — read-only (PVD + Joliet + Rock Ridge + El Torito).
     Iso9660(Box<crate::fs::iso9660::Iso9660>),
+    /// GRF — Ragnarok Online archive; full read/write/add/rm.
+    Grf(Box<crate::fs::grf::Grf>),
 }
 
 impl AnyFs {
@@ -197,6 +206,7 @@ impl AnyFs {
             FsKind::Iso9660 => Ok(Self::Iso9660(Box::new(crate::fs::iso9660::Iso9660::open(
                 dev,
             )?))),
+            FsKind::Grf => Ok(Self::Grf(Box::new(crate::fs::grf::Grf::open_dev(dev)?))),
         }
     }
 
@@ -214,6 +224,7 @@ impl AnyFs {
             Self::F2fs(_) => FsKind::F2fs,
             Self::Squashfs(_) => FsKind::Squashfs,
             Self::Iso9660(_) => FsKind::Iso9660,
+            Self::Grf(_) => FsKind::Grf,
         }
     }
 
@@ -236,6 +247,10 @@ impl AnyFs {
             Self::F2fs(f2) => f2.list_path(dev, path),
             Self::Squashfs(sq) => sq.list_path(dev, path),
             Self::Iso9660(iso) => iso.list_path(dev, path),
+            Self::Grf(grf) => {
+                use crate::fs::Filesystem;
+                grf.list(dev, std::path::Path::new(path))
+            }
         }
     }
 
@@ -312,6 +327,17 @@ impl AnyFs {
             }
             Self::Iso9660(iso) => {
                 let mut r = iso.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
+            Self::Grf(grf) => {
+                // GRF entries are full-buffer inflated; stream the
+                // bytes from a cursor over the inflated body.
+                let key = path.trim_start_matches('/').to_string();
+                let entry = grf.entries.get(&key).cloned().ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!("grf: no entry at {key:?}"))
+                })?;
+                let bytes = grf.read_entry(dev, &entry)?;
+                let mut r = std::io::Cursor::new(bytes);
                 pump(&mut r, out, &mut buf)
             }
         }
@@ -411,6 +437,7 @@ impl AnyFs {
             Self::Tar(t) => crate::fs::Filesystem::mutation_capability(t.as_ref()),
             Self::Apfs(a) => crate::fs::Filesystem::mutation_capability(a.as_ref()),
             Self::Exfat(e) => crate::fs::Filesystem::mutation_capability(e.as_ref()),
+            Self::Grf(g) => crate::fs::Filesystem::mutation_capability(g.as_ref()),
         }
     }
 
@@ -458,6 +485,7 @@ impl AnyFs {
             Self::Apfs(a) => f(a.as_mut()),
             Self::Exfat(e) => f(e.as_mut()),
             Self::Iso9660(iso) => f(iso.as_mut()),
+            Self::Grf(g) => f(g.as_mut()),
         }
     }
 
@@ -486,6 +514,7 @@ impl AnyFs {
         match self {
             Self::Ext(ext) => ext.flush(dev),
             Self::Fat32(fat) => fat.flush(dev),
+            Self::Grf(g) => crate::fs::Filesystem::flush(g.as_mut(), dev),
             // Read-only handles have nothing to flush.
             Self::Tar(_)
             | Self::Xfs(_)
@@ -527,6 +556,9 @@ impl AnyFs {
         if let Self::Iso9660(_) = self {
             return "iso9660";
         }
+        if let Self::Grf(_) = self {
+            return "grf";
+        }
         match self {
             Self::Ext(ext) => match ext.kind {
                 crate::fs::ext::FsKind::Ext2 => "ext2",
@@ -543,7 +575,8 @@ impl AnyFs {
             | Self::Ntfs(_)
             | Self::F2fs(_)
             | Self::Squashfs(_)
-            | Self::Iso9660(_) => unreachable!(),
+            | Self::Iso9660(_)
+            | Self::Grf(_) => unreachable!(),
         }
     }
 }
@@ -653,6 +686,7 @@ impl AnyFs {
             Self::F2fs(b) => b,
             Self::Squashfs(b) => b,
             Self::Iso9660(b) => b,
+            Self::Grf(b) => b,
         }
     }
 }

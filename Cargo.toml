@@ -39,6 +39,10 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
 crc32c = "0.6.8"
+# CP949 (Korean) ↔ UTF-8 for the GRF backend (Gravity Ragnarok archives
+# store filenames in CP949). encoding_rs's `EUC_KR` label is the WHATWG
+# alias that covers CP949 — the spec mapping is identical in practice.
+encoding_rs = "0.8"
 # Used to spool compressed tar streams to a temp file when reading or
 # writing `.tar.gz` / `.tar.zst` / etc., so we don't have to hold the
 # whole archive in RAM. Cheap dep; already in dev-dependencies.

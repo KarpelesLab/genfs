@@ -499,6 +499,13 @@ fn repack_cmd(
                     let bytes = sum_source_file_bytes(src_dev, &mut src_fs)?;
                     bytes.saturating_add(32 * 1024 * 1024)
                 }
+                "grf" => {
+                    // GRF stores zlib-compressed bodies — sum_source
+                    // gives an upper bound (uncompressed). Add 64 KiB
+                    // headroom for the header + table.
+                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs)?;
+                    bytes.saturating_add(64 * 1024)
+                }
                 other => {
                     return Err(fstool::Error::InvalidArgument(format!(
                         "repack: unknown --fs-type {other:?}"
@@ -517,6 +524,10 @@ fn repack_cmd(
                     // unused tail of the backing file alone.
                     let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
                     bytes.saturating_add(32 * 1024 * 1024)
+                }
+                "grf" => {
+                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
+                    bytes.saturating_add(64 * 1024)
                 }
                 _ => src_total,
             },
@@ -626,6 +637,10 @@ fn repack_cmd(
                     ..fstool::fs::iso9660::FormatOpts::default()
                 };
                 repack_via_trait::<fstool::fs::iso9660::Iso9660>(dst_dev.as_mut(), &opts, src)?;
+            }
+            "grf" => {
+                let opts = fstool::fs::grf::FormatOpts::default();
+                repack_via_trait::<fstool::fs::grf::Grf>(dst_dev.as_mut(), &opts, src)?;
             }
             other => {
                 return Err(fstool::Error::InvalidArgument(format!(
@@ -1916,6 +1931,15 @@ fn tar_size_upper_bound(
                 total += per_entry_overhead(xb) + content;
             }
         }
+        AnyFs::Grf(src_grf) => {
+            // GRF stores file *sizes* uncompressed in the entry
+            // table — no need to inflate to size the output tar.
+            // No xattrs, so the per-entry overhead is constant.
+            for entry in src_grf.entries.values() {
+                let content = (u64::from(entry.size) + 511) & !511;
+                total += per_entry_overhead(0) + content;
+            }
+        }
         _ => return Err(unsupported_repack_src(src_fs)),
     }
     // Two zero blocks for EOF + 1 KiB pad.
@@ -2020,8 +2044,53 @@ fn repack_walk_into_sink(
         AnyFs::Ext(src_ext) => tar_walk_ext(src_dev, src_ext, 2, "", sink),
         AnyFs::Fat32(src_fat) => tar_walk_fat(src_dev, src_fat, "/", sink),
         AnyFs::Tar(src_tar) => tar_replay_tar(src_dev, src_tar, sink),
+        AnyFs::Grf(src_grf) => tar_walk_grf(src_dev, src_grf, sink),
         _ => Err(unsupported_repack_src(src_fs)),
     }
+}
+
+fn tar_walk_grf(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::grf::Grf,
+    writer: &mut dyn fstool::fs::tar::TarSink,
+) -> fstool::Result<()> {
+    use fstool::fs::tar::TarEntryMeta;
+    // GRF entries are flat archives — no POSIX metadata, no
+    // directory entries (parents are implicit from `/`-separated
+    // path components). We synthesise tar dir entries for each
+    // unique parent so the output is well-formed.
+    let mut emitted_dirs: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let meta = TarEntryMeta {
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        uname: String::new(),
+        gname: String::new(),
+    };
+    let dir_meta = TarEntryMeta {
+        mode: 0o755,
+        ..meta.clone()
+    };
+    for (name, entry) in &src.entries {
+        // Emit each prefix directory exactly once.
+        let mut acc = String::new();
+        for part in name.split('/').collect::<Vec<_>>().split_last().unwrap().1 {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(part);
+            if emitted_dirs.insert(acc.clone()) {
+                writer.add_dir(&format!("/{acc}"), dir_meta.clone(), &[])?;
+            }
+        }
+        let bytes = src.read_entry(src_dev, entry)?;
+        let len = bytes.len() as u64;
+        let mut reader = std::io::Cursor::new(bytes);
+        writer.add_file(&format!("/{name}"), &mut reader, len, meta.clone(), &[])?;
+    }
+    Ok(())
 }
 
 fn tar_walk_ext(
@@ -2551,6 +2620,7 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         fstool::inspect::AnyFs::F2fs(f2) => print_f2fs_info(f2),
         fstool::inspect::AnyFs::Squashfs(sq) => print_squashfs_info(sq),
         fstool::inspect::AnyFs::Iso9660(iso) => print_iso9660_info(iso),
+        fstool::inspect::AnyFs::Grf(grf) => print_grf_info(grf),
     }
     println!();
     println!("/ listing:");
@@ -2675,6 +2745,15 @@ fn print_iso9660_info(iso: &fstool::fs::iso9660::Iso9660) {
         println!("  boot lba:        {}", boot.default_entry.load_rba);
         println!("  boot sectors:    {}", boot.default_entry.sector_count);
     }
+}
+
+fn print_grf_info(grf: &fstool::fs::grf::Grf) {
+    println!("grf version:       {:#x}", grf.version);
+    println!("table offset:      {}", grf.table_offset);
+    println!("seed:              {}", grf.seed);
+    println!("encrypted header:  {}", grf.encrypted_header);
+    println!("file count:        {}", grf.entries.len());
+    println!("wasted space (B):  {}", grf.wasted_space());
 }
 
 fn format_uuid(bytes: &[u8; 16]) -> String {

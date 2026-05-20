@@ -12,6 +12,7 @@
 pub mod boot;
 pub mod dir;
 pub mod fsinfo;
+pub mod handle;
 pub mod mutate;
 pub mod table;
 
@@ -549,6 +550,21 @@ impl Fat32 {
         &self.fat
     }
 
+    /// Mutable access to the in-memory FAT — used by the modify-in-place
+    /// file handle to grow / shrink cluster chains.
+    pub(super) fn fat_mut(&mut self) -> &mut Fat {
+        &mut self.fat
+    }
+
+    /// Hint the free-cluster scanner to consider `cluster` next. Used when
+    /// the file handle frees a tail of clusters during a shrink so the
+    /// allocator can hand them out again.
+    pub(super) fn hint_next_free(&mut self, cluster: u32) {
+        if cluster >= 2 && cluster < self.boot.cluster_count() + 2 {
+            self.next_free = cluster;
+        }
+    }
+
     /// Walk the cluster chain starting at `start`, collecting every cluster
     /// in order.
     pub fn chain_of(&self, start: u32) -> Result<Vec<u32>> {
@@ -916,6 +932,72 @@ impl crate::fs::Filesystem for Fat32 {
         Ok(Box::new(r))
     }
 
+    fn open_file_rw<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &Path,
+        flags: crate::fs::OpenFlags,
+        meta: Option<crate::fs::FileMeta>,
+    ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        // Resolve the parent + leaf. We do this once up front so the
+        // create-then-reopen branch shares the result.
+        let (parent_cluster, leaf) = self.resolve_parent(dev, s)?;
+        let existing = self.find_entry(dev, parent_cluster, &leaf)?;
+        let found = match existing {
+            Some(f) => {
+                if f.entry.attr & dir::ATTR_DIRECTORY != 0 {
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "fat32: {s:?} is a directory, not a file"
+                    )));
+                }
+                f
+            }
+            None => {
+                if !flags.create {
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "fat32: {s:?} not found and `create` is false"
+                    )));
+                }
+                if meta.is_none() {
+                    return Err(crate::Error::InvalidArgument(
+                        "fat32: open_file_rw with create=true requires meta".into(),
+                    ));
+                }
+                // Create an empty file via the existing modify-in-place
+                // path, then re-find its entry.
+                self.add_file_from_reader(dev, s, &mut std::io::empty(), 0)?;
+                self.find_entry(dev, parent_cluster, &leaf)?
+                    .ok_or_else(|| {
+                        crate::Error::InvalidImage(
+                            "fat32: created file disappeared before open".into(),
+                        )
+                    })?
+            }
+        };
+        let mutate::FoundEntry {
+            chain: dir_chain,
+            entry_pos,
+            entry,
+            ..
+        } = found;
+        let mut handle = handle::FatFileHandle::open_existing(self, dev, dir_chain, entry_pos, entry)?;
+        if flags.truncate {
+            crate::fs::FileHandle::set_len(&mut handle, 0)?;
+        }
+        if flags.append {
+            // Position at end so the first write appends.
+            use std::io::Seek as _;
+            let len = crate::fs::FileHandle::len(&handle);
+            handle
+                .seek(std::io::SeekFrom::Start(len))
+                .map_err(crate::Error::Io)?;
+        }
+        Ok(Box::new(handle))
+    }
+
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         Self::flush(self, dev)
     }
@@ -925,6 +1007,30 @@ impl crate::fs::Filesystem for Fat32 {
 mod tests {
     use super::*;
     use crate::block::MemoryBackend;
+    use crate::fs::{FileMeta, FileSource, Filesystem, OpenFlags};
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    /// Format a fresh 48 MiB FAT32 volume in memory; return (dev, fs).
+    fn fresh_volume() -> (MemoryBackend, Fat32) {
+        let mut dev = MemoryBackend::new(48 * 1024 * 1024);
+        let opts = FatFormatOpts {
+            total_sectors: 48 * 1024 * 1024 / 512,
+            volume_id: 0xCAFE_F00D,
+            volume_label: *b"OPENRWTEST ",
+        };
+        let fs = Fat32::format(&mut dev, &opts).unwrap();
+        (dev, fs)
+    }
+
+    /// Read a whole file by path into a Vec via the streaming reader.
+    fn read_all(fs: &mut Fat32, dev: &mut dyn BlockDevice, path: &str) -> Vec<u8> {
+        let mut r = fs
+            .open_file_reader(dev, path)
+            .expect("open_file_reader for read_all");
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).expect("read_to_end");
+        out
+    }
 
     #[test]
     fn geometry_small_volume() {
@@ -967,5 +1073,213 @@ mod tests {
         assert_eq!(bs, backup);
         // Root cluster's FAT entry is an end-of-chain marker.
         assert!(Fat::is_eoc(fs.fat.get(2)));
+    }
+
+    #[test]
+    fn open_file_rw_partial_write_round_trip() {
+        let (mut dev, mut fs) = fresh_volume();
+        // Initial contents: 200 bytes of 0xAA.
+        let initial = vec![0xAAu8; 200];
+        fs.create_file(
+            &mut dev,
+            Path::new("hello.bin"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(initial.clone())),
+                len: 200,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        // Reopen rw and patch 16 bytes at offset 100.
+        let patch = [0x55u8; 16];
+        {
+            let mut h = fs
+                .open_file_rw(
+                    &mut dev,
+                    Path::new("hello.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.seek(SeekFrom::Start(100)).unwrap();
+            h.write_all(&patch).unwrap();
+            h.sync().unwrap();
+        }
+
+        let got = read_all(&mut fs, &mut dev, "hello.bin");
+        assert_eq!(got.len(), 200);
+        // 0..100 unchanged.
+        assert!(got[..100].iter().all(|&b| b == 0xAA));
+        // 100..116 patched.
+        assert_eq!(&got[100..116], &patch);
+        // 116..200 unchanged.
+        assert!(got[116..].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn open_file_rw_extends_file() {
+        let (mut dev, mut fs) = fresh_volume();
+        let initial = vec![0x11u8; 50];
+        fs.create_file(
+            &mut dev,
+            Path::new("grow.bin"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(initial)),
+                len: 50,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        // Seek past EOF and write 1 KiB of pattern.
+        let pattern: Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();
+        {
+            let mut h = fs
+                .open_file_rw(&mut dev, Path::new("grow.bin"), OpenFlags::default(), None)
+                .unwrap();
+            assert_eq!(h.len(), 50);
+            h.seek(SeekFrom::Start(2000)).unwrap();
+            h.write_all(&pattern).unwrap();
+            // len() = 2000 + 1024 = 3024.
+            assert_eq!(h.len(), 2000 + 1024);
+            h.sync().unwrap();
+        }
+
+        let got = read_all(&mut fs, &mut dev, "grow.bin");
+        assert_eq!(got.len(), 3024);
+        // First 50 bytes preserved.
+        assert!(got[..50].iter().all(|&b| b == 0x11));
+        // Gap 50..2000 is zero.
+        assert!(got[50..2000].iter().all(|&b| b == 0));
+        // Patched range matches.
+        assert_eq!(&got[2000..], &pattern[..]);
+    }
+
+    #[test]
+    fn open_file_rw_set_len_grow_and_shrink() {
+        let (mut dev, mut fs) = fresh_volume();
+        let initial = vec![0x77u8; 128];
+        fs.create_file(
+            &mut dev,
+            Path::new("resize.bin"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(initial)),
+                len: 128,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        // Grow to 4096 bytes — added bytes must read as zero.
+        {
+            let mut h = fs
+                .open_file_rw(
+                    &mut dev,
+                    Path::new("resize.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.set_len(4096).unwrap();
+            assert_eq!(h.len(), 4096);
+            h.sync().unwrap();
+        }
+        let after_grow = read_all(&mut fs, &mut dev, "resize.bin");
+        assert_eq!(after_grow.len(), 4096);
+        assert!(after_grow[..128].iter().all(|&b| b == 0x77));
+        assert!(after_grow[128..].iter().all(|&b| b == 0));
+
+        // Shrink back to 64 — truncation discards trailing bytes.
+        {
+            let mut h = fs
+                .open_file_rw(
+                    &mut dev,
+                    Path::new("resize.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.set_len(64).unwrap();
+            assert_eq!(h.len(), 64);
+            h.sync().unwrap();
+        }
+        let after_shrink = read_all(&mut fs, &mut dev, "resize.bin");
+        assert_eq!(after_shrink.len(), 64);
+        assert!(after_shrink.iter().all(|&b| b == 0x77));
+    }
+
+    #[test]
+    fn open_file_rw_append() {
+        let (mut dev, mut fs) = fresh_volume();
+        let initial = b"head".to_vec();
+        fs.create_file(
+            &mut dev,
+            Path::new("app.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(initial.clone())),
+                len: initial.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        {
+            let mut h = fs
+                .open_file_rw(
+                    &mut dev,
+                    Path::new("app.txt"),
+                    OpenFlags {
+                        append: true,
+                        ..OpenFlags::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            h.write_all(b"-tail").unwrap();
+            h.sync().unwrap();
+        }
+        let got = read_all(&mut fs, &mut dev, "app.txt");
+        assert_eq!(got, b"head-tail");
+    }
+
+    #[test]
+    fn open_file_rw_create_new() {
+        let (mut dev, mut fs) = fresh_volume();
+        // The path doesn't exist yet — `create: true` should make it.
+        {
+            let mut h = fs
+                .open_file_rw(
+                    &mut dev,
+                    Path::new("brand-new.dat"),
+                    OpenFlags {
+                        create: true,
+                        ..OpenFlags::default()
+                    },
+                    Some(FileMeta::default()),
+                )
+                .unwrap();
+            assert_eq!(h.len(), 0);
+            h.write_all(b"hello from rw create").unwrap();
+            h.sync().unwrap();
+        }
+        let got = read_all(&mut fs, &mut dev, "brand-new.dat");
+        assert_eq!(got, b"hello from rw create");
+
+        // Without `create`, a non-existent path is an error.
+        match fs.open_file_rw(
+            &mut dev,
+            Path::new("never.bin"),
+            OpenFlags::default(),
+            None,
+        ) {
+            Ok(_) => panic!("expected error for non-existent path with create=false"),
+            Err(crate::Error::InvalidArgument(_)) => {}
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
     }
 }

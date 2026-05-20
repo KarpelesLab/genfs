@@ -15,17 +15,17 @@ use crate::block::BlockDevice;
 
 /// Result of [`Fat32::find_entry`] — a directory's loaded byte buffer plus
 /// the position of the named entry (and any preceding LFN run) within it.
-struct FoundEntry {
+pub(super) struct FoundEntry {
     /// The directory's cluster chain.
-    chain: Vec<u32>,
+    pub(super) chain: Vec<u32>,
     /// Every cluster of the directory, concatenated.
-    bytes: Vec<u8>,
+    pub(super) bytes: Vec<u8>,
     /// Byte offset of the first slot of the LFN run (== entry_pos if none).
-    run_start: usize,
+    pub(super) run_start: usize,
     /// Byte offset of the 8.3 entry itself.
-    entry_pos: usize,
+    pub(super) entry_pos: usize,
     /// Decoded 8.3 entry.
-    entry: dir::DirEntry,
+    pub(super) entry: dir::DirEntry,
 }
 
 impl Fat32 {
@@ -163,7 +163,7 @@ impl Fat32 {
     /// entry within the directory's flat buffer, along with the position
     /// of the first slot of its preceding LFN run (== same position when
     /// there is no LFN run).
-    fn find_entry(
+    pub(super) fn find_entry(
         &self,
         dev: &mut dyn BlockDevice,
         dir_cluster: u32,
@@ -391,7 +391,11 @@ impl Fat32 {
 
     /// Split `path` into (parent_dir_cluster, leaf_name). Errors if the
     /// path is `/` or if the parent doesn't exist.
-    fn resolve_parent(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<(u32, String)> {
+    pub(super) fn resolve_parent(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<(u32, String)> {
         let parts: Vec<&str> = path
             .split(['/', '\\'])
             .filter(|p| !p.is_empty() && *p != ".")

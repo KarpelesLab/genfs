@@ -606,6 +606,140 @@ fn split_path(path: &str) -> Vec<&str> {
         .collect()
 }
 
+// ----------------------------------------------------------------------
+// `crate::fs::Filesystem` trait impl. Mutators forward to the path
+// wrappers added in `write.rs`; reads use the existing path API.
+// ----------------------------------------------------------------------
+
+impl crate::fs::FilesystemFactory for Xfs {
+    type FormatOpts = format::FormatOpts;
+
+    fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
+        format::format(dev, opts)
+    }
+
+    fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        Self::open(dev)
+    }
+}
+
+impl crate::fs::Filesystem for Xfs {
+    fn create_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        let len = src.len()?;
+        let (mut reader, _) = src.open()?;
+        let em = entry_meta_from(meta);
+        self.add_file_path(dev, s, em, len, &mut reader).map(|_| ())
+    }
+
+    fn create_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        self.add_dir_path(dev, s, entry_meta_from(meta)).map(|_| ())
+    }
+
+    fn create_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        target: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        let t = target
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 symlink target".into()))?;
+        self.add_symlink_path(dev, s, t, entry_meta_from(meta))
+            .map(|_| ())
+    }
+
+    fn create_device(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        let dk = match kind {
+            crate::fs::DeviceKind::Char => crate::fs::xfs::write::DeviceKind::Char,
+            crate::fs::DeviceKind::Block => crate::fs::xfs::write::DeviceKind::Block,
+            crate::fs::DeviceKind::Fifo => crate::fs::xfs::write::DeviceKind::Fifo,
+            crate::fs::DeviceKind::Socket => crate::fs::xfs::write::DeviceKind::Socket,
+        };
+        self.add_device_path(dev, s, dk, major, minor, entry_meta_from(meta))
+            .map(|_| ())
+    }
+
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        self.remove_path(dev, s).map(|_| ())
+    }
+
+    fn list(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        self.list_path(dev, s)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        self.flush_writes(dev)
+    }
+}
+
+/// Convert public [`crate::fs::FileMeta`] to XFS's private
+/// [`write::EntryMeta`]. XFS keeps `atime`/`ctime` (XFS supports them)
+/// so all fields round-trip.
+fn entry_meta_from(meta: crate::fs::FileMeta) -> crate::fs::xfs::write::EntryMeta {
+    crate::fs::xfs::write::EntryMeta {
+        mode: meta.mode,
+        uid: meta.uid,
+        gid: meta.gid,
+        atime: meta.atime,
+        mtime: meta.mtime,
+        ctime: meta.ctime,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

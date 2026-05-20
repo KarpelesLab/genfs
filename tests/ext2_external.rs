@@ -370,7 +370,7 @@ fn ext2_open_lists_and_reads_what_was_written() {
 #[test]
 fn ext2_via_filesystem_trait() {
     use fstool::block::BlockDevice;
-    use fstool::fs::Filesystem;
+    use fstool::fs::{Filesystem, FilesystemFactory};
     use std::io::Read;
     use std::path::Path;
 
@@ -381,7 +381,7 @@ fn ext2_via_filesystem_trait() {
     };
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = FileBackend::create(tmp.path(), size).unwrap();
-    let mut ext = <Ext as Filesystem>::format(&mut dev, &opts).unwrap();
+    let mut ext = <Ext as FilesystemFactory>::format(&mut dev, &opts).unwrap();
 
     let mut src = NamedTempFile::new().unwrap();
     src.as_file_mut()

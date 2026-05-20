@@ -179,10 +179,98 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
     match fs.fs_type.to_ascii_lowercase().as_str() {
         "ext2" | "ext3" | "ext4" => build_bare_ext(fs, output),
         "fat32" | "vfat" => build_bare_fat32(fs, output),
+        "hfsplus" | "hfs+" => build_bare_via_trait::<crate::fs::hfs_plus::HfsPlus>(
+            fs,
+            output,
+            hfs_plus_format_opts(fs),
+        ),
+        "ntfs" => build_bare_via_trait::<crate::fs::ntfs::Ntfs>(fs, output, ntfs_format_opts(fs)?),
+        "f2fs" => build_bare_via_trait::<crate::fs::f2fs::F2fs>(fs, output, f2fs_format_opts(fs)),
+        "squashfs" => build_bare_via_trait::<crate::fs::squashfs::Squashfs>(
+            fs,
+            output,
+            squashfs_format_opts(fs),
+        ),
+        "xfs" => build_bare_via_trait::<crate::fs::xfs::Xfs>(fs, output, xfs_format_opts(fs)?),
         other => Err(crate::Error::InvalidArgument(format!(
             "spec: unknown filesystem type {other:?}"
         ))),
     }
+}
+
+/// Generic "create the backing file, format `F`, populate from
+/// `source`, flush" pipeline. Used for every writable FS whose
+/// destination size doesn't have to be derived from the source tree
+/// (we accept an explicit `size` in TOML, defaulting to 256 MiB).
+fn build_bare_via_trait<F: crate::fs::FilesystemFactory>(
+    fs: &FilesystemSpec,
+    output: &Path,
+    opts: F::FormatOpts,
+) -> Result<()> {
+    let bytes = match fs.size.as_deref() {
+        Some(s) => parse_size(s)?,
+        None => 256 * 1024 * 1024,
+    };
+    let mut dev = crate::block::create_image(output, bytes, &crate::block::CreateOpts::default())?;
+    let mut fs_obj = F::format(dev.as_mut(), &opts)?;
+    if let Some(src) = &fs.source {
+        let source = source_from_spec(src)?;
+        crate::repack::populate_fs_from_source(dev.as_mut(), &mut fs_obj, &source)?;
+    }
+    fs_obj.flush(dev.as_mut())?;
+    dev.sync()?;
+    Ok(())
+}
+
+/// In-partition variant of [`build_bare_via_trait`]: takes an already
+/// pre-sliced `dev` (just one partition's view) and formats `F` into
+/// it, optionally populating from `source`.
+fn format_in_partition_via_trait<F: crate::fs::FilesystemFactory>(
+    dev: &mut dyn BlockDevice,
+    fs: &FilesystemSpec,
+    opts: F::FormatOpts,
+) -> Result<()> {
+    let mut fs_obj = F::format(dev, &opts)?;
+    if let Some(src) = &fs.source {
+        let source = source_from_spec(src)?;
+        crate::repack::populate_fs_from_source(dev, &mut fs_obj, &source)?;
+    }
+    fs_obj.flush(dev)?;
+    Ok(())
+}
+
+fn hfs_plus_format_opts(fs: &FilesystemSpec) -> crate::fs::hfs_plus::FormatOpts {
+    crate::fs::hfs_plus::FormatOpts {
+        volume_name: fs
+            .volume_label
+            .clone()
+            .unwrap_or_else(|| "Untitled".to_string()),
+        ..crate::fs::hfs_plus::FormatOpts::default()
+    }
+}
+
+fn ntfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::ntfs::format::FormatOpts> {
+    Ok(crate::fs::ntfs::format::FormatOpts {
+        volume_label: fs.volume_label.clone().unwrap_or_default(),
+        ..crate::fs::ntfs::format::FormatOpts::default()
+    })
+}
+
+fn f2fs_format_opts(_fs: &FilesystemSpec) -> crate::fs::f2fs::FormatOpts {
+    crate::fs::f2fs::FormatOpts::default()
+}
+
+fn squashfs_format_opts(fs: &FilesystemSpec) -> crate::fs::squashfs::FormatOpts {
+    crate::fs::squashfs::FormatOpts {
+        block_size: fs
+            .block_size
+            .unwrap_or(crate::fs::squashfs::DEFAULT_BLOCK_SIZE),
+        ..crate::fs::squashfs::FormatOpts::default()
+    }
+}
+
+fn xfs_format_opts(_fs: &FilesystemSpec) -> Result<crate::fs::xfs::format::FormatOpts> {
+    Ok(crate::fs::xfs::format::FormatOpts::default())
 }
 
 fn build_bare_ext(fs: &FilesystemSpec, output: &Path) -> Result<()> {
@@ -487,6 +575,41 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                 let label = fat32_volume_label(fs.volume_label.as_deref());
                 let volume_id = fs.volume_id.unwrap_or(0);
                 format_fat32_into(&mut slice, fs, total_sectors, volume_id, label)?;
+            }
+            "hfsplus" | "hfs+" => {
+                format_in_partition_via_trait::<crate::fs::hfs_plus::HfsPlus>(
+                    &mut slice,
+                    fs,
+                    hfs_plus_format_opts(fs),
+                )?;
+            }
+            "ntfs" => {
+                format_in_partition_via_trait::<crate::fs::ntfs::Ntfs>(
+                    &mut slice,
+                    fs,
+                    ntfs_format_opts(fs)?,
+                )?;
+            }
+            "f2fs" => {
+                format_in_partition_via_trait::<crate::fs::f2fs::F2fs>(
+                    &mut slice,
+                    fs,
+                    f2fs_format_opts(fs),
+                )?;
+            }
+            "squashfs" => {
+                format_in_partition_via_trait::<crate::fs::squashfs::Squashfs>(
+                    &mut slice,
+                    fs,
+                    squashfs_format_opts(fs),
+                )?;
+            }
+            "xfs" => {
+                format_in_partition_via_trait::<crate::fs::xfs::Xfs>(
+                    &mut slice,
+                    fs,
+                    xfs_format_opts(fs)?,
+                )?;
             }
             other => {
                 return Err(crate::Error::InvalidArgument(format!(

@@ -2032,7 +2032,7 @@ fn split_path(path: &std::path::Path) -> Result<(std::path::PathBuf, String)> {
     Ok((std::path::PathBuf::from(parent), name.to_string()))
 }
 
-impl crate::fs::Filesystem for Ext {
+impl crate::fs::FilesystemFactory for Ext {
     type FormatOpts = FormatOpts;
 
     fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
@@ -2042,7 +2042,9 @@ impl crate::fs::Filesystem for Ext {
     fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         Self::open(dev)
     }
+}
 
+impl crate::fs::Filesystem for Ext {
     fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,

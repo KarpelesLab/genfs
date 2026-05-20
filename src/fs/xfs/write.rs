@@ -1408,6 +1408,98 @@ impl Xfs {
         dev.sync()?;
         Ok(())
     }
+
+    // ----------------------------------------------------------------
+    // Path-based wrappers — convenience callers for the generic
+    // `crate::fs::Filesystem` trait. Each splits `/a/b/c` into a parent
+    // dir + a leaf name; the parent is resolved via `lookup_path_ino`
+    // (returns root for `/`), then the matching inode-based method is
+    // invoked.
+    // ----------------------------------------------------------------
+
+    /// Path-based equivalent of [`Self::add_file`].
+    pub fn add_file_path<R: Read>(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        meta: EntryMeta,
+        size: u64,
+        src: &mut R,
+    ) -> Result<u64> {
+        let (parent_ino, name) = self.split_path_for_create(dev, path)?;
+        self.add_file(dev, parent_ino, &name, meta, size, src)
+    }
+
+    /// Path-based equivalent of [`Self::add_dir`].
+    pub fn add_dir_path(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        meta: EntryMeta,
+    ) -> Result<u64> {
+        let (parent_ino, name) = self.split_path_for_create(dev, path)?;
+        self.add_dir(dev, parent_ino, &name, meta)
+    }
+
+    /// Path-based equivalent of [`Self::add_symlink`].
+    pub fn add_symlink_path(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        target: &str,
+        meta: EntryMeta,
+    ) -> Result<u64> {
+        let (parent_ino, name) = self.split_path_for_create(dev, path)?;
+        self.add_symlink(dev, parent_ino, &name, target, meta)
+    }
+
+    /// Path-based equivalent of [`Self::add_device`].
+    pub fn add_device_path(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        kind: DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: EntryMeta,
+    ) -> Result<u64> {
+        let (parent_ino, name) = self.split_path_for_create(dev, path)?;
+        self.add_device(dev, parent_ino, &name, kind, major, minor, meta)
+    }
+
+    /// Path-based equivalent of [`Self::remove`].
+    pub fn remove_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
+        let (parent_ino, name) = self.split_path_for_create(dev, path)?;
+        self.remove(dev, parent_ino, &name)
+    }
+
+    /// Split `path` into `(parent_inode, leaf_name)`. `path` must be
+    /// absolute and non-empty. The parent directory must already exist.
+    fn split_path_for_create(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<(u64, String)> {
+        let trimmed = path.trim_start_matches('/');
+        if trimmed.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "xfs: cannot create entry at root".into(),
+            ));
+        }
+        let (parent, leaf) = match trimmed.rfind('/') {
+            None => ("/", trimmed),
+            Some(i) => (&path[..=i], &trimmed[i + 1..]),
+        };
+        let parent_ino = self.lookup_path_ino(dev, parent)?;
+        Ok((parent_ino, leaf.to_string()))
+    }
+
+    /// Resolve an absolute path to its inode number. `/` returns the
+    /// volume's root inode.
+    pub fn lookup_path_ino(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
+        let (ino, _, _) = self.resolve_path(dev, path)?;
+        Ok(ino)
+    }
 }
 
 #[allow(dead_code)]

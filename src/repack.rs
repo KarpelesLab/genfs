@@ -197,6 +197,246 @@ pub fn ext_build_plan_for_source(
     Ok(plan)
 }
 
+/// Populate any [`crate::fs::Filesystem`] from `source`, dispatching
+/// through the trait for every entry create. Works for HFS+, NTFS,
+/// F2FS, SquashFS, XFS — whatever implements the trait — though
+/// ext/FAT32 callers should prefer [`populate_ext_from_source`] /
+/// [`populate_fat32_from_source`] which preserve xattrs and use the
+/// per-FS fast paths.
+///
+/// Tar-archive and existing-image sources route through an internal
+/// helper that opens the source via
+/// [`crate::inspect::AnyFs`] and replays entries through trait
+/// methods.
+pub fn populate_fs_from_source<F: crate::fs::Filesystem>(
+    dst_dev: &mut dyn crate::block::BlockDevice,
+    dst: &mut F,
+    source: &Source,
+) -> Result<()> {
+    populate_fs_from_source_dyn(dst_dev, dst, source)
+}
+
+/// Trait-object form of [`populate_fs_from_source`]. Used by code
+/// paths (e.g. [`crate::inspect::AnyFs`] dispatch helpers) that have
+/// a `&mut dyn Filesystem` rather than a known concrete type.
+pub fn populate_fs_from_source_dyn(
+    dst_dev: &mut dyn crate::block::BlockDevice,
+    dst: &mut dyn crate::fs::Filesystem,
+    source: &Source,
+) -> Result<()> {
+    match source {
+        Source::HostDir(p) => populate_host_dir_via_trait(dst_dev, dst, p),
+        Source::TarArchive {
+            path,
+            codec: Some(_algo),
+        } => {
+            // Compressed tar: open as image via AnyFs::Tar isn't easy
+            // (we'd need to decompress first). For now, the generic
+            // path supports plain tar via the image walker below.
+            let target = crate::inspect::Target::parse(&path.to_string_lossy());
+            populate_image_via_trait(&target, dst_dev, dst)
+        }
+        Source::TarArchive { path, codec: None } => {
+            let target = crate::inspect::Target::parse(&path.to_string_lossy());
+            populate_image_via_trait(&target, dst_dev, dst)
+        }
+        Source::Image(target) => populate_image_via_trait(target, dst_dev, dst),
+    }
+}
+
+/// Recursively copy a host directory tree into `dst` via the trait.
+fn populate_host_dir_via_trait(
+    dst_dev: &mut dyn crate::block::BlockDevice,
+    dst: &mut dyn crate::fs::Filesystem,
+    root: &Path,
+) -> Result<()> {
+    // Stack of (host dir, fs path).
+    let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), "/".to_string())];
+    while let Some((dir, fs_dir)) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_str().ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("repack: non-UTF-8 host filename {:?}", name))
+            })?;
+            let dest = join_fs_path(&fs_dir, name_str);
+            let dest_path = std::path::Path::new(&dest);
+            let meta = entry.metadata()?;
+            let ft = meta.file_type();
+            let fmeta = host_meta_to_fs(&meta);
+            if ft.is_dir() {
+                dst.create_dir(dst_dev, dest_path, fmeta)?;
+                stack.push((entry.path(), dest));
+            } else if ft.is_symlink() {
+                let target = std::fs::read_link(entry.path())?;
+                dst.create_symlink(dst_dev, dest_path, &target, fmeta)?;
+            } else if ft.is_file() {
+                let len = meta.len();
+                let src = crate::fs::FileSource::HostPath(entry.path());
+                dst.create_file(dst_dev, dest_path, src, fmeta)?;
+                let _ = len;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open `target` as an image, walk its filesystem, replay entries
+/// into `dst` via trait methods.
+fn populate_image_via_trait(
+    target: &crate::inspect::Target,
+    dst_dev: &mut dyn crate::block::BlockDevice,
+    dst: &mut dyn crate::fs::Filesystem,
+) -> Result<()> {
+    crate::inspect::with_target_device(target, |src_dev| {
+        let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+        let mut stack: Vec<String> = vec!["/".to_string()];
+        while let Some(dir) = stack.pop() {
+            let entries = src_fs.list(src_dev, &dir)?;
+            for e in entries {
+                if e.name == "." || e.name == ".." || e.name == "lost+found" {
+                    continue;
+                }
+                let child = join_fs_path(&dir, &e.name);
+                let child_path = std::path::Path::new(&child);
+                let fmeta = crate::fs::FileMeta::default();
+                match e.kind {
+                    crate::fs::EntryKind::Dir => {
+                        dst.create_dir(dst_dev, child_path, fmeta)?;
+                        stack.push(child);
+                    }
+                    crate::fs::EntryKind::Regular => {
+                        // Stream source body through a tempfile so the
+                        // destination's create_file can take a HostPath
+                        // (works around the trait's source-Read lifetime
+                        // borrowing src_dev mutably).
+                        let tmp = staging_tempfile(src_dev, &mut src_fs, &child)?;
+                        let path = tmp.path().to_path_buf();
+                        // Keep tmp alive for the duration of create_file
+                        // by binding it; the source path is consumed
+                        // before tmp drops.
+                        dst.create_file(
+                            dst_dev,
+                            child_path,
+                            crate::fs::FileSource::HostPath(path),
+                            fmeta,
+                        )?;
+                        drop(tmp);
+                    }
+                    crate::fs::EntryKind::Symlink => {
+                        let target_str = read_symlink_via_anyfs(src_dev, &mut src_fs, &child)?;
+                        dst.create_symlink(
+                            dst_dev,
+                            child_path,
+                            std::path::Path::new(&target_str),
+                            fmeta,
+                        )?;
+                    }
+                    crate::fs::EntryKind::Char
+                    | crate::fs::EntryKind::Block
+                    | crate::fs::EntryKind::Fifo
+                    | crate::fs::EntryKind::Socket => {
+                        // Major/minor extraction isn't on AnyFs yet; fall
+                        // back to (0, 0) which is enough for FIFO/socket.
+                        let dk = match e.kind {
+                            crate::fs::EntryKind::Char => crate::fs::DeviceKind::Char,
+                            crate::fs::EntryKind::Block => crate::fs::DeviceKind::Block,
+                            crate::fs::EntryKind::Fifo => crate::fs::DeviceKind::Fifo,
+                            crate::fs::EntryKind::Socket => crate::fs::DeviceKind::Socket,
+                            _ => unreachable!(),
+                        };
+                        let _ = dst.create_device(dst_dev, child_path, dk, 0, 0, fmeta);
+                    }
+                    crate::fs::EntryKind::Unknown => {
+                        eprintln!("repack: skipping unknown entry {child:?}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Stream a file's body from the source FS into a fresh tempfile and
+/// return the handle. Lets the trait-based copier feed
+/// `FileSource::HostPath` to the destination without re-borrowing the
+/// source device.
+fn staging_tempfile(
+    src_dev: &mut dyn crate::block::BlockDevice,
+    src_fs: &mut crate::inspect::AnyFs,
+    fs_path: &str,
+) -> Result<tempfile::NamedTempFile> {
+    let mut tmp = tempfile::NamedTempFile::new()?;
+    src_fs.copy_file_to(src_dev, fs_path, &mut tmp)?;
+    tmp.as_file_mut().sync_all()?;
+    Ok(tmp)
+}
+
+/// Read the target of a symbolic link via the best per-FS reader on
+/// `AnyFs`. Different FSes name the reader differently (some take a
+/// path, some an inode); we centralise the dispatch here. Sources
+/// that don't (yet) expose a symlink reader return `Unsupported`.
+fn read_symlink_via_anyfs(
+    src_dev: &mut dyn crate::block::BlockDevice,
+    src_fs: &mut crate::inspect::AnyFs,
+    path: &str,
+) -> Result<String> {
+    use crate::inspect::AnyFs;
+    match src_fs {
+        AnyFs::Ext(_) => Err(crate::Error::Unsupported(
+            "repack: ext symlinks via the generic walker are not yet wired".into(),
+        )),
+        AnyFs::Fat32(_) => Err(crate::Error::Unsupported(
+            "repack: FAT32 source has no symlinks".into(),
+        )),
+        AnyFs::Tar(t) => t
+            .lookup(path)
+            .and_then(|e| e.link_target.clone())
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "repack: tar source has no symlink at {path:?}"
+                ))
+            }),
+        AnyFs::Xfs(x) => x.read_symlink(src_dev, path),
+        AnyFs::HfsPlus(h) => h.read_symlink_target_path(src_dev, path),
+        AnyFs::Apfs(_) => Err(crate::Error::Unsupported(
+            "repack: APFS symlink reading via repack not yet wired".into(),
+        )),
+        AnyFs::Ntfs(_) => Err(crate::Error::Unsupported(
+            "repack: NTFS symlink reading via repack not yet wired".into(),
+        )),
+        AnyFs::F2fs(_) => Err(crate::Error::Unsupported(
+            "repack: F2FS symlink reading via repack not yet wired".into(),
+        )),
+        AnyFs::Squashfs(s) => s.read_symlink(src_dev, path),
+        AnyFs::Exfat(_) => Err(crate::Error::Unsupported(
+            "repack: exFAT source has no symlinks".into(),
+        )),
+    }
+}
+
+/// Convert host `Metadata` into a public [`crate::fs::FileMeta`].
+fn host_meta_to_fs(meta: &std::fs::Metadata) -> crate::fs::FileMeta {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)]
+    {
+        crate::fs::FileMeta {
+            mode: (meta.mode() & 0o7777) as u16,
+            uid: meta.uid(),
+            gid: meta.gid(),
+            mtime: meta.mtime() as u32,
+            atime: meta.atime() as u32,
+            ctime: meta.ctime() as u32,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        crate::fs::FileMeta::default()
+    }
+}
+
 /// Compute the minimum FAT32 byte capacity needed to fit `source`.
 /// Bumps to the FAT32 cluster-count minimum + rounds up to a 512-byte
 /// sector boundary.

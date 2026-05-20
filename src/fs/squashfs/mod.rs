@@ -593,6 +593,135 @@ impl Squashfs {
     }
 }
 
+/// Convert the public [`crate::fs::FileMeta`] to the squashfs-private
+/// [`writer::EntryMeta`]. Drops `atime` / `ctime` since SquashFS only
+/// stores `mtime`.
+fn entry_meta_from(meta: crate::fs::FileMeta) -> writer::EntryMeta {
+    writer::EntryMeta {
+        mode: meta.mode,
+        uid: meta.uid,
+        gid: meta.gid,
+        mtime: meta.mtime,
+    }
+}
+
+// ----------------------------------------------------------------------
+// `crate::fs::Filesystem` trait impl — bridges Squashfs into the
+// generic walker. SquashFS is a write-once archive: mutators only work
+// after `format()`, and `remove()` is unsupported.
+// ----------------------------------------------------------------------
+
+impl crate::fs::FilesystemFactory for Squashfs {
+    type FormatOpts = FormatOpts;
+
+    fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
+        Self::format(dev, opts)
+    }
+
+    fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        Self::open(dev)
+    }
+}
+
+impl crate::fs::Filesystem for Squashfs {
+    fn create_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        self.create_file(dev, s, src, entry_meta_from(meta), Vec::new())
+    }
+
+    fn create_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        self.create_dir(dev, s, entry_meta_from(meta), Vec::new())
+    }
+
+    fn create_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        target: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        let t = target.to_str().ok_or_else(|| {
+            crate::Error::InvalidArgument("squashfs: non-UTF-8 symlink target".into())
+        })?;
+        self.create_symlink(dev, s, t, entry_meta_from(meta), Vec::new())
+    }
+
+    fn create_device(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        self.create_device(
+            dev,
+            s,
+            kind,
+            major,
+            minor,
+            entry_meta_from(meta),
+            Vec::new(),
+        )
+    }
+
+    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "squashfs: archives are write-once; remove() is unsupported".into(),
+        ))
+    }
+
+    fn list(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        self.list_path(dev, s)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        Self::flush(self, dev)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

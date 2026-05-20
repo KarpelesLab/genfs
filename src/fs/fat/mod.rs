@@ -816,6 +816,107 @@ fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
     .encode()
 }
 
+// ----------------------------------------------------------------------
+// `crate::fs::Filesystem` trait impl — lets `Fat32` be driven by the
+// generic walker in `crate::repack` alongside the other writable FSes.
+// ----------------------------------------------------------------------
+
+impl crate::fs::FilesystemFactory for Fat32 {
+    type FormatOpts = FatFormatOpts;
+
+    fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
+        Self::format(dev, opts)
+    }
+
+    fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        Self::open(dev)
+    }
+}
+
+impl crate::fs::Filesystem for Fat32 {
+    fn create_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        src: crate::fs::FileSource,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        let (mut reader, len) = src.open()?;
+        self.add_file_from_reader(dev, s, &mut reader, len)
+    }
+
+    fn create_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        self.add_dir(dev, s)
+    }
+
+    fn create_symlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &Path,
+        _target: &Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "fat32: filesystem does not support symbolic links".into(),
+        ))
+    }
+
+    fn create_device(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &Path,
+        _kind: crate::fs::DeviceKind,
+        _major: u32,
+        _minor: u32,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "fat32: filesystem does not support device / FIFO / socket nodes".into(),
+        ))
+    }
+
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &Path) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        self.remove(dev, s)
+    }
+
+    fn list(&mut self, dev: &mut dyn BlockDevice, path: &Path) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        self.list_path(dev, s)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &Path,
+    ) -> Result<Box<dyn Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        Self::flush(self, dev)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

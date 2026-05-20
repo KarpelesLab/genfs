@@ -901,6 +901,123 @@ fn split_path(path: &str) -> Vec<&str> {
         .collect()
 }
 
+// ----------------------------------------------------------------------
+// `crate::fs::Filesystem` trait impl — bridges HfsPlus into the generic
+// walker. Note: `open()` returns a read-only handle (writer = None),
+// so the mutating trait methods only work after `format()` for now.
+// ----------------------------------------------------------------------
+
+impl crate::fs::FilesystemFactory for HfsPlus {
+    type FormatOpts = writer::FormatOpts;
+
+    fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
+        Self::format(dev, opts)
+    }
+
+    fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        Self::open(dev)
+    }
+}
+
+impl crate::fs::Filesystem for HfsPlus {
+    fn create_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        let len = src.len()?;
+        let (mut reader, _) = src.open()?;
+        let mode = meta.mode;
+        self.create_file(dev, s, &mut reader, len, mode, meta.uid, meta.gid)
+            .map(|_| ())
+    }
+
+    fn create_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        let mode = meta.mode;
+        self.create_dir(dev, s, mode, meta.uid, meta.gid)
+            .map(|_| ())
+    }
+
+    fn create_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        target: &std::path::Path,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        let t = target.to_str().ok_or_else(|| {
+            crate::Error::InvalidArgument("hfs+: non-UTF-8 symlink target".into())
+        })?;
+        let mode = meta.mode;
+        self.create_symlink(dev, s, t, mode, meta.uid, meta.gid)
+            .map(|_| ())
+    }
+
+    fn create_device(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _kind: crate::fs::DeviceKind,
+        _major: u32,
+        _minor: u32,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "hfs+: device / FIFO / socket nodes are not yet implemented".into(),
+        ))
+    }
+
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        self.remove(dev, s)
+    }
+
+    fn list(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        self.list_path(dev, s)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        Self::flush(self, dev)
+    }
+}
+
 // -- tests ---------------------------------------------------------------
 
 #[cfg(test)]

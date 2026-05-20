@@ -373,7 +373,7 @@ impl F2fs {
     }
 }
 
-impl crate::fs::Filesystem for F2fs {
+impl crate::fs::FilesystemFactory for F2fs {
     type FormatOpts = FormatOpts;
 
     fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
@@ -383,7 +383,9 @@ impl crate::fs::Filesystem for F2fs {
     fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         Self::open(dev)
     }
+}
 
+impl crate::fs::Filesystem for F2fs {
     fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,

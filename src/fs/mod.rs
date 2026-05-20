@@ -165,30 +165,14 @@ pub enum EntryKind {
     Unknown,
 }
 
-/// Top-level API every filesystem implements.
-///
-/// The two-pass nature of writers is encoded externally: callers first
-/// [`format`](Self::format) (which determines the FS geometry from the
-/// device's size) and then call the `create_*` methods. Filesystems whose
-/// geometry depends on the *total content size* (e.g. ext, which sizes its
-/// inode table at mkfs time) provide a `format_for_plan` constructor in
-/// their own module so the planner can pre-compute counts.
-pub trait Filesystem: Sized {
-    /// Format options understood by this filesystem. Each implementation
-    /// exposes its own type (e.g. [`ext::FormatOpts`]).
-    type FormatOpts;
-
-    /// Format a fresh filesystem on `dev`. Overwrites whatever was there.
-    fn format(
-        dev: &mut dyn crate::block::BlockDevice,
-        opts: &Self::FormatOpts,
-    ) -> crate::Result<Self>;
-
-    /// Open an existing filesystem from `dev`. Returns
-    /// [`Error::InvalidImage`](crate::Error::InvalidImage) if the on-disk
-    /// metadata is malformed.
-    fn open(dev: &mut dyn crate::block::BlockDevice) -> crate::Result<Self>;
-
+/// Top-level dyn-compatible API every filesystem implements. The
+/// `format` / `open` factory methods live on the sibling
+/// [`FilesystemFactory`] trait so this one stays object-safe — the
+/// generic walker in [`crate::repack`] can hold a `&mut dyn
+/// Filesystem` and drive any of `Ext` / `Fat32` / `HfsPlus` / `Ntfs`
+/// / `F2fs` / `Squashfs` / `Xfs` through the same `create_*` /
+/// `remove` / `list` / `read_file` / `flush` entry points.
+pub trait Filesystem {
     /// Create a regular file at `path` populated from `src` with metadata `meta`.
     fn create_file(
         &mut self,
@@ -250,6 +234,24 @@ pub trait Filesystem: Sized {
 
     /// Persist outstanding dirty state to the device.
     fn flush(&mut self, dev: &mut dyn crate::block::BlockDevice) -> crate::Result<()>;
+}
+
+/// Companion trait for filesystems that can be created from scratch
+/// (`format`) or opened from an existing image (`open`). Kept separate
+/// from [`Filesystem`] so the latter remains object-safe.
+pub trait FilesystemFactory: Filesystem + Sized {
+    /// Format options understood by this filesystem. Each implementation
+    /// exposes its own type (e.g. [`ext::FormatOpts`]).
+    type FormatOpts;
+
+    /// Format a fresh filesystem on `dev`. Overwrites whatever was there.
+    fn format(
+        dev: &mut dyn crate::block::BlockDevice,
+        opts: &Self::FormatOpts,
+    ) -> crate::Result<Self>;
+
+    /// Open an existing filesystem from `dev`.
+    fn open(dev: &mut dyn crate::block::BlockDevice) -> crate::Result<Self>;
 }
 
 /// A `Read + Seek` that produces `remaining` zero bytes and then EOF.

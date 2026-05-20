@@ -2523,4 +2523,87 @@ mod tests {
         assert!(reopened.sb.feature_compat & constants::feature::COMPAT_SPARSE_SUPER2 != 0);
         assert!(!reopened.layout.groups[2].has_superblock);
     }
+
+    #[test]
+    fn xattrs_round_trip_on_ext4_image() {
+        // End-to-end: format an ext4 image (so metadata_csum is on),
+        // add a regular file, attach a mix of xattrs spanning every
+        // supported namespace, flush, reopen, and verify
+        // `read_xattrs` returns the same set the writer was handed.
+        //
+        // This exercises the full `set_xattrs` → block alloc →
+        // CRC32C-stamped block write → `decode_block` path that the
+        // unit-level encode/decode tests in `xattr.rs` don't cover,
+        // and pins the `COMPAT_EXT_ATTR` feature bit as a side effect.
+        let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
+        let payload = b"hello xattrs".to_vec();
+        let ino = ext
+            .add_file_to_streaming(
+                &mut dev,
+                constants::INO_ROOT_DIR,
+                b"labelled.txt",
+                &mut payload.as_slice(),
+                payload.len() as u64,
+                FileMeta {
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    atime: 0,
+                    ctime: 0,
+                },
+            )
+            .expect("add file");
+
+        // One xattr per supported namespace prefix so the index-encoding
+        // path is fully covered by a single round-trip.
+        let xs = vec![
+            xattr::Xattr::new("user.greeting", b"hello".to_vec()),
+            xattr::Xattr::new(
+                "security.selinux",
+                b"system_u:object_r:unlabeled_t:s0\0".to_vec(),
+            ),
+            xattr::Xattr::new("trusted.opaque", vec![0u8, 1, 2, 3, 4]),
+            xattr::Xattr::new("system.foo", b"bar".to_vec()),
+        ];
+        ext.set_xattrs(&mut dev, ino, &xs).expect("set_xattrs");
+        ext.flush(&mut dev).expect("flush");
+
+        // `COMPAT_EXT_ATTR` must be advertised after attaching xattrs.
+        assert!(
+            ext.sb.feature_compat & constants::feature::COMPAT_EXT_ATTR != 0,
+            "COMPAT_EXT_ATTR must be set once xattrs are attached"
+        );
+
+        let reopened = Ext::open(&mut dev).expect("reopen ext4");
+        assert!(
+            reopened.sb.feature_compat & constants::feature::COMPAT_EXT_ATTR != 0,
+            "round-tripped image must keep COMPAT_EXT_ATTR"
+        );
+        let ino2 = reopened
+            .path_to_inode(&mut dev, "/labelled.txt")
+            .expect("path lookup");
+        let mut back = reopened.read_xattrs(&mut dev, ino2).expect("read_xattrs");
+
+        // `read_xattrs` returns entries in the kernel's sort order
+        // (name_index ASC, suffix ASC), so sort the expected set the
+        // same way before comparing.
+        let mut want = xs.clone();
+        let key = |x: &xattr::Xattr| {
+            let (idx, suffix) = xattr::name_index_and_suffix(&x.name);
+            (idx, suffix.to_string())
+        };
+        back.sort_by_key(&key);
+        want.sort_by_key(&key);
+        assert_eq!(back, want);
+    }
 }

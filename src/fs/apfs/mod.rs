@@ -794,7 +794,7 @@ impl crate::fs::Filesystem for Apfs {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "apfs: read-only on this trait surface".into(),
+            "apfs: write support is not yet implemented".into(),
         ))
     }
 
@@ -805,7 +805,7 @@ impl crate::fs::Filesystem for Apfs {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "apfs: read-only on this trait surface".into(),
+            "apfs: write support is not yet implemented".into(),
         ))
     }
 
@@ -817,7 +817,7 @@ impl crate::fs::Filesystem for Apfs {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "apfs: read-only on this trait surface".into(),
+            "apfs: write support is not yet implemented".into(),
         ))
     }
 
@@ -831,13 +831,13 @@ impl crate::fs::Filesystem for Apfs {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "apfs: read-only on this trait surface".into(),
+            "apfs: write support is not yet implemented".into(),
         ))
     }
 
     fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "apfs: read-only on this trait surface".into(),
+            "apfs: write support is not yet implemented".into(),
         ))
     }
 

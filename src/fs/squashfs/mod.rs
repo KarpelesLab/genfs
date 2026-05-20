@@ -692,9 +692,10 @@ impl crate::fs::Filesystem for Squashfs {
     }
 
     fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "squashfs: archives are write-once; remove() is unsupported".into(),
-        ))
+        Err(crate::Error::RepackOnly {
+            kind: "squashfs",
+            op: "rm",
+        })
     }
 
     fn list(

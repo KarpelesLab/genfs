@@ -326,10 +326,9 @@ impl crate::fs::Filesystem for Iso9660 {
     ) -> Result<()> {
         self.writer
             .as_mut()
-            .ok_or_else(|| {
-                crate::Error::Unsupported(
-                    "iso9660: read-only handle (no in-place modification)".into(),
-                )
+            .ok_or(crate::Error::RepackOnly {
+                kind: "iso9660",
+                op: "write",
             })?
             .add_file(path, src, meta)
     }
@@ -342,10 +341,9 @@ impl crate::fs::Filesystem for Iso9660 {
     ) -> Result<()> {
         self.writer
             .as_mut()
-            .ok_or_else(|| {
-                crate::Error::Unsupported(
-                    "iso9660: read-only handle (no in-place modification)".into(),
-                )
+            .ok_or(crate::Error::RepackOnly {
+                kind: "iso9660",
+                op: "write",
             })?
             .add_dir(path, meta)
     }
@@ -359,10 +357,9 @@ impl crate::fs::Filesystem for Iso9660 {
     ) -> Result<()> {
         self.writer
             .as_mut()
-            .ok_or_else(|| {
-                crate::Error::Unsupported(
-                    "iso9660: read-only handle (no in-place modification)".into(),
-                )
+            .ok_or(crate::Error::RepackOnly {
+                kind: "iso9660",
+                op: "write",
             })?
             .add_symlink(path, target, meta)
     }
@@ -378,10 +375,9 @@ impl crate::fs::Filesystem for Iso9660 {
     ) -> Result<()> {
         self.writer
             .as_mut()
-            .ok_or_else(|| {
-                crate::Error::Unsupported(
-                    "iso9660: read-only handle (no in-place modification)".into(),
-                )
+            .ok_or(crate::Error::RepackOnly {
+                kind: "iso9660",
+                op: "write",
             })?
             .add_device(path, kind, major, minor, meta)
     }
@@ -389,10 +385,9 @@ impl crate::fs::Filesystem for Iso9660 {
     fn remove(&mut self, _dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
         self.writer
             .as_mut()
-            .ok_or_else(|| {
-                crate::Error::Unsupported(
-                    "iso9660: read-only handle (no in-place modification)".into(),
-                )
+            .ok_or(crate::Error::RepackOnly {
+                kind: "iso9660",
+                op: "write",
             })?
             .remove_entry(path)
     }

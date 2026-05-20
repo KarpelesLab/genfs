@@ -367,9 +367,10 @@ impl crate::fs::Filesystem for Tar {
         _src: crate::fs::FileSource,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "tar: archives are sequential — use `repack` to produce a new tar".into(),
-        ))
+        Err(crate::Error::RepackOnly {
+            kind: "tar",
+            op: "write",
+        })
     }
 
     fn create_dir(
@@ -378,9 +379,10 @@ impl crate::fs::Filesystem for Tar {
         _path: &std::path::Path,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "tar: archives are sequential — use `repack` to produce a new tar".into(),
-        ))
+        Err(crate::Error::RepackOnly {
+            kind: "tar",
+            op: "write",
+        })
     }
 
     fn create_symlink(
@@ -390,9 +392,10 @@ impl crate::fs::Filesystem for Tar {
         _target: &std::path::Path,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "tar: archives are sequential — use `repack` to produce a new tar".into(),
-        ))
+        Err(crate::Error::RepackOnly {
+            kind: "tar",
+            op: "write",
+        })
     }
 
     fn create_device(
@@ -404,15 +407,17 @@ impl crate::fs::Filesystem for Tar {
         _minor: u32,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "tar: archives are sequential — use `repack` to produce a new tar".into(),
-        ))
+        Err(crate::Error::RepackOnly {
+            kind: "tar",
+            op: "write",
+        })
     }
 
     fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "tar: archives are sequential — use `repack` to produce a new tar".into(),
-        ))
+        Err(crate::Error::RepackOnly {
+            kind: "tar",
+            op: "write",
+        })
     }
 
     fn list(

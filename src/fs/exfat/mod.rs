@@ -1176,7 +1176,7 @@ impl crate::fs::Filesystem for Exfat {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "exfat: read-only on this trait surface".into(),
+            "exfat: write support is not yet implemented".into(),
         ))
     }
 
@@ -1187,7 +1187,7 @@ impl crate::fs::Filesystem for Exfat {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "exfat: read-only on this trait surface".into(),
+            "exfat: write support is not yet implemented".into(),
         ))
     }
 
@@ -1199,7 +1199,7 @@ impl crate::fs::Filesystem for Exfat {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "exfat: read-only on this trait surface".into(),
+            "exfat: write support is not yet implemented".into(),
         ))
     }
 
@@ -1213,13 +1213,13 @@ impl crate::fs::Filesystem for Exfat {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "exfat: read-only on this trait surface".into(),
+            "exfat: write support is not yet implemented".into(),
         ))
     }
 
     fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "exfat: read-only on this trait surface".into(),
+            "exfat: write support is not yet implemented".into(),
         ))
     }
 

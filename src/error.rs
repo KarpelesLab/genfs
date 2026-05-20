@@ -33,6 +33,23 @@ pub enum Error {
     /// A user-supplied value was malformed or contradictory (bad spec, etc.).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// The requested operation tried to mutate a repack-only filesystem
+    /// (ISO 9660, SquashFS, tar, …) on an already-flushed image.
+    /// Distinct from [`Error::Unsupported`] so callers can match the
+    /// variant directly instead of grepping a message string and route
+    /// the user to `repack`.
+    #[error(
+        "{op}: {kind} is a repack-only filesystem — use `fstool repack` to rebuild it"
+    )]
+    RepackOnly {
+        /// The filesystem kind that refused the operation (e.g.
+        /// `"iso9660"`, `"squashfs"`, `"tar"`).
+        kind: &'static str,
+        /// The operation that was attempted (`"add"`, `"rm"`, `"mkdir"`,
+        /// …). Free-form short verb; not a stable enum.
+        op: &'static str,
+    },
 }
 
 /// Convenience alias used throughout the crate.

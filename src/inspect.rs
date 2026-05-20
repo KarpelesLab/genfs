@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::DirEntry;
-use crate::fs::Filesystem;
 use crate::fs::apfs::Apfs;
 use crate::fs::exfat::Exfat;
 use crate::fs::ext::Ext;
@@ -385,34 +384,50 @@ impl AnyFs {
     }
 
     /// Whether this filesystem can mutate an already-flushed image
-    /// (`add` / `rm` against an existing on-disk FS). Returns the
-    /// inner trait impl's [`crate::fs::Filesystem::supports_mutation`]
-    /// for filesystems that have one, and `false` for read-only or
-    /// not-yet-trait-wired variants (tar, APFS, exFAT).
+    /// (`add` / `rm` against an existing on-disk FS). Delegates to the
+    /// inner [`crate::fs::Filesystem::supports_mutation`]. Repack-only
+    /// formats (tar / ISO 9660 / SquashFS) override the trait method
+    /// to false; everyone else inherits the `true` default — though
+    /// individual write methods on FSes whose writer isn't fully
+    /// implemented yet (APFS, exFAT) still return `Unsupported`
+    /// per-call.
     pub fn supports_mutation(&self) -> bool {
+        // Use the trait's `supports_mutation`, going through the same
+        // dispatch helper the rest of the surface uses. We don't take
+        // `&mut self` here, so we re-do a small per-variant match.
         match self {
-            Self::Ext(ext) => ext.supports_mutation(),
-            Self::Fat32(fat) => fat.supports_mutation(),
-            Self::HfsPlus(h) => h.supports_mutation(),
-            Self::Ntfs(n) => n.supports_mutation(),
-            Self::F2fs(fs2) => fs2.supports_mutation(),
-            Self::Squashfs(sq) => sq.supports_mutation(),
-            Self::Xfs(x) => x.supports_mutation(),
-            Self::Iso9660(iso) => iso.supports_mutation(),
-            Self::Tar(_) | Self::Apfs(_) | Self::Exfat(_) => false,
+            Self::Ext(ext) => crate::fs::Filesystem::supports_mutation(ext.as_ref()),
+            Self::Fat32(fat) => crate::fs::Filesystem::supports_mutation(fat.as_ref()),
+            Self::HfsPlus(h) => crate::fs::Filesystem::supports_mutation(h.as_ref()),
+            Self::Ntfs(n) => crate::fs::Filesystem::supports_mutation(n.as_ref()),
+            Self::F2fs(fs2) => crate::fs::Filesystem::supports_mutation(fs2.as_ref()),
+            Self::Squashfs(sq) => crate::fs::Filesystem::supports_mutation(sq.as_ref()),
+            Self::Xfs(x) => crate::fs::Filesystem::supports_mutation(x.as_ref()),
+            Self::Iso9660(iso) => crate::fs::Filesystem::supports_mutation(iso.as_ref()),
+            Self::Tar(t) => crate::fs::Filesystem::supports_mutation(t.as_ref()),
+            Self::Apfs(a) => crate::fs::Filesystem::supports_mutation(a.as_ref()),
+            Self::Exfat(e) => crate::fs::Filesystem::supports_mutation(e.as_ref()),
         }
     }
 
-    /// Internal guard: emit a uniform "repack-only" error for read-only
-    /// or sequential filesystems before dispatching a write call.
-    fn require_mutable(&self, op: &str) -> Result<()> {
+    /// Internal guard: if this filesystem is genuinely repack-only
+    /// (sequential layout — tar / ISO 9660 / SquashFS), emit
+    /// [`crate::Error::RepackOnly`] before dispatching a write call.
+    /// For filesystems whose writer simply isn't wired yet (APFS,
+    /// exFAT, …) the underlying trait method's own `Unsupported`
+    /// error will surface from the dispatch instead — the right
+    /// answer is "not implemented", not "use repack."
+    fn require_mutable(&self, op: &'static str) -> Result<()> {
         if self.supports_mutation() {
             return Ok(());
         }
-        let kind = self.kind_string();
-        Err(crate::Error::Unsupported(format!(
-            "{op}: {kind} is a repack-only filesystem — use `fstool repack` to rebuild it"
-        )))
+        // Only sequential / one-shot formats hit this — APFS/exFAT
+        // default to `supports_mutation == true` and let their own
+        // create_* methods return `Unsupported`.
+        Err(crate::Error::RepackOnly {
+            kind: self.kind_string(),
+            op,
+        })
     }
 
     /// Dispatch a closure to whichever inner filesystem implements
@@ -856,5 +871,35 @@ mod tests {
         let s = summary(&mut dev).unwrap();
         assert_eq!(s.kind, "ext2");
         assert!(s.supports_mutation);
+    }
+
+    /// `add` / `rm` on a repack-only filesystem (here: tar) should
+    /// surface the typed `Error::RepackOnly` variant — callers
+    /// shouldn't have to grep the message string to detect this.
+    #[test]
+    fn add_on_repack_only_returns_typed_error() {
+        use crate::fs::tar::{TarEntryMeta, TarStreamWriter};
+        // Build a minimal in-memory tar so AnyFs can open it. The
+        // single `/etc/` directory entry is enough for tar's parser.
+        let mut buf = Vec::<u8>::new();
+        {
+            let mut w = TarStreamWriter::new(&mut buf);
+            w.add_dir("/etc", TarEntryMeta::default(), &[]).unwrap();
+            w.finish().unwrap();
+        }
+        let mut dev = MemoryBackend::new(buf.len() as u64);
+        dev.write_at(0, &buf).unwrap();
+
+        let mut fs = AnyFs::open(&mut dev).unwrap();
+        let err = fs
+            .add_file(&mut dev, "/etc/new", std::path::Path::new("/dev/null"))
+            .expect_err("add on tar must fail");
+        match err {
+            crate::Error::RepackOnly { kind, op } => {
+                assert_eq!(kind, "tar");
+                assert_eq!(op, "add");
+            }
+            other => panic!("expected RepackOnly, got {other:?}"),
+        }
     }
 }

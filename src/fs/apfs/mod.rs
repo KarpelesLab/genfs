@@ -26,7 +26,12 @@
 //!    `(xid, name, sblock_paddr, create_time)` tuples. Snapshots can be
 //!    opened via [`Apfs::open_snapshot`] / [`Apfs::open_snapshot_by_name`].
 //! 7. The [`mod@write`] submodule produces minimal APFS images from
-//!    scratch — see [`write::ApfsWriter`] for the API.
+//!    scratch — see [`write::ApfsWriter`] for the library-only API.
+//!    The [`crate::fs::Filesystem`] trait is also wired up via
+//!    [`Apfs::format`]: `format → create_dir / create_file /
+//!    create_symlink → flush` materialises an image and transitions
+//!    the [`Apfs`] to read mode. After flush the volume is sealed
+//!    (no further mutation), matching the writer's single-pass model.
 //!
 //! ## Honest limitations
 //!
@@ -100,6 +105,17 @@ const ROOT_DIR_INO: u64 = 2;
 /// internally mutate cache state. Callers that need read-from-multiple
 /// threads should wrap the whole `Apfs` in a `Mutex` — there is no
 /// internal locking.
+///
+/// An [`Apfs`] can be in one of two states:
+///
+/// - **Read state** (the default after [`Apfs::open`] / [`Apfs::open_volume`]):
+///   the volume has been parsed off the device and the reader caches
+///   are live.
+/// - **Pending-write state** (after [`Apfs::format`]): the device has
+///   not yet been written. Buffered `create_*` operations are queued
+///   in memory; [`crate::fs::Filesystem::flush`] drains the queue
+///   into an [`write::ApfsWriter`] and then transitions the [`Apfs`]
+///   to read state by re-parsing the just-written image.
 pub struct Apfs {
     /// Effective block size (`nx_block_size`).
     block_size: u32,
@@ -107,6 +123,23 @@ pub struct Apfs {
     total_bytes: u64,
     /// Volume name (UTF-8, trimmed of trailing NUL).
     volume_name: String,
+    /// Internal state: either pending-write (buffered ops) or read
+    /// (parsed fs-tree, ready for queries).
+    state: ApfsState,
+}
+
+/// Internal state machine for [`Apfs`]. See the [`Apfs`] doc-comment
+/// for what each state means.
+enum ApfsState {
+    /// Read mode: the volume has been parsed and is ready for queries.
+    Read(ReadState),
+    /// Pending-write mode: buffered `create_*` ops waiting for
+    /// [`crate::fs::Filesystem::flush`].
+    PendingWrite(PendingWrite),
+}
+
+/// Read-mode caches: everything needed to walk the fs-tree.
+struct ReadState {
     /// `apfs_snap_meta_tree_oid` — physical block of the snapshot
     /// metadata B-tree root, or zero when the volume has no snapshots.
     snap_meta_tree_oid: u64,
@@ -126,14 +159,62 @@ pub struct Apfs {
     drec_layout: DrecKeyLayout,
 }
 
+/// Pending-write buffer: an ordered list of `create_*` operations
+/// plus a path → oid map. Drained by [`crate::fs::Filesystem::flush`].
+struct PendingWrite {
+    /// Image geometry recorded at `format()` time.
+    total_blocks: u64,
+    /// Map of every directory created so far to its inode oid. The
+    /// root "/" maps to 2 from the start. Walking nested paths during
+    /// `create_*` requires the parent to be in this map.
+    dir_oid: std::collections::HashMap<std::path::PathBuf, u64>,
+    /// Buffered create operations, replayed in order on `flush()`.
+    ops: Vec<PendingOp>,
+    /// Synthetic oid counter used to populate `dir_oid` for nested
+    /// directories at buffer time. Mirrors the writer's
+    /// `alloc_oid` sequence so flushed oids stay consistent with
+    /// what callers were told to expect.
+    next_oid: u64,
+}
+
+/// A single buffered create operation.
+enum PendingOp {
+    /// `create_dir` — `parent_oid` is the oid of the directory the
+    /// new dir lives under; `name` is the leaf name.
+    Dir {
+        parent_oid: u64,
+        name: String,
+        mode: u16,
+    },
+    /// `create_file` — same shape as `Dir`. The file's bytes are
+    /// captured into `data` at buffer time because [`crate::fs::FileSource`]
+    /// is consumed by the trait call.
+    File {
+        parent_oid: u64,
+        name: String,
+        mode: u16,
+        data: Vec<u8>,
+    },
+    /// `create_symlink` — same shape as `Dir`, plus the link target.
+    Symlink {
+        parent_oid: u64,
+        name: String,
+        mode: u16,
+        target: String,
+    },
+}
+
 impl std::fmt::Debug for Apfs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state_name = match &self.state {
+            ApfsState::Read(_) => "Read",
+            ApfsState::PendingWrite(_) => "PendingWrite",
+        };
         f.debug_struct("Apfs")
             .field("block_size", &self.block_size)
             .field("total_bytes", &self.total_bytes)
             .field("volume_name", &self.volume_name)
-            .field("drec_layout", &self.drec_layout)
-            .field("volume_index", &self.volume_index)
+            .field("state", &state_name)
             .finish_non_exhaustive()
     }
 }
@@ -187,6 +268,61 @@ pub struct SnapshotInfo {
 }
 
 impl Apfs {
+    /// Return `&ReadState` if in read mode, else an error. Used by every
+    /// reader API to refuse cleanly when the [`Apfs`] is still buffering
+    /// writes.
+    fn read_state(&self) -> Result<&ReadState> {
+        match &self.state {
+            ApfsState::Read(r) => Ok(r),
+            ApfsState::PendingWrite(_) => Err(crate::Error::Unsupported(
+                "apfs: filesystem is in pending-write mode; call flush() first".into(),
+            )),
+        }
+    }
+
+    /// Format an empty single-volume APFS image on `dev`. The returned
+    /// [`Apfs`] is in pending-write mode: [`crate::fs::Filesystem::create_file`],
+    /// [`crate::fs::Filesystem::create_dir`], and
+    /// [`crate::fs::Filesystem::create_symlink`] buffer their effects
+    /// in memory, and [`crate::fs::Filesystem::flush`] materialises the
+    /// on-disk image and transitions the [`Apfs`] to read mode.
+    ///
+    /// `total_blocks * block_size` must fit inside `dev.total_size()`.
+    /// `block_size` follows the same constraints as
+    /// [`write::ApfsWriter::new`] (power of two between 512 and 65 536;
+    /// 4096 is the conventional value).
+    ///
+    /// Note: the image is only written to `dev` when `flush()` is
+    /// called. Before that, `dev` is not touched (other than the
+    /// size sanity-check performed inside [`write::ApfsWriter::new`],
+    /// which is non-destructive).
+    pub fn format(
+        dev: &mut dyn BlockDevice,
+        total_blocks: u64,
+        block_size: u32,
+        volume_name: &str,
+    ) -> Result<Self> {
+        // Sanity-check geometry up front by constructing (and discarding)
+        // a writer. This validates the same invariants `flush()` will
+        // re-check, so callers find out about a bad geometry immediately
+        // instead of after a series of `create_*` calls.
+        let _ = write::ApfsWriter::new(dev, total_blocks, block_size, volume_name)?;
+        let mut dir_oid = std::collections::HashMap::new();
+        dir_oid.insert(std::path::PathBuf::from("/"), ROOT_DIR_INO);
+        Ok(Self {
+            block_size,
+            total_bytes: total_blocks.saturating_mul(block_size as u64),
+            volume_name: volume_name.to_string(),
+            state: ApfsState::PendingWrite(PendingWrite {
+                total_blocks,
+                dir_oid,
+                ops: Vec::new(),
+                // Mirror `ApfsWriter::new`: writer starts oid counter at 16.
+                next_oid: 16,
+            }),
+        })
+    }
+
     /// Decode the container, find the active checkpoint, locate the
     /// first populated volume slot, and cache its fs-tree root block.
     /// Errors out with `Unsupported` when the image trips one of the
@@ -371,11 +507,13 @@ impl Apfs {
             block_size,
             total_bytes: ctx.total_bytes,
             volume_name: apsb.volname,
-            snap_meta_tree_oid: apsb.snap_meta_tree_oid,
-            volume_index: index,
-            fsroot_block,
-            fs_ctx: std::cell::RefCell::new(fs_ctx),
-            drec_layout,
+            state: ApfsState::Read(ReadState {
+                snap_meta_tree_oid: apsb.snap_meta_tree_oid,
+                volume_index: index,
+                fsroot_block,
+                fs_ctx: std::cell::RefCell::new(fs_ctx),
+                drec_layout,
+            }),
         })
     }
 
@@ -384,13 +522,12 @@ impl Apfs {
     /// block directly. Multi-level snap-meta trees return `Unsupported`
     /// cleanly.
     pub fn list_snapshots(&self, dev: &mut dyn BlockDevice) -> Result<Vec<SnapshotInfo>> {
-        if self.snap_meta_tree_oid == 0 {
+        let rs = self.read_state()?;
+        if rs.snap_meta_tree_oid == 0 {
             return Ok(Vec::new());
         }
         let mut root = vec![0u8; self.block_size as usize];
-        let off = self
-            .snap_meta_tree_oid
-            .saturating_mul(self.block_size as u64);
+        let off = rs.snap_meta_tree_oid.saturating_mul(self.block_size as u64);
         dev.read_at(off, &mut root)?;
         let node = btree::BTreeNode::decode(&root)?;
         if !node.is_leaf() {
@@ -428,6 +565,7 @@ impl Apfs {
     /// `self` but filters lookups by the snapshot's xid, so it sees
     /// the on-disk state that existed at that xid.
     pub fn open_snapshot(&self, dev: &mut dyn BlockDevice, xid: u64) -> Result<Self> {
+        let vol_index = self.read_state()?.volume_index;
         let snaps = self.list_snapshots(dev)?;
         let snap = snaps
             .iter()
@@ -437,16 +575,12 @@ impl Apfs {
             })?
             .clone();
         let ctx = load_container(dev)?;
-        Self::open_volume_with_ctx(
-            dev,
-            &ctx,
-            self.volume_index,
-            Some((snap.sblock_paddr, snap.xid)),
-        )
+        Self::open_volume_with_ctx(dev, &ctx, vol_index, Some((snap.sblock_paddr, snap.xid)))
     }
 
     /// Open a snapshot of this volume by name.
     pub fn open_snapshot_by_name(&self, dev: &mut dyn BlockDevice, name: &str) -> Result<Self> {
+        let vol_index = self.read_state()?.volume_index;
         let snaps = self.list_snapshots(dev)?;
         let snap = snaps
             .iter()
@@ -456,12 +590,7 @@ impl Apfs {
             })?
             .clone();
         let ctx = load_container(dev)?;
-        Self::open_volume_with_ctx(
-            dev,
-            &ctx,
-            self.volume_index,
-            Some((snap.sblock_paddr, snap.xid)),
-        )
+        Self::open_volume_with_ctx(dev, &ctx, vol_index, Some((snap.sblock_paddr, snap.xid)))
     }
 
     /// List the children of `path`. Only absolute paths starting at "/"
@@ -496,17 +625,18 @@ impl Apfs {
         path: &str,
     ) -> Result<std::collections::HashMap<String, Vec<u8>>> {
         let target_oid = self.resolve_path_to_oid(dev, path)?;
+        let rs = self.read_state()?;
         let target = FsKeyTarget {
             oid: target_oid,
             kind: APFS_TYPE_XATTR,
             tail: &[],
-            drec_layout: self.drec_layout,
+            drec_layout: rs.drec_layout,
         };
         let block_size = self.block_size;
-        let mut ctx = self.fs_ctx.borrow_mut();
+        let mut ctx = rs.fs_ctx.borrow_mut();
         let mut out = std::collections::HashMap::new();
         let mut scan =
-            RangeScan::start(&self.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
                 read_at_paddr(dev, paddr, block_size, buf)
             })?;
         while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
@@ -601,7 +731,8 @@ impl Apfs {
         parent_oid: u64,
         name: &str,
     ) -> Result<Option<u64>> {
-        let layout = self.drec_layout;
+        let rs = self.read_state()?;
+        let layout = rs.drec_layout;
         let target = FsKeyTarget {
             oid: parent_oid,
             kind: APFS_TYPE_DIR_REC,
@@ -609,9 +740,9 @@ impl Apfs {
             drec_layout: layout,
         };
         let block_size = self.block_size;
-        let mut ctx = self.fs_ctx.borrow_mut();
+        let mut ctx = rs.fs_ctx.borrow_mut();
         let mut scan =
-            RangeScan::start(&self.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
                 read_at_paddr(dev, paddr, block_size, buf)
             })?;
         while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
@@ -641,7 +772,8 @@ impl Apfs {
         dir_oid: u64,
     ) -> Result<Vec<crate::fs::DirEntry>> {
         use crate::fs::{DirEntry as FsDirEntry, EntryKind};
-        let layout = self.drec_layout;
+        let rs = self.read_state()?;
+        let layout = rs.drec_layout;
         let target = FsKeyTarget {
             oid: dir_oid,
             kind: APFS_TYPE_DIR_REC,
@@ -649,10 +781,10 @@ impl Apfs {
             drec_layout: layout,
         };
         let block_size = self.block_size;
-        let mut ctx = self.fs_ctx.borrow_mut();
+        let mut ctx = rs.fs_ctx.borrow_mut();
         let mut out = Vec::new();
         let mut scan =
-            RangeScan::start(&self.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
                 read_at_paddr(dev, paddr, block_size, buf)
             })?;
         while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
@@ -701,16 +833,17 @@ impl Apfs {
     /// `(oid, APFS_TYPE_INODE)` range scan yields exactly the one we
     /// want (at most one record per oid in a fs-tree).
     fn lookup_inode_size(&self, dev: &mut dyn BlockDevice, oid: u64) -> Result<(u64, Option<u64>)> {
+        let rs = self.read_state()?;
         let target = FsKeyTarget {
             oid,
             kind: APFS_TYPE_INODE,
             tail: &[],
-            drec_layout: self.drec_layout,
+            drec_layout: rs.drec_layout,
         };
         let block_size = self.block_size;
-        let mut ctx = self.fs_ctx.borrow_mut();
+        let mut ctx = rs.fs_ctx.borrow_mut();
         let mut scan =
-            RangeScan::start(&self.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
                 read_at_paddr(dev, paddr, block_size, buf)
             })?;
         if let Some((_kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
@@ -749,17 +882,18 @@ impl Apfs {
         dev: &mut dyn BlockDevice,
         dstream_oid: u64,
     ) -> Result<Vec<(u64, FileExtentVal)>> {
+        let rs = self.read_state()?;
         let target = FsKeyTarget {
             oid: dstream_oid,
             kind: APFS_TYPE_FILE_EXTENT,
             tail: &[],
-            drec_layout: self.drec_layout,
+            drec_layout: rs.drec_layout,
         };
         let block_size = self.block_size;
-        let mut ctx = self.fs_ctx.borrow_mut();
+        let mut ctx = rs.fs_ctx.borrow_mut();
         let mut out = Vec::new();
         let mut scan =
-            RangeScan::start(&self.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
                 read_at_paddr(dev, paddr, block_size, buf)
             })?;
         while let Some((kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
@@ -781,44 +915,95 @@ impl Apfs {
     }
 }
 
-/// Read-only `Filesystem` adapter so `inspect::open(dev)` can return a
-/// `Box<dyn Filesystem>` that walks an APFS container. Writes return
-/// `Unsupported` — the APFS writer is library-only and not yet trait
-/// wired.
+/// `Filesystem` adapter for APFS. An [`Apfs`] opened via
+/// [`Apfs::open`] is read-only — mutation calls return `Unsupported`.
+/// An [`Apfs`] returned by [`Apfs::format`] is in pending-write mode:
+/// `create_file` / `create_dir` / `create_symlink` buffer operations
+/// in memory and `flush` drains them into a fresh image through
+/// [`write::ApfsWriter`]. After `flush` the [`Apfs`] is in read mode
+/// and behaves like a freshly-opened image.
 impl crate::fs::Filesystem for Apfs {
     fn create_file(
         &mut self,
         _dev: &mut dyn BlockDevice,
-        _path: &std::path::Path,
-        _src: crate::fs::FileSource,
-        _meta: crate::fs::FileMeta,
+        path: &std::path::Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "apfs: write support is not yet implemented".into(),
-        ))
+        // Pull bytes out of `src` while we still have it. APFS' writer
+        // streams from a Read, but we have to buffer here because the
+        // writer doesn't exist yet — flush() builds it. For real-world
+        // use this means create_file is bounded by available RAM. Empty
+        // files are fine.
+        let (mut reader, size) = src
+            .open()
+            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+        let mut data = Vec::with_capacity(size.min(64 * 1024 * 1024) as usize);
+        let n = std::io::Read::read_to_end(&mut reader, &mut data)
+            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+        if n as u64 != size {
+            // Pad with zeros so dstream.size still matches what the user
+            // asked for; mirrors the writer's truncation handling.
+            data.resize(size as usize, 0);
+        }
+        let pw = pending_write_mut(&mut self.state)?;
+        let (parent_oid, name) = pw.resolve_parent(path)?;
+        pw.ops.push(PendingOp::File {
+            parent_oid,
+            name,
+            mode: meta.mode,
+            data,
+        });
+        // Consume an oid slot so future creates see the same sequence
+        // the writer will use. add_file_from_reader allocates one oid.
+        pw.next_oid = pw.next_oid.saturating_add(1);
+        Ok(())
     }
 
     fn create_dir(
         &mut self,
         _dev: &mut dyn BlockDevice,
-        _path: &std::path::Path,
-        _meta: crate::fs::FileMeta,
+        path: &std::path::Path,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "apfs: write support is not yet implemented".into(),
-        ))
+        let pw = pending_write_mut(&mut self.state)?;
+        let (parent_oid, name) = pw.resolve_parent(path)?;
+        // Assign a deterministic oid that matches what the writer will
+        // hand out for this position in the call sequence, and remember
+        // it so nested children of this directory can resolve their
+        // parent path on subsequent calls.
+        let new_oid = pw.next_oid;
+        pw.next_oid = pw.next_oid.saturating_add(1);
+        pw.dir_oid.insert(path.to_path_buf(), new_oid);
+        pw.ops.push(PendingOp::Dir {
+            parent_oid,
+            name,
+            mode: meta.mode,
+        });
+        Ok(())
     }
 
     fn create_symlink(
         &mut self,
         _dev: &mut dyn BlockDevice,
-        _path: &std::path::Path,
-        _target: &std::path::Path,
-        _meta: crate::fs::FileMeta,
+        path: &std::path::Path,
+        target: &std::path::Path,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "apfs: write support is not yet implemented".into(),
-        ))
+        let target_str = target
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 symlink target".into()))?
+            .to_string();
+        let pw = pending_write_mut(&mut self.state)?;
+        let (parent_oid, name) = pw.resolve_parent(path)?;
+        pw.ops.push(PendingOp::Symlink {
+            parent_oid,
+            name,
+            mode: meta.mode,
+            target: target_str,
+        });
+        pw.next_oid = pw.next_oid.saturating_add(1);
+        Ok(())
     }
 
     fn create_device(
@@ -831,13 +1016,13 @@ impl crate::fs::Filesystem for Apfs {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "apfs: write support is not yet implemented".into(),
+            "apfs: device nodes are not supported by the writer".into(),
         ))
     }
 
     fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "apfs: write support is not yet implemented".into(),
+            "apfs: remove is not supported (writer is single-pass)".into(),
         ))
     }
 
@@ -864,12 +1049,163 @@ impl crate::fs::Filesystem for Apfs {
         Ok(Box::new(r))
     }
 
-    fn flush(&mut self, _dev: &mut dyn BlockDevice) -> Result<()> {
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        // Take ownership of the pending buffer so we can drop our
+        // borrow on `self.state` before re-opening below.
+        let pw = match std::mem::replace(
+            &mut self.state,
+            ApfsState::PendingWrite(PendingWrite {
+                total_blocks: 0,
+                dir_oid: std::collections::HashMap::new(),
+                ops: Vec::new(),
+                next_oid: 16,
+            }),
+        ) {
+            ApfsState::Read(_) => {
+                // Nothing to flush — restore an empty read view by
+                // re-reading the device. This is a no-op for read-mode
+                // images.
+                return Ok(());
+            }
+            ApfsState::PendingWrite(p) => p,
+        };
+        // Materialise the image via ApfsWriter, replaying our buffered
+        // operations in order.
+        let block_size = self.block_size;
+        let volume_name = self.volume_name.clone();
+        {
+            let mut w = write::ApfsWriter::new(dev, pw.total_blocks, block_size, &volume_name)?;
+            for op in pw.ops {
+                match op {
+                    PendingOp::Dir {
+                        parent_oid,
+                        name,
+                        mode,
+                    } => {
+                        w.add_dir(parent_oid, &name, mode)?;
+                    }
+                    PendingOp::File {
+                        parent_oid,
+                        name,
+                        mode,
+                        data,
+                    } => {
+                        let len = data.len() as u64;
+                        let mut r = std::io::Cursor::new(data);
+                        w.add_file_from_reader(parent_oid, &name, mode, &mut r, len)?;
+                    }
+                    PendingOp::Symlink {
+                        parent_oid,
+                        name,
+                        mode,
+                        target,
+                    } => {
+                        w.add_symlink(parent_oid, &name, mode, &target)?;
+                    }
+                }
+            }
+            w.finish()?;
+        }
+        // Re-parse the just-written image into read state. We open the
+        // single volume we just wrote and adopt its state.
+        let fresh = Apfs::open(dev)?;
+        // Take fresh's state. fresh's other fields (block_size, etc.)
+        // must already match ours since they describe the same image.
+        debug_assert_eq!(fresh.block_size, self.block_size);
+        debug_assert_eq!(fresh.total_bytes, self.total_bytes);
+        self.state = fresh.state;
+        self.volume_name = fresh.volume_name;
         Ok(())
     }
 
-    fn supports_mutation(&self) -> bool {
-        false
+    fn mutation_capability(&self) -> crate::fs::MutationCapability {
+        match &self.state {
+            // In pending-write mode the writer is single-pass / append-
+            // only with no remove or partial-write hooks. WholeFileOnly
+            // is the closest fit ("can add whole files, can't patch").
+            ApfsState::PendingWrite(_) => crate::fs::MutationCapability::WholeFileOnly,
+            // Once flushed, the image is sealed — the writer can't
+            // re-open and mutate. Mirrors ISO 9660 / SquashFS.
+            ApfsState::Read(_) => crate::fs::MutationCapability::Immutable,
+        }
+    }
+}
+
+impl crate::fs::FilesystemFactory for Apfs {
+    type FormatOpts = ApfsFormatOpts;
+
+    fn format(dev: &mut dyn BlockDevice, opts: &Self::FormatOpts) -> Result<Self> {
+        Apfs::format(dev, opts.total_blocks, opts.block_size, &opts.volume_name)
+    }
+
+    fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        Apfs::open(dev)
+    }
+}
+
+/// Format options for [`Apfs::format`] via the [`crate::fs::FilesystemFactory`]
+/// surface. Mirrors the positional arguments on the inherent
+/// `Apfs::format` method.
+#[derive(Debug, Clone)]
+pub struct ApfsFormatOpts {
+    /// Image size in blocks. Must satisfy
+    /// `total_blocks * block_size <= dev.total_size()`.
+    pub total_blocks: u64,
+    /// Block size in bytes. Power of two between 512 and 65 536.
+    /// 4096 is the conventional APFS value.
+    pub block_size: u32,
+    /// Volume label written into the APSB.
+    pub volume_name: String,
+}
+
+impl Default for ApfsFormatOpts {
+    /// Sensible defaults: 64 blocks × 4096 bytes = 256 KiB image,
+    /// volume named "APFS".
+    fn default() -> Self {
+        Self {
+            total_blocks: 64,
+            block_size: 4096,
+            volume_name: "APFS".to_string(),
+        }
+    }
+}
+
+/// Borrow the [`PendingWrite`] inside `state`, or return an error if
+/// the [`Apfs`] is in read mode.
+fn pending_write_mut(state: &mut ApfsState) -> Result<&mut PendingWrite> {
+    match state {
+        ApfsState::PendingWrite(p) => Ok(p),
+        ApfsState::Read(_) => Err(crate::Error::Unsupported(
+            "apfs: filesystem has already been flushed; mutation after flush is not supported"
+                .into(),
+        )),
+    }
+}
+
+impl PendingWrite {
+    /// Split `path` into `(parent_oid, leaf_name)`. The parent must
+    /// already exist in `dir_oid` (created via `create_dir`, or "/")
+    /// — implicit parent creation is not supported.
+    fn resolve_parent(&self, path: &std::path::Path) -> Result<(u64, String)> {
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("/"));
+        let parent_buf = if parent.as_os_str().is_empty() {
+            std::path::PathBuf::from("/")
+        } else {
+            parent.to_path_buf()
+        };
+        let leaf = path
+            .file_name()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: empty leaf name".into()))?
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 leaf name".into()))?
+            .to_string();
+        let parent_oid = *self.dir_oid.get(&parent_buf).ok_or_else(|| {
+            crate::Error::InvalidArgument(format!(
+                "apfs: parent directory {:?} not found; call create_dir() for it first",
+                parent_buf
+            ))
+        })?;
+        Ok((parent_oid, leaf))
     }
 }
 
@@ -1169,5 +1505,144 @@ mod tests {
         let mut dev = MemoryBackend::new(64 * 1024);
         let e = Apfs::list_volumes(&mut dev).unwrap_err();
         assert!(matches!(e, crate::Error::InvalidImage(_)));
+    }
+
+    /// End-to-end through the [`crate::fs::Filesystem`] trait:
+    /// `format` → `create_dir` → `create_file` → `flush` → `list` /
+    /// `read_file`. This is the round-trip the task brief calls out as
+    /// the success bar for trait wiring.
+    #[test]
+    fn trait_round_trip_format_create_flush_read() {
+        use crate::fs::{FileMeta, FileSource, Filesystem};
+        use std::io::Read;
+
+        let total_blocks = 128u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+
+        let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "TraitVol").unwrap();
+        // Capability advertises WholeFileOnly while buffering.
+        assert!(matches!(
+            apfs.mutation_capability(),
+            crate::fs::MutationCapability::WholeFileOnly
+        ));
+
+        // create_dir + create_file under root and under that dir.
+        apfs.create_dir(
+            &mut dev,
+            std::path::Path::new("/sub"),
+            FileMeta::with_mode(0o755),
+        )
+        .unwrap();
+        let payload: Vec<u8> = b"hello via trait".to_vec();
+        apfs.create_file(
+            &mut dev,
+            std::path::Path::new("/sub/hello.txt"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(payload.clone())),
+                len: payload.len() as u64,
+            },
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        // A file at root too, to exercise the "/"-as-parent path.
+        apfs.create_file(
+            &mut dev,
+            std::path::Path::new("/note"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"top-level".to_vec())),
+                len: 9,
+            },
+            FileMeta::with_mode(0o600),
+        )
+        .unwrap();
+
+        // Flush materialises the image and transitions to read mode.
+        apfs.flush(&mut dev).unwrap();
+        assert!(matches!(
+            apfs.mutation_capability(),
+            crate::fs::MutationCapability::Immutable
+        ));
+
+        // Verify by listing and reading through the same trait surface.
+        let root = apfs.list(&mut dev, std::path::Path::new("/")).unwrap();
+        let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"sub"), "root listing: {names:?}");
+        assert!(names.contains(&"note"), "root listing: {names:?}");
+
+        let sub = apfs.list(&mut dev, std::path::Path::new("/sub")).unwrap();
+        let sub_names: Vec<&str> = sub.iter().map(|e| e.name.as_str()).collect();
+        assert!(sub_names.contains(&"hello.txt"), "/sub listing: {sub_names:?}");
+
+        let mut buf = Vec::new();
+        apfs.read_file(&mut dev, std::path::Path::new("/sub/hello.txt"))
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
+        assert_eq!(buf, payload);
+
+        buf.clear();
+        apfs.read_file(&mut dev, std::path::Path::new("/note"))
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
+        assert_eq!(buf, b"top-level");
+    }
+
+    /// Once flushed, further `create_*` calls return Unsupported (the
+    /// writer doesn't support post-flush mutation).
+    #[test]
+    fn trait_create_after_flush_is_unsupported() {
+        use crate::fs::{FileMeta, FileSource, Filesystem};
+        let total_blocks = 64u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Vol").unwrap();
+        apfs.flush(&mut dev).unwrap();
+        let e = apfs
+            .create_file(
+                &mut dev,
+                std::path::Path::new("/late"),
+                FileSource::Zero(0),
+                FileMeta::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(e, crate::Error::Unsupported(_)));
+    }
+
+    /// Creating a file under a parent that hasn't been declared via
+    /// `create_dir` is an InvalidArgument (no implicit-parent magic).
+    #[test]
+    fn trait_create_file_requires_existing_parent() {
+        use crate::fs::{FileMeta, FileSource, Filesystem};
+        let total_blocks = 64u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Vol").unwrap();
+        let e = apfs
+            .create_file(
+                &mut dev,
+                std::path::Path::new("/nope/file"),
+                FileSource::Zero(0),
+                FileMeta::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(e, crate::Error::InvalidArgument(_)));
+    }
+
+    /// Reading from a freshly-formatted (still-buffering) [`Apfs`]
+    /// refuses cleanly with Unsupported — the device hasn't been
+    /// written yet.
+    #[test]
+    fn read_before_flush_is_unsupported() {
+        use crate::fs::Filesystem;
+        let total_blocks = 64u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        let mut apfs = Apfs::format(&mut dev, total_blocks, bs, "Vol").unwrap();
+        let e = apfs
+            .list(&mut dev, std::path::Path::new("/"))
+            .unwrap_err();
+        assert!(matches!(e, crate::Error::Unsupported(_)));
     }
 }

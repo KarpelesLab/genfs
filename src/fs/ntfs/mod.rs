@@ -64,6 +64,7 @@ pub mod boot;
 pub mod compression;
 pub mod format;
 pub mod index;
+pub mod logfile;
 pub mod mft;
 pub mod run_list;
 pub mod rw;

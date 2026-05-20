@@ -8,23 +8,32 @@
 //! attribute, an updated `$FILE_NAME` size pair, and free / allocate
 //! clusters in the volume bitmap.
 //!
-//! ## Path B: clean-unmount bypass
+//! ## Path A: real `$LogFile` records
 //!
-//! NTFS's journal lives in `$LogFile` (MFT record 2). A real
-//! transaction-aware writer would emit `LCNS_LOG_RECORD` entries for
-//! every update; we don't.
+//! Each `sync()` runs a write-ahead-log commit through [`super::logfile`]:
 //!
-//! Instead we rely on the property that an all-zero `$LogFile` is treated
-//! by both kernel NTFS3 and ntfs-3g as "empty / not replayable" (i.e. a
-//! cleanly closed log). `format()` already lays the file down as
-//! zero-filled. `open_file_rw`:
+//! 1. Pack `(target_offset, redo_bytes, undo_bytes)` for every metadata
+//!    write (the MFT record itself; optionally the parent dir's `$I30`
+//!    size patch) into an `RCRD` page and stamp it into `$LogFile`.
+//! 2. Mark the restart pages dirty (`CleanDismount` cleared) with the
+//!    new `CurrentLsn`.
+//! 3. Apply the in-place writes.
+//! 4. Mark the restart pages clean.
 //!
-//! * Refuses to start if the existing `$LogFile` carries any non-zero
-//!   bytes (i.e. the volume has an active journal we don't understand).
-//! * Leaves `$LogFile` untouched after writes (still zero ⇒ still clean).
+//! A crash between steps 2 and 4 leaves a recoverable image: on the
+//! next open, `ensure_clean_log` walks the `RCRD` pages and re-applies
+//! their `redo_bytes`, then re-stamps `CleanDismount`. Foreign LFS
+//! consumers (kernel NTFS3, ntfs-3g, `ntfsfix`) see the restart pages
+//! as a structurally valid v1.1 log with `CleanDismount` set, and
+//! don't try to decode our private record payload (see
+//! [`super::logfile`] for the payload format).
 //!
-//! Other ntfs-3g sanity bits (`$Bitmap`, `$MFT`, `$MFTMirr`, the boot
-//! sector) are persisted by [`super::Ntfs::flush`] as today.
+//! Bulk `$DATA` byte writes are not journaled — they go straight to
+//! disk inside `write_internal`. This matches the NTFS convention:
+//! only metadata is logged, not user-data ranges.
+//!
+//! Volume-level state (`$Bitmap`, `$MFT`, `$MFTMirr`, boot sector) is
+//! persisted by [`super::Ntfs::flush`] as today.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -36,8 +45,7 @@ use super::attribute::{
     AttributeIter, AttributeKind, FileName, TYPE_DATA, TYPE_FILE_NAME, decode_utf16le,
 };
 use super::format::{
-    self, REC_LOGFILE, build_file_name_value, build_non_resident_attr, build_resident_attr,
-    encode_run_list,
+    self, build_file_name_value, build_non_resident_attr, build_resident_attr, encode_run_list,
 };
 use super::mft;
 use super::run_list::Extent;
@@ -372,6 +380,13 @@ impl<'a> NtfsFileHandle<'a> {
     /// Rewrite the MFT record with up-to-date `$STANDARD_INFORMATION`,
     /// `$FILE_NAME`, and `$DATA` attributes. Called from `sync()` /
     /// `Drop`.
+    ///
+    /// Goes through the LFS journal: every in-place write of metadata
+    /// (the MFT record itself plus the parent directory's `$I30` size
+    /// pair) is captured as a redo/undo pair, packed into an RCRD page,
+    /// and stamped into `$LogFile` before being applied. Restart pages
+    /// are toggled `dirty → clean` around the commit so a crash in the
+    /// middle leaves enough information to redo on the next open.
     fn flush_record(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
@@ -459,49 +474,44 @@ impl<'a> NtfsFileHandle<'a> {
             1,
         );
 
-        // Write the record back to its MFT slot.
-        let off = {
+        // Pre-read the old MFT record bytes so we can journal the
+        // (redo, undo) pair.
+        let mft_off = {
             let w =
                 self.fs.writer.as_ref().ok_or_else(|| {
                     crate::Error::Unsupported("ntfs: writer not initialised".into())
                 })?;
             w.mft_offset(self.rec_no)?
         };
-        self.dev.write_at(off, &rec_buf)?;
+        let mut old_rec = vec![0u8; self.rec_size];
+        self.dev.read_at(mft_off, &mut old_rec)?;
 
-        // Also update the parent directory's $I30 entry's embedded size
-        // pair, so `list_path()` reports the new size without re-reading
-        // the file's MFT record. This is best-effort: if the directory
-        // index doesn't carry an entry for us (e.g. concurrent rename),
-        // we just leave the index alone.
-        let _ = self.update_index_entry();
+        // Gather pending journal entries. The MFT record is the
+        // load-bearing one; the parent-dir index patch is best-effort
+        // and we include it only when it actually changes bytes.
+        let mut txn: Vec<super::logfile::RedoEntry> = Vec::new();
+        txn.push(super::logfile::RedoEntry {
+            target_offset: mft_off,
+            redo_bytes: rec_buf.clone(),
+            undo_bytes: old_rec,
+        });
+        if let Some(entry) = self.build_index_entry_redo()? {
+            txn.push(entry);
+        }
+
+        // Commit through the journal: write LFS records, stamp restart
+        // pages dirty, apply the in-place writes, stamp restart pages
+        // clean.
+        self.commit_txn(&txn)?;
 
         self.dirty = false;
         Ok(())
     }
 
-    /// Read the `flags` u16 from the current on-disk MFT record. Falls
-    /// back to `FLAG_IN_USE` when the record can't be parsed.
-    fn read_existing_flags(&mut self) -> Result<u16> {
-        let off = self
-            .fs
-            .writer
-            .as_ref()
-            .ok_or_else(|| crate::Error::Unsupported("ntfs: writer not initialised".into()))?
-            .mft_offset(self.rec_no)?;
-        let mut rec = vec![0u8; self.rec_size];
-        self.dev.read_at(off, &mut rec)?;
-        if mft::apply_fixup(&mut rec, self.sector_size).is_err() {
-            return Ok(mft::RecordHeader::FLAG_IN_USE);
-        }
-        let hdr = mft::RecordHeader::parse(&rec)?;
-        Ok(hdr.flags)
-    }
-
-    /// Patch the parent directory's `$I30` index entry (root-only and
-    /// $INDEX_ALLOCATION blocks both supported) to carry the new
-    /// `real_size` / `allocated_size`. Best-effort.
-    fn update_index_entry(&mut self) -> Result<()> {
+    /// Build a `RedoEntry` for the parent directory's `$I30` size patch.
+    /// Returns `Ok(None)` if no patch applies (no matching entry, or the
+    /// bytes are already correct).
+    fn build_index_entry_redo(&mut self) -> Result<Option<super::logfile::RedoEntry>> {
         let parent_rec_no = self.parent_ref & 0x0000_FFFF_FFFF_FFFF;
         let off = self
             .fs
@@ -511,17 +521,15 @@ impl<'a> NtfsFileHandle<'a> {
             .mft_offset(parent_rec_no)?;
         let mut rec = vec![0u8; self.rec_size];
         self.dev.read_at(off, &mut rec)?;
-        mft::apply_fixup(&mut rec, self.sector_size)?;
-
-        // Walk $INDEX_ROOT (always resident) for an entry whose file_ref
-        // points at our record. If it's a "large index" (promoted), the
-        // root holds only a child pointer — patch the entry inside the
-        // INDX block instead.
+        let old_rec = rec.clone();
+        if mft::apply_fixup(&mut rec, self.sector_size).is_err() {
+            return Ok(None);
+        }
         let hdr = mft::RecordHeader::parse(&rec)?;
         let bytes_in_use = hdr.bytes_in_use as usize;
         let first = hdr.first_attribute_offset as usize;
         let mut cursor = first;
-        let mut root_off_in_rec: Option<(usize, usize, usize)> = None; // (attr_start, value_off, value_len)
+        let mut root_off_in_rec: Option<(usize, usize, usize)> = None;
         let mut alloc_runs: Option<Vec<Extent>> = None;
         while cursor + 4 <= bytes_in_use {
             let tc = u32::from_le_bytes(rec[cursor..cursor + 4].try_into().unwrap());
@@ -559,36 +567,35 @@ impl<'a> NtfsFileHandle<'a> {
             }
             cursor += len;
         }
-
         let Some((attr_start, value_off, value_len)) = root_off_in_rec else {
-            return Ok(()); // No index — skip.
+            return Ok(None);
         };
         let root_v_start = attr_start + value_off;
         let root_v_end = root_v_start + value_len;
         let root_val = &mut rec[root_v_start..root_v_end];
-
-        // Index root layout: 16-byte header (attr type, collation, ...),
-        // then 16-byte index node header at +16, then entries.
         if root_val.len() < 32 {
-            return Ok(());
+            return Ok(None);
         }
         let index_flags = root_val[28];
         let large_index = index_flags & 0x01 != 0;
         if !large_index {
             if patch_entries_for_record(root_val, 16, self.rec_no, self.len) {
-                // Re-install fixup + write record back.
                 mft::install_fixup(&mut rec, self.sector_size, 1);
-                self.dev.write_at(off, &rec)?;
+                if rec != old_rec {
+                    return Ok(Some(super::logfile::RedoEntry {
+                        target_offset: off,
+                        redo_bytes: rec,
+                        undo_bytes: old_rec,
+                    }));
+                }
             }
-            return Ok(());
+            return Ok(None);
         }
-
-        // Large-index — drop the root, look at the $INDEX_ALLOCATION block.
         let Some(runs) = alloc_runs else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(first_run_lcn) = runs.first().and_then(|r| r.lcn) else {
-            return Ok(());
+            return Ok(None);
         };
         let block_size = self
             .fs
@@ -599,21 +606,196 @@ impl<'a> NtfsFileHandle<'a> {
         let block_off = first_run_lcn * self.cluster_size;
         let mut block = vec![0u8; block_size];
         self.dev.read_at(block_off, &mut block)?;
+        let old_block = block.clone();
         if mft::apply_fixup(&mut block, self.sector_size).is_err() {
-            return Ok(());
+            return Ok(None);
         }
-        // Entries start at 0x18 + first_entry_offset (relative to 0x18).
         if block.len() < 0x20 {
-            return Ok(());
+            return Ok(None);
         }
         let first_entry_offset = u32::from_le_bytes(block[0x18..0x1C].try_into().unwrap()) as usize;
         let entries_start = 0x18 + first_entry_offset;
         if patch_entries_for_record(&mut block, entries_start, self.rec_no, self.len) {
             mft::install_fixup(&mut block, self.sector_size, 1);
-            self.dev.write_at(block_off, &block)?;
+            if block != old_block {
+                return Ok(Some(super::logfile::RedoEntry {
+                    target_offset: block_off,
+                    redo_bytes: block,
+                    undo_bytes: old_block,
+                }));
+            }
         }
+        Ok(None)
+    }
+
+    /// Run a commit-time protocol:
+    ///
+    /// 1. Locate `$LogFile` and the current restart-area `CurrentLsn`.
+    /// 2. Pack `entries` into one or more RCRD pages starting at the
+    ///    record-page region (`logfile_offset + 2·LOG_PAGE_SIZE`).
+    /// 3. Stamp both restart pages with the new `CurrentLsn` and
+    ///    `CleanDismount` cleared (== "transaction in progress").
+    /// 4. Apply the in-place writes.
+    /// 5. Stamp both restart pages again with `CleanDismount` set.
+    ///
+    /// If the process dies between steps 3 and 5, the next open's
+    /// `ensure_clean_log` sees the dirty marker, walks the RCRD pages,
+    /// re-applies the redo bytes, and re-stamps clean.
+    fn commit_txn(&mut self, entries: &[super::logfile::RedoEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (logfile_offset, log_size) = locate_logfile(self.fs, self.dev)?;
+        if log_size < 4 * super::logfile::LOG_PAGE_SIZE as u64 {
+            // Tiny log — fall back to direct writes (no journal).
+            for e in entries {
+                self.dev.write_at(e.target_offset, &e.redo_bytes)?;
+            }
+            return Ok(());
+        }
+
+        // Pick a starting LSN past the existing current_lsn.
+        let prev_view = super::logfile::read_current_restart(self.dev, logfile_offset)?;
+        let prev_lsn = prev_view.map(|(v, _)| v.current_lsn).unwrap_or(0);
+        let mut next_lsn = prev_lsn + 1;
+
+        // Pack into RCRD pages — one page per chunk, splitting on
+        // overflow. The record-page region starts at offset
+        // 2·LOG_PAGE_SIZE; pages cycle modulo (log_size - 2·LOG_PAGE_SIZE).
+        let rcrd_region_start = logfile_offset + 2 * super::logfile::LOG_PAGE_SIZE as u64;
+        let rcrd_region_size = log_size - 2 * super::logfile::LOG_PAGE_SIZE as u64;
+        let mut page_idx: u64 = 0;
+        let mut chunk_start = 0usize;
+        let mut last_lsn = next_lsn;
+        while chunk_start < entries.len() {
+            // Find the largest prefix that fits in one page.
+            let mut chunk_end = chunk_start + 1;
+            while chunk_end <= entries.len() {
+                match super::logfile::build_record_page(&entries[chunk_start..chunk_end], next_lsn)
+                {
+                    Ok(_) => chunk_end += 1,
+                    Err(_) => break,
+                }
+            }
+            if chunk_end == chunk_start + 1 {
+                // Even one record doesn't fit — bail to direct writes.
+                for e in entries {
+                    self.dev.write_at(e.target_offset, &e.redo_bytes)?;
+                }
+                return Ok(());
+            }
+            chunk_end -= 1;
+            let (page, ll) =
+                super::logfile::build_record_page(&entries[chunk_start..chunk_end], next_lsn)?;
+            let off = rcrd_region_start
+                + (page_idx * super::logfile::LOG_PAGE_SIZE as u64) % rcrd_region_size;
+            self.dev.write_at(off, &page)?;
+            last_lsn = ll;
+            next_lsn = ll + 1;
+            page_idx += 1;
+            chunk_start = chunk_end;
+        }
+
+        // Stamp restart pages: dirty, current_lsn = last_lsn.
+        let dirty_page = super::logfile::build_restart_page(last_lsn, log_size, false);
+        self.dev.write_at(logfile_offset, &dirty_page)?;
+        self.dev.write_at(
+            logfile_offset + super::logfile::LOG_PAGE_SIZE as u64,
+            &dirty_page,
+        )?;
+
+        // Apply in-place writes.
+        for e in entries {
+            self.dev.write_at(e.target_offset, &e.redo_bytes)?;
+        }
+
+        // Stamp restart pages: clean.
+        let clean_page = super::logfile::build_restart_page(last_lsn, log_size, true);
+        self.dev.write_at(logfile_offset, &clean_page)?;
+        self.dev.write_at(
+            logfile_offset + super::logfile::LOG_PAGE_SIZE as u64,
+            &clean_page,
+        )?;
         Ok(())
     }
+
+    /// Read the `flags` u16 from the current on-disk MFT record. Falls
+    /// back to `FLAG_IN_USE` when the record can't be parsed.
+    fn read_existing_flags(&mut self) -> Result<u16> {
+        let off = self
+            .fs
+            .writer
+            .as_ref()
+            .ok_or_else(|| crate::Error::Unsupported("ntfs: writer not initialised".into()))?
+            .mft_offset(self.rec_no)?;
+        let mut rec = vec![0u8; self.rec_size];
+        self.dev.read_at(off, &mut rec)?;
+        if mft::apply_fixup(&mut rec, self.sector_size).is_err() {
+            return Ok(mft::RecordHeader::FLAG_IN_USE);
+        }
+        let hdr = mft::RecordHeader::parse(&rec)?;
+        Ok(hdr.flags)
+    }
+}
+
+/// Resolve `$LogFile`'s on-disk byte offset and total size by reading
+/// MFT record 2 and decoding its non-resident `$DATA` run list.
+fn locate_logfile(fs: &mut super::Ntfs, dev: &mut dyn BlockDevice) -> Result<(u64, u64)> {
+    let (rec_size, sector_size, cluster_size) = {
+        let w = fs.writer.as_ref().expect("writer present");
+        (
+            w.layout.mft_record_size as usize,
+            w.layout.bytes_per_sector as usize,
+            w.cluster_size,
+        )
+    };
+    let mft_off = fs
+        .writer
+        .as_ref()
+        .expect("writer present")
+        .mft_offset(super::format::REC_LOGFILE)?;
+    let mut rec = vec![0u8; rec_size];
+    dev.read_at(mft_off, &mut rec)?;
+    mft::apply_fixup(&mut rec, sector_size)?;
+    let hdr = mft::RecordHeader::parse(&rec)?;
+    for attr_res in AttributeIter::new(&rec, hdr.first_attribute_offset as usize) {
+        let attr = attr_res?;
+        if attr.type_code == TYPE_DATA && attr.name.is_empty() {
+            if let AttributeKind::NonResident {
+                runs, real_size, ..
+            } = attr.kind
+            {
+                if let Some(first) = runs.first().and_then(|r| r.lcn) {
+                    return Ok((first * cluster_size, real_size));
+                }
+            }
+        }
+    }
+    Ok((0, 0))
+}
+
+/// Apply the redo bytes of every entry in order, then re-stamp the two
+/// restart pages with `CleanDismount` set and `current_lsn = 0`
+/// (records will be overwritten on the next sync).
+fn replay_and_clean(
+    dev: &mut dyn BlockDevice,
+    logfile_offset: u64,
+    log_size: u64,
+    entries: &[super::logfile::RedoEntry],
+    _last_seq: u64,
+) -> Result<()> {
+    for e in entries {
+        dev.write_at(e.target_offset, &e.redo_bytes)?;
+    }
+    // Zero the record-page region and re-stamp clean restart pages.
+    let rstr_region = 2 * super::logfile::LOG_PAGE_SIZE as u64;
+    if log_size > rstr_region {
+        dev.zero_range(logfile_offset + rstr_region, log_size - rstr_region)?;
+    }
+    let page = super::logfile::build_restart_page(0, log_size, true);
+    dev.write_at(logfile_offset, &page)?;
+    dev.write_at(logfile_offset + super::logfile::LOG_PAGE_SIZE as u64, &page)?;
+    Ok(())
 }
 
 /// Walk index entries starting at `start_off` in `buf`, looking for one
@@ -910,76 +1092,44 @@ impl super::Ntfs {
         Ok(Box::new(handle))
     }
 
-    /// Check that the existing `$LogFile` data is all zero. The format
-    /// path leaves it zero, which kernel NTFS3 / ntfs-3g accept as
-    /// "clean shutdown / nothing to replay." Any non-zero byte means the
-    /// volume carries a real journal we don't model — refuse.
+    /// Inspect `$LogFile`. We accept three states:
+    ///
+    /// 1. **Structured + clean.** Restart pages parse as RSTR and carry
+    ///    `CleanDismount`. No replay needed.
+    /// 2. **Structured + dirty.** Restart pages parse as RSTR but lack
+    ///    `CleanDismount`. We have records to replay; walk them and
+    ///    apply the redo bytes in order, then re-stamp the restart pages
+    ///    with `CleanDismount` set.
+    /// 3. **All-zero log.** Legacy / unformatted log. Treated as clean.
+    ///
+    /// Any other shape (foreign journal, torn write) → refuse.
     fn ensure_clean_log(fs: &mut super::Ntfs, dev: &mut dyn BlockDevice) -> Result<()> {
-        let (rec_size, sector_size) = {
-            let w = fs.writer.as_ref().expect("writer present");
-            (
-                w.layout.mft_record_size as usize,
-                w.layout.bytes_per_sector as usize,
-            )
-        };
-        let off = fs
-            .writer
-            .as_ref()
-            .expect("writer present")
-            .mft_offset(REC_LOGFILE)?;
-        let mut rec = vec![0u8; rec_size];
-        dev.read_at(off, &mut rec)?;
-        mft::apply_fixup(&mut rec, sector_size)?;
-        let hdr = mft::RecordHeader::parse(&rec)?;
-
-        // Find $LogFile's $DATA run list and total length.
-        let mut log_runs: Vec<Extent> = Vec::new();
-        let mut log_size: u64 = 0;
-        for attr_res in AttributeIter::new(&rec, hdr.first_attribute_offset as usize) {
-            let attr = attr_res?;
-            if attr.type_code == TYPE_DATA && attr.name.is_empty() {
-                if let AttributeKind::NonResident {
-                    runs, real_size, ..
-                } = attr.kind
-                {
-                    log_runs = runs;
-                    log_size = real_size;
-                }
-                break;
-            }
-        }
-        if log_runs.is_empty() || log_size == 0 {
-            return Ok(()); // Nothing to scan.
+        let (logfile_offset, log_size) = locate_logfile(fs, dev)?;
+        if log_size == 0 {
+            return Ok(());
         }
 
-        let cs = fs.writer.as_ref().expect("writer present").cluster_size;
-        // Sample the restart-area region: first 4 KiB (covers both the
-        // primary and mirror restart pages on a 4 KiB-cluster volume).
-        let scan_bytes = (4 * 1024u64).min(log_size);
-        let mut remaining = scan_bytes;
-        let mut buf = vec![0u8; cs as usize];
-        for ext in &log_runs {
-            if remaining == 0 {
-                break;
-            }
-            let Some(lcn) = ext.lcn else { continue };
-            let ext_bytes = ext.length * cs;
-            let mut taken = 0u64;
-            while taken < ext_bytes && remaining > 0 {
-                let chunk = (ext_bytes - taken).min(remaining).min(cs);
-                let phys = lcn * cs + taken;
-                dev.read_at(phys, &mut buf[..chunk as usize])?;
-                if buf[..chunk as usize].iter().any(|&b| b != 0) {
-                    return Err(crate::Error::Unsupported(
-                        "ntfs: open_file_rw refuses to mutate a volume with a non-empty $LogFile"
-                            .into(),
-                    ));
-                }
-                taken += chunk;
-                remaining -= chunk;
-            }
+        // Peek the first 8 bytes — if they're zero, treat as legacy clean.
+        let mut head = [0u8; 8];
+        dev.read_at(logfile_offset, &mut head)?;
+        if head.iter().all(|&b| b == 0) {
+            return Ok(());
         }
-        Ok(())
+
+        match super::logfile::read_current_restart(dev, logfile_offset)? {
+            Some((view, _which)) if view.is_clean() => Ok(()),
+            Some((view, _which)) => {
+                // Dirty restart area — replay the records, then re-stamp
+                // restart pages as clean.
+                let entries = super::logfile::walk_records(dev, logfile_offset, log_size)?;
+                let seq = super::logfile::lsn_seq(view.current_lsn).max(1);
+                replay_and_clean(dev, logfile_offset, log_size, &entries, seq)
+            }
+            None => Err(crate::Error::Unsupported(
+                "ntfs: open_file_rw refuses to mutate a volume with a non-LFS-shaped $LogFile"
+                    .into(),
+            )),
+        }
     }
 }
 
@@ -1190,16 +1340,19 @@ mod tests {
     }
 
     #[test]
-    fn open_file_rw_refused_when_log_dirty() {
+    fn open_file_rw_refused_when_log_unparseable() {
         let (mut dev, mut fs) = fresh(8 * 1024 * 1024);
-        // Stamp the first few bytes of $LogFile with a non-zero marker.
-        // The log starts at logfile_lcn * cluster_size.
+        // Corrupt both restart pages so neither parses as a valid LFS
+        // restart area. We want the dirty-but-unrecognised path to
+        // refuse.
         let (lcn, cs) = {
             let w = fs.writer.as_ref().unwrap();
             (w.layout.logfile_lcn, w.cluster_size)
         };
         let phys = lcn * cs;
-        dev.write_at(phys, b"RSTR").unwrap();
+        dev.write_at(phys, b"JUNKJUNK\x01\x02\x03\x04").unwrap();
+        dev.write_at(phys + 4096, b"JUNKJUNK\x01\x02\x03\x04")
+            .unwrap();
 
         let res = Filesystem::open_file_rw(
             &mut fs,
@@ -1215,6 +1368,158 @@ mod tests {
             Err(other) => panic!("expected Unsupported on dirty log, got {other:?}"),
             Ok(_) => panic!("expected Unsupported on dirty log, got Ok"),
         }
+    }
+
+    /// Simulate a crash mid-commit: write a file, then poison its MFT
+    /// record in-place AND clear the restart-area's `CleanDismount` flag.
+    /// Reopening should replay the LFS records — restoring the MFT
+    /// record — and the file should read back correctly.
+    #[test]
+    fn open_file_rw_replay_restores_metadata() {
+        let (mut dev, mut fs) = fresh(16 * 1024 * 1024);
+
+        // Step 1: create the file and write through open_file_rw so an
+        // LFS record carrying the redo MFT bytes lands in $LogFile. We
+        // pick an initial payload short enough that the open_file_rw
+        // overwrite truncates / refills it cleanly.
+        let payload = b"abcdefghij".to_vec();
+        fs.create_file(
+            &mut dev,
+            "/jnl.bin",
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(payload.clone())),
+                len: payload.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        // Look up the MFT record number now (before we poison it) for
+        // later verification.
+        let rec_no = fs.lookup_path(&mut dev, "/jnl.bin").unwrap();
+        let mft_off = fs.writer.as_ref().unwrap().mft_offset(rec_no).unwrap();
+        let rec_size = fs.writer.as_ref().unwrap().layout.mft_record_size as usize;
+
+        // Use open_file_rw to overwrite the contents — this populates the
+        // log with a metadata-update record.
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                Path::new("/jnl.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            // Write 18 bytes (longer than the initial 10) so the MFT
+            // record's $DATA length is bumped to 18 — recorded in the
+            // journal entry.
+            h.write_all(b"REPLAY MATERIAL XX").unwrap();
+            h.sync().unwrap();
+        }
+
+        // Step 2: poison the in-place MFT record bytes — overwrite with
+        // zeros so any read of it fails. Also flip the restart-area
+        // CleanDismount flag off to simulate a crash between writing
+        // the records and stamping clean.
+        let zero_rec = vec![0u8; rec_size];
+        dev.write_at(mft_off, &zero_rec).unwrap();
+        let (lcn, cs) = {
+            let w = fs.writer.as_ref().unwrap();
+            (w.layout.logfile_lcn, w.cluster_size)
+        };
+        let logfile_offset = lcn * cs;
+        // Read current restart page, parse, rebuild as dirty.
+        let (view, _) = super::super::logfile::read_current_restart(&mut dev, logfile_offset)
+            .unwrap()
+            .expect("restart parses");
+        let dirty =
+            super::super::logfile::build_restart_page(view.current_lsn, view.file_size, false);
+        dev.write_at(logfile_offset, &dirty).unwrap();
+        dev.write_at(
+            logfile_offset + super::super::logfile::LOG_PAGE_SIZE as u64,
+            &dirty,
+        )
+        .unwrap();
+
+        // Step 3: reopen the file via open_file_rw. The ensure_clean_log
+        // path should replay the LFS records, restoring the MFT record;
+        // a subsequent read should see the rewritten contents.
+        {
+            let _h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                Path::new("/jnl.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+        }
+        let bytes = read_all(&mut fs, &mut dev, "/jnl.bin");
+        assert_eq!(bytes, b"REPLAY MATERIAL XX");
+
+        // Step 4: subsequent open should see a clean log (the replay
+        // path re-stamps CleanDismount) and not error out.
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                Path::new("/jnl.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.write_all(b"!").unwrap();
+            h.sync().unwrap();
+        }
+        let bytes = read_all(&mut fs, &mut dev, "/jnl.bin");
+        assert_eq!(&bytes[..1], b"!");
+        // Length is preserved at 18; tail unchanged.
+        assert_eq!(bytes.len(), 18);
+        assert_eq!(&bytes[1..], b"EPLAY MATERIAL XX");
+    }
+
+    /// Two sync()s in a row on the same handle should each emit a valid
+    /// LFS record and leave the restart area marked clean. The
+    /// `ntfsfix --no-action` external sanity test for the resulting
+    /// volume continues to pass (verified by the dedicated test below;
+    /// this test asserts only the on-disk shape).
+    #[test]
+    fn open_file_rw_journal_idempotent_clean_close() {
+        let (mut dev, mut fs) = fresh(16 * 1024 * 1024);
+        fs.create_file(
+            &mut dev,
+            "/k.bin",
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"A".to_vec())),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+        for _ in 0..3 {
+            let mut h = Filesystem::open_file_rw(
+                &mut fs,
+                &mut dev,
+                Path::new("/k.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.write_all(b"Z").unwrap();
+            h.sync().unwrap();
+        }
+        // Confirm clean shutdown shape after all writes.
+        let (lcn, cs) = {
+            let w = fs.writer.as_ref().unwrap();
+            (w.layout.logfile_lcn, w.cluster_size)
+        };
+        let logfile_offset = lcn * cs;
+        let (view, _) = super::super::logfile::read_current_restart(&mut dev, logfile_offset)
+            .unwrap()
+            .expect("restart parses");
+        assert!(view.is_clean(), "restart area must be clean after sync");
     }
 
     /// External-tool round-trip: format, mutate via open_file_rw, then

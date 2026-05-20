@@ -2146,17 +2146,14 @@ pub fn format_volume(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Lay
         )?;
     }
 
-    // Write $LogFile (zeroed). Use device.zero_range for sparse writes.
-    dev.zero_range(
+    // Write $LogFile. We stamp two structurally-valid RSTR restart
+    // pages with `CleanDismount` set; everything past those two pages
+    // stays zero (== "no log records"). See [`super::logfile`].
+    super::logfile::write_initial_logfile(
+        dev,
         logfile_lcn * cluster_size as u64,
         logfile_clusters * cluster_size as u64,
     )?;
-    // Now stamp the well-known "RSTR" record at the start so kernel
-    // NTFS3 / ntfs-3g treat the log as cleanly closed. We emit a minimal
-    // restart record. The format is non-trivial but a fully zero log is
-    // accepted as a valid empty log by both Linux drivers and chkdsk's
-    // /f option (which just sees it as needing redo, finds nothing, and
-    // succeeds). We leave the log fully zero — both readers handle it.
 
     // Write $AttrDef payload.
     {

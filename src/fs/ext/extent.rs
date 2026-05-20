@@ -34,6 +34,11 @@ pub const EXT4_EXT_MAGIC: u16 = 0xF30A;
 /// 60-byte `i_block` array.
 pub const MAX_EXTENTS_IN_INODE: usize = 4;
 
+/// Maximum number of index entries that fit alongside the header in the
+/// 60-byte `i_block` array. Same value as the leaf cap; both records are
+/// 12 bytes.
+pub const MAX_INDICES_IN_INODE: usize = 4;
+
 /// Maximum `ee_len` for an "initialized" extent. Values in `32768..=65535`
 /// are interpreted as "uninitialized" (zero-filled on read), which we
 /// don't emit — so callers must split runs longer than this.
@@ -46,6 +51,25 @@ pub struct ExtentRun {
     pub logical: u32,
     pub len: u16,
     pub physical: u64,
+}
+
+/// One internal-node entry in the extent tree. Points at a child node
+/// (another idx block at depth > 1, or a leaf block at depth == 1).
+#[derive(Debug, Clone, Copy)]
+pub struct ExtentIdx {
+    /// First logical block covered by the subtree rooted at this index.
+    pub block: u32,
+    /// Physical block holding the child node (extent_header + entries).
+    pub leaf: u64,
+}
+
+/// Number of extent records (leaf or idx) that fit in a single
+/// `block_size`-byte tree block, after subtracting the 12-byte header and
+/// the optional 4-byte CRC tail. We don't emit a CRC tail (no
+/// `metadata_csum`-with-extent-tree path yet), so we use the full
+/// `(bs - 12) / 12` capacity.
+pub fn entries_per_leaf_block(block_size: u32) -> usize {
+    ((block_size as usize) - 12) / 12
 }
 
 /// Encode the 12-byte extent header.
@@ -127,6 +151,124 @@ pub fn pack_into_iblock(runs: &[ExtentRun]) -> crate::Result<[u8; 60]> {
         out[off..off + 12].copy_from_slice(&encode_leaf(*run));
     }
     Ok(out)
+}
+
+/// Encode one 12-byte index record (`extent_idx`).
+///
+/// Layout:
+///
+/// ```text
+///   0..4   ei_block       = first logical block covered by the subtree
+///   4..8   ei_leaf_lo     = low  32 bits of physical block holding the child node
+///   8..10  ei_leaf_hi     = high 16 bits of physical block holding the child node
+///   10..12 ei_unused      = 0
+/// ```
+pub fn encode_idx(idx: ExtentIdx) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[0..4].copy_from_slice(&idx.block.to_le_bytes());
+    out[4..8].copy_from_slice(&(idx.leaf as u32).to_le_bytes());
+    out[8..10].copy_from_slice(&((idx.leaf >> 32) as u16).to_le_bytes());
+    // 10..12 zero
+    out
+}
+
+/// Decode one 12-byte index record.
+pub fn decode_idx(buf: &[u8]) -> ExtentIdx {
+    let block = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let leaf_lo = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as u64;
+    let leaf_hi = u16::from_le_bytes(buf[8..10].try_into().unwrap()) as u64;
+    ExtentIdx {
+        block,
+        leaf: (leaf_hi << 32) | leaf_lo,
+    }
+}
+
+/// Pack an extent header + a list of index entries into a 60-byte
+/// `i_block` slice. Returns `Err` if more than [`MAX_INDICES_IN_INODE`]
+/// idx entries are supplied (i.e. we'd need depth > 1).
+pub fn pack_idx_into_iblock(indices: &[ExtentIdx]) -> crate::Result<[u8; 60]> {
+    if indices.len() > MAX_INDICES_IN_INODE {
+        return Err(crate::Error::Unsupported(format!(
+            "ext4: depth-1 tree requires {} idx entries, max {} inline (depth > 1 not implemented)",
+            indices.len(),
+            MAX_INDICES_IN_INODE
+        )));
+    }
+    let mut out = [0u8; 60];
+    let hdr = encode_header(indices.len() as u16, MAX_INDICES_IN_INODE as u16, 1);
+    out[0..12].copy_from_slice(&hdr);
+    for (i, idx) in indices.iter().enumerate() {
+        let off = 12 + i * 12;
+        out[off..off + 12].copy_from_slice(&encode_idx(*idx));
+    }
+    Ok(out)
+}
+
+/// Encode a full leaf block (header + leaf extents) into a `bs`-byte
+/// buffer. Used when writing a leaf block to disk in a depth-1 tree.
+pub fn encode_leaf_block(runs: &[ExtentRun], block_size: u32) -> crate::Result<Vec<u8>> {
+    let max = entries_per_leaf_block(block_size);
+    if runs.len() > max {
+        return Err(crate::Error::Unsupported(format!(
+            "ext4: leaf block would need {} entries, max {} per {}-byte block (depth > 1 not implemented)",
+            runs.len(),
+            max,
+            block_size,
+        )));
+    }
+    let mut out = vec![0u8; block_size as usize];
+    let hdr = encode_header(runs.len() as u16, max as u16, 0);
+    out[0..12].copy_from_slice(&hdr);
+    for (i, r) in runs.iter().enumerate() {
+        let off = 12 + i * 12;
+        out[off..off + 12].copy_from_slice(&encode_leaf(*r));
+    }
+    Ok(out)
+}
+
+/// Decode a leaf block's runs. The header must claim depth == 0; any
+/// other value is an internal-node block and the caller should walk the
+/// tree further (not yet implemented for depth > 1).
+pub fn decode_leaf_block(buf: &[u8]) -> crate::Result<(ExtentHeader, Vec<ExtentRun>)> {
+    let header = decode_header(&buf[..12])?;
+    if header.depth != 0 {
+        return Err(crate::Error::Unsupported(format!(
+            "ext4: nested extent block has depth {} (only depth 0 leaves supported)",
+            header.depth
+        )));
+    }
+    let max = entries_per_leaf_block(buf.len() as u32);
+    if header.entries as usize > max {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext4: leaf block claims {} entries, max {}",
+            header.entries, max
+        )));
+    }
+    let mut runs = Vec::with_capacity(header.entries as usize);
+    for i in 0..header.entries as usize {
+        let off = 12 + i * 12;
+        runs.push(decode_leaf(&buf[off..off + 12]));
+    }
+    Ok((header, runs))
+}
+
+/// Decode the index entries from a 60-byte `i_block` view that represents
+/// a depth-1 (or deeper) extent tree. Caller must verify
+/// `header.depth >= 1` before treating `indices` as idx entries.
+pub fn decode_idx_iblock(buf: &[u8; 60]) -> crate::Result<(ExtentHeader, Vec<ExtentIdx>)> {
+    let header = decode_header(&buf[..12])?;
+    if header.entries as usize > MAX_INDICES_IN_INODE {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext4: inline extent header claims {} idx entries, max is {}",
+            header.entries, MAX_INDICES_IN_INODE
+        )));
+    }
+    let mut indices = Vec::with_capacity(header.entries as usize);
+    for i in 0..header.entries as usize {
+        let off = 12 + i * 12;
+        indices.push(decode_idx(&buf[off..off + 12]));
+    }
+    Ok((header, indices))
 }
 
 /// Convert the 15 `u32` slots of an inode's `i_block` array into the

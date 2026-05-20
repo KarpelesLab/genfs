@@ -1650,7 +1650,7 @@ impl Ext {
     /// otherwise → direct + single-indirect (double/triple deferred).
     pub fn file_block(&self, dev: &mut dyn BlockDevice, ino: &Inode, n: u32) -> Result<u32> {
         if ino.flags & constants::EXT4_EXTENTS_FL != 0 {
-            return self.file_block_extent(ino, n);
+            return self.file_block_extent(dev, ino, n);
         }
         if (n as usize) < constants::N_DIRECT {
             return Ok(ino.block[n as usize]);
@@ -1674,50 +1674,43 @@ impl Ext {
         ))
     }
 
-    /// Resolve logical block `n` against an inode that uses an inline
-    /// (depth-0) ext4 extent tree.
-    fn file_block_extent(&self, ino: &Inode, n: u32) -> Result<u32> {
-        // The 15-slot u32 i_block array overlays as a 60-byte extent tree.
-        let mut buf = [0u8; 60];
-        for (i, slot) in ino.block.iter().enumerate() {
-            let off = i * 4;
-            buf[off..off + 4].copy_from_slice(&slot.to_le_bytes());
+    /// Resolve logical block `n` against an inode that uses an ext4
+    /// extent tree. Supports depth-0 (inline up to 4 leaves) and depth-1
+    /// (up to 4 idx entries in `i_block`, each pointing at one leaf
+    /// block on disk holding the actual extent records).
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn file_block_extent(&self, dev: &mut dyn BlockDevice, ino: &Inode, n: u32) -> Result<u32> {
+        let iblock = extent::iblock_to_bytes(&ino.block);
+        let header = extent::decode_header(&iblock[..12])?;
+        if header.depth == 0 {
+            let (_, runs) = extent::decode_depth0_iblock(&iblock)?;
+            return Ok(resolve_logical_in_runs(&runs, n));
         }
-        let magic = u16::from_le_bytes(buf[0..2].try_into().unwrap());
-        if magic != extent::EXT4_EXT_MAGIC {
-            return Err(crate::Error::InvalidImage(format!(
-                "ext4: extent header magic {magic:#06x} != {:#06x}",
-                extent::EXT4_EXT_MAGIC
-            )));
-        }
-        let entries = u16::from_le_bytes(buf[2..4].try_into().unwrap()) as usize;
-        let depth = u16::from_le_bytes(buf[6..8].try_into().unwrap());
-        if depth != 0 {
-            return Err(crate::Error::Unsupported(
-                "ext4: multi-level extent trees not yet supported in reader".into(),
-            ));
-        }
-        for i in 0..entries {
-            let off = 12 + i * 12;
-            let ee_block = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-            let ee_len = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap());
-            let ee_start_hi = u16::from_le_bytes(buf[off + 6..off + 8].try_into().unwrap()) as u64;
-            let ee_start_lo = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as u64;
-            // Uninitialized extents have ee_len in the [32768, 65535] range
-            // and represent zero blocks; we don't emit those but tolerate
-            // them on read.
-            let len = if ee_len > extent::MAX_LEN_PER_EXTENT {
-                ee_len - extent::MAX_LEN_PER_EXTENT
-            } else {
-                ee_len
-            };
-            if n >= ee_block && n < ee_block + len as u32 {
-                let phys = (ee_start_hi << 32) | ee_start_lo;
-                return Ok((phys + (n - ee_block) as u64) as u32);
+        if header.depth == 1 {
+            let (_, indices) = extent::decode_idx_iblock(&iblock)?;
+            // The idx array is sorted by ei_block ascending; find the
+            // last idx whose block <= n.
+            let mut chosen: Option<extent::ExtentIdx> = None;
+            for idx in &indices {
+                if idx.block <= n {
+                    chosen = Some(*idx);
+                } else {
+                    break;
+                }
             }
+            let Some(idx) = chosen else {
+                return Ok(0);
+            };
+            let bs = self.layout.block_size as usize;
+            let mut buf = vec![0u8; bs];
+            self.read_block(dev, idx.leaf as u32, &mut buf)?;
+            let (_, runs) = extent::decode_leaf_block(&buf)?;
+            return Ok(resolve_logical_in_runs(&runs, n));
         }
-        // Logical block not covered by any extent → sparse hole, reads as zero.
-        Ok(0)
+        Err(crate::Error::Unsupported(format!(
+            "ext4: extent tree depth {} not yet supported in reader (depth-0 and depth-1 only)",
+            header.depth
+        )))
     }
 
     /// List the entries of the directory inode `ino`. Returns
@@ -2223,6 +2216,24 @@ impl crate::fs::Filesystem for Ext {
     }
 }
 
+/// Scan a leaf-extent list for the run containing logical block `n` and
+/// return the corresponding physical block. Returns 0 if `n` falls in a
+/// hole (no extent covers it).
+fn resolve_logical_in_runs(runs: &[extent::ExtentRun], n: u32) -> u32 {
+    for r in runs {
+        let len = if r.len > extent::MAX_LEN_PER_EXTENT {
+            r.len - extent::MAX_LEN_PER_EXTENT
+        } else {
+            r.len
+        };
+        if n >= r.logical && n < r.logical + len as u32 {
+            let phys = r.physical + (n - r.logical) as u64;
+            return phys as u32;
+        }
+    }
+    0
+}
+
 /// Translate an ext mode word into a [`crate::fs::EntryKind`].
 fn kind_from_mode(mode: u16) -> crate::fs::EntryKind {
     use crate::fs::EntryKind;
@@ -2398,7 +2409,12 @@ mod tests {
         assert_eq!(ext.layout.num_groups(), 4, "test setup must yield 4 groups");
         let g0 = ext.layout.groups[0];
         // Leader's metadata range: [start_block + sb+gdt, data_start).
-        let leader_meta_start = g0.start_block + if g0.has_superblock { 1 + ext.layout.gdt_blocks } else { 0 };
+        let leader_meta_start = g0.start_block
+            + if g0.has_superblock {
+                1 + ext.layout.gdt_blocks
+            } else {
+                0
+            };
         let leader_meta_end = g0.data_start;
         for gi in 1..ext.layout.num_groups() as usize {
             let g = ext.layout.groups[gi];
@@ -3097,7 +3113,9 @@ mod tests {
                 String::from_utf8(o.stdout).unwrap().trim().to_string()
             }
             _ => {
-                eprintln!("skipping open_file_rw_ext3_clean_journal_passes_e2fsck: e2fsck not installed");
+                eprintln!(
+                    "skipping open_file_rw_ext3_clean_journal_passes_e2fsck: e2fsck not installed"
+                );
                 return;
             }
         };
@@ -3407,14 +3425,17 @@ mod tests {
         // walk an index it can't allocate.
         let (ext, mut dev) = ext4_with_file(b"deep.bin", b"hello");
 
-        // Locate the file's inode and patch its i_block header so eh_depth = 1.
+        // Locate the file's inode and patch its i_block header so eh_depth = 2.
+        // Depth 0 (inline) and depth 1 (one level of idx → leaf) are both
+        // supported by the writer; depth 2+ still needs a second level of
+        // idx-block allocation and is refused.
         let ino = ext
             .path_to_inode(&mut dev, "/deep.bin")
             .expect("path lookup");
         let mut inode = ext.read_inode(&mut dev, ino).expect("read inode");
         let mut bytes = extent::iblock_to_bytes(&inode.block);
         // eh_depth lives at bytes 6..8 (little-endian).
-        bytes[6..8].copy_from_slice(&1u16.to_le_bytes());
+        bytes[6..8].copy_from_slice(&2u16.to_le_bytes());
         inode.block = extent::bytes_to_iblock(&bytes);
 
         // Write the patched inode straight to disk; we want the
@@ -3441,13 +3462,196 @@ mod tests {
         match res {
             Ok(_) => panic!("must refuse on deeper extent tree"),
             Err(crate::Error::Unsupported(msg)) => {
-                assert!(
-                    msg.contains("depth"),
-                    "unexpected message: {msg}"
-                );
+                assert!(msg.contains("depth"), "unexpected message: {msg}");
             }
             Err(other) => panic!("expected Unsupported, got {other}"),
         }
+    }
+
+    /// Build an ext4 file whose extent tree must spill into depth-1
+    /// (more than 4 leaf extents). We force fragmentation by writing
+    /// individual blocks at logically-discontiguous offsets, so each
+    /// block sits in its own extent run rather than merging into a
+    /// single run.
+    #[test]
+    fn open_file_rw_depth1_extent_round_trip_ext4() {
+        let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
+        // Start from an empty file so every alloc lands somewhere
+        // chosen by the bitmap walker rather than continuing a tail.
+        ext.add_file_to_streaming(
+            &mut dev,
+            constants::INO_ROOT_DIR,
+            b"deep.bin",
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+            0,
+            FileMeta::default(),
+        )
+        .expect("add empty file");
+        ext.flush(&mut dev).expect("flush");
+
+        // Six distinct sparse offsets → six logically-discontiguous
+        // extents (depth-0 caps at 4, so the tree must promote to
+        // depth-1).
+        let offsets: &[u64] = &[0, 40_000, 80_000, 120_000, 160_000, 200_000];
+        let mark = b"DEPTH1!"; // 7 bytes, well under a block
+
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/deep.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open_file_rw on empty extent file");
+            for off in offsets {
+                h.seek(SeekFrom::Start(*off)).unwrap();
+                h.write_all(mark).unwrap();
+            }
+            h.sync().expect("sync");
+            assert_eq!(h.len(), 200_000 + mark.len() as u64);
+        }
+
+        // Walk the on-disk inode to verify the tree is in fact depth-1.
+        let ino = ext.path_to_inode(&mut dev, "/deep.bin").expect("ino");
+        let inode = ext.read_inode(&mut dev, ino).expect("read inode");
+        let iblock = extent::iblock_to_bytes(&inode.block);
+        let header = extent::decode_header(&iblock[..12]).expect("header");
+        assert_eq!(
+            header.depth, 1,
+            "expected depth-1 extent tree, got depth {}",
+            header.depth
+        );
+        assert!(
+            header.entries >= 1 && header.entries <= 4,
+            "expected 1..=4 idx entries, got {}",
+            header.entries
+        );
+
+        // Reopen and verify the contents survive. Each marked offset
+        // must read back its bytes; everything else must read as zero.
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let mut h = reopened
+            .open_file_rw(
+                &mut dev,
+                std::path::Path::new("/deep.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .expect("reopen rw on depth-1 file");
+        for off in offsets {
+            h.seek(SeekFrom::Start(*off)).unwrap();
+            let mut buf = vec![0u8; mark.len()];
+            h.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf[..], mark, "marker mismatch at offset {off}");
+        }
+        // Pick a block we never wrote and verify it's zero (hole).
+        h.seek(SeekFrom::Start(20_000)).unwrap();
+        let mut zero = vec![0u8; 4096];
+        h.read_exact(&mut zero).unwrap();
+        assert!(
+            zero.iter().all(|&b| b == 0),
+            "untouched region must be zero"
+        );
+    }
+
+    /// Round-trip a depth-1 tree through shrink: write enough extents to
+    /// promote to depth-1, then shrink past EOF and confirm the tree
+    /// drops back to depth-0 and any leaf blocks are returned to the
+    /// bitmap.
+    #[test]
+    fn open_file_rw_depth1_shrink_back_to_depth0() {
+        let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
+        ext.add_file_to_streaming(
+            &mut dev,
+            constants::INO_ROOT_DIR,
+            b"shrink.bin",
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+            0,
+            FileMeta::default(),
+        )
+        .unwrap();
+        ext.flush(&mut dev).expect("flush");
+
+        // Snapshot free-block count before any depth-1 work.
+        let free_before = ext.sb.free_blocks_count;
+
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/shrink.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open empty");
+            for &off in &[0u64, 40_000, 80_000, 120_000, 160_000] {
+                h.seek(SeekFrom::Start(off)).unwrap();
+                h.write_all(b"x").unwrap();
+            }
+            h.sync().unwrap();
+
+            // Confirm we hit depth-1 mid-sequence.
+            let ino_now = h.len(); // not used; the assert below uses inode lookup
+            let _ = ino_now;
+        }
+        {
+            // Walk the inode to confirm depth-1 reached.
+            let ino = ext.path_to_inode(&mut dev, "/shrink.bin").unwrap();
+            let inode = ext.read_inode(&mut dev, ino).unwrap();
+            let iblock = extent::iblock_to_bytes(&inode.block);
+            let header = extent::decode_header(&iblock[..12]).expect("header");
+            assert_eq!(header.depth, 1, "should be depth-1 mid-shrink");
+        }
+
+        // Now truncate to 100 bytes — drops back to a single block, well
+        // within depth-0.
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/shrink.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("reopen");
+            h.set_len(100).unwrap();
+            h.sync().unwrap();
+        }
+        {
+            let ino = ext.path_to_inode(&mut dev, "/shrink.bin").unwrap();
+            let inode = ext.read_inode(&mut dev, ino).unwrap();
+            let iblock = extent::iblock_to_bytes(&inode.block);
+            let header = extent::decode_header(&iblock[..12]).expect("header");
+            assert_eq!(header.depth, 0, "should drop back to depth-0 after shrink");
+        }
+
+        // The leaf block(s) and any freed data blocks must be back in the
+        // bitmap — free-blocks should be ≥ free_before − 1 (we still have
+        // the one data block holding the surviving 100 bytes).
+        let free_after = ext.sb.free_blocks_count;
+        assert!(
+            free_after + 2 >= free_before,
+            "shrink leaked blocks: free was {free_before}, now {free_after}",
+        );
     }
 
     #[test]

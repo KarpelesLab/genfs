@@ -22,22 +22,26 @@ fstool repack out.img out.tar                    # convert ext4 → tar (and bac
 
 ## Filesystem support
 
-| Filesystem | Read           | Write | Notes                                              |
-|------------|----------------|-------|----------------------------------------------------|
-| ext2       | ✅              | ✅     | byte-exact with `genext2fs` on the same input      |
-| ext3       | ✅              | ✅     | + JBD2 journal                                     |
-| ext4       | ✅              | ✅     | extents, FILETYPE, `metadata_csum`, xattrs         |
-| FAT32      | ✅              | ✅     | VFAT LFN entries, 8.3 short-name aliases           |
-| exFAT      | ✅              | ✅     | format + create + remove + flush                   |
-| tar        | ✅              | ✅     | ustar + PAX, `SCHILY.xattr.*` for xattrs           |
-| XFS        | ✅ (shortform + block / leaf / node dirs + BMBT) | —     | + inline + remote symlinks; B-tree dirs deferred   |
-| HFS+ / HFSX| ✅              | —     | inline + extents-overflow, symlinks, hard links    |
-| APFS       | ✅              | —     | multi-level omap + fs-tree; no snapshots / crypto  |
-| NTFS       | ✅              | —     | MFT, attributes, $DATA + ADS, indexes; xattr map   |
-| F2FS       | ✅              | —     | CP / NAT / dnodes / inline data + dentries         |
-| SquashFS   | ✅              | —     | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features |
-| qcow2      | ✅              | ✅     | v2 + v3, allocate-on-write writer                  |
-| dmg        | scaffold        | —     | UDIF v4 trailer parsed; chunk decoder TBD          |
+| Filesystem | Read | Write | Notes                                                                |
+|------------|------|-------|----------------------------------------------------------------------|
+| ext2       | ✅    | ✅     | byte-exact with `genext2fs` on the same input                        |
+| ext3       | ✅    | ✅     | + JBD2 journal                                                       |
+| ext4       | ✅    | ✅     | extents, FILETYPE, `metadata_csum`, xattrs                           |
+| FAT32      | ✅    | ✅     | VFAT LFN entries, 8.3 short-name aliases                             |
+| exFAT      | ✅    | ✅     | format + create + remove + flush                                     |
+| tar        | ✅    | ✅     | ustar + PAX, `SCHILY.xattr.*` for xattrs                             |
+| XFS        | ✅    | ✅     | shortform + block / leaf / node dirs + BMBT; writer passes `xfs_repair -n` single + multi-AG; B-tree dirs deferred |
+| HFS+/HFSX  | ✅    | ✅     | inline + extents-overflow, symlinks, hard links; writer passes `fsck.hfsplus` with optional journal stub |
+| APFS       | ✅    | 🚧    | multi-level omap + fs-tree; writer is single-volume + stub spaceman (no snapshots / encryption); not yet `fsck_apfs` clean |
+| NTFS       | ✅    | 🚧    | MFT, attributes, $DATA + ADS, indexes; xattr map; writer passes `ntfsfix --no-action` but isn't `ntfs-3g`-mountable yet (system files in root `$I30` pending) |
+| F2FS       | ✅    | ✅     | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs` |
+| SquashFS   | ✅    | ✅     | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs` |
+| qcow2      | ✅    | ✅     | v2 + v3, allocate-on-write writer                                    |
+| dmg        | 🚧   | —     | UDIF v4 trailer parsed; chunk decoder TBD                            |
+
+`🚧` marks writers that exist at the library level but have known gaps
+(see Limitations). The high-level CLI only writes ext2/3/4, FAT32, and
+tar today — the other writers are reachable via the library API.
 
 The reader for each FS streams: file contents are never fully resident in
 memory regardless of size. The writers do the same, two-pass: scan to size
@@ -167,9 +171,10 @@ preserving symlinks, device nodes, mode, uid/gid, and xattrs. tar in either
 direction round-trips content + mode + uid/gid + mtime + symlinks + device
 nodes + xattrs.
 
-For the read-only filesystems (XFS, HFS+, APFS, NTFS, F2FS, SquashFS),
-repack works **from** them. Repacking **to** them isn't supported until
-their writers land.
+`fstool repack` writes ext2/3/4, FAT32, and tar destinations today;
+the XFS / HFS+ / APFS / NTFS / F2FS / SquashFS writers exist as a
+library API (see the support table) but aren't wired into `repack` /
+`add` / `rm` yet — call them directly through the crate for now.
 
 ## Compression
 
@@ -202,11 +207,20 @@ cargo install fstool --no-default-features --features gzip,lz4,xz,lzma
 
 Things explicitly out of scope today, in rough order of likely-to-change:
 
-- NTFS / F2FS / XFS / APFS / HFS+ writers.
-- NTFS compressed and encrypted `$DATA`, `$ATTRIBUTE_LIST` spill, `$Secure`
-  security-descriptor indirection — all return `Unsupported`.
-- APFS snapshots, encryption, sealed-volume integrity.
-- XFS B-tree-format directories (block / leaf / node formats are covered).
+- High-level CLI (`build`, `add`, `rm`, `repack`) only writes ext2/3/4,
+  FAT32, and tar. The library writers for XFS / HFS+ / APFS / NTFS /
+  F2FS / SquashFS work, just not via the CLI.
+- NTFS writer: produced image isn't `ntfs-3g`-mountable — root `$I30`
+  doesn't index the system files yet; `ntfsfix --no-action` is clean.
+- NTFS reader: compressed and encrypted `$DATA`, `$ATTRIBUTE_LIST`
+  spill, and `$Secure` security-descriptor indirection beyond what
+  the resident path handles all return `Unsupported`.
+- APFS writer: single volume, stub space-manager → `fsck_apfs`
+  flags the spaceman; `mount_apfs` typically refuses the image.
+- APFS reader: snapshots, encryption, and sealed-volume integrity
+  are out of scope.
+- XFS reader: B-tree-format directories (block / leaf / node formats
+  are covered); writer assumes shortform / extent dirs.
 - ext4 `flex_bg` on the *write* path (the reader handles it).
 - Partial-file rewrites — in-place modification is whole-file granularity.
 

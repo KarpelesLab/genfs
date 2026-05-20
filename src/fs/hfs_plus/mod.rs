@@ -1072,4 +1072,83 @@ mod tests {
         // Default zeros => signature 0x0000, not H+ or HX.
         assert!(HfsPlus::open(&mut dev).is_err());
     }
+
+    /// Hard-link resolver invariant: the link-inode number returned by
+    /// [`HfsPlus::create_hardlink`] must equal the `file_id` of the
+    /// iNode catalog file that holds the data, and `BSDInfo.special`
+    /// on every `hlnk` record in the chain must point at that same
+    /// CNID. Cross-checks that:
+    /// * both source and destination hlnk records carry the same
+    ///   `special` (= `link_inode`), and neither one's `file_id`
+    ///   collides with it;
+    /// * `lookup_file_by_cnid(link_inode)` returns a non-hlnk file
+    ///   whose `file_id == link_inode`;
+    /// * the iNode owns the real data fork (logical_size matches the
+    ///   payload), while the hlnk records' own data forks are empty;
+    /// * the iNode's `bsd.special` carries the link count (2 here).
+    ///
+    /// Regression: this is the contract `resolve_hard_link` relies on
+    /// to walk `hlnk -> iNode<N>`. If `create_hardlink` ever returned
+    /// a non-CNID handle (e.g. a sequential counter), reads would
+    /// silently mis-resolve.
+    #[test]
+    fn create_hardlink_returns_inode_cnid_matching_resolved_file_id() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+
+        let data = b"link-inode invariant payload\n".repeat(8);
+        let mut src = std::io::Cursor::new(&data);
+        hfs.create_file(&mut dev, "/src", &mut src, data.len() as u64, 0o644, 0, 0)
+            .unwrap();
+        let link_inode = hfs.create_hardlink(&mut dev, "/src", "/dst").unwrap();
+        hfs.flush(&mut dev).unwrap();
+
+        // Re-open from disk so we exercise the read-side resolver.
+        let hfs = HfsPlus::open(&mut dev).unwrap();
+
+        // The iNode CNID must be resolvable as a real file whose
+        // file_id matches the link-inode handle exactly.
+        let inode_file = hfs.lookup_file_by_cnid(&mut dev, link_inode).unwrap();
+        assert_eq!(
+            inode_file.file_id, link_inode,
+            "iNode's catalog file_id must equal the link-inode CNID"
+        );
+        assert!(
+            !inode_file.is_hard_link(),
+            "iNode itself must not be an hlnk record (would recurse)"
+        );
+        assert_eq!(
+            inode_file.data_fork.logical_size,
+            data.len() as u64,
+            "iNode owns the data fork; logical_size must equal payload"
+        );
+        assert_eq!(
+            inode_file.bsd.special, 2,
+            "iNode.bsd.special is the link count (2 = src + dst)"
+        );
+
+        // Both hlnk records must carry `special == link_inode` and have
+        // a file_id distinct from it (their own catalog identity).
+        for path in ["/src", "/dst"] {
+            let rec = hfs.lookup_path(&mut dev, path).unwrap();
+            let f = match rec {
+                catalog::CatalogRecord::File(f) => f,
+                _ => panic!("{path:?} should be a catalog file record"),
+            };
+            assert!(f.is_hard_link(), "{path:?} must be an hlnk record");
+            assert_eq!(
+                f.bsd.special, link_inode,
+                "{path:?} bsd.special must point at the iNode CNID"
+            );
+            assert_ne!(
+                f.file_id, link_inode,
+                "{path:?} hlnk file_id must differ from the iNode CNID"
+            );
+            assert_eq!(
+                f.data_fork.logical_size, 0,
+                "{path:?} hlnk record's own data fork must be empty"
+            );
+        }
+    }
 }

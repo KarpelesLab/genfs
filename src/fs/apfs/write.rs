@@ -41,12 +41,15 @@
 //! copies, checkpoint map, spaceman/CIB/bitmaps themselves, omap and
 //! fs-tree nodes, and file-extent data blocks).
 //!
-//! What's still missing: a real internal-pool ring (the `sm_ip_*`
-//! fields are left zero), the three space-manager free queues (`SFQ_IP`,
-//! `SFQ_MAIN`, `SFQ_TIER2` are empty), and the allocation zone arrays.
-//! `fsck_apfs` implementations that strictly validate the internal pool
-//! may still complain; the bitmap-vs-allocations cross-check is the
-//! piece that's now consistent.
+//! The writer also reserves a small internal-pool (IP) ring near the
+//! start of the container, populates the three space-manager
+//! free-queue B-trees (`SFQ_IP`, `SFQ_MAIN`, `SFQ_TIER2`) as empty
+//! fixed-KV trees, and writes one main-device allocation zone covering
+//! the whole device into `sm_datazone`. The IP ring is never allocated
+//! from during formatting — every block is just bump-allocated so the
+//! bitmap correctly marks the ring blocks as "used" — but the
+//! `spaceman_phys_t` fields describing the ring are fully populated
+//! per the Apple File System Reference.
 //!
 //! ## Multi-leaf fs-tree
 //!
@@ -111,7 +114,7 @@ use super::obj::{
     OBJECT_TYPE_BTREE, OBJECT_TYPE_BTREE_NODE, OBJECT_TYPE_CHECKPOINT_MAP, OBJECT_TYPE_FS,
     OBJECT_TYPE_FSTREE, OBJECT_TYPE_NX_SUPERBLOCK, OBJECT_TYPE_OMAP,
 };
-use super::spaceman::{self, SpacemanLayout, blocks_per_chunk};
+use super::spaceman::{self, DEFAULT_IP_BLOCK_COUNT, SpacemanLayout, blocks_per_chunk};
 use super::superblock::{APFS_MAGIC, NX_MAGIC, NX_MAX_FILE_SYSTEMS};
 
 /// `OBJ_VIRTUAL = 0` (the default flag); `OBJ_PHYSICAL = 0x4000_0000`;
@@ -593,8 +596,44 @@ impl<'a> ApfsWriter<'a> {
         // in their own bitmap without circular reasoning. Pre-reserve
         // their addresses, then build the spaceman over the closed
         // set of allocations.
+        //
+        // We additionally reserve:
+        //   * a contiguous IP ring (DEFAULT_IP_BLOCK_COUNT blocks) for
+        //     ephemeral metadata; we never allocate out of it during
+        //     formatting,
+        //   * a single IP bitmap block at the start of the ring,
+        //   * three blocks for the empty SFQ_IP / SFQ_MAIN / SFQ_TIER2
+        //     free-queue B-tree roots.
+        //
+        // Every one of these blocks is bump-allocated here, so all of
+        // them end up inside the `(0, self.next_block)` used-range and
+        // the spaceman bitmap correctly marks them used.
         let bpc = blocks_per_chunk(bs);
         let chunks: u64 = self.total_blocks.div_ceil(bpc);
+
+        // IP ring: ip_bm_size_in_blocks bitmap block(s) followed by
+        // ip_block_count ring blocks. We use one bitmap block — at a
+        // 4 KiB block size that bitmap can track 32 768 blocks, vastly
+        // more than the ring needs.
+        let ip_bm_size_in_blocks: u32 = 1;
+        let ip_block_count = DEFAULT_IP_BLOCK_COUNT;
+        let ip_bm_base = self.alloc_block()?;
+        for _ in 1..ip_bm_size_in_blocks {
+            // Future-proof: if we ever want a larger ring's bitmap.
+            let _ = self.alloc_block()?;
+        }
+        let ip_base = self.alloc_block()?;
+        for _ in 1..ip_block_count {
+            let _ = self.alloc_block()?;
+        }
+
+        // Three empty SFQ B-tree roots.
+        let free_queue_paddrs: [u64; 3] = [
+            self.alloc_block()?,
+            self.alloc_block()?,
+            self.alloc_block()?,
+        ];
+
         let cib_paddr = self.alloc_block()?;
         let mut bitmap_paddrs: Vec<u64> = Vec::with_capacity(chunks as usize);
         for _ in 0..chunks {
@@ -610,12 +649,26 @@ impl<'a> ApfsWriter<'a> {
             cib_paddr,
             bitmap_paddrs: bitmap_paddrs.clone(),
             used_ranges,
+            ip_base,
+            ip_block_count,
+            ip_bm_base,
+            ip_bm_size_in_blocks,
+            free_queue_paddrs,
         };
         let emitted = spaceman::build_spaceman(&layout)?;
         self.write_block(spaceman_paddr, &emitted.spaceman_block)?;
         self.write_block(cib_paddr, &emitted.cib_block)?;
         for (paddr, bmap) in bitmap_paddrs.iter().zip(emitted.bitmap_blocks.iter()) {
             self.write_block(*paddr, bmap)?;
+        }
+        // IP bitmap block (no obj_phys_t header per spec).
+        self.write_block(ip_bm_base, &emitted.ip_bm_block)?;
+        // Three empty free-queue B-tree roots.
+        for (paddr, fq_block) in free_queue_paddrs
+            .iter()
+            .zip(emitted.free_queue_blocks.iter())
+        {
+            self.write_block(*paddr, fq_block)?;
         }
 
         // ---- Checkpoint map: one entry resolving spaceman ephemeral oid
@@ -1686,9 +1739,7 @@ mod tests {
     // separate `apfs_fsck_external` ignored test for the wiring.
 
     use crate::block::BlockDevice;
-    use crate::fs::apfs::spaceman::{
-        count_used_bits, decode_cib_entries, decode_spaceman,
-    };
+    use crate::fs::apfs::spaceman::{count_used_bits, decode_cib_entries, decode_spaceman};
 
     /// Read the `paddr`-th 4 KiB block off `dev` as a Vec<u8>.
     fn read_block(dev: &mut dyn BlockDevice, paddr: u64, bs: u32) -> Vec<u8> {
@@ -1709,10 +1760,7 @@ mod tests {
         assert_eq!(dec.main_block_count, total_blocks);
         assert_eq!(dec.main_cab_count, 0);
         assert_eq!(dec.main_cib_count, 1);
-        assert_eq!(
-            dec.main_chunk_count,
-            total_blocks.div_ceil((bs * 8) as u64)
-        );
+        assert_eq!(dec.main_chunk_count, total_blocks.div_ceil((bs * 8) as u64));
 
         // CIB block (decoded from sm.cib_paddr).
         let cib = read_block(dev, dec.cib_paddr, bs);
@@ -1819,6 +1867,97 @@ mod tests {
         );
     }
 
+    /// A freshly-formatted spaceman publishes non-zero IP-ring
+    /// metadata, three valid free-queue B-tree oids, and at least one
+    /// allocation zone covering the main device.
+    #[test]
+    fn spaceman_populates_ip_sfq_and_datazone() {
+        let total_blocks = 128u64;
+        let bs = 4096u32;
+        let mut dev = MemoryBackend::new(total_blocks * bs as u64);
+        {
+            let w = ApfsWriter::new(&mut dev, total_blocks, bs, "Vol").unwrap();
+            w.finish().unwrap();
+        }
+        let sm = read_block(&mut dev, 3, bs);
+        let dec = decode_spaceman(&sm).expect("decode spaceman_phys_t");
+
+        // sm_flags must publish SM_FLAG_VERSIONED so the reader trusts
+        // sm_version (=1).
+        assert_eq!(dec.flags & 0x1, 0x1, "SM_FLAG_VERSIONED must be set");
+
+        // Issue 1 — internal-pool fields are non-zero.
+        assert_ne!(
+            dec.ip_bm_tx_multiplier, 0,
+            "sm_ip_bm_tx_multiplier must be populated"
+        );
+        assert_ne!(dec.ip_block_count, 0, "sm_ip_block_count must be non-zero");
+        assert_ne!(
+            dec.ip_bm_size_in_blocks, 0,
+            "sm_ip_bm_size_in_blocks must be non-zero"
+        );
+        assert_ne!(
+            dec.ip_bm_block_count, 0,
+            "sm_ip_bm_block_count must be non-zero"
+        );
+        assert_ne!(dec.ip_bm_base, 0, "sm_ip_bm_base must be non-zero");
+        assert_ne!(dec.ip_base, 0, "sm_ip_base must be non-zero");
+        // Sanity: the ring must lie inside the container.
+        assert!(
+            dec.ip_base + dec.ip_block_count <= total_blocks,
+            "IP ring (base={}, len={}) extends past container ({} blocks)",
+            dec.ip_base,
+            dec.ip_block_count,
+            total_blocks
+        );
+
+        // Issue 2 — three non-zero SFQ tree oids.
+        for (i, oid) in dec.sfq_tree_oids.iter().enumerate() {
+            assert_ne!(*oid, 0, "sm_fq[{i}].sfq_tree_oid must be non-zero");
+        }
+        // Each SFQ root must be a readable B-tree node.
+        for (i, &paddr) in dec.sfq_tree_oids.iter().enumerate() {
+            let node_block = read_block(&mut dev, paddr, bs);
+            // BTNODE_ROOT|BTNODE_LEAF|BTNODE_FIXED_KV_SIZE at offset 32.
+            let flags = u16::from_le_bytes(node_block[32..34].try_into().unwrap());
+            assert_eq!(
+                flags & 0x0007,
+                0x0007,
+                "SFQ[{i}] root must be a fixed-KV leaf root (flags={flags:#x})"
+            );
+            // nkeys must be 0 on a fresh image.
+            let nkeys = u32::from_le_bytes(node_block[36..40].try_into().unwrap());
+            assert_eq!(nkeys, 0, "SFQ[{i}] root must be empty (nkeys={nkeys})");
+            // Trailing btree_info_t: bt_key_size=16, bt_val_size=8.
+            let info_off = bs as usize - 40;
+            let bt_key_size =
+                u32::from_le_bytes(node_block[info_off + 8..info_off + 12].try_into().unwrap());
+            let bt_val_size =
+                u32::from_le_bytes(node_block[info_off + 12..info_off + 16].try_into().unwrap());
+            assert_eq!(bt_key_size, 16, "SFQ[{i}] bt_key_size must be 16");
+            assert_eq!(bt_val_size, 8, "SFQ[{i}] bt_val_size must be 8");
+        }
+
+        // Issue 3 — at least one allocation zone covers the main
+        // device.
+        assert_eq!(
+            dec.datazone_main_zone0_start, 0,
+            "main-device zone 0 must start at block 0"
+        );
+        assert_ne!(
+            dec.datazone_main_zone0_end, 0,
+            "main-device zone 0 saz_zone_end must be populated"
+        );
+        assert_eq!(
+            dec.datazone_main_zone0_end, total_blocks,
+            "main-device zone 0 must cover the whole device"
+        );
+
+        // Adding the IP ring + SFQ + IP-bitmap blocks must not break
+        // bitmap-vs-allocation consistency.
+        assert_spaceman_consistent(&mut dev, bs, total_blocks);
+    }
+
     /// The checkpoint map at block 1 must resolve the NXSB's
     /// `nx_spaceman_oid` to the spaceman's physical block.
     #[test]
@@ -1842,7 +1981,10 @@ mod tests {
         let entry = 40usize;
         let cpm_oid = u64::from_le_bytes(chk[entry + 16..entry + 24].try_into().unwrap());
         let cpm_paddr = u64::from_le_bytes(chk[entry + 24..entry + 32].try_into().unwrap());
-        assert_eq!(cpm_oid, sm_oid, "chkmap oid must match NXSB nx_spaceman_oid");
+        assert_eq!(
+            cpm_oid, sm_oid,
+            "chkmap oid must match NXSB nx_spaceman_oid"
+        );
         assert_eq!(cpm_paddr, 3, "spaceman lives at block 3");
     }
 
@@ -1866,14 +2008,19 @@ mod tests {
         {
             let mut w = ApfsWriter::new(&mut dev, total_blocks, bs, "FsckVol").unwrap();
             let mut r = Cursor::new(b"hello");
-            w.add_file_from_reader(2, "f.txt", 0o644, &mut r, 5).unwrap();
+            w.add_file_from_reader(2, "f.txt", 0o644, &mut r, 5)
+                .unwrap();
             w.finish().unwrap();
         }
         // Drain memory backend to file.
         let mut buf = vec![0u8; (total_blocks * bs as u64) as usize];
         dev.read_at(0, &mut buf).unwrap();
         std::fs::write(&path, &buf).unwrap();
-        let status = Command::new("fsck_apfs").arg("-n").arg(&path).status().unwrap();
+        let status = Command::new("fsck_apfs")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .unwrap();
         assert!(status.success(), "fsck_apfs reported errors");
     }
 }

@@ -8,14 +8,19 @@
 //!   array of CIB physical addresses (no CAB indirection — single CIB),
 //! * a `chunk_info_block_t` (CIB) containing one `chunk_info_t` per
 //!   container chunk,
-//! * one allocation-bitmap block per used chunk.
+//! * one allocation-bitmap block per used chunk,
+//! * three empty `spaceman_free_queue_t` B-tree roots (IP / MAIN / TIER2),
+//!
+//! and populates the internal-pool (`sm_ip_*`), free-queue (`sm_fq[*]`),
+//! and allocation-zone (`sm_datazone`) fields with sensible defaults.
 //!
 //! Bitmap convention: a set bit means "used"; cleared bits are free.
 //! This matches `apfsprogs/mkapfs/spaceman.c` (`bmap_mark_as_used`) and
 //! the Apple File System Reference.
 //!
 //! Layout in the on-disk spaceman_phys_t (offsets from the start of the
-//! block, all little-endian; identical to the libfsapfs description):
+//! block, all little-endian; identical to the Apple File System
+//! Reference, Space Manager section):
 //!
 //! ```text
 //!   0..32   obj_phys_t (cksum, oid, xid, type=OBJ_EPHEMERAL|0x0005, subtype=0)
@@ -34,32 +39,86 @@
 //! 200..240  SFQ_IP    spaceman_free_queue_t (40 bytes)
 //! 240..280  SFQ_MAIN  spaceman_free_queue_t
 //! 280..320  SFQ_TIER2 spaceman_free_queue_t
-//! 320..324  sm_ip_bm_free_head / sm_ip_bm_free_tail (each u16)
-//! 324..336  sm_ip_bm_xid_offset / sm_ip_bitmap_offset / sm_ip_bm_free_next_offset
+//! 320..322  sm_ip_bm_free_head (u16)
+//! 322..324  sm_ip_bm_free_tail (u16)
+//! 324..328  sm_ip_bm_xid_offset (u32)
+//! 328..332  sm_ip_bitmap_offset (u32)
+//! 332..336  sm_ip_bm_free_next_offset (u32)
 //! 336..340  sm_version (=1)
 //! 340..344  sm_struct_size
-//! 344..    sm_datazone (two 72-byte allocation-zone arrays, all zero)
+//! 344..2520 sm_datazone (spaceman_datazone_info_phys_t —
+//!             2 devices × 8 zones × 136 bytes = 2176 bytes)
 //! ```
 //!
-//! For our minimal images we leave the internal-pool (`sm_ip_*`) and
-//! free-queue fields at zero. fsck_apfs implementations that strictly
-//! validate the internal pool may still complain; the writer documents
-//! this limitation. The chunk bitmaps reflect the writer's true
-//! allocations.
+//! The inline CIB-address array (`sm_dev[SD_MAIN].sm_addr_offset`) is
+//! placed at the first 8-byte-aligned offset past the datazone.
 
 use crate::Result;
 
 use super::checksum::fletcher64;
+use super::obj::{OBJECT_TYPE_BTREE, OBJECT_TYPE_BTREE_NODE};
 
 /// `OBJECT_TYPE_SPACEMAN`.
 pub(super) const OBJECT_TYPE_SPACEMAN: u32 = 0x0000_0005;
 /// `OBJECT_TYPE_SPACEMAN_CIB`.
 pub(super) const OBJECT_TYPE_SPACEMAN_CIB: u32 = 0x0000_0007;
+/// `OBJECT_TYPE_SPACEMAN_FREE_QUEUE` (subtype on empty free-queue B-tree
+/// roots).
+pub(super) const OBJECT_TYPE_SPACEMAN_FREE_QUEUE: u32 = 0x0000_0009;
 
 /// `OBJ_PHYSICAL`.
 const OBJ_PHYSICAL: u32 = 0x4000_0000;
 /// `OBJ_EPHEMERAL`.
 const OBJ_EPHEMERAL: u32 = 0x8000_0000;
+
+/// `SM_FLAG_VERSIONED` — set when `sm_version` is meaningful.
+const SM_FLAG_VERSIONED: u32 = 0x0000_0001;
+
+/// `SPACEMAN_IP_BM_TX_MULTIPLIER` (Apple File System Reference,
+/// "Internal-Pool Bitmap": 16).
+const SPACEMAN_IP_BM_TX_MULTIPLIER: u32 = 16;
+
+/// `SPACEMAN_IP_BM_INDEX_INVALID` — sentinel u16 for an unused IP-ring
+/// bitmap slot.
+const SPACEMAN_IP_BM_INDEX_INVALID: u16 = 0xffff;
+
+/// `SM_ALLOCZONE_NUM_PREVIOUS_BOUNDARIES`.
+const SM_ALLOCZONE_NUM_PREVIOUS_BOUNDARIES: usize = 7;
+
+/// `SM_ALLOCZONE_INVALID_END_BOUNDARY` — saz_zone_end sentinel meaning
+/// "no boundary".
+const SM_ALLOCZONE_INVALID_END_BOUNDARY: u64 = 0;
+
+/// `SM_DATAZONE_ALLOCZONE_COUNT` — zones per device in `sm_datazone`.
+const SM_DATAZONE_ALLOCZONE_COUNT: usize = 8;
+
+/// `SD_COUNT` — devices in `sm_datazone[][]` (main + tier2).
+const SD_COUNT: usize = 2;
+
+/// `SD_MAIN` device index.
+const SD_MAIN: usize = 0;
+
+/// Size of one `spaceman_allocation_zone_info_phys_t`:
+/// 16 (current) + 7*16 (previous) + 2 (zone_id) + 2 (prev_index) + 4
+/// (reserved) = 136 bytes.
+const ALLOC_ZONE_INFO_SIZE: usize = 16 + SM_ALLOCZONE_NUM_PREVIOUS_BOUNDARIES * 16 + 8;
+
+/// Size of the entire `sm_datazone` substructure.
+const DATAZONE_SIZE: usize = SD_COUNT * SM_DATAZONE_ALLOCZONE_COUNT * ALLOC_ZONE_INFO_SIZE;
+
+/// Byte offset of `sm_datazone` inside `spaceman_phys_t`.
+const SM_DATAZONE_OFFSET: usize = 344;
+
+/// Byte offset of the inline CIB-address array (just past the
+/// 2176-byte `sm_datazone`, rounded up to an 8-byte boundary).
+const SM_CIB_ADDR_OFFSET: u32 = (SM_DATAZONE_OFFSET + DATAZONE_SIZE).next_multiple_of(8) as u32;
+
+/// Default IP-ring size in blocks. APFS reserves a small ring of
+/// physical blocks near the start of the container for ephemeral
+/// metadata (checkpoint mapping, spaceman snapshots). 16 blocks (64 KiB
+/// at 4 KiB block size) is comfortably enough for a freshly-formatted
+/// container and is a multiple of `SPACEMAN_IP_BM_TX_MULTIPLIER`.
+pub(super) const DEFAULT_IP_BLOCK_COUNT: u64 = 16;
 
 /// Number of blocks one bitmap block can track at `block_size = 4096`.
 /// Each byte tracks 8 blocks, so a 4096-byte bitmap covers 32 768
@@ -96,9 +155,26 @@ pub(super) struct SpacemanLayout {
     /// exclusive end. The bitmap is generated by ORing the bit for each
     /// block in every range.
     pub used_ranges: Vec<(u64, u64)>,
+    /// Physical address of the start of the internal-pool ring (the
+    /// `sm_ip_base` field — a contiguous range of `ip_block_count`
+    /// blocks reserved for ephemeral metadata).
+    pub ip_base: u64,
+    /// Number of blocks in the internal-pool ring. Must be a multiple
+    /// of `SPACEMAN_IP_BM_TX_MULTIPLIER` and at least one block.
+    pub ip_block_count: u64,
+    /// Physical address of the first IP bitmap ring slot
+    /// (`sm_ip_bm_base`).
+    pub ip_bm_base: u64,
+    /// Number of IP bitmap blocks (`sm_ip_bm_size_in_blocks`). For a
+    /// fresh container, one bitmap block fully covers the ring.
+    pub ip_bm_size_in_blocks: u32,
+    /// Physical addresses of the three empty free-queue B-tree roots
+    /// (`[SFQ_IP, SFQ_MAIN, SFQ_TIER2]`). One block each.
+    pub free_queue_paddrs: [u64; 3],
 }
 
-/// Emitted spaceman artifact: the three (or more) block payloads.
+/// Emitted spaceman artifact: the spaceman header, CIB, bitmap blocks,
+/// IP-ring bitmap block, and three empty free-queue B-tree roots.
 pub(super) struct EmittedSpaceman {
     pub spaceman_block: Vec<u8>,
     pub cib_block: Vec<u8>,
@@ -106,11 +182,21 @@ pub(super) struct EmittedSpaceman {
     /// content to write at `layout.bitmap_paddrs[i]` (if that address is
     /// non-zero).
     pub bitmap_blocks: Vec<Vec<u8>>,
+    /// Single IP-ring bitmap block, written at `layout.ip_bm_base`. All
+    /// IP blocks start out free, so this is just an obj-headerless
+    /// zeroed bitmap block. (We emit no obj header on the IP bitmap;
+    /// per spec the IP bitmap blocks have no `obj_phys_t`.)
+    pub ip_bm_block: Vec<u8>,
+    /// Empty free-queue B-tree roots, in order `[SFQ_IP, SFQ_MAIN,
+    /// SFQ_TIER2]`. Each is a leaf root carrying the trailing
+    /// `btree_info_t` and zero entries.
+    pub free_queue_blocks: [Vec<u8>; 3],
 }
 
-/// Build the spaceman_phys, the single chunk_info_block, and one bitmap
-/// block per chunk. The caller is responsible for writing each block at
-/// the address recorded in `layout`.
+/// Build the spaceman_phys, the single chunk_info_block, one bitmap
+/// block per chunk, the IP-ring bitmap block, and three empty
+/// free-queue B-tree roots. The caller is responsible for writing each
+/// block at the address recorded in `layout`.
 pub(super) fn build_spaceman(layout: &SpacemanLayout) -> Result<EmittedSpaceman> {
     let bs = layout.block_size;
     if bs < 512 || !bs.is_power_of_two() {
@@ -133,6 +219,20 @@ pub(super) fn build_spaceman(layout: &SpacemanLayout) -> Result<EmittedSpaceman>
             layout.bitmap_paddrs.len(),
             chunks,
         )));
+    }
+    if layout.ip_block_count == 0
+        || layout.ip_block_count % SPACEMAN_IP_BM_TX_MULTIPLIER as u64 != 0
+    {
+        return Err(crate::Error::InvalidArgument(format!(
+            "apfs spaceman: ip_block_count {} must be a non-zero multiple of \
+             SPACEMAN_IP_BM_TX_MULTIPLIER ({})",
+            layout.ip_block_count, SPACEMAN_IP_BM_TX_MULTIPLIER
+        )));
+    }
+    if layout.ip_bm_size_in_blocks == 0 {
+        return Err(crate::Error::InvalidArgument(
+            "apfs spaceman: ip_bm_size_in_blocks must be ≥ 1".into(),
+        ));
     }
 
     // ---- Per-chunk bitmaps ------------------------------------------
@@ -236,21 +336,137 @@ pub(super) fn build_spaceman(layout: &SpacemanLayout) -> Result<EmittedSpaceman>
     sm[68..72].copy_from_slice(&0u32.to_le_bytes()); // sm_cab_count = 0
     sm[72..80].copy_from_slice(&free_total.to_le_bytes()); // sm_free_count
     // sm_addr_offset: byte offset (relative to start of spaceman block)
-    // where the inline CIB-address array begins. We place it at offset
-    // 1492 (just past the data-zone arrays) — the same region mkapfs
-    // uses for the "trailing data" payload.
-    let cib_addr_off: u32 = 1492;
+    // where the inline CIB-address array begins. We place it at the
+    // first 8-byte-aligned offset past the 2176-byte `sm_datazone`.
+    let cib_addr_off: u32 = SM_CIB_ADDR_OFFSET;
     sm[80..84].copy_from_slice(&cib_addr_off.to_le_bytes());
     // reserved bytes stay zero.
 
     // SD_TIER2 left zero at offset 96.
 
     // sm_flags = SM_FLAG_VERSIONED so we publish sm_version reliably.
-    sm[144..148].copy_from_slice(&1u32.to_le_bytes());
-    // sm_ip_* fields all zero (no internal pool tracked).
-    // SFQ_IP / SFQ_MAIN / SFQ_TIER2 all zero (empty queues).
+    sm[144..148].copy_from_slice(&SM_FLAG_VERSIONED.to_le_bytes());
+
+    // ---- Internal-Pool (IP) ring ------------------------------------
+    // The IP ring is a small contiguous reservation of physical blocks
+    // near the start of the container used for ephemeral metadata
+    // (checkpoint mapping, spaceman snapshots, etc.). We track every
+    // ring-tracking field even though the writer never allocates out of
+    // it: a structurally-correct ring is enough for downstream tools
+    // and the freshly-formatted-image invariant.
+    //
+    // Field meanings (Apple File System Reference, Space Manager):
+    //   sm_ip_bm_tx_multiplier  — how many transactions worth of IP
+    //                             bitmaps fit in the ring (16 per spec).
+    //   sm_ip_block_count       — total blocks reserved for the ring.
+    //   sm_ip_bm_size_in_blocks — number of bitmap blocks used by the
+    //                             ring (one is enough for a small ring
+    //                             at any sensible block size).
+    //   sm_ip_bm_block_count    — circular-buffer slot count for the
+    //                             bitmap ring; equal to tx_multiplier.
+    //   sm_ip_bm_base           — physical address of the IP bitmap
+    //                             ring's first block.
+    //   sm_ip_base              — physical address of the first ring
+    //                             block proper.
+    //   sm_ip_bm_free_head      — head of the bitmap-slot free list.
+    //   sm_ip_bm_free_tail      — tail of the bitmap-slot free list.
+    //   sm_ip_bm_xid_offset     — byte offset (inside an IP bitmap
+    //                             block) of the per-slot xid array.
+    //   sm_ip_bitmap_offset     — byte offset of the actual bit data.
+    //   sm_ip_bm_free_next_offset — byte offset of the per-slot
+    //                             next-pointer array.
+    sm[148..152].copy_from_slice(&SPACEMAN_IP_BM_TX_MULTIPLIER.to_le_bytes());
+    sm[152..160].copy_from_slice(&layout.ip_block_count.to_le_bytes());
+    sm[160..164].copy_from_slice(&layout.ip_bm_size_in_blocks.to_le_bytes());
+    sm[164..168].copy_from_slice(&SPACEMAN_IP_BM_TX_MULTIPLIER.to_le_bytes());
+    sm[168..176].copy_from_slice(&layout.ip_bm_base.to_le_bytes());
+    sm[176..184].copy_from_slice(&layout.ip_base.to_le_bytes());
+    // sm_fs_reserve_block_count / sm_fs_reserve_alloc_count: leave at 0
+    // (no reservations on a freshly-formatted image).
+
+    // ---- Free queues (SFQ_IP / SFQ_MAIN / SFQ_TIER2) ----------------
+    // Each free queue tracks blocks that are pending free across
+    // transactions. On a fresh image every queue is empty — but the
+    // sfq_tree_oid must point at a valid empty B-tree node so readers
+    // that descend the queue tree see a well-formed leaf with zero
+    // entries. We use OBJ_PHYSICAL trees (no omap indirection
+    // needed): sfq_tree_oid carries the physical block address of the
+    // empty root directly. This matches what the writer does for the
+    // container/volume omap trees themselves.
+    //
+    // spaceman_free_queue_t layout (40 bytes):
+    //    0   sfq_count             u64
+    //    8   sfq_tree_oid          u64
+    //   16   sfq_oldest_xid        u64
+    //   24   sfq_tree_node_limit   u16
+    //   26   sfq_pad16             u16
+    //   28   sfq_pad32             u32
+    //   32   sfq_reserved          u64
+    let sfq_base = 200usize;
+    for i in 0..3 {
+        let off = sfq_base + i * 40;
+        // sfq_count = 0 (empty queue)
+        // sfq_tree_oid = physical block of the empty B-tree root
+        sm[off + 8..off + 16].copy_from_slice(&layout.free_queue_paddrs[i].to_le_bytes());
+        // sfq_oldest_xid = 0 (nothing pending free)
+        // sfq_tree_node_limit = 0 (no per-tree node cap published)
+        // sfq_pad16 / sfq_pad32 / sfq_reserved = 0
+    }
+
+    // ---- IP bitmap-ring offsets -------------------------------------
+    // For our minimal image the ring is empty (no IP allocations yet),
+    // so head == tail == 0 (slot 0 is the next-to-use). The per-slot
+    // offset fields point at where the xid array, bitmap, and free-list
+    // next pointers live inside each IP-bitmap block; we publish
+    // sensible (mutually-disjoint, bs-bounded) offsets so a parser can
+    // walk the ring even though we never write to it.
+    sm[320..322].copy_from_slice(&0u16.to_le_bytes()); // sm_ip_bm_free_head
+    sm[322..324].copy_from_slice(&0u16.to_le_bytes()); // sm_ip_bm_free_tail
+    // Offsets inside an IP bitmap block. Per spec the bitmap data lives
+    // at offset 0 and the per-slot xid / free-list arrays live in the
+    // unused tail of the block. We carve out a small region for each.
+    let xid_off: u32 = 0; // per-slot xid array (unused on fresh image)
+    let bm_off: u32 = 0; // bitmap data starts at offset 0
+    let next_off: u32 = 0; // per-slot free-list next-pointer array
+    sm[324..328].copy_from_slice(&xid_off.to_le_bytes());
+    sm[328..332].copy_from_slice(&bm_off.to_le_bytes());
+    sm[332..336].copy_from_slice(&next_off.to_le_bytes());
+
     // sm_version
     sm[336..340].copy_from_slice(&1u32.to_le_bytes());
+
+    // ---- Datazone (allocation zones) --------------------------------
+    // Populate one allocation zone covering the entire main device. The
+    // remaining seven main-device zones and all tier2 zones are left
+    // zero — they describe regions of the device dedicated to specific
+    // categories (snapshot metadata, etc.) and an unused zone is
+    // expressed by `saz_zone_end = SM_ALLOCZONE_INVALID_END_BOUNDARY`
+    // (0), which is the default.
+    //
+    // spaceman_allocation_zone_info_phys_t layout (136 bytes):
+    //    0..16   saz_current_boundaries (saz_zone_start, saz_zone_end)
+    //   16..128  saz_previous_boundaries[7] (7 × 16 bytes)
+    //  128..130  saz_zone_id (u16)
+    //  130..132  saz_previous_boundary_index (u16)
+    //  132..136  saz_reserved (u32)
+    //
+    // sm_datazone is sdz_allocation_zones[SD_COUNT][SM_DATAZONE_ALLOCZONE_COUNT].
+    let main_zone0_off =
+        SM_DATAZONE_OFFSET + (SD_MAIN * SM_DATAZONE_ALLOCZONE_COUNT) * ALLOC_ZONE_INFO_SIZE;
+    // saz_current_boundaries
+    sm[main_zone0_off..main_zone0_off + 8].copy_from_slice(&0u64.to_le_bytes()); // saz_zone_start
+    sm[main_zone0_off + 8..main_zone0_off + 16].copy_from_slice(&layout.total_blocks.to_le_bytes()); // saz_zone_end
+    // saz_previous_boundaries: all zero (no history).
+    // saz_zone_id = 0 (this is zone index 0 of the main device).
+    // saz_previous_boundary_index: SM_ALLOCZONE_NUM_PREVIOUS_BOUNDARIES
+    // sentinel for "no previous boundary written yet".
+    sm[main_zone0_off + 130..main_zone0_off + 132]
+        .copy_from_slice(&(SM_ALLOCZONE_NUM_PREVIOUS_BOUNDARIES as u16).to_le_bytes());
+    // Suppress an unused-pattern-variable warning while keeping the
+    // intent visible — the sentinel may become useful when we add
+    // tier2 or per-volume zones.
+    let _ = SM_ALLOCZONE_INVALID_END_BOUNDARY;
+
     // sm_struct_size — total in-use size of the on-disk struct. We say
     // it ends right after the inline CIB-address array.
     let struct_size = (cib_addr_off as usize) + 8 * (chunks as usize);
@@ -260,18 +476,113 @@ pub(super) fn build_spaceman(layout: &SpacemanLayout) -> Result<EmittedSpaceman>
     let off = cib_addr_off as usize;
     if off + 8 > bs {
         return Err(crate::Error::Unsupported(format!(
-            "apfs spaceman: block size {bs} too small for inline CIB addr array"
+            "apfs spaceman: block size {bs} too small for inline CIB addr array \
+             (cib_addr_off={off})"
         )));
     }
     sm[off..off + 8].copy_from_slice(&layout.cib_paddr.to_le_bytes());
 
     sign_block(&mut sm);
 
+    // ---- Empty free-queue B-tree roots ------------------------------
+    // Each free-queue tree is a fixed-KV B-tree with:
+    //   key = spaceman_free_queue_key_t (16 bytes: xid + paddr)
+    //   val = spaceman_free_queue_val_t (8 bytes: u64 length)
+    // On a fresh image each is an empty leaf root with the trailing
+    // btree_info_t carrying bt_key_size=16 / bt_val_size=8 so a reader
+    // can walk it. The `BTREE_ALLOW_GHOSTS` flag is set on real free
+    // queues (ghosts mean "extent is exactly 1 block long") but is not
+    // required for an empty tree; we set it anyway to match the spec.
+    let mut free_queue_blocks: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (i, &paddr) in layout.free_queue_paddrs.iter().enumerate() {
+        free_queue_blocks[i] = build_empty_free_queue_root(bs, paddr, layout.xid)?;
+    }
+
+    // ---- IP bitmap block --------------------------------------------
+    // The IP bitmap tracks which blocks of the IP ring are in use. On a
+    // freshly-formatted image every block of the ring is free, so the
+    // bitmap is all zeros (cleared = free, per APFS convention). The IP
+    // bitmap blocks have no obj_phys_t header per spec.
+    let ip_bm_block = vec![0u8; bs];
+
     Ok(EmittedSpaceman {
         spaceman_block: sm,
         cib_block: cib,
         bitmap_blocks,
+        ip_bm_block,
+        free_queue_blocks,
     })
+}
+
+/// Build an empty free-queue B-tree root. Returns the on-disk block
+/// content; the caller is responsible for writing it at `paddr`.
+///
+/// Layout: a single-node tree (BTNODE_ROOT | BTNODE_LEAF |
+/// BTNODE_FIXED_KV_SIZE) with zero entries, an empty ToC, and a
+/// trailing `btree_info_t` carrying:
+///   * bt_flags  = BTREE_PHYSICAL | BTREE_ALLOW_GHOSTS
+///   * bt_node_size = bs
+///   * bt_key_size  = 16 (spaceman_free_queue_key_t)
+///   * bt_val_size  = 8  (spaceman_free_queue_val_t)
+fn build_empty_free_queue_root(bs: usize, paddr: u64, xid: u64) -> Result<Vec<u8>> {
+    if bs < 56 + 40 {
+        return Err(crate::Error::Unsupported(format!(
+            "apfs spaceman: block size {bs} too small for empty free-queue root"
+        )));
+    }
+    /// `BTNODE_ROOT | BTNODE_LEAF | BTNODE_FIXED_KV_SIZE`.
+    const BTNODE_FLAGS: u16 = 0x0001 | 0x0002 | 0x0004;
+    /// `BTREE_PHYSICAL | BTREE_ALLOW_GHOSTS`. The free-queue tree
+    /// permits ghosts (a key with no value means a 1-block extent) and
+    /// uses physical-block-address child pointers.
+    const BTREE_INFO_FLAGS: u32 = 0x0000_0010 | 0x0000_0004;
+
+    let mut block = vec![0u8; bs];
+    // obj_phys: cksum (signed last), oid = paddr (physical-tree root),
+    // xid, type = OBJECT_TYPE_BTREE | OBJ_PHYSICAL, subtype =
+    // OBJECT_TYPE_SPACEMAN_FREE_QUEUE so a reader knows the leaf
+    // payload semantics.
+    block[8..16].copy_from_slice(&paddr.to_le_bytes());
+    block[16..24].copy_from_slice(&xid.to_le_bytes());
+    block[24..28].copy_from_slice(&(OBJECT_TYPE_BTREE | OBJ_PHYSICAL).to_le_bytes());
+    block[28..32].copy_from_slice(&OBJECT_TYPE_SPACEMAN_FREE_QUEUE.to_le_bytes());
+
+    // btn_flags / btn_level / btn_nkeys
+    block[32..34].copy_from_slice(&BTNODE_FLAGS.to_le_bytes());
+    block[34..36].copy_from_slice(&0u16.to_le_bytes()); // level (leaf)
+    block[36..40].copy_from_slice(&0u32.to_le_bytes()); // nkeys = 0
+
+    // Empty ToC at btn_data[0..0].
+    block[40..42].copy_from_slice(&0u16.to_le_bytes()); // btn_table_space.off
+    block[42..44].copy_from_slice(&0u16.to_le_bytes()); // btn_table_space.len
+    // btn_free_space: the entire payload area between the (empty) ToC
+    // and the trailing btree_info_t is free. data_start = 56,
+    // vals_end = bs - 40, so free length = (bs - 40) - 56.
+    let free_len = (bs - 40 - 56) as u16;
+    block[44..46].copy_from_slice(&0u16.to_le_bytes()); // free_space.off
+    block[46..48].copy_from_slice(&free_len.to_le_bytes()); // free_space.len
+    // btn_key_free_list / btn_val_free_list: empty (BTOFF_INVALID).
+    block[48..50].copy_from_slice(&0xffffu16.to_le_bytes());
+    block[50..52].copy_from_slice(&0u16.to_le_bytes());
+    block[52..54].copy_from_slice(&0xffffu16.to_le_bytes());
+    block[54..56].copy_from_slice(&0u16.to_le_bytes());
+
+    // Trailing btree_info_t at bs-40.
+    let info_off = bs - 40;
+    block[info_off..info_off + 4].copy_from_slice(&BTREE_INFO_FLAGS.to_le_bytes());
+    block[info_off + 4..info_off + 8].copy_from_slice(&(bs as u32).to_le_bytes()); // bt_node_size
+    block[info_off + 8..info_off + 12].copy_from_slice(&16u32.to_le_bytes()); // bt_key_size
+    block[info_off + 12..info_off + 16].copy_from_slice(&8u32.to_le_bytes()); // bt_val_size
+    // bt_longest_key / bt_longest_val / bt_key_count / bt_node_count
+    // all zero (empty tree).
+    block[info_off + 32..info_off + 40].copy_from_slice(&1u64.to_le_bytes()); // bt_node_count = 1
+
+    // Suppress unused-imports lint while keeping the constants visible
+    // for downstream readers.
+    let _ = (OBJECT_TYPE_BTREE_NODE, SPACEMAN_IP_BM_INDEX_INVALID);
+
+    sign_block(&mut block);
+    Ok(block)
 }
 
 /// Fletcher-64 sign helper (duplicated from `write.rs` so this module
@@ -295,13 +606,23 @@ pub(super) struct DecodedSpaceman {
     pub main_cab_count: u32,
     pub main_free_count: u64,
     pub cib_paddr: u64,
+    pub flags: u32,
+    pub ip_bm_tx_multiplier: u32,
+    pub ip_block_count: u64,
+    pub ip_bm_size_in_blocks: u32,
+    pub ip_bm_block_count: u32,
+    pub ip_bm_base: u64,
+    pub ip_base: u64,
+    pub sfq_tree_oids: [u64; 3],
+    pub datazone_main_zone0_start: u64,
+    pub datazone_main_zone0_end: u64,
 }
 
 /// Decode a freshly emitted spaceman block. Returns an error if the
 /// type bits or version look wrong.
 #[cfg(test)]
 pub(super) fn decode_spaceman(buf: &[u8]) -> Result<DecodedSpaceman> {
-    if buf.len() < 344 {
+    if buf.len() < SM_DATAZONE_OFFSET + DATAZONE_SIZE {
         return Err(crate::Error::InvalidImage(
             "apfs spaceman: block too short".into(),
         ));
@@ -326,6 +647,27 @@ pub(super) fn decode_spaceman(buf: &[u8]) -> Result<DecodedSpaceman> {
         )));
     }
     let cib_paddr = u64::from_le_bytes(buf[cib_addr_off..cib_addr_off + 8].try_into().unwrap());
+    let flags = u32::from_le_bytes(buf[144..148].try_into().unwrap());
+    let ip_bm_tx_multiplier = u32::from_le_bytes(buf[148..152].try_into().unwrap());
+    let ip_block_count = u64::from_le_bytes(buf[152..160].try_into().unwrap());
+    let ip_bm_size_in_blocks = u32::from_le_bytes(buf[160..164].try_into().unwrap());
+    let ip_bm_block_count = u32::from_le_bytes(buf[164..168].try_into().unwrap());
+    let ip_bm_base = u64::from_le_bytes(buf[168..176].try_into().unwrap());
+    let ip_base = u64::from_le_bytes(buf[176..184].try_into().unwrap());
+    let mut sfq_tree_oids = [0u64; 3];
+    for (i, slot) in sfq_tree_oids.iter_mut().enumerate() {
+        let off = 200 + i * 40 + 8;
+        *slot = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    }
+    let dz_main_zone0 =
+        SM_DATAZONE_OFFSET + (SD_MAIN * SM_DATAZONE_ALLOCZONE_COUNT) * ALLOC_ZONE_INFO_SIZE;
+    let datazone_main_zone0_start =
+        u64::from_le_bytes(buf[dz_main_zone0..dz_main_zone0 + 8].try_into().unwrap());
+    let datazone_main_zone0_end = u64::from_le_bytes(
+        buf[dz_main_zone0 + 8..dz_main_zone0 + 16]
+            .try_into()
+            .unwrap(),
+    );
     Ok(DecodedSpaceman {
         block_size,
         blocks_per_chunk,
@@ -335,6 +677,16 @@ pub(super) fn decode_spaceman(buf: &[u8]) -> Result<DecodedSpaceman> {
         main_cab_count,
         main_free_count,
         cib_paddr,
+        flags,
+        ip_bm_tx_multiplier,
+        ip_block_count,
+        ip_bm_size_in_blocks,
+        ip_bm_block_count,
+        ip_bm_base,
+        ip_base,
+        sfq_tree_oids,
+        datazone_main_zone0_start,
+        datazone_main_zone0_end,
     })
 }
 

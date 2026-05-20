@@ -1254,6 +1254,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
         signature: SIG_HFS_PLUS,
         version: 4,
         attributes: VOL_ATTR_UNMOUNTED,
+        journal_info_block: writer.journal_info_block,
         block_size: bs,
         total_blocks,
         free_blocks: writer.free_blocks,
@@ -2331,13 +2332,23 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     // include the root folder").
     folder_count = folder_count.saturating_sub(1);
 
+    // Prefer the writer's journal_info_block (set when this writer was
+    // built by `format()`); fall back to the VolumeHeader's field when
+    // reconstructing via `open_writable` left the writer's zero. This
+    // keeps the on-disk JournalInfoBlock pointer stable across reopen
+    // -> flush cycles on journaled volumes.
+    let jib = if writer.journal_info_block != 0 {
+        writer.journal_info_block
+    } else {
+        vh.journal_info_block
+    };
     let buf = encode_volume_header(
         vh,
         writer.next_alloc,
         file_count,
         folder_count,
         writer.create_date,
-        writer.journal_info_block,
+        jib,
     );
     dev.write_at(VOLUME_HEADER_OFFSET, &buf)?;
 
@@ -2749,6 +2760,7 @@ mod tests {
             signature: SIG_HFS_PLUS,
             version: 4,
             attributes: VOL_ATTR_UNMOUNTED,
+            journal_info_block: 0,
             block_size: 4096,
             total_blocks: 1024,
             free_blocks: 1000,

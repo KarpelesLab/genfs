@@ -142,6 +142,10 @@ pub struct VolumeHeader {
     pub version: u16,
     /// Attribute flags.
     pub attributes: u32,
+    /// Allocation-block number of the JournalInfoBlock on journaled
+    /// volumes. Zero on unjournaled volumes. Lives at byte 12 of the
+    /// on-disk volume header.
+    pub journal_info_block: u32,
     /// Allocation block size, in bytes.
     pub block_size: u32,
     /// Total number of allocation blocks in the volume.
@@ -177,6 +181,7 @@ impl VolumeHeader {
         }
         let version = u16::from_be_bytes(buf[2..4].try_into().unwrap());
         let attributes = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+        let journal_info_block = u32::from_be_bytes(buf[12..16].try_into().unwrap());
         let block_size = u32::from_be_bytes(buf[40..44].try_into().unwrap());
         let total_blocks = u32::from_be_bytes(buf[44..48].try_into().unwrap());
         let free_blocks = u32::from_be_bytes(buf[48..52].try_into().unwrap());
@@ -205,6 +210,7 @@ impl VolumeHeader {
             signature,
             version,
             attributes,
+            journal_info_block,
             block_size,
             total_blocks,
             free_blocks,

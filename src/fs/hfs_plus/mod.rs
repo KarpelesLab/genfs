@@ -41,6 +41,7 @@
 pub mod btree;
 pub mod catalog;
 pub mod extents;
+pub mod handle;
 pub mod volume_header;
 pub mod writer;
 
@@ -1031,6 +1032,16 @@ impl crate::fs::Filesystem for HfsPlus {
         Ok(Box::new(r))
     }
 
+    fn open_file_rw<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        meta: Option<crate::fs::FileMeta>,
+    ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
+        handle::open_file_rw(self, dev, path, flags, meta)
+    }
+
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         Self::flush(self, dev)
     }
@@ -1321,5 +1332,234 @@ mod tests {
              (before={free_before}, after={})",
             hfs.volume_header.free_blocks
         );
+    }
+
+    /// `Filesystem::open_file_rw` on a non-journaled image: full
+    /// round-trip — open existing file, patch a byte range in the
+    /// middle, `sync`, drop the handle, reopen, verify the patch is
+    /// present and the surrounding bytes are intact.
+    #[test]
+    fn open_file_rw_round_trip_non_journaled() {
+        use crate::fs::{Filesystem, OpenFlags};
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+        let payload: Vec<u8> = (0..16 * 1024).map(|i| (i & 0xFF) as u8).collect();
+
+        {
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let mut src = std::io::Cursor::new(&payload);
+            hfs.create_file(
+                &mut dev,
+                "/edit.bin",
+                &mut src,
+                payload.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        // Reopen, patch.
+        {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            let mut h = hfs
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/edit.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(h.len(), payload.len() as u64);
+            h.seek(SeekFrom::Start(4096)).unwrap();
+            h.write_all(b"PATCHED_RANGE").unwrap();
+            h.sync().unwrap();
+            drop(h);
+        }
+
+        // Reopen, verify.
+        {
+            let hfs = HfsPlus::open(&mut dev).unwrap();
+            let mut r = hfs
+                .open_file_reader(&mut dev, "/edit.bin")
+                .unwrap();
+            let mut got = Vec::new();
+            r.read_to_end(&mut got).unwrap();
+            assert_eq!(got.len(), payload.len());
+            assert_eq!(&got[..4096], &payload[..4096], "head unchanged");
+            assert_eq!(
+                &got[4096..4096 + 13],
+                b"PATCHED_RANGE",
+                "patch is present"
+            );
+            assert_eq!(
+                &got[4096 + 13..],
+                &payload[4096 + 13..],
+                "tail unchanged"
+            );
+        }
+    }
+
+    /// Same round-trip as the non-journaled test but on an image
+    /// formatted with the journal stub enabled. Path B keeps the
+    /// journal clean (start == end) so reopening from scratch still
+    /// works.
+    #[test]
+    fn open_file_rw_round_trip_journaled() {
+        use crate::fs::{Filesystem, OpenFlags};
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts {
+            journaled: true,
+            ..writer::FormatOpts::default()
+        };
+        let payload: Vec<u8> = (0..8 * 1024).map(|i| (i & 0xFF) as u8).collect();
+
+        {
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let mut src = std::io::Cursor::new(&payload);
+            hfs.create_file(
+                &mut dev,
+                "/jrnl.bin",
+                &mut src,
+                payload.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        // Reopen + patch via the FileHandle API.
+        {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            assert_ne!(
+                hfs.volume_header.attributes & writer::VOL_ATTR_JOURNALED,
+                0,
+                "journaled bit must survive reopen"
+            );
+            let mut h = hfs
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/jrnl.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.seek(SeekFrom::Start(2048)).unwrap();
+            h.write_all(b"journal-bypass").unwrap();
+            h.sync().unwrap();
+        }
+
+        // Verify the data survived and the journal header is still clean.
+        {
+            let hfs = HfsPlus::open(&mut dev).unwrap();
+            let mut r = hfs.open_file_reader(&mut dev, "/jrnl.bin").unwrap();
+            let mut got = Vec::new();
+            r.read_to_end(&mut got).unwrap();
+            assert_eq!(got.len(), payload.len());
+            assert_eq!(&got[..2048], &payload[..2048]);
+            assert_eq!(&got[2048..2048 + 14], b"journal-bypass");
+            assert_eq!(&got[2048 + 14..], &payload[2048 + 14..]);
+        }
+
+        // Inspect the journal header directly: start MUST equal end
+        // (Path B contract). The journal header lives at the start of
+        // the journal buffer; the JournalInfoBlock at byte 12 of the
+        // volume header tells us where the buffer starts.
+        let mut vh_buf = [0u8; 512];
+        dev.read_at(volume_header::VOLUME_HEADER_OFFSET, &mut vh_buf)
+            .unwrap();
+        let info_block = u32::from_be_bytes(vh_buf[12..16].try_into().unwrap());
+        let bs = u32::from_be_bytes(vh_buf[40..44].try_into().unwrap());
+        assert_ne!(info_block, 0);
+        let info_off = u64::from(info_block) * u64::from(bs);
+        let mut info = [0u8; 52];
+        dev.read_at(info_off, &mut info).unwrap();
+        let jbuf_off = u64::from_be_bytes(info[36..44].try_into().unwrap());
+        let mut hdr = [0u8; 24];
+        dev.read_at(jbuf_off, &mut hdr).unwrap();
+        let start = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+        let end = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+        assert_eq!(
+            start, end,
+            "Path B requires the journal to be clean after partial writes \
+             (start={start:#x}, end={end:#x})"
+        );
+    }
+
+    /// Manually corrupt the journal header so `end != start`, then
+    /// verify `open_file_rw` refuses cleanly with `Unsupported` rather
+    /// than scribbling on a volume with unreplayed work.
+    #[test]
+    fn open_file_rw_refused_when_journal_dirty() {
+        use crate::fs::{Filesystem, OpenFlags};
+
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts {
+            journaled: true,
+            ..writer::FormatOpts::default()
+        };
+        let payload = b"original\n".repeat(4);
+        {
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let mut src = std::io::Cursor::new(&payload);
+            hfs.create_file(
+                &mut dev,
+                "/dirty.bin",
+                &mut src,
+                payload.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        // Locate the journal buffer and corrupt the `end` field so it
+        // diverges from `start`. Same lookup as the inspection above.
+        let (jbuf_off, _bs) = {
+            let mut vh_buf = [0u8; 512];
+            dev.read_at(volume_header::VOLUME_HEADER_OFFSET, &mut vh_buf)
+                .unwrap();
+            let info_block = u32::from_be_bytes(vh_buf[12..16].try_into().unwrap());
+            let bs = u32::from_be_bytes(vh_buf[40..44].try_into().unwrap());
+            let info_off = u64::from(info_block) * u64::from(bs);
+            let mut info = [0u8; 52];
+            dev.read_at(info_off, &mut info).unwrap();
+            let jbuf_off = u64::from_be_bytes(info[36..44].try_into().unwrap());
+            (jbuf_off, bs)
+        };
+        // Write a non-equal `end` value at offset jbuf_off + 16. We
+        // don't bother re-checksumming; the open_file_rw guard only
+        // checks magic + start vs. end, not the CRC.
+        let dirty_end: u64 = 0x2000;
+        dev.write_at(jbuf_off + 16, &dirty_end.to_be_bytes()).unwrap();
+
+        // Now open_file_rw must refuse.
+        let mut hfs = HfsPlus::open(&mut dev).unwrap();
+        let res = hfs.open_file_rw(
+            &mut dev,
+            std::path::Path::new("/dirty.bin"),
+            OpenFlags::default(),
+            None,
+        );
+        match res {
+            Err(crate::Error::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("unreplayed") || msg.contains("journal"),
+                    "expected an unreplayed-journal complaint, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Error::Unsupported, got: {other}"),
+            Ok(_) => panic!("expected open_file_rw to refuse on a dirty journal"),
+        }
     }
 }

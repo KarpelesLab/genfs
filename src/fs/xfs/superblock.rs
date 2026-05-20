@@ -84,9 +84,13 @@ pub struct Superblock {
     pub dblocks: u64,
     pub rblocks: u64,
     pub uuid: [u8; 16],
+    /// `sb_logstart` — first FSB of the internal log (0 = external).
+    pub logstart: u64,
     pub rootino: u64,
     pub agblocks: u32,
     pub agcount: u32,
+    /// `sb_logblocks` — FS-block count of the internal log.
+    pub logblocks: u32,
     pub versionnum: u16,
     pub sectsize: u16,
     pub inodesize: u16,
@@ -132,9 +136,11 @@ impl Superblock {
         let rblocks = u64::from_be_bytes(buf[16..24].try_into().unwrap());
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&buf[32..48]);
+        let logstart = u64::from_be_bytes(buf[48..56].try_into().unwrap());
         let rootino = u64::from_be_bytes(buf[56..64].try_into().unwrap());
         let agblocks = u32::from_be_bytes(buf[84..88].try_into().unwrap());
         let agcount = u32::from_be_bytes(buf[88..92].try_into().unwrap());
+        let logblocks = u32::from_be_bytes(buf[96..100].try_into().unwrap());
         let versionnum = u16::from_be_bytes(buf[100..102].try_into().unwrap());
         let sectsize = u16::from_be_bytes(buf[102..104].try_into().unwrap());
         let inodesize = u16::from_be_bytes(buf[104..106].try_into().unwrap());
@@ -199,9 +205,11 @@ impl Superblock {
             dblocks,
             rblocks,
             uuid,
+            logstart,
             rootino,
             agblocks,
             agcount,
+            logblocks,
             versionnum,
             sectsize,
             inodesize,
@@ -235,6 +243,24 @@ impl Superblock {
     /// `1 << sb_dirblklog`.
     pub fn dir_block_size(&self) -> u32 {
         self.blocksize << (self.dirblklog as u32)
+    }
+
+    /// Byte offset on the device where the internal log begins. Translates
+    /// `sb_logstart` (an FSB packed `(ag << agblklog) | agblk`) to a
+    /// byte address using the same scheme as inode/extent addressing.
+    /// Returns 0 if there is no internal log (`logstart == 0`).
+    pub fn logstart_byte_offset(&self) -> u64 {
+        if self.logstart == 0 {
+            return 0;
+        }
+        let ag = self.logstart >> self.agblklog as u32;
+        let agblk = self.logstart & ((1u64 << self.agblklog as u32) - 1);
+        ag * (self.agblocks as u64) * (self.blocksize as u64) + agblk * (self.blocksize as u64)
+    }
+
+    /// Byte size of the internal log: `sb_logblocks * sb_blocksize`.
+    pub fn log_bytes(&self) -> u64 {
+        (self.logblocks as u64) * (self.blocksize as u64)
     }
 }
 

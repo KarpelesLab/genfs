@@ -39,6 +39,7 @@ pub mod dir;
 pub mod format;
 pub mod inode;
 pub mod journal;
+pub mod rw;
 pub mod superblock;
 pub mod symlink;
 pub mod write;
@@ -723,6 +724,19 @@ impl crate::fs::Filesystem for Xfs {
 
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         self.flush_writes(dev)
+    }
+
+    fn open_file_rw<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+        flags: crate::fs::OpenFlags,
+        meta: Option<crate::fs::FileMeta>,
+    ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        Xfs::open_rw(self, dev, s, flags, meta)
     }
 
     fn read_symlink(

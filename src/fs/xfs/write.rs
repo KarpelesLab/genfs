@@ -547,7 +547,7 @@ impl Xfs {
     /// `agblklog`). All write-path callers funnel through this so
     /// `fsb_to_byte` yields the right device offset regardless of
     /// which AG was picked.
-    fn alloc_blocks_fsb(&mut self, n: u32) -> Result<u64> {
+    pub(super) fn alloc_blocks_fsb(&mut self, n: u32) -> Result<u64> {
         let (ag, agblk) = self.alloc_blocks_in_any_ag(n)?;
         Ok(((ag as u64) << self.sb.agblklog as u32) | (agblk as u64))
     }
@@ -607,7 +607,7 @@ impl Xfs {
 
     /// Free `n` blocks starting at FSB `start_fsb` back to its AG's
     /// freed-extent list. The next allocator pass may reuse them.
-    fn free_blocks_fsb(&mut self, start_fsb: u64, n: u32) -> Result<()> {
+    pub(super) fn free_blocks_fsb(&mut self, start_fsb: u64, n: u32) -> Result<()> {
         let agblklog = self.sb.agblklog as u32;
         let ag = (start_fsb >> agblklog) as u32;
         let agblk = (start_fsb & ((1u64 << agblklog) - 1)) as u32;

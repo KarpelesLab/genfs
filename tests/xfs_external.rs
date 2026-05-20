@@ -361,3 +361,88 @@ fn mkfs_xfs_image_is_readable_by_fstool() {
     drop(dev);
     let _ = std::fs::remove_file(&path);
 }
+
+/// Format a single-AG XFS image, create a file, then re-open and use
+/// `open_file_rw` to patch + extend it. After the file handle is dropped
+/// (which restamps the clean-unmount log), `xfs_repair -n` must still
+/// report the image as clean.
+#[test]
+fn open_file_rw_round_trip_passes_xfs_repair() {
+    let Some(_) = which("xfs_repair") else {
+        eprintln!("skipping: xfs_repair not installed");
+        return;
+    };
+
+    use fstool::fs::{FileMeta, Filesystem, OpenFlags};
+    use std::io::{Seek, SeekFrom, Write};
+
+    let size: u64 = 64 * 1024 * 1024;
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let opts = FormatOpts {
+        uuid: [0x9au8; 16],
+        ..Default::default()
+    };
+    // First lifecycle: format + populate + flush.
+    {
+        let mut x = xfs::format(&mut dev, &opts).unwrap();
+        x.begin_writes(opts.uuid);
+        let rootino = x.superblock().rootino;
+        let body = vec![0xAAu8; 100];
+        let mut src = std::io::Cursor::new(body.clone());
+        x.add_file(
+            &mut dev,
+            rootino,
+            "rw.bin",
+            EntryMeta::default(),
+            body.len() as u64,
+            &mut src,
+        )
+        .unwrap();
+        x.flush_writes(&mut dev).unwrap();
+    }
+    // Second lifecycle: re-open as writable, patch the file, sync.
+    {
+        let mut x = Xfs::open(&mut dev).unwrap();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut x,
+                &mut dev,
+                std::path::Path::new("/rw.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+            h.seek(SeekFrom::Start(10)).unwrap();
+            h.write_all(b"PATCHED").unwrap();
+            // Also extend so we exercise the AGF allocator path.
+            h.seek(SeekFrom::End(0)).unwrap();
+            h.write_all(&vec![0x55u8; 4096]).unwrap();
+            h.sync().unwrap();
+        }
+    }
+    // Third lifecycle: create a brand-new file via open_file_rw create=true.
+    {
+        let mut x = Xfs::open(&mut dev).unwrap();
+        {
+            let mut h = Filesystem::open_file_rw(
+                &mut x,
+                &mut dev,
+                std::path::Path::new("/created.bin"),
+                OpenFlags {
+                    create: true,
+                    truncate: false,
+                    append: false,
+                },
+                Some(FileMeta::default()),
+            )
+            .unwrap();
+            h.write_all(b"made via open_file_rw").unwrap();
+            h.sync().unwrap();
+        }
+    }
+    dev.sync().unwrap();
+    drop(dev);
+
+    assert_xfs_repair_clean(tmp.path());
+}

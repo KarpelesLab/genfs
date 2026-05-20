@@ -39,9 +39,13 @@ fstool repack out.img out.tar                    # convert ext4 → tar (and bac
 | qcow2      | ✅    | ✅     | v2 + v3, allocate-on-write writer                                    |
 | dmg        | 🚧   | —     | UDIF v4 trailer parsed; chunk decoder TBD                            |
 
-`🚧` marks writers that exist at the library level but have known gaps
-(see Limitations). The high-level CLI only writes ext2/3/4, FAT32, and
-tar today — the other writers are reachable via the library API.
+`🚧` marks writers that exist at the library level but have known
+gaps (see Limitations). All seven writable filesystems — ext2/3/4,
+FAT32, XFS, HFS+, NTFS, F2FS, SquashFS — implement a single
+`Filesystem` trait, so the CLI (`build`, `repack`, `add`, `rm`) and
+the TOML `[filesystem] type = "…"` spec dispatch through one
+codepath; pick a target FS by setting `--fs-type` on `repack` or
+`type = "hfsplus"` (etc.) in the TOML spec.
 
 The reader for each FS streams: file contents are never fully resident in
 memory regardless of size. The writers do the same, two-pass: scan to size
@@ -203,10 +207,13 @@ preserving symlinks, device nodes, mode, uid/gid, and xattrs. tar in either
 direction round-trips content + mode + uid/gid + mtime + symlinks + device
 nodes + xattrs.
 
-`fstool repack` writes ext2/3/4, FAT32, and tar destinations today;
-the XFS / HFS+ / APFS / NTFS / F2FS / SquashFS writers exist as a
-library API (see the support table) but aren't wired into `repack` /
-`add` / `rm` yet — call them directly through the crate for now.
+`fstool repack` writes any destination implementing the `Filesystem`
+trait — `ext2/3/4`, FAT32, tar, XFS, HFS+, NTFS, F2FS, SquashFS. APFS
+isn't yet trait-implemented (its `Builder` API hasn't been mapped),
+so it remains library-only. `add` / `rm` go through the same trait,
+which means they work on any FS whose writer can re-open an existing
+image; today that's ext, FAT32, and F2FS — the others can `format` +
+populate but can't `add` to an already-flushed image yet.
 
 ## Compression
 
@@ -239,9 +246,10 @@ cargo install fstool --no-default-features --features gzip,lz4,xz,lzma
 
 Things explicitly out of scope today, in rough order of likely-to-change:
 
-- High-level CLI (`build`, `add`, `rm`, `repack`) only writes ext2/3/4,
-  FAT32, and tar. The library writers for XFS / HFS+ / APFS / NTFS /
-  F2FS / SquashFS work, just not via the CLI.
+- `add` / `rm` on existing images: only ext, FAT32, and F2FS can be
+  re-opened as writable. HFS+ / NTFS / XFS / SquashFS / APFS writers
+  format + populate fine but can't yet mutate an already-flushed
+  image. APFS isn't trait-wired at all (Builder pattern).
 - NTFS writer: produced image isn't `ntfs-3g`-mountable — root `$I30`
   doesn't index the system files yet; `ntfsfix --no-action` is clean.
 - NTFS reader: compressed and encrypted `$DATA`, `$ATTRIBUTE_LIST`

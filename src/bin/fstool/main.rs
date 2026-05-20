@@ -529,6 +529,41 @@ fn repack_cmd(
                 copy_into_fat32(src_dev, &src_fs, dst_dev.as_mut(), &mut dst_fat)?;
                 dst_fat.flush(dst_dev.as_mut())?;
             }
+            "hfsplus" | "hfs+" => {
+                repack_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
+                    dst_dev.as_mut(),
+                    &fstool::fs::hfs_plus::FormatOpts::default(),
+                    src,
+                )?;
+            }
+            "ntfs" => {
+                repack_via_trait::<fstool::fs::ntfs::Ntfs>(
+                    dst_dev.as_mut(),
+                    &fstool::fs::ntfs::format::FormatOpts::default(),
+                    src,
+                )?;
+            }
+            "f2fs" => {
+                repack_via_trait::<fstool::fs::f2fs::F2fs>(
+                    dst_dev.as_mut(),
+                    &fstool::fs::f2fs::FormatOpts::default(),
+                    src,
+                )?;
+            }
+            "squashfs" => {
+                repack_via_trait::<fstool::fs::squashfs::Squashfs>(
+                    dst_dev.as_mut(),
+                    &fstool::fs::squashfs::FormatOpts::default(),
+                    src,
+                )?;
+            }
+            "xfs" => {
+                repack_via_trait::<fstool::fs::xfs::Xfs>(
+                    dst_dev.as_mut(),
+                    &fstool::fs::xfs::format::FormatOpts::default(),
+                    src,
+                )?;
+            }
             other => {
                 return Err(fstool::Error::InvalidArgument(format!(
                     "repack: unknown --fs-type {other:?}"
@@ -542,6 +577,23 @@ fn repack_cmd(
         );
         Ok(())
     })
+}
+
+/// Generic repack pipeline driven by [`fstool::fs::FilesystemFactory`].
+/// Formats `F` onto `dst_dev`, walks the source `src` (passed as the
+/// CLI's `disk.img:N` / tar / dir spec) through
+/// [`fstool::repack::Source::detect`], and replays every entry into
+/// `F` via the trait. The destination is flushed before this returns.
+fn repack_via_trait<F: fstool::fs::FilesystemFactory>(
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    opts: &F::FormatOpts,
+    src: &str,
+) -> fstool::Result<()> {
+    let mut dst = F::format(dst_dev, opts)?;
+    let source = fstool::repack::Source::detect(src)?;
+    fstool::repack::populate_fs_from_source(dst_dev, &mut dst, &source)?;
+    dst.flush(dst_dev)?;
+    Ok(())
 }
 
 /// Walk the source filesystem and recreate every entry inside the

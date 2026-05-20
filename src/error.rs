@@ -40,9 +40,7 @@ pub enum Error {
     /// fstool. Distinct from [`Error::Immutable`] so callers can tell
     /// "the writer fundamentally can't go back" apart from "the
     /// on-disk layout was never designed for in-place edits."
-    #[error(
-        "{op}: {kind} is a streaming format — use `fstool repack` to produce a new one"
-    )]
+    #[error("{op}: {kind} is a streaming format — use `fstool repack` to produce a new one")]
     Streaming {
         /// The filesystem kind that refused (today: `"tar"`).
         kind: &'static str,
@@ -57,9 +55,7 @@ pub enum Error {
     /// writer can seek, but re-opening the image as writable isn't
     /// part of the format's design — modifications go through
     /// `fstool repack` to rebuild the image from scratch.
-    #[error(
-        "{op}: {kind} is a write-once format — use `fstool repack` to rebuild it"
-    )]
+    #[error("{op}: {kind} is a write-once format — use `fstool repack` to rebuild it")]
     Immutable {
         /// The filesystem kind that refused (today: `"iso9660"`,
         /// `"squashfs"`).

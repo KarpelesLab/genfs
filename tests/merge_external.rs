@@ -64,10 +64,7 @@ fn make_tar(dir: &std::path::Path, members: &[(&str, &[u8])]) -> std::path::Path
             .unwrap()
             .as_nanos()
     ));
-    let args: Vec<String> = members
-        .iter()
-        .map(|(name, _)| name.to_string())
-        .collect();
+    let args: Vec<String> = members.iter().map(|(name, _)| name.to_string()).collect();
     let mut cmd = Command::new("tar");
     cmd.arg("cf")
         .arg(&tar_path)
@@ -88,11 +85,7 @@ fn list_tar(path: &std::path::Path) -> Vec<String> {
     String::from_utf8(out.stdout)
         .unwrap()
         .lines()
-        .map(|s| {
-            s.trim_end_matches('/')
-                .trim_start_matches('/')
-                .to_string()
-        })
+        .map(|s| s.trim_end_matches('/').trim_start_matches('/').to_string())
         .collect()
 }
 
@@ -188,10 +181,7 @@ fn merge_opaque_dir_drops_lower_children() {
     // base: etc/a=A, etc/b=B
     let base = make_tar(work.path(), &[("etc/a", b"A"), ("etc/b", b"B")]);
     // top: etc/.wh..wh..opq (opaque), etc/c=C
-    let top = make_tar(
-        work.path(),
-        &[("etc/.wh..wh..opq", b""), ("etc/c", b"C")],
-    );
+    let top = make_tar(work.path(), &[("etc/.wh..wh..opq", b""), ("etc/c", b"C")]);
 
     let out_tar = work.path().join("merged.tar");
 

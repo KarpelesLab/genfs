@@ -2059,8 +2059,7 @@ fn tar_walk_grf(
     // directory entries (parents are implicit from `/`-separated
     // path components). We synthesise tar dir entries for each
     // unique parent so the output is well-formed.
-    let mut emitted_dirs: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut emitted_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let meta = TarEntryMeta {
         mode: 0o644,
         uid: 0,

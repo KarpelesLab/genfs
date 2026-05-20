@@ -412,11 +412,10 @@ impl crate::fs::Filesystem for Grf {
             path.to_str()
                 .ok_or_else(|| crate::Error::InvalidArgument("grf: non-UTF-8 path".into()))?,
         );
-        let entry = self
-            .entries
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| crate::Error::InvalidArgument(format!("grf: no entry at {key:?}")))?;
+        let entry =
+            self.entries.get(&key).cloned().ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("grf: no entry at {key:?}"))
+            })?;
         let bytes = self.read_entry(dev, &entry)?;
         Ok(Box::new(std::io::Cursor::new(bytes)))
     }
@@ -467,7 +466,9 @@ mod tests {
 
         let mut reopen = Grf::open(&mut dev).unwrap();
         assert_eq!(reopen.entries.len(), 1);
-        let entries = reopen.list(&mut dev, std::path::Path::new("/data")).unwrap();
+        let entries = reopen
+            .list(&mut dev, std::path::Path::new("/data"))
+            .unwrap();
         assert!(entries.iter().any(|e| e.name == "info.txt"));
         let entry = reopen.entries.get("data/info.txt").cloned().unwrap();
         let bytes = reopen.read_entry(&mut dev, &entry).unwrap();

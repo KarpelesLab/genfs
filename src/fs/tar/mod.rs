@@ -459,9 +459,9 @@ impl crate::fs::Filesystem for Tar {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
-        let entry = self.lookup(s).ok_or_else(|| {
-            crate::Error::InvalidArgument(format!("tar: no entry at {s:?}"))
-        })?;
+        let entry = self
+            .lookup(s)
+            .ok_or_else(|| crate::Error::InvalidArgument(format!("tar: no entry at {s:?}")))?;
         if !matches!(entry.kind, EntryKind::Symlink) {
             return Err(crate::Error::InvalidArgument(format!(
                 "tar: {s:?} is not a symlink"

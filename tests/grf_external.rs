@@ -116,7 +116,10 @@ fn build_grf_from_tar_and_round_trip() {
         .expect("spawn fstool info");
     let info = String::from_utf8(out.stdout).unwrap();
     assert!(info.contains("0x200"), "info missing version: {info}");
-    assert!(info.contains("file count:        2"), "info missing count: {info}");
+    assert!(
+        info.contains("file count:        2"),
+        "info missing count: {info}"
+    );
 }
 
 #[test]

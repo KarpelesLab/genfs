@@ -1032,7 +1032,9 @@ impl crate::fs::Filesystem for HfsPlus {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
-        Ok(std::path::PathBuf::from(self.read_symlink_target_path(dev, s)?))
+        Ok(std::path::PathBuf::from(
+            self.read_symlink_target_path(dev, s)?,
+        ))
     }
 }
 

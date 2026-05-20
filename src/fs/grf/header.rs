@@ -131,7 +131,10 @@ mod tests {
             version: 0x103,
         };
         let bytes = h.encode();
-        assert_eq!(&bytes[16..30], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+        assert_eq!(
+            &bytes[16..30],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        );
         let back = Header::decode(&bytes).unwrap();
         assert!(back.encrypted_header);
     }

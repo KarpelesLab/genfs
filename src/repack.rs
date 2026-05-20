@@ -602,10 +602,9 @@ pub(crate) fn scan_into_build_plan(
                         .unwrap_or(usize::MAX);
                     plan.add_symlink(len);
                 }
-                EntryKind::Char
-                | EntryKind::Block
-                | EntryKind::Fifo
-                | EntryKind::Socket => plan.add_device(),
+                EntryKind::Char | EntryKind::Block | EntryKind::Fifo | EntryKind::Socket => {
+                    plan.add_device()
+                }
                 EntryKind::Unknown => {}
             }
         }
@@ -1422,4 +1421,3 @@ pub(crate) fn sum_source_file_bytes(
 ) -> crate::Result<u64> {
     src_fs.total_file_bytes(src_dev)
 }
-

@@ -256,9 +256,9 @@ fn apply_v102_crypto_heuristic(entry: &mut Entry) {
     let lower = entry.name.to_ascii_lowercase();
     let is_no_mix = lower.len() >= 4
         && lower.as_bytes()[lower.len() - 4] == b'.'
-        && NO_MIX.iter().any(|ext| {
-            &lower.as_bytes()[lower.len() - 3..] == ext.as_slice()
-        });
+        && NO_MIX
+            .iter()
+            .any(|ext| &lower.as_bytes()[lower.len() - 3..] == ext.as_slice());
     if is_no_mix {
         entry.flags |= GRF_FLAG_DES;
     } else {

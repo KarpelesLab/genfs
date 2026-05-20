@@ -132,9 +132,7 @@ impl MergedTree {
 /// Flatten `layers` into a single tar archive on disk. Returns the
 /// temp-file handle (the caller MUST keep it alive for the lifetime of
 /// any downstream `Source::TarArchive` that references it).
-pub fn flatten_to_tempfile(
-    layers: &[Source],
-) -> Result<tempfile::NamedTempFile> {
+pub fn flatten_to_tempfile(layers: &[Source]) -> Result<tempfile::NamedTempFile> {
     let mut merged = MergedTree::new();
     for layer in layers {
         apply_layer(layer, &mut merged)?;
@@ -399,12 +397,7 @@ fn basename_of_str(path: &str) -> String {
 #[cfg(unix)]
 fn host_attrs(meta: &std::fs::Metadata) -> (u32, u32, u32, i64) {
     use std::os::unix::fs::MetadataExt;
-    (
-        meta.uid(),
-        meta.gid(),
-        meta.mode(),
-        meta.mtime(),
-    )
+    (meta.uid(), meta.gid(), meta.mode(), meta.mtime())
 }
 
 #[cfg(not(unix))]
@@ -435,11 +428,7 @@ fn write_tar(merged: &MergedTree, out: &mut std::fs::File) -> Result<()> {
     Ok(())
 }
 
-fn write_ustar_entry(
-    out: &mut std::fs::File,
-    rel_name: &str,
-    node: &MergedNode,
-) -> Result<()> {
+fn write_ustar_entry(out: &mut std::fs::File, rel_name: &str, node: &MergedNode) -> Result<()> {
     // Pre-emit a PAX header when name exceeds 100 chars (we keep this
     // path simple — no long-name support in the ustar header itself).
     if rel_name.len() > 100 {
@@ -599,10 +588,7 @@ pub fn populate_from_layered(
 ) -> Result<()> {
     let tmp = flatten_to_tempfile(layers)?;
     let path = tmp.path().to_path_buf();
-    let merged_source = Source::TarArchive {
-        path,
-        codec: None,
-    };
+    let merged_source = Source::TarArchive { path, codec: None };
     crate::repack::populate_fs_from_source_dyn(dst_dev, dst, &merged_source)?;
     drop(tmp);
     Ok(())

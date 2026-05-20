@@ -49,13 +49,10 @@ pub(super) fn add_file(
     // body's bytes become wasted space (we don't try to reclaim them
     // in place — that would require a free-list, see Limitations).
     if let Some(old) = grf.entries.remove(&key) {
-        grf.wasted_space = grf
-            .wasted_space
-            .saturating_add(u64::from(old.len_aligned));
+        grf.wasted_space = grf.wasted_space.saturating_add(u64::from(old.len_aligned));
     }
 
-    let compressed =
-        crate::compression::compress(crate::compression::Algo::Zlib, &plain)?;
+    let compressed = crate::compression::compress(crate::compression::Algo::Zlib, &plain)?;
     let len = compressed.len() as u32;
     let len_aligned = len.div_ceil(DATA_ALIGN) * DATA_ALIGN;
 
@@ -97,9 +94,10 @@ pub(super) fn add_file(
 /// stop being referenced; `wasted_space` accumulates the bytes that
 /// could be reclaimed by a repack.
 pub(super) fn remove(grf: &mut Grf, key: &str) -> Result<()> {
-    let removed = grf.entries.remove(key).ok_or_else(|| {
-        crate::Error::InvalidArgument(format!("grf: no entry at {key:?}"))
-    })?;
+    let removed = grf
+        .entries
+        .remove(key)
+        .ok_or_else(|| crate::Error::InvalidArgument(format!("grf: no entry at {key:?}")))?;
     grf.wasted_space = grf
         .wasted_space
         .saturating_add(u64::from(removed.len_aligned));
@@ -129,8 +127,7 @@ pub(super) fn flush(grf: &mut Grf, dev: &mut dyn BlockDevice) -> Result<()> {
     by_pos.sort_by_key(|e| e.pos);
 
     let raw_table = table::encode_v200(&by_pos);
-    let compressed =
-        crate::compression::compress(crate::compression::Algo::Zlib, &raw_table)?;
+    let compressed = crate::compression::compress(crate::compression::Algo::Zlib, &raw_table)?;
 
     // Table sits at data_end. Write the 8-byte posinfo header,
     // then the compressed table bytes.

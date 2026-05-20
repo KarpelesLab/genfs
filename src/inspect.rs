@@ -389,10 +389,7 @@ impl AnyFs {
     /// need to distinguish *why* a filesystem isn't mutable should
     /// use [`Self::mutation_capability`] instead.
     pub fn supports_mutation(&self) -> bool {
-        matches!(
-            self.mutation_capability(),
-            crate::fs::MutationCapability::Mutable
-        )
+        self.mutation_capability().supports_add_remove()
     }
 
     /// How this filesystem can be mutated. Delegates to the inner
@@ -426,7 +423,10 @@ impl AnyFs {
     fn require_mutable(&self, op: &'static str) -> Result<()> {
         use crate::fs::MutationCapability;
         match self.mutation_capability() {
-            MutationCapability::Mutable => Ok(()),
+            // Mutable and WholeFileOnly both satisfy `create_file` /
+            // `remove`; the difference between them matters only for
+            // partial-write APIs (none today).
+            MutationCapability::Mutable | MutationCapability::WholeFileOnly => Ok(()),
             MutationCapability::Streaming => Err(crate::Error::Streaming {
                 kind: self.kind_string(),
                 op,

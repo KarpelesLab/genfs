@@ -160,11 +160,26 @@ pub struct DirEntry {
 
 /// How — and whether — a filesystem can be mutated after `flush()`.
 /// Returned by [`Filesystem::mutation_capability`].
+///
+/// The variants are ordered from most-capable to least-capable; each
+/// implies the abilities of the ones below it (`Mutable` can do what
+/// `WholeFileOnly` can, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationCapability {
     /// Full in-place edits: open an existing image, `create_*` /
-    /// `remove`, flush back. ext, FAT32, F2FS today.
+    /// `remove` files, and (when a partial-write API exists) patch
+    /// arbitrary byte ranges within an existing file. ext, FAT32,
+    /// F2FS today.
     Mutable,
+    /// `create_file` (whole-file replacement) and `remove` work, but
+    /// partial in-place writes to an existing file's contents do
+    /// not. Existing files can be removed and rewritten from scratch;
+    /// they cannot be patched in place. No backend reports this
+    /// today — reserved for future formats (write-once archives with
+    /// free-list reclamation, content-addressed stores, append-only
+    /// records) where add/remove is structurally possible but
+    /// offset-write isn't.
+    WholeFileOnly,
     /// Writer is sequential / streaming — once bytes are emitted you
     /// can't seek backward to patch. The only way to "modify" is to
     /// produce a new image from scratch. Tar today.
@@ -174,6 +189,22 @@ pub enum MutationCapability {
     /// writer can seek, but the image isn't re-openable as writable.
     /// ISO 9660 and SquashFS today.
     Immutable,
+}
+
+impl MutationCapability {
+    /// Whether the filesystem can satisfy a `create_file` / `remove`
+    /// request — i.e. add or delete a whole file. True for `Mutable`
+    /// and `WholeFileOnly`; false for `Streaming` and `Immutable`.
+    pub fn supports_add_remove(self) -> bool {
+        matches!(self, Self::Mutable | Self::WholeFileOnly)
+    }
+
+    /// Whether the filesystem can patch bytes inside an existing
+    /// file without removing-and-recreating it. True only for
+    /// `Mutable`. Future partial-write APIs gate on this.
+    pub fn supports_partial_writes(self) -> bool {
+        matches!(self, Self::Mutable)
+    }
 }
 
 /// File-type bucket exposed by [`DirEntry`]. Mirrors POSIX `d_type`.
@@ -276,11 +307,15 @@ pub trait Filesystem {
         MutationCapability::Mutable
     }
 
-    /// Convenience shortcut for `mutation_capability() == Mutable`.
-    /// Pre-existing callers that don't care about *why* a filesystem
-    /// can't be mutated keep working unchanged.
+    /// Convenience shortcut: can this filesystem satisfy
+    /// `create_file` / `remove`? Equivalent to
+    /// `mutation_capability().supports_add_remove()`. Returns true
+    /// for both [`MutationCapability::Mutable`] and
+    /// [`MutationCapability::WholeFileOnly`] — callers that need
+    /// finer detail (e.g. "can I patch byte N?") should query
+    /// [`Self::mutation_capability`] directly.
     fn supports_mutation(&self) -> bool {
-        matches!(self.mutation_capability(), MutationCapability::Mutable)
+        self.mutation_capability().supports_add_remove()
     }
 
     /// Read a symbolic link's target. Default returns `Unsupported`

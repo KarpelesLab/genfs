@@ -720,6 +720,10 @@ impl crate::fs::Filesystem for Squashfs {
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         Self::flush(self, dev)
     }
+
+    fn supports_mutation(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

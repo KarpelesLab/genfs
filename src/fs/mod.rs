@@ -235,6 +235,19 @@ pub trait Filesystem {
 
     /// Persist outstanding dirty state to the device.
     fn flush(&mut self, dev: &mut dyn crate::block::BlockDevice) -> crate::Result<()>;
+
+    /// True if this filesystem can mutate an *existing* on-disk image
+    /// — i.e. open it, call `create_*` / `remove` against it, and
+    /// flush back. False for sequential / one-shot formats (ISO 9660,
+    /// SquashFS, …) whose layout is fixed at format time. Such
+    /// filesystems can still be `format`-ed and populated in one shot
+    /// via `repack`, but `add` / `rm` on an already-flushed image
+    /// returns a clear error rather than a low-level surprise.
+    ///
+    /// Default: `true`. Repack-only filesystems override to `false`.
+    fn supports_mutation(&self) -> bool {
+        true
+    }
 }
 
 /// Companion trait for filesystems that can be created from scratch

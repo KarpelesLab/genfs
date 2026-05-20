@@ -421,6 +421,10 @@ impl crate::fs::Filesystem for Iso9660 {
         }
         Ok(())
     }
+
+    fn supports_mutation(&self) -> bool {
+        false
+    }
 }
 
 mod file {

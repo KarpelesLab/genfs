@@ -322,8 +322,10 @@ Things explicitly out of scope today, in rough order of likely-to-change:
 - `add` / `rm` on existing images: only ext, FAT32, and F2FS can be
   re-opened as writable. HFS+ / NTFS / XFS / SquashFS / ISO / APFS
   writers format + populate fine but can't yet mutate an
-  already-flushed image. ISO is sequential by design (repack-only);
-  APFS isn't trait-wired at all (Builder pattern).
+  already-flushed image. ISO and SquashFS are sequential by design
+  (repack-only — `Filesystem::supports_mutation()` returns `false`,
+  so `add`/`rm` fail fast with an actionable error); APFS isn't
+  trait-wired at all (Builder pattern).
 - ISO 9660 writer does not yet emit the Rock Ridge `SP` marker on the
   root's `.` entry, so `isoinfo -d` reports "No SUSP/Rock Ridge
   present" even though `NM` / `PX` / `SL` entries are written and our

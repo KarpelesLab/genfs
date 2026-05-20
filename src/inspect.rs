@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::DirEntry;
+use crate::fs::Filesystem;
 use crate::fs::apfs::Apfs;
 use crate::fs::exfat::Exfat;
 use crate::fs::ext::Ext;
@@ -300,6 +301,7 @@ impl AnyFs {
         dest_path: &str,
         host_src: &Path,
     ) -> Result<()> {
+        self.require_mutable("add")?;
         let meta = std::fs::symlink_metadata(host_src)?;
         let fmeta = crate::fs::FileMeta {
             mode: host_mode_from_meta(&meta, false),
@@ -319,6 +321,7 @@ impl AnyFs {
         dest_path: &str,
         host_src: &Path,
     ) -> Result<()> {
+        self.require_mutable("add")?;
         let meta = std::fs::symlink_metadata(host_src)?;
         let fmeta = crate::fs::FileMeta {
             mode: host_mode_from_meta(&meta, true),
@@ -335,6 +338,7 @@ impl AnyFs {
     /// Create an empty directory at `path` with mode 0o755 (umask 022
     /// over 0o777). Dispatches through the trait.
     pub fn mkdir(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        self.require_mutable("mkdir")?;
         let fmeta = crate::fs::FileMeta {
             mode: 0o755,
             ..crate::fs::FileMeta::default()
@@ -347,8 +351,40 @@ impl AnyFs {
     /// directory. Non-empty directories are rejected. Dispatches
     /// through the trait.
     pub fn remove(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        self.require_mutable("rm")?;
         let p = std::path::Path::new(path);
         self.as_filesystem_dyn(|fs| fs.remove(dev, p))
+    }
+
+    /// Whether this filesystem can mutate an already-flushed image
+    /// (`add` / `rm` against an existing on-disk FS). Returns the
+    /// inner trait impl's [`crate::fs::Filesystem::supports_mutation`]
+    /// for filesystems that have one, and `false` for read-only or
+    /// not-yet-trait-wired variants (tar, APFS, exFAT).
+    pub fn supports_mutation(&self) -> bool {
+        match self {
+            Self::Ext(ext) => ext.supports_mutation(),
+            Self::Fat32(fat) => fat.supports_mutation(),
+            Self::HfsPlus(h) => h.supports_mutation(),
+            Self::Ntfs(n) => n.supports_mutation(),
+            Self::F2fs(fs2) => fs2.supports_mutation(),
+            Self::Squashfs(sq) => sq.supports_mutation(),
+            Self::Xfs(x) => x.supports_mutation(),
+            Self::Iso9660(iso) => iso.supports_mutation(),
+            Self::Tar(_) | Self::Apfs(_) | Self::Exfat(_) => false,
+        }
+    }
+
+    /// Internal guard: emit a uniform "repack-only" error for read-only
+    /// or sequential filesystems before dispatching a write call.
+    fn require_mutable(&self, op: &str) -> Result<()> {
+        if self.supports_mutation() {
+            return Ok(());
+        }
+        let kind = self.kind_string();
+        Err(crate::Error::Unsupported(format!(
+            "{op}: {kind} is a repack-only filesystem — use `fstool repack` to rebuild it"
+        )))
     }
 
     /// Dispatch a closure to whichever inner filesystem implements

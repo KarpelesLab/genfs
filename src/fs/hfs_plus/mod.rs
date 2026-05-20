@@ -27,8 +27,13 @@
 //! * No journal replay on read — the on-disk catalog is read as-is.
 //! * HFSX case-sensitive comparison is honoured at the catalog-key
 //!   level; non-ASCII case folding follows a simplified table.
-//! * Extended-attribute B-tree (`attributesFile`) is not parsed or
-//!   written.
+//! * Extended-attribute B-tree (`attributesFile`) is parsed on the
+//!   read side (for HFSCompression / `com.apple.decmpfs`); the writer
+//!   never produces one.
+//! * HFSCompression (`UF_COMPRESSED` + `com.apple.decmpfs`) is decoded
+//!   for compression types 1, 3, and 4 (uncompressed inline, zlib
+//!   inline, zlib in the resource fork); LZVN (7, 8) and LZFSE
+//!   (11, 12) return [`crate::Error::Unsupported`].
 //! * Resource forks are always written as empty.
 //!
 //! ## Module layout
@@ -37,9 +42,13 @@
 //! * [`btree`] — node descriptors, header records, record-offset tables.
 //! * [`catalog`] — catalog keys, leaf records, lookup.
 //! * [`extents`] — extents-overflow B-tree walker for spilled extents.
+//! * [`attributes`] — extended-attribute B-tree walker.
+//! * [`decmpfs`] — HFSCompression header / block decoder.
 
+pub mod attributes;
 pub mod btree;
 pub mod catalog;
+pub mod decmpfs;
 pub mod extents;
 pub mod handle;
 pub(crate) mod journal;
@@ -53,6 +62,7 @@ use std::io::Read;
 use crate::Result;
 use crate::block::BlockDevice;
 
+use attributes::Attributes;
 use btree::ForkReader;
 use catalog::{Catalog, CatalogFile, CatalogKey, CatalogRecord, ROOT_FOLDER_ID, UniStr, mode};
 use extents::ExtentsOverflow;
@@ -70,6 +80,10 @@ pub struct HfsPlus {
     /// Absent only if the volume header has no extents-overflow file,
     /// which is unusual but technically permitted.
     overflow: Option<ExtentsOverflow>,
+    /// Attributes B-tree (extended attributes), opened lazily-but-once
+    /// at mount time. Absent on volumes that have never had an xattr
+    /// set — including every volume produced by this writer.
+    attributes: Option<Attributes>,
     /// CNID of the HFS+ private data directory (where `iNode<N>`
     /// indirect-node files live), if it exists on this volume.
     /// Resolved lazily on first hard-link encounter.
@@ -118,6 +132,12 @@ impl HfsPlus {
             None
         };
 
+        // Open the attributes B-tree if the volume carries one. This
+        // is the table HFSCompression reads `com.apple.decmpfs` from;
+        // images produced by our writer have an empty attributes fork
+        // and so skip this path entirely.
+        let attributes = open_attributes(dev, &vh, case_sensitive)?;
+
         // The root folder's thread record is keyed by (ROOT_FOLDER_ID, "");
         // its name field is the volume name.
         let volume_name = lookup_thread_name(dev, &catalog, ROOT_FOLDER_ID)?
@@ -133,6 +153,7 @@ impl HfsPlus {
             volume_header: vh,
             catalog,
             overflow,
+            attributes,
             private_dir_cnid: std::cell::Cell::new(None),
             private_dir_resolved: std::cell::Cell::new(false),
             volume_name,
@@ -163,11 +184,13 @@ impl HfsPlus {
         } else {
             None
         };
+        let attributes = open_attributes(dev, &vh_mut, case_sensitive)?;
         let volume_name = w.volume_name.clone();
         Ok(Self {
             volume_header: vh_mut,
             catalog,
             overflow,
+            attributes,
             private_dir_cnid: std::cell::Cell::new(None),
             private_dir_resolved: std::cell::Cell::new(false),
             volume_name,
@@ -428,13 +451,23 @@ impl HfsPlus {
                 file.bsd.file_mode
             )));
         }
+        // HFSCompression: when UF_COMPRESSED is set, the data fork is
+        // empty and the logical content lives in the
+        // `com.apple.decmpfs` extended attribute (with optional
+        // overflow into the resource fork). Materialise the
+        // decompressed bytes up front and hand back a cursor over
+        // them — the data is bounded by the header's uncompressed_size
+        // field.
+        if file.bsd.owner_flags & decmpfs::UF_COMPRESSED != 0 {
+            let bytes = self.read_decmpfs_file(dev, &file, path)?;
+            return Ok(HfsPlusFileReader::buffered(bytes));
+        }
         let fork = self.open_data_fork(dev, &file)?;
-        Ok(HfsPlusFileReader {
+        Ok(HfsPlusFileReader::streaming(
             dev,
             fork,
-            remaining: file.data_fork.logical_size,
-            position: 0,
-        })
+            file.data_fork.logical_size,
+        ))
     }
 
     /// Read a symlink's target by absolute path. Returns the raw
@@ -703,6 +736,91 @@ impl HfsPlus {
         ForkReader::from_inline_plus_overflow(fork, &extra, self.volume_header.block_size, what)
     }
 
+    /// HFSCompression read path: look up `com.apple.decmpfs` for
+    /// `file.file_id`, decode the header, and return the file's
+    /// fully-decompressed bytes. For codecs that store the payload in
+    /// the resource fork (type 4 / 8 / 12) we read the resource fork
+    /// in one shot and hand it to the codec.
+    fn read_decmpfs_file(
+        &self,
+        dev: &mut dyn BlockDevice,
+        file: &CatalogFile,
+        path: &str,
+    ) -> Result<Vec<u8>> {
+        let attrs = self.attributes.as_ref().ok_or_else(|| {
+            crate::Error::InvalidImage(format!(
+                "hfs+: {path:?} has UF_COMPRESSED set but volume has no \
+                 attributes file to hold com.apple.decmpfs"
+            ))
+        })?;
+        let rec = attrs
+            .lookup(dev, file.file_id, "com.apple.decmpfs")?
+            .ok_or_else(|| {
+                crate::Error::InvalidImage(format!(
+                    "hfs+: {path:?} has UF_COMPRESSED set but no com.apple.decmpfs \
+                     attribute exists for CNID {}",
+                    file.file_id
+                ))
+            })?;
+        // Inline xattr — the entire decmpfs record fits in the leaf.
+        let xattr_bytes = match rec {
+            attributes::AttrRecord::Inline { data } => data,
+            attributes::AttrRecord::Fork { fork } => {
+                // Extremely rare in practice: an xattr that itself spilled
+                // into its own fork. Read the whole fork into memory and
+                // continue as if it were inline.
+                let what = "decmpfs-xattr-fork";
+                let reader = if u64::from(fork.total_blocks) <= fork.inline_blocks() {
+                    ForkReader::from_inline(&fork, self.volume_header.block_size, what)?
+                } else {
+                    return Err(crate::Error::Unsupported(
+                        "hfs+: decmpfs xattr stored in a fork that needs overflow extents".into(),
+                    ));
+                };
+                let mut buf = vec![0u8; fork.logical_size as usize];
+                reader.read(dev, 0, &mut buf)?;
+                buf
+            }
+        };
+        if xattr_bytes.len() < decmpfs::DecmpfsHeader::SIZE {
+            return Err(crate::Error::InvalidImage(format!(
+                "hfs+: {path:?} com.apple.decmpfs is {} bytes, shorter than the 16-byte header",
+                xattr_bytes.len()
+            )));
+        }
+        let header = decmpfs::DecmpfsHeader::decode(&xattr_bytes)?;
+        if header.compression_type.is_resource_fork() {
+            // Type 4 / 8 / 12 — payload lives in the resource fork.
+            if file.resource_fork.logical_size == 0 {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: {path:?} decmpfs claims compression type {:?} but resource fork is empty",
+                    header.compression_type
+                )));
+            }
+            let rf_reader = self.open_fork(
+                dev,
+                &file.resource_fork,
+                file.file_id,
+                extents::FORK_RESOURCE,
+                "resource",
+            )?;
+            let mut rf_bytes = vec![0u8; file.resource_fork.logical_size as usize];
+            rf_reader.read(dev, 0, &mut rf_bytes)?;
+            decmpfs::decompress_resource_fork(
+                header.compression_type,
+                &rf_bytes,
+                header.uncompressed_size,
+            )
+        } else {
+            // Inline payload follows the 16-byte header in the xattr.
+            decmpfs::decompress_inline(
+                header.compression_type,
+                &xattr_bytes[decmpfs::DecmpfsHeader::SIZE..],
+                header.uncompressed_size,
+            )
+        }
+    }
+
     /// Read up to `SYMLINK_MAX_BYTES` from a symlink's data fork and
     /// return the result as a Rust string. `descriptor` is a human-
     /// readable identifier (path or CNID) used only in error text.
@@ -835,57 +953,157 @@ impl HfsPlus {
     }
 }
 
-/// Streaming reader for a regular HFS+ file. Holds the data-fork
-/// extent list in `ForkReader` and walks it on demand from the
-/// borrowed [`BlockDevice`].
-pub struct HfsPlusFileReader<'a> {
-    dev: &'a mut dyn BlockDevice,
-    fork: ForkReader,
-    /// Bytes of the file still to return.
-    remaining: u64,
-    /// Current fork-relative byte position.
-    position: u64,
+/// Reader for a regular HFS+ file. Two storage variants:
+///
+/// * [`HfsPlusFileReader::Streaming`] — the common case. Holds the
+///   data-fork extent list in a [`ForkReader`] and walks it on
+///   demand from the borrowed [`BlockDevice`].
+/// * [`HfsPlusFileReader::Buffered`] — used when the on-disk file
+///   carries `UF_COMPRESSED` and its logical content has to be
+///   reconstructed from the `com.apple.decmpfs` extended attribute
+///   (and optionally the resource fork) up front. Once we've inflated
+///   the payload we hold it in RAM and serve reads from a cursor — a
+///   single decmpfs file decompresses to at most a few MiB per leaf
+///   record and the resource-fork path is bounded by 64 KiB blocks,
+///   so this is fine for the workloads we care about.
+pub enum HfsPlusFileReader<'a> {
+    /// On-disk data fork; reads stream from `dev`.
+    Streaming {
+        dev: &'a mut dyn BlockDevice,
+        fork: ForkReader,
+        /// Bytes of the file still to return.
+        remaining: u64,
+        /// Current fork-relative byte position.
+        position: u64,
+    },
+    /// Decompressed (or otherwise materialised) payload held in RAM.
+    /// Carries the file lifetime so the public type signature is
+    /// uniform regardless of variant.
+    Buffered {
+        bytes: Vec<u8>,
+        position: u64,
+        _phantom: std::marker::PhantomData<&'a ()>,
+    },
+}
+
+impl<'a> HfsPlusFileReader<'a> {
+    /// Build a streaming reader over the bytes of `fork`. Reads stop
+    /// once `logical_size` has been returned.
+    pub(crate) fn streaming(
+        dev: &'a mut dyn BlockDevice,
+        fork: ForkReader,
+        logical_size: u64,
+    ) -> Self {
+        Self::Streaming {
+            dev,
+            fork,
+            remaining: logical_size,
+            position: 0,
+        }
+    }
+
+    /// Build a buffered reader serving `bytes` from a 0-based cursor.
+    /// Used by the HFSCompression path so the public reader interface
+    /// looks identical to the data-fork case.
+    pub(crate) fn buffered(bytes: Vec<u8>) -> Self {
+        Self::Buffered {
+            bytes,
+            position: 0,
+            _phantom: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<'a> Read for HfsPlusFileReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 || buf.is_empty() {
-            return Ok(0);
+        match self {
+            HfsPlusFileReader::Streaming {
+                dev,
+                fork,
+                remaining,
+                position,
+            } => {
+                if *remaining == 0 || buf.is_empty() {
+                    return Ok(0);
+                }
+                let want = (buf.len() as u64).min(*remaining) as usize;
+                fork.read(*dev, *position, &mut buf[..want])
+                    .map_err(std::io::Error::other)?;
+                *position += want as u64;
+                *remaining -= want as u64;
+                Ok(want)
+            }
+            HfsPlusFileReader::Buffered {
+                bytes, position, ..
+            } => {
+                let len = bytes.len() as u64;
+                if *position >= len || buf.is_empty() {
+                    return Ok(0);
+                }
+                let avail = (len - *position) as usize;
+                let want = buf.len().min(avail);
+                let p = *position as usize;
+                buf[..want].copy_from_slice(&bytes[p..p + want]);
+                *position += want as u64;
+                Ok(want)
+            }
         }
-        let want = (buf.len() as u64).min(self.remaining) as usize;
-        self.fork
-            .read(self.dev, self.position, &mut buf[..want])
-            .map_err(std::io::Error::other)?;
-        self.position += want as u64;
-        self.remaining -= want as u64;
-        Ok(want)
     }
 }
 
 impl<'a> std::io::Seek for HfsPlusFileReader<'a> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        let total = self.fork.logical_size as i128;
-        let new = match pos {
-            std::io::SeekFrom::Start(n) => n as i128,
-            std::io::SeekFrom::Current(d) => self.position as i128 + d as i128,
-            std::io::SeekFrom::End(d) => total + d as i128,
-        };
-        if new < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "hfs+: seek to negative offset",
-            ));
+        match self {
+            HfsPlusFileReader::Streaming {
+                fork,
+                remaining,
+                position,
+                ..
+            } => {
+                let total = fork.logical_size as i128;
+                let new = match pos {
+                    std::io::SeekFrom::Start(n) => n as i128,
+                    std::io::SeekFrom::Current(d) => *position as i128 + d as i128,
+                    std::io::SeekFrom::End(d) => total + d as i128,
+                };
+                if new < 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "hfs+: seek to negative offset",
+                    ));
+                }
+                *position = new as u64;
+                *remaining = fork.logical_size.saturating_sub(*position);
+                Ok(*position)
+            }
+            HfsPlusFileReader::Buffered {
+                bytes, position, ..
+            } => {
+                let total = bytes.len() as i128;
+                let new = match pos {
+                    std::io::SeekFrom::Start(n) => n as i128,
+                    std::io::SeekFrom::Current(d) => *position as i128 + d as i128,
+                    std::io::SeekFrom::End(d) => total + d as i128,
+                };
+                if new < 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "hfs+: seek to negative offset",
+                    ));
+                }
+                *position = new as u64;
+                Ok(*position)
+            }
         }
-        self.position = new as u64;
-        // Recompute remaining relative to the new cursor.
-        self.remaining = self.fork.logical_size.saturating_sub(self.position);
-        Ok(self.position)
     }
 }
 
 impl<'a> crate::fs::FileReadHandle for HfsPlusFileReader<'a> {
     fn len(&self) -> u64 {
-        self.fork.logical_size
+        match self {
+            HfsPlusFileReader::Streaming { fork, .. } => fork.logical_size,
+            HfsPlusFileReader::Buffered { bytes, .. } => bytes.len() as u64,
+        }
     }
 }
 
@@ -935,6 +1153,22 @@ fn lookup_thread_name(
         Some(CatalogRecord::Thread(t)) => Ok(Some(t.name.to_string_lossy())),
         _ => Ok(None),
     }
+}
+
+/// Open the volume's attributes B-tree (extended-attribute file), or
+/// return `None` if the volume has no attributes file. Image producers
+/// (including our own writer) commonly leave the attributes fork
+/// empty.
+fn open_attributes(
+    dev: &mut dyn BlockDevice,
+    vh: &VolumeHeader,
+    case_sensitive: bool,
+) -> Result<Option<Attributes>> {
+    if vh.attributes_file.total_blocks == 0 {
+        return Ok(None);
+    }
+    let fork = ForkReader::from_inline(&vh.attributes_file, vh.block_size, "attributes")?;
+    Ok(Some(Attributes::open(dev, fork, case_sensitive)?))
 }
 
 /// Render an OSType 4-byte tag for diagnostics, preferring ASCII
@@ -2114,5 +2348,403 @@ mod tests {
         let mut buf2 = [0u8; 64];
         h.read_exact(&mut buf2).unwrap();
         assert_eq!(&buf2[..], &data[40..104]);
+    }
+
+    // ----------------------------------------------------------------
+    // HFSCompression (decmpfs) integration tests
+    // ----------------------------------------------------------------
+    //
+    // Our writer doesn't emit an attributes B-tree, so to test the
+    // read path we:
+    //
+    //   1. format + create_file an empty placeholder file;
+    //   2. *before* flush, mutate writer state directly to:
+    //      - flip UF_COMPRESSED on the file's owner_flags;
+    //      - allocate blocks for the attributes file;
+    //      - point writer.attributes_file / volume_header.attributes_file
+    //        at those blocks;
+    //      - for type-4 tests, allocate + register the resource fork's
+    //        extents in the on-disk file body too;
+    //   3. flush (writes a normal catalog + VH referencing the new
+    //      attributes file extents);
+    //   4. lay down a synthesized 2-node attributes B-tree (header +
+    //      leaf) in the allocated blocks;
+    //   5. for type-4 tests, lay down a synthesized resource fork in
+    //      its allocated blocks;
+    //   6. re-open and read the file — the read path inflates the
+    //      decmpfs payload and returns logical bytes.
+
+    /// Build the 16-byte decmpfs header for `compression_type` /
+    /// `uncompressed_size`. Magic is big-endian, the rest little-endian.
+    fn make_decmpfs_header(compression_type: u32, uncompressed_size: u64) -> [u8; 16] {
+        let mut hdr = [0u8; 16];
+        hdr[0..4].copy_from_slice(&decmpfs::DECMPFS_MAGIC.to_be_bytes());
+        hdr[4..8].copy_from_slice(&compression_type.to_le_bytes());
+        hdr[8..16].copy_from_slice(&uncompressed_size.to_le_bytes());
+        hdr
+    }
+
+    /// Construct a single-leaf attributes B-tree containing exactly
+    /// one inline-data record for (file_id, "com.apple.decmpfs"). The
+    /// returned buffer is two `node_size`-byte nodes back-to-back:
+    /// node 0 is the B-tree header node, node 1 is the leaf.
+    fn synth_attributes_btree(node_size: u32, file_id: u32, decmpfs_value: &[u8]) -> Vec<u8> {
+        use btree::{HEADER_REC_SIZE, KIND_HEADER, KIND_LEAF, NODE_DESCRIPTOR_SIZE};
+        let ns = node_size as usize;
+        // ----- node 0: header node.
+        let mut hdr = vec![0u8; ns];
+        // BTNodeDescriptor: kind = header, height = 0, numRecords = 3.
+        hdr[8] = KIND_HEADER as u8;
+        hdr[9] = 0;
+        hdr[10..12].copy_from_slice(&3u16.to_be_bytes());
+        // BTHeaderRec at offset 14.
+        let h = NODE_DESCRIPTOR_SIZE;
+        hdr[h..h + 2].copy_from_slice(&1u16.to_be_bytes()); // tree_depth
+        hdr[h + 2..h + 6].copy_from_slice(&1u32.to_be_bytes()); // root_node = leaf
+        hdr[h + 6..h + 10].copy_from_slice(&1u32.to_be_bytes()); // leaf_records
+        hdr[h + 10..h + 14].copy_from_slice(&1u32.to_be_bytes()); // first_leaf
+        hdr[h + 14..h + 18].copy_from_slice(&1u32.to_be_bytes()); // last_leaf
+        hdr[h + 18..h + 20].copy_from_slice(&(node_size as u16).to_be_bytes());
+        hdr[h + 20..h + 22].copy_from_slice(&264u16.to_be_bytes()); // maxKeyLength
+        hdr[h + 22..h + 26].copy_from_slice(&2u32.to_be_bytes()); // total_nodes
+        hdr[h + 26..h + 30].copy_from_slice(&0u32.to_be_bytes()); // free_nodes
+        hdr[h + 32..h + 36].copy_from_slice(&node_size.to_be_bytes()); // clumpSize
+        hdr[h + 36] = 0; // btreeType = HFS+
+        hdr[h + 37] = 0xCF; // keyCompareType = case-fold (plain HFS+)
+        hdr[h + 38..h + 42].copy_from_slice(&6u32.to_be_bytes()); // big-keys + variable-index
+        // Map record fills the rest. Offset table at the tail.
+        let user_off = NODE_DESCRIPTOR_SIZE + HEADER_REC_SIZE;
+        let map_off = user_off + 128;
+        let offsets_table = 2 * 4;
+        let free_off = ns - offsets_table;
+        let offs = [
+            NODE_DESCRIPTOR_SIZE as u16,
+            user_off as u16,
+            map_off as u16,
+            free_off as u16,
+        ];
+        for (i, &o) in offs.iter().enumerate() {
+            let pos = ns - 2 * (i + 1);
+            hdr[pos..pos + 2].copy_from_slice(&o.to_be_bytes());
+        }
+        // Map: nodes 0 and 1 both in use.
+        hdr[map_off] = 0b1100_0000;
+
+        // ----- node 1: leaf with one record.
+        let name = "com.apple.decmpfs";
+        let name_units: Vec<u16> = name.encode_utf16().collect();
+        let name_len = name_units.len();
+        // Key bytes.
+        let mut key_buf = Vec::new();
+        let key_payload_len = 12 + 2 * name_len;
+        key_buf.extend_from_slice(&(key_payload_len as u16).to_be_bytes());
+        key_buf.extend_from_slice(&0u16.to_be_bytes()); // pad
+        key_buf.extend_from_slice(&file_id.to_be_bytes());
+        key_buf.extend_from_slice(&0u32.to_be_bytes()); // start_block
+        key_buf.extend_from_slice(&(name_len as u16).to_be_bytes());
+        for u in &name_units {
+            key_buf.extend_from_slice(&u.to_be_bytes());
+        }
+        // Pad key to even (already is — 14 + 2*N).
+        // Record body: inline-data.
+        let mut body = Vec::new();
+        body.extend_from_slice(&attributes::REC_INLINE_DATA.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        body.extend_from_slice(&(decmpfs_value.len() as u32).to_be_bytes());
+        body.extend_from_slice(decmpfs_value);
+
+        let rec = [key_buf.clone(), body.clone()].concat();
+        let mut leaf = vec![0u8; ns];
+        leaf[8] = KIND_LEAF as u8;
+        leaf[9] = 1; // height
+        leaf[10..12].copy_from_slice(&1u16.to_be_bytes());
+        // Record at the start of the data area.
+        let start = NODE_DESCRIPTOR_SIZE;
+        let end = start + rec.len();
+        assert!(end <= ns - 4, "attribute record overruns node");
+        leaf[start..end].copy_from_slice(&rec);
+        // Offset table: two entries (start of record + start of free).
+        let l_offs = [start as u16, end as u16];
+        for (i, &o) in l_offs.iter().enumerate() {
+            let pos = ns - 2 * (i + 1);
+            leaf[pos..pos + 2].copy_from_slice(&o.to_be_bytes());
+        }
+
+        let mut out = Vec::with_capacity(2 * ns);
+        out.extend_from_slice(&hdr);
+        out.extend_from_slice(&leaf);
+        out
+    }
+
+    /// Locate the catalog file's encoded body inside `writer.catalog`
+    /// by walking it to find the entry whose `(parent_id, name)` matches
+    /// `path_name` under the root folder, and return a mutable handle.
+    fn find_root_file_body_mut<'a>(w: &'a mut writer::Writer, file_name: &str) -> &'a mut Vec<u8> {
+        // The writer keeps a BTreeMap<OwnedKey, Vec<u8>>. We need to
+        // find the entry whose key is (ROOT_FOLDER_ID, file_name) and
+        // is a REC_FILE. Construct the equivalent UniStr to match.
+        let target = UniStr::from_str_lossy(file_name);
+        for (k, body) in w.catalog.iter_mut() {
+            if k.parent_id == catalog::ROOT_FOLDER_ID
+                && k.name.code_units == target.code_units
+                && body.len() >= 2
+                && i16::from_be_bytes([body[0], body[1]]) == catalog::REC_FILE
+            {
+                return body;
+            }
+        }
+        panic!("no catalog file record for /{file_name}");
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn read_decmpfs_type3_inline_zlib() {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+
+        // Empty placeholder file. The actual logical content will come
+        // from the decmpfs xattr we install below.
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let cnid = hfs
+            .create_file(&mut dev, "/cmp.bin", &mut empty, 0, 0o644, 0, 0)
+            .unwrap();
+
+        let plain = b"hello hfsplus decmpfs inline zlib world!\n".repeat(20);
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&plain).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        // Build the decmpfs xattr payload: 16-byte header (type 3) +
+        // inline zlib bytes.
+        let mut xattr = Vec::new();
+        xattr.extend_from_slice(&make_decmpfs_header(3, plain.len() as u64));
+        xattr.extend_from_slice(&compressed);
+
+        // Allocate two attributes-file blocks (= 2 * node_size / block_size).
+        let block_size = hfs.volume_header.block_size;
+        let node_size = opts.node_size;
+        let attr_bytes_needed = (2 * node_size) as u64;
+        let blocks_needed = u32::try_from(attr_bytes_needed.div_ceil(u64::from(block_size)))
+            .expect("attribute fork block count fits in u32");
+        let w = hfs.writer.as_mut().unwrap();
+        let attr_start_block = w.allocate(blocks_needed).expect("allocate attributes file");
+
+        // Update writer + VH attributes_file ForkData.
+        let mut attr_fork = ForkData {
+            logical_size: attr_bytes_needed,
+            clump_size: node_size,
+            total_blocks: blocks_needed,
+            extents: Default::default(),
+        };
+        attr_fork.extents[0] = volume_header::ExtentDescriptor {
+            start_block: attr_start_block,
+            block_count: blocks_needed,
+        };
+        w.attributes_file = attr_fork;
+        hfs.volume_header.attributes_file = attr_fork;
+
+        // Flip UF_COMPRESSED on the file's owner_flags (offset 41 of
+        // the encoded REC_FILE body) and zero the resource fork
+        // (already empty post-create_file, defensive).
+        {
+            let body = find_root_file_body_mut(w, "cmp.bin");
+            body[41] |= decmpfs::UF_COMPRESSED;
+        }
+
+        // Flush so the on-disk catalog + volume header pick up our
+        // changes.
+        hfs.flush(&mut dev).unwrap();
+
+        // Lay down the synthesized 2-node attributes B-tree at its
+        // extents start.
+        let attr_tree = synth_attributes_btree(node_size, cnid, &xattr);
+        let attr_off = u64::from(attr_start_block) * u64::from(block_size);
+        dev.write_at(attr_off, &attr_tree).unwrap();
+
+        // Now re-open and read the file via the public reader.
+        let hfs = HfsPlus::open(&mut dev).unwrap();
+        let mut r = hfs.open_file_reader(&mut dev, "/cmp.bin").unwrap();
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+        assert_eq!(got.len(), plain.len(), "decompressed length matches header");
+        assert_eq!(got, plain, "decompressed bytes match original");
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn read_decmpfs_type4_resource_fork_zlib() {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+
+        let mut dev = crate::block::MemoryBackend::new(16 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let cnid = hfs
+            .create_file(&mut dev, "/big.bin", &mut empty, 0, 0o644, 0, 0)
+            .unwrap();
+
+        // Build two blocks: first 64 KiB, then a tail.
+        let mut plain = Vec::new();
+        plain.extend(std::iter::repeat_n(0xABu8, decmpfs::HFSCOMPRESS_BLOCK_SIZE));
+        plain.extend_from_slice(b"hfscompression type-4 tail data");
+        let block1 = &plain[..decmpfs::HFSCOMPRESS_BLOCK_SIZE];
+        let block2 = &plain[decmpfs::HFSCOMPRESS_BLOCK_SIZE..];
+
+        let compress = |data: &[u8]| -> Vec<u8> {
+            let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+            e.write_all(data).unwrap();
+            e.finish().unwrap()
+        };
+        let c1 = compress(block1);
+        let c2 = compress(block2);
+
+        // Assemble resource-fork bytes (data area at offset 256, table
+        // base at data_offset + 4).
+        let block_count: u32 = 2;
+        let table_size = 4 + 8 * block_count as usize;
+        let blk1_off = table_size as u32;
+        let blk2_off = blk1_off + c1.len() as u32;
+
+        let mut rdata = Vec::new();
+        let inner_size: u32 = (table_size + c1.len() + c2.len()) as u32;
+        rdata.extend_from_slice(&inner_size.to_be_bytes());
+        rdata.extend_from_slice(&block_count.to_le_bytes());
+        rdata.extend_from_slice(&blk1_off.to_le_bytes());
+        rdata.extend_from_slice(&(c1.len() as u32).to_le_bytes());
+        rdata.extend_from_slice(&blk2_off.to_le_bytes());
+        rdata.extend_from_slice(&(c2.len() as u32).to_le_bytes());
+        rdata.extend_from_slice(&c1);
+        rdata.extend_from_slice(&c2);
+
+        let data_offset: u32 = 256;
+        let data_length: u32 = rdata.len() as u32;
+        let mut rf = Vec::new();
+        rf.extend_from_slice(&data_offset.to_be_bytes());
+        rf.extend_from_slice(&(data_offset + data_length).to_be_bytes());
+        rf.extend_from_slice(&data_length.to_be_bytes());
+        rf.extend_from_slice(&0u32.to_be_bytes());
+        rf.resize(data_offset as usize, 0);
+        rf.extend_from_slice(&rdata);
+
+        // decmpfs xattr: header only (type 4 = data in resource fork).
+        let xattr = make_decmpfs_header(4, plain.len() as u64).to_vec();
+
+        // Layout:
+        //   - allocate blocks for the attributes B-tree (2 nodes)
+        //   - allocate blocks for the resource fork (covers rf.len())
+        let block_size = hfs.volume_header.block_size;
+        let node_size = opts.node_size;
+        let attr_bytes_needed = (2 * node_size) as u64;
+        let attr_blocks = u32::try_from(attr_bytes_needed.div_ceil(u64::from(block_size))).unwrap();
+        let rf_blocks = u32::try_from((rf.len() as u64).div_ceil(u64::from(block_size))).unwrap();
+        let w = hfs.writer.as_mut().unwrap();
+        let attr_start = w.allocate(attr_blocks).unwrap();
+        let rf_start = w.allocate(rf_blocks).unwrap();
+
+        // Attributes-file fork.
+        let mut attr_fork = ForkData {
+            logical_size: attr_bytes_needed,
+            clump_size: node_size,
+            total_blocks: attr_blocks,
+            extents: Default::default(),
+        };
+        attr_fork.extents[0] = volume_header::ExtentDescriptor {
+            start_block: attr_start,
+            block_count: attr_blocks,
+        };
+        w.attributes_file = attr_fork;
+        hfs.volume_header.attributes_file = attr_fork;
+
+        // Resource fork: rewrite the file's catalog body so its
+        // resourceFork ForkData (offset 168..248) points at rf_start.
+        {
+            let body = find_root_file_body_mut(w, "big.bin");
+            body[41] |= decmpfs::UF_COMPRESSED;
+            // logical_size (8 BE) = rf.len()
+            body[168..176].copy_from_slice(&(rf.len() as u64).to_be_bytes());
+            // clump_size (4 BE)
+            body[176..180].copy_from_slice(&block_size.to_be_bytes());
+            // total_blocks (4 BE)
+            body[180..184].copy_from_slice(&rf_blocks.to_be_bytes());
+            // extents[0]
+            body[184..188].copy_from_slice(&rf_start.to_be_bytes());
+            body[188..192].copy_from_slice(&rf_blocks.to_be_bytes());
+        }
+
+        hfs.flush(&mut dev).unwrap();
+
+        // Write the synthesized attribute tree and resource-fork bytes
+        // to the allocated blocks.
+        let attr_tree = synth_attributes_btree(node_size, cnid, &xattr);
+        let attr_off = u64::from(attr_start) * u64::from(block_size);
+        dev.write_at(attr_off, &attr_tree).unwrap();
+        let rf_off = u64::from(rf_start) * u64::from(block_size);
+        dev.write_at(rf_off, &rf).unwrap();
+
+        let hfs = HfsPlus::open(&mut dev).unwrap();
+        let mut r = hfs.open_file_reader(&mut dev, "/big.bin").unwrap();
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+        assert_eq!(got.len(), plain.len());
+        assert_eq!(got, plain);
+    }
+
+    #[test]
+    fn read_decmpfs_unsupported_codec_errors_clearly() {
+        // A file marked UF_COMPRESSED whose xattr advertises an
+        // LZVN/LZFSE codec should produce a clear `Unsupported` error
+        // rather than data corruption. We exercise this with type 7
+        // (LZVN inline).
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let cnid = hfs
+            .create_file(&mut dev, "/lzvn.bin", &mut empty, 0, 0o644, 0, 0)
+            .unwrap();
+
+        // decmpfs header advertises type 7 (LZVN inline), but we ship
+        // no payload — the test only checks the codec dispatch path.
+        let xattr = make_decmpfs_header(7, 4).to_vec();
+
+        let block_size = hfs.volume_header.block_size;
+        let node_size = opts.node_size;
+        let attr_bytes_needed = (2 * node_size) as u64;
+        let attr_blocks = u32::try_from(attr_bytes_needed.div_ceil(u64::from(block_size))).unwrap();
+        let w = hfs.writer.as_mut().unwrap();
+        let attr_start = w.allocate(attr_blocks).unwrap();
+        let mut attr_fork = ForkData {
+            logical_size: attr_bytes_needed,
+            clump_size: node_size,
+            total_blocks: attr_blocks,
+            extents: Default::default(),
+        };
+        attr_fork.extents[0] = volume_header::ExtentDescriptor {
+            start_block: attr_start,
+            block_count: attr_blocks,
+        };
+        w.attributes_file = attr_fork;
+        hfs.volume_header.attributes_file = attr_fork;
+        {
+            let body = find_root_file_body_mut(w, "lzvn.bin");
+            body[41] |= decmpfs::UF_COMPRESSED;
+        }
+        hfs.flush(&mut dev).unwrap();
+        let attr_tree = synth_attributes_btree(node_size, cnid, &xattr);
+        let attr_off = u64::from(attr_start) * u64::from(block_size);
+        dev.write_at(attr_off, &attr_tree).unwrap();
+
+        let hfs = HfsPlus::open(&mut dev).unwrap();
+        let err = hfs.open_file_reader(&mut dev, "/lzvn.bin").err().unwrap();
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "LZVN should surface as Unsupported, got {err:?}"
+        );
     }
 }

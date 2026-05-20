@@ -142,8 +142,8 @@ fn fold_case(c: u16) -> u16 {
 
 /// Lexicographic compare of two HFSUniStr255 values. With
 /// `case_sensitive == false` (plain HFS+) each code unit is mapped
-/// through [`fold_case`] before comparison; `case_sensitive == true`
-/// (HFSX binary mode) keeps the verbatim u16 values.
+/// through the case-folding table before comparison; `case_sensitive
+/// == true` (HFSX binary mode) keeps the verbatim u16 values.
 pub fn compare_unistr(a: &UniStr, b: &UniStr, case_sensitive: bool) -> Ordering {
     let n = a.code_units.len().min(b.code_units.len());
     for i in 0..n {

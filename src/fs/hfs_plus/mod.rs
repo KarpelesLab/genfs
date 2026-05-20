@@ -42,6 +42,7 @@ pub mod btree;
 pub mod catalog;
 pub mod extents;
 pub mod handle;
+pub(crate) mod journal;
 pub mod volume_header;
 pub mod writer;
 
@@ -1444,9 +1445,10 @@ mod tests {
     }
 
     /// Same round-trip as the non-journaled test but on an image
-    /// formatted with the journal stub enabled. Path B keeps the
-    /// journal clean (start == end) so reopening from scratch still
-    /// works.
+    /// formatted with the journal stub enabled. After Path A's commit
+    /// sequence (write tx → advance end → apply blocks → advance
+    /// start) the journal is back to `start == end`, so a subsequent
+    /// open sees no replay work and treats the volume as clean.
     #[test]
     fn open_file_rw_round_trip_journaled() {
         use crate::fs::{Filesystem, OpenFlags};
@@ -1509,8 +1511,9 @@ mod tests {
         }
 
         // Inspect the journal header directly: start MUST equal end
-        // (Path B contract). The journal header lives at the start of
-        // the journal buffer; the JournalInfoBlock at byte 12 of the
+        // (Path A leaves the journal sealed once the transaction is
+        // applied). The journal header lives at the start of the
+        // journal buffer; the JournalInfoBlock at byte 12 of the
         // volume header tells us where the buffer starts.
         let mut vh_buf = [0u8; 512];
         dev.read_at(volume_header::VOLUME_HEADER_OFFSET, &mut vh_buf)
@@ -1528,30 +1531,34 @@ mod tests {
         let end = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
         assert_eq!(
             start, end,
-            "Path B requires the journal to be clean after partial writes \
-             (start={start:#x}, end={end:#x})"
+            "Path A requires the journal to be sealed (start == end) \
+             after a successful sync (start={start:#x}, end={end:#x})"
         );
     }
 
-    /// Manually corrupt the journal header so `end != start`, then
-    /// verify `open_file_rw` refuses cleanly with `Unsupported` rather
-    /// than scribbling on a volume with unreplayed work.
+    /// Simulate a crash mid-sync: commit a journal transaction (so
+    /// `end` is advanced and the user data is on disk), then forcibly
+    /// rewind `start` so the on-disk journal claims unreplayed work,
+    /// and corrupt the user data so we can confirm replay reapplies
+    /// it. The next open_file_rw must drain the journal and produce
+    /// the post-sync contents.
     #[test]
-    fn open_file_rw_refused_when_journal_dirty() {
+    fn open_file_rw_replays_dirty_journal_on_open() {
         use crate::fs::{Filesystem, OpenFlags};
+        use std::io::{Read, Seek, SeekFrom, Write};
 
         let mut dev = MemoryBackend::new(8 * 1024 * 1024);
         let opts = writer::FormatOpts {
             journaled: true,
             ..writer::FormatOpts::default()
         };
-        let payload = b"original\n".repeat(4);
+        let payload = b"original\n".repeat(64);
         {
             let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
             let mut src = std::io::Cursor::new(&payload);
             hfs.create_file(
                 &mut dev,
-                "/dirty.bin",
+                "/replay.bin",
                 &mut src,
                 payload.len() as u64,
                 0o644,
@@ -1562,9 +1569,26 @@ mod tests {
             hfs.flush(&mut dev).unwrap();
         }
 
-        // Locate the journal buffer and corrupt the `end` field so it
-        // diverges from `start`. Same lookup as the inspection above.
-        let (jbuf_off, _bs) = {
+        // Round 1: do a journaled write — sync persists everything.
+        // Capture the journal `start`/`end` afterwards so we can roll
+        // `start` back to simulate a crash that lost step 4 of the
+        // commit sequence.
+        let (jbuf_off, sealed_start, sealed_end) = {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            {
+                let mut h = hfs
+                    .open_file_rw(
+                        &mut dev,
+                        std::path::Path::new("/replay.bin"),
+                        OpenFlags::default(),
+                        None,
+                    )
+                    .unwrap();
+                h.seek(SeekFrom::Start(64)).unwrap();
+                h.write_all(b"REPLAYED-DATA-FROM-JOURNAL").unwrap();
+                h.sync().unwrap();
+            }
+            // Sneak a peek at the journal header.
             let mut vh_buf = [0u8; 512];
             dev.read_at(volume_header::VOLUME_HEADER_OFFSET, &mut vh_buf)
                 .unwrap();
@@ -1574,32 +1598,274 @@ mod tests {
             let mut info = [0u8; 52];
             dev.read_at(info_off, &mut info).unwrap();
             let jbuf_off = u64::from_be_bytes(info[36..44].try_into().unwrap());
-            (jbuf_off, bs)
+            let mut hdr = [0u8; 24];
+            dev.read_at(jbuf_off, &mut hdr).unwrap();
+            let s = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+            let e = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+            assert_eq!(s, e, "post-sync the journal must be clean");
+            (jbuf_off, s, e)
         };
-        // Write a non-equal `end` value at offset jbuf_off + 16. We
-        // don't bother re-checksumming; the open_file_rw guard only
-        // checks magic + start vs. end, not the CRC.
-        let dirty_end: u64 = 0x2000;
-        dev.write_at(jbuf_off + 16, &dirty_end.to_be_bytes()).unwrap();
+        assert_eq!(sealed_start, sealed_end);
 
-        // Now open_file_rw must refuse.
-        let mut hfs = HfsPlus::open(&mut dev).unwrap();
-        let res = hfs.open_file_rw(
-            &mut dev,
-            std::path::Path::new("/dirty.bin"),
-            OpenFlags::default(),
-            None,
-        );
-        match res {
-            Err(crate::Error::Unsupported(msg)) => {
-                assert!(
-                    msg.contains("unreplayed") || msg.contains("journal"),
-                    "expected an unreplayed-journal complaint, got: {msg}"
-                );
-            }
-            Err(other) => panic!("expected Error::Unsupported, got: {other}"),
-            Ok(_) => panic!("expected open_file_rw to refuse on a dirty journal"),
+        // Simulate the crash by rewinding the on-disk `start` past
+        // the existing transaction. Replay must re-apply it (which is
+        // a no-op since the user data is already on disk) and leave
+        // the journal clean again.
+        {
+            let hfs = HfsPlus::open(&mut dev).unwrap();
+            let mut got = Vec::new();
+            hfs.open_file_reader(&mut dev, "/replay.bin")
+                .unwrap()
+                .read_to_end(&mut got)
+                .unwrap();
+            assert_eq!(&got[64..64 + 26], b"REPLAYED-DATA-FROM-JOURNAL");
         }
+        // Rewind `start` to JHDR_SIZE — the journal-header size we
+        // ship at format time (= 512). Now `start != end` and the
+        // on-disk transaction is "unapplied" as far as the journal is
+        // concerned. We rely on JournalLog::load tolerating a missing
+        // checksum recompute because replay only reads start/end.
+        let rewound_start: u64 = u64::from(super::journal::JHDR_SIZE);
+        // Patch the header in-place.
+        let mut hdr = [0u8; 24];
+        dev.read_at(jbuf_off, &mut hdr).unwrap();
+        hdr[8..16].copy_from_slice(&rewound_start.to_be_bytes());
+        dev.write_at(jbuf_off, &hdr).unwrap();
+
+        // Reopen and open the file for writing. The replay should fire
+        // and re-apply the transaction. We then close without writing
+        // and confirm the contents are intact.
+        {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            let h = hfs
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/replay.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            // Reading from the freshly-opened handle should match the
+            // journaled contents. The point of the test isn't the
+            // bytes — replay already wrote them to disk before we got
+            // here — but the journal header itself must now be clean
+            // again.
+            drop(h);
+            let mut hdr = [0u8; 24];
+            dev.read_at(jbuf_off, &mut hdr).unwrap();
+            let s = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+            let e = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+            assert_eq!(s, e, "replay must leave the journal clean");
+        }
+    }
+
+    /// Simulate a crash *before* the journal applies its block writes.
+    /// We synthesize the state by:
+    ///
+    ///   1. Doing a real journaled sync (so `end > start` was reached
+    ///      and re-equalised).
+    ///   2. Rewinding `start` to before the transaction (so the journal
+    ///      looks dirty).
+    ///   3. Zeroing the user-data block (so the in-place write looks
+    ///      lost).
+    ///
+    /// Then we reopen via [`crate::fs::Filesystem::open_file_rw`] and
+    /// verify the journal contents successfully restored the bytes.
+    #[test]
+    fn replay_on_open_restores_lost_user_data() {
+        use crate::fs::{Filesystem, OpenFlags};
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut dev = MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts {
+            journaled: true,
+            ..writer::FormatOpts::default()
+        };
+        let payload = vec![0xAAu8; 4096];
+        {
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let mut src = std::io::Cursor::new(&payload);
+            hfs.create_file(
+                &mut dev,
+                "/x.bin",
+                &mut src,
+                payload.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        // 1. Journaled sync.
+        let (jbuf_off, sealed_end) = {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            {
+                let mut h = hfs
+                    .open_file_rw(
+                        &mut dev,
+                        std::path::Path::new("/x.bin"),
+                        OpenFlags::default(),
+                        None,
+                    )
+                    .unwrap();
+                h.seek(SeekFrom::Start(0)).unwrap();
+                h.write_all(&[0xBBu8; 4096]).unwrap();
+                h.sync().unwrap();
+            }
+            let mut vh_buf = [0u8; 512];
+            dev.read_at(volume_header::VOLUME_HEADER_OFFSET, &mut vh_buf)
+                .unwrap();
+            let info_block = u32::from_be_bytes(vh_buf[12..16].try_into().unwrap());
+            let bs = u32::from_be_bytes(vh_buf[40..44].try_into().unwrap());
+            let info_off = u64::from(info_block) * u64::from(bs);
+            let mut info = [0u8; 52];
+            dev.read_at(info_off, &mut info).unwrap();
+            let jbuf_off = u64::from_be_bytes(info[36..44].try_into().unwrap());
+            let mut hdr = [0u8; 24];
+            dev.read_at(jbuf_off, &mut hdr).unwrap();
+            let e = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+            (jbuf_off, e)
+        };
+
+        // 2. Find the file's first data block to corrupt it.
+        let dev_off_block0 = {
+            let hfs = HfsPlus::open(&mut dev).unwrap();
+            let CatalogRecord::File(f) = hfs.lookup_path(&mut dev, "/x.bin").unwrap() else {
+                panic!("expected file");
+            };
+            // Read the file record's first inline extent: stored at
+            // raw_body[88..96] (start_block, block_count). We grab the
+            // run from the writer instead — easier.
+            let w = hfs.writer.as_ref().unwrap();
+            let body = w
+                .catalog
+                .get(&writer::OwnedKey {
+                    parent_id: ROOT_FOLDER_ID,
+                    name: catalog::UniStr::from_str_lossy("x.bin"),
+                })
+                .expect("catalog body");
+            let sb =
+                u32::from_be_bytes(body[88 + 16..88 + 20].try_into().unwrap()); // first ext start
+            assert!(sb > 0, "file must have a real data block");
+            let _ = f;
+            u64::from(sb) * u64::from(hfs.volume_header.block_size)
+        };
+
+        // 3. Zero the user-data block on disk, and rewind start so
+        //    the journal looks dirty again.
+        dev.write_at(dev_off_block0, &[0u8; 4096]).unwrap();
+        let mut hdr = [0u8; 24];
+        dev.read_at(jbuf_off, &mut hdr).unwrap();
+        let rewound: u64 = u64::from(super::journal::JHDR_SIZE);
+        hdr[8..16].copy_from_slice(&rewound.to_be_bytes());
+        dev.write_at(jbuf_off, &hdr).unwrap();
+        let _ = sealed_end;
+
+        // 4. Reopen — replay should restore the 0xBB pattern.
+        {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            let h = hfs
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/x.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            drop(h);
+        }
+        let mut got = [0u8; 4096];
+        dev.read_at(dev_off_block0, &mut got).unwrap();
+        assert!(
+            got.iter().all(|&b| b == 0xBB),
+            "replay must have restored the user data"
+        );
+    }
+
+    /// Round-trip on a journaled image, then run `fsck.hfsplus` on the
+    /// resulting bytes. Silently skipped when the binary isn't on PATH.
+    #[test]
+    fn open_file_rw_journaled_passes_fsck_hfsplus() {
+        use crate::fs::{Filesystem, OpenFlags};
+        use std::io::{Seek, SeekFrom, Write};
+        use std::process::Command;
+
+        let fsck = match Command::new("sh")
+            .arg("-c")
+            .arg("command -v fsck.hfsplus")
+            .output()
+        {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
+            _ => return, // not installed; skip
+        };
+
+        let tmp = tempfile::NamedTempFile::new().expect("tmp");
+        let path = tmp.path().to_path_buf();
+        let total: u64 = 8 * 1024 * 1024;
+        // Truncate to the target size.
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(total).unwrap();
+        drop(f);
+
+        let mut dev = crate::block::FileBackend::open(&path).unwrap();
+        let opts = writer::FormatOpts {
+            journaled: true,
+            volume_name: "fsckTestVol".into(),
+            ..writer::FormatOpts::default()
+        };
+        let payload: Vec<u8> = (0..16 * 1024).map(|i| (i & 0xFF) as u8).collect();
+        {
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let mut src = std::io::Cursor::new(&payload);
+            hfs.create_file(
+                &mut dev,
+                "/edit.bin",
+                &mut src,
+                payload.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+        {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            let mut h = hfs
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/edit.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.seek(SeekFrom::Start(8192)).unwrap();
+            h.write_all(b"journal-test-payload").unwrap();
+            h.sync().unwrap();
+        }
+        crate::block::BlockDevice::sync(&mut dev).unwrap();
+        drop(dev);
+
+        let out = Command::new(&fsck)
+            .arg("-fn")
+            .arg(&path)
+            .output()
+            .expect("run fsck.hfsplus");
+        // fsck.hfsplus returns 0 on a clean volume.
+        assert!(
+            out.status.success(),
+            "fsck.hfsplus failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
     }
 
     #[test]

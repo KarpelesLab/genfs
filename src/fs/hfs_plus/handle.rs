@@ -1,21 +1,37 @@
 //! HFS+ in-place read/write file handle.
 //!
 //! Backs [`crate::fs::Filesystem::open_file_rw`] for HFS+ volumes.
-//! Every `Write::write` is eager: the relevant allocation block(s) are
-//! read, patched, written back, and the catalog file record's data
-//! fork is updated in the in-memory writer. The actual catalog B-tree
-//! rewrite happens on `sync()` (or `Drop`), which delegates to
+//!
+//! ## Journal handling — Path A (real transactions)
+//!
+//! On a journaled volume, user-data writes are buffered in an in-memory
+//! [`super::journal::JournalLog`] until `sync()`. On sync we emit one
+//! journal transaction holding every modified disk block:
+//!
+//!   1. Write the block-list-header + block_info array + block data
+//!      into the journal buffer at `end`.
+//!   2. Persist the journal header with the new `end` value.
+//!   3. Apply the buffered writes to their target offsets on disk.
+//!   4. Persist the journal header with `start = end`.
+//!
+//! A crash between steps 2 and 4 leaves a valid journal entry that
+//! the next open replays. Replay is idempotent. On open we always
+//! drain any unreplayed work via [`super::journal::replay`] before
+//! attaching the handle, so the caller never sees a half-applied
+//! transaction.
+//!
+//! On an unjournaled volume the journal log is `None` and writes go
+//! straight to disk; metadata is persisted by `sync()` via
 //! [`super::HfsPlus::flush`].
 //!
-//! ## Journal handling — Path B (clean-shutdown bypass)
+//! ### Known limitation
 //!
-//! On open, the journal header is read (if the volume carries one) and
-//! verified clean (`start == end`). All mutations are then performed
-//! in-place, bypassing the journal entirely. After flush, the journal
-//! is still clean — the kernel/fsck will conclude there is nothing to
-//! replay. If the journal is dirty on open, we refuse with
-//! [`crate::Error::Unsupported`]: the caller should mount the image
-//! with a tool that replays first.
+//! The metadata rewrite inside [`super::HfsPlus::flush`] (catalog
+//! B-tree, extents-overflow, allocation bitmap, volume header) is
+//! *not* journaled. A crash between the journal commit and the
+//! metadata flush leaves the user data on disk but the catalog still
+//! describing the file's previous size / extents. fsck will report a
+//! leak (allocated-but-uncatalogued blocks) but no corruption.
 //!
 //! ## Lifetime
 //!
@@ -27,6 +43,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use super::HfsPlus;
 use super::catalog::{REC_FILE, UniStr, mode};
 use super::extents::FORK_DATA;
+use super::journal::JournalLog;
 use super::volume_header::{ExtentDescriptor, FORK_DATA_SIZE, FORK_EXTENT_COUNT, ForkData};
 use super::writer::OwnedKey;
 use crate::Result;
@@ -57,12 +74,17 @@ pub struct HfsPlusFileHandle<'a> {
     /// True once mutations have made the on-disk catalog stale. Cleared
     /// on `sync` / `Drop`.
     dirty: bool,
+    /// In-memory journal log on a journaled volume. `None` on
+    /// unjournaled images. Buffers every user-data write until `sync`
+    /// commits the transaction.
+    journal: Option<JournalLog>,
 }
 
 impl<'a> HfsPlusFileHandle<'a> {
     /// Construct a handle for the file at `cat_key`. Caller has already
-    /// resolved the entry to a non-hardlink non-symlink regular file
-    /// and assembled its merged run list.
+    /// resolved the entry to a non-hardlink non-symlink regular file,
+    /// assembled its merged run list, replayed any outstanding journal
+    /// transactions, and loaded a fresh [`JournalLog`] if applicable.
     pub(super) fn new(
         fs: &'a mut HfsPlus,
         dev: &'a mut dyn BlockDevice,
@@ -70,6 +92,7 @@ impl<'a> HfsPlusFileHandle<'a> {
         file_id: u32,
         runs: Vec<ExtentDescriptor>,
         file_size: u64,
+        journal: Option<JournalLog>,
     ) -> Self {
         Self {
             fs,
@@ -80,6 +103,7 @@ impl<'a> HfsPlusFileHandle<'a> {
             file_size,
             pos: 0,
             dirty: false,
+            journal,
         }
     }
 
@@ -140,13 +164,93 @@ impl<'a> HfsPlusFileHandle<'a> {
                 ))
             })?;
             let chunk = (want - done).min(in_run as usize);
-            self.dev
-                .read_at(dev_off, &mut buf[done..done + chunk])
-                .map_err(io::Error::other)?;
+            self.dev_read_at(dev_off, &mut buf[done..done + chunk])
+                .map_err(|e| io::Error::other(e.to_string()))?;
             done += chunk;
         }
         self.pos += done as u64;
         Ok(done)
+    }
+
+    /// Positional read that consults the journal buffer first (so a
+    /// `write` -> `read` round trip within the same handle sees the
+    /// pending data even though we have not yet committed). Bytes not
+    /// covered by any pending block fall through to the device.
+    fn dev_read_at(&mut self, off: u64, buf: &mut [u8]) -> Result<()> {
+        if let Some(journal) = self.journal.as_ref() {
+            let mut idx = 0;
+            while idx < buf.len() {
+                let cur = off + idx as u64;
+                if let Some((block_off, data)) = journal.lookup(cur) {
+                    let inside = (cur - block_off) as usize;
+                    let take = (buf.len() - idx).min(data.len() - inside);
+                    buf[idx..idx + take].copy_from_slice(&data[inside..inside + take]);
+                    idx += take;
+                } else {
+                    // Read from disk up to the next pending byte.
+                    let mut stretch = buf.len() - idx;
+                    for j in 0..stretch {
+                        if journal.lookup(cur + j as u64).is_some() {
+                            stretch = j;
+                            break;
+                        }
+                    }
+                    if stretch == 0 {
+                        continue;
+                    }
+                    self.dev.read_at(cur, &mut buf[idx..idx + stretch])?;
+                    idx += stretch;
+                }
+            }
+            Ok(())
+        } else {
+            self.dev.read_at(off, buf)
+        }
+    }
+
+    /// Positional write that prefers the journal buffer on journaled
+    /// volumes (the write is buffered until `sync`). On unjournaled
+    /// volumes we still go straight to disk.
+    ///
+    /// Journal commits must describe each block as a whole multiple of
+    /// the journal sector size (512 B). A partial-sector write would
+    /// be padded with zeros at commit time, clobbering the original
+    /// surrounding bytes. To avoid that, we expand sub-sector writes
+    /// here by reading the affected sector(s) from disk (or from
+    /// previously-pending journal entries) and patching them in
+    /// memory, then handing the sector-aligned merged buffer to the
+    /// journal.
+    fn dev_write_at(&mut self, off: u64, data: &[u8]) -> Result<()> {
+        if self.journal.is_none() {
+            return self.dev.write_at(off, data);
+        }
+        const SECTOR: u64 = super::journal::JOURNAL_SECTOR;
+        let end = off + data.len() as u64;
+        let aligned_start = off / SECTOR * SECTOR;
+        let aligned_end = end.div_ceil(SECTOR) * SECTOR;
+        let aligned_len = (aligned_end - aligned_start) as usize;
+
+        let merged = if aligned_start == off && aligned_len == data.len() {
+            // Already sector-aligned end-to-end; nothing to read.
+            data.to_vec()
+        } else {
+            let mut buf = vec![0u8; aligned_len];
+            // Read the existing aligned range from disk (with journal
+            // overlay) so we don't zero out neighbouring bytes.
+            self.dev_read_at(aligned_start, &mut buf)?;
+            let dst_start = (off - aligned_start) as usize;
+            buf[dst_start..dst_start + data.len()].copy_from_slice(data);
+            buf
+        };
+
+        let journal = self
+            .journal
+            .as_mut()
+            .expect("journal presence checked above");
+        // `merged` already starts at `aligned_start` and is whole sectors.
+        journal.add(aligned_start, merged);
+        self.dirty = true;
+        Ok(())
     }
 
     /// Append new runs to cover at least `needed_bytes` bytes total
@@ -164,18 +268,30 @@ impl<'a> HfsPlusFileHandle<'a> {
                 "hfs+ handle: capacity grow overflows u32 block count".into(),
             )
         })?;
-        let writer = self.fs.writer.as_mut().ok_or_else(|| {
-            crate::Error::InvalidArgument("hfs+: volume opened read-only".into())
-        })?;
-        while extra_blocks > 0 {
-            let run = writer.allocate_largest_run(extra_blocks)?;
-            // Zero the freshly-allocated run on disk so reads of holes
-            // return zero. (A block freed by `remove` and re-handed-out
-            // may still carry stale bytes.)
+        // Two-phase to avoid the alternating borrow between
+        // `self.fs.writer` (allocation bookkeeping) and `self.dev_write_at`
+        // (which needs `self` as a whole): first stage every run, then
+        // drop the writer borrow, then journal/apply the zero-fills.
+        let mut staged: Vec<ExtentDescriptor> = Vec::new();
+        {
+            let writer = self.fs.writer.as_mut().ok_or_else(|| {
+                crate::Error::InvalidArgument("hfs+: volume opened read-only".into())
+            })?;
+            while extra_blocks > 0 {
+                let run = writer.allocate_largest_run(extra_blocks)?;
+                extra_blocks -= run.block_count;
+                staged.push(run);
+            }
+        }
+        for run in staged {
+            // Zero the freshly-allocated run so reads of holes return
+            // zero. (A block freed by `remove` and re-handed-out may
+            // still carry stale bytes.) On a journaled volume the
+            // zero-fill is buffered into the journal alongside the
+            // user write — replay will re-zero on recovery.
             let zero = vec![0u8; (u64::from(run.block_count) * bs) as usize];
             let off = u64::from(run.start_block) * bs;
-            self.dev.write_at(off, &zero)?;
-            extra_blocks -= run.block_count;
+            self.dev_write_at(off, &zero)?;
             self.runs.push(run);
         }
         Ok(())
@@ -226,9 +342,8 @@ impl<'a> HfsPlusFileHandle<'a> {
                 io::Error::other("hfs+: write past allocated capacity (internal)")
             })?;
             let chunk = (data.len() - done).min(in_run as usize);
-            self.dev
-                .write_at(dev_off, &data[done..done + chunk])
-                .map_err(io::Error::other)?;
+            self.dev_write_at(dev_off, &data[done..done + chunk])
+                .map_err(|e| io::Error::other(e.to_string()))?;
             done += chunk;
         }
         Ok(())
@@ -378,16 +493,32 @@ impl<'a> HfsPlusFileHandle<'a> {
         Ok(())
     }
 
-    /// Persist this handle's changes. Updates the catalog body bytes,
-    /// then calls `HfsPlus::flush` to rewrite the catalog tree, the
-    /// extents-overflow tree, the allocation bitmap, and the volume
-    /// header. The journal stub (if present) is left untouched — it's
-    /// still clean because all mutations went straight to the live
-    /// metadata.
+    /// Persist this handle's changes.
+    ///
+    /// Two-phase commit on a journaled volume:
+    ///
+    ///   1. Commit the user-data journal — writes the transaction
+    ///      header into the journal buffer at `end`, persists `end`,
+    ///      applies the in-place writes, then advances `start = end`.
+    ///      A crash anywhere in this sequence leaves a recoverable
+    ///      journal state ([`super::journal::replay`] is idempotent).
+    ///   2. Refresh the catalog body and run [`super::HfsPlus::flush`]
+    ///      to rewrite the catalog tree, extents-overflow tree,
+    ///      allocation bitmap, and volume header. NOT journaled; a
+    ///      crash here leaves an orphan-allocation leak — see module
+    ///      docs.
+    ///
+    /// On an unjournaled volume step 1 is a no-op and writes have
+    /// already been applied in place by `dev_write_at`.
     fn sync_inner(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
         }
+        // Phase 1: flush the user-data journal.
+        if let Some(journal) = self.journal.as_mut() {
+            journal.commit(self.dev)?;
+        }
+        // Phase 2: refresh metadata.
         self.refresh_catalog_body()?;
         self.fs.flush(self.dev)?;
         self.dirty = false;
@@ -450,6 +581,9 @@ impl<'a> Drop for HfsPlusFileHandle<'a> {
         // swallow them. Tests should `sync()` explicitly to surface I/O
         // failures.
         if self.dirty {
+            if let Some(journal) = self.journal.as_mut() {
+                let _ = journal.commit(self.dev);
+            }
             let _ = self.refresh_catalog_body();
             let _ = self.fs.flush(self.dev);
             self.dirty = false;
@@ -473,10 +607,10 @@ fn encode_fork_array(fork: &ForkData) -> [u8; FORK_DATA_SIZE] {
     out
 }
 
-/// Open `path` for read+write, honoring the requested flags. Refuses
-/// (with [`crate::Error::Unsupported`]) on a journaled volume whose
-/// journal still has work to replay — the caller should mount the image
-/// with a tool that performs the replay first.
+/// Open `path` for read+write, honoring the requested flags. On a
+/// journaled volume that carries an unreplayed transaction we replay
+/// it first — the caller never has to know whether the previous
+/// session crashed mid-sync.
 pub(super) fn open_file_rw<'a>(
     fs: &'a mut HfsPlus,
     dev: &'a mut dyn BlockDevice,
@@ -488,11 +622,9 @@ pub(super) fn open_file_rw<'a>(
         .to_str()
         .ok_or_else(|| crate::Error::InvalidArgument(format!("hfs+: non-UTF-8 path {path:?}")))?;
 
-    // Path-B journal check: if the volume is journaled, the on-disk
-    // journal MUST be clean (start == end). Otherwise we'd be writing
-    // into a volume that still has pending transactions to replay,
-    // which would corrupt the next-replay outcome.
-    ensure_journal_clean(fs, dev)?;
+    // Drain any outstanding journal transactions so we open over a
+    // clean volume. On an unjournaled image this is a no-op.
+    super::journal::replay(dev, &fs.volume_header)?;
 
     // Resolve to an existing file, optionally creating it. We can't
     // borrow `fs` through the lookup machinery while we also need a
@@ -593,7 +725,12 @@ pub(super) fn open_file_rw<'a>(
         (file_id, fork.logical_size, runs)
     };
 
-    let mut handle = HfsPlusFileHandle::new(fs, dev, owned_key, file_id, runs, file_size);
+    // Load a fresh JournalLog (if applicable) so the handle can buffer
+    // user-data writes through the journal. Loading happens AFTER the
+    // replay above, so `start == end` is the only state we accept here.
+    let journal = super::journal::JournalLog::load(dev, &fs.volume_header)?;
+
+    let mut handle = HfsPlusFileHandle::new(fs, dev, owned_key, file_id, runs, file_size, journal);
     if flags.truncate && handle.file_size > 0 {
         handle.set_len_inner(0)?;
     }
@@ -601,75 +738,6 @@ pub(super) fn open_file_rw<'a>(
         handle.pos = handle.file_size;
     }
     Ok(Box::new(handle))
-}
-
-/// Verify the volume's journal (if any) reports zero pending work.
-/// Returns Ok on unjournaled volumes and on journaled volumes whose
-/// `start == end`. Returns [`crate::Error::Unsupported`] otherwise.
-fn ensure_journal_clean(fs: &HfsPlus, dev: &mut dyn BlockDevice) -> Result<()> {
-    use super::writer::{JOURNAL_HEADER_ENDIAN, JOURNAL_HEADER_MAGIC, VOL_ATTR_JOURNALED};
-
-    if fs.volume_header.attributes & VOL_ATTR_JOURNALED == 0 {
-        return Ok(());
-    }
-    let info_block = fs.volume_header.journal_info_block;
-    if info_block == 0 {
-        return Err(crate::Error::InvalidImage(
-            "hfs+: volume has the journaled bit set but no JournalInfoBlock".into(),
-        ));
-    }
-    let bs = u64::from(fs.volume_header.block_size);
-    let info_off = u64::from(info_block) * bs;
-    // The JournalInfoBlock fits in a single allocation block; we only
-    // need the first 52 bytes (flags + device_signature + offset + size).
-    let mut info = [0u8; 52];
-    dev.read_at(info_off, &mut info)?;
-    let jbuf_off = u64::from_be_bytes(info[36..44].try_into().unwrap());
-    let jbuf_size = u64::from_be_bytes(info[44..52].try_into().unwrap());
-    if jbuf_off == 0 || jbuf_size == 0 {
-        return Err(crate::Error::InvalidImage(
-            "hfs+: JournalInfoBlock has zero buffer offset or size".into(),
-        ));
-    }
-
-    // The journal header lives at the start of the journal buffer. We
-    // only need the first 24 bytes: magic + endian + start + end.
-    let mut hdr = [0u8; 24];
-    dev.read_at(jbuf_off, &mut hdr)?;
-    let magic = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
-    let endian = u32::from_be_bytes(hdr[4..8].try_into().unwrap());
-    if magic != JOURNAL_HEADER_MAGIC || endian != JOURNAL_HEADER_ENDIAN {
-        // Could be a native-endian journal header from a tool that
-        // wrote it in the host's byte order. Try LE.
-        let magic_le = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
-        let endian_le = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-        if magic_le != JOURNAL_HEADER_MAGIC || endian_le != JOURNAL_HEADER_ENDIAN {
-            return Err(crate::Error::InvalidImage(format!(
-                "hfs+: journal header has unrecognised magic/endian \
-                 ({magic:#010x}/{endian:#010x})"
-            )));
-        }
-        // Native-LE encoding: start, end are at the same offsets but
-        // little-endian.
-        let start = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-        let end = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        if start != end {
-            return Err(crate::Error::Unsupported(format!(
-                "hfs+: journal has unreplayed work (start={start:#x} != end={end:#x}); \
-                 mount and unmount with a journal-aware tool first"
-            )));
-        }
-        return Ok(());
-    }
-    let start = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
-    let end = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
-    if start != end {
-        return Err(crate::Error::Unsupported(format!(
-            "hfs+: journal has unreplayed work (start={start:#x} != end={end:#x}); \
-             mount and unmount with a journal-aware tool first"
-        )));
-    }
-    Ok(())
 }
 
 /// Probe the writer's in-memory catalog for a regular file at

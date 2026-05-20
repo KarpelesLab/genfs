@@ -187,6 +187,25 @@ pub trait FileHandle: Read + Write + Seek {
     fn sync(&mut self) -> crate::Result<()>;
 }
 
+/// A handle into a regular file opened **read-only** via
+/// [`Filesystem::open_file_ro`]. Implementations are `Read + Seek`
+/// with a known total `len`; no writes, no allocation, no journal
+/// interaction. Every backend (including the immutable ones —
+/// ISO 9660 / SquashFS / tar — and the streaming ones if the format
+/// permits backward seeks) can implement this.
+///
+/// The handle borrows both the filesystem state and the block device
+/// for its full lifetime, mirroring [`FileHandle`].
+pub trait FileReadHandle: Read + Seek {
+    /// Total length of the file in bytes.
+    fn len(&self) -> u64;
+
+    /// Whether the file is zero bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Special-file class for [`Filesystem::create_device`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
@@ -341,6 +360,27 @@ pub trait Filesystem {
         dev: &'a mut dyn crate::block::BlockDevice,
         path: &Path,
     ) -> crate::Result<Box<dyn Read + 'a>>;
+
+    /// Open a regular file for **random-access reads** with no
+    /// writes. The returned handle is `Read + Seek` and reports the
+    /// file's total length via `len()`. Every backend that can
+    /// surface file contents should implement this — including the
+    /// immutable formats (ISO 9660 / SquashFS / tar / GRF) where
+    /// `open_file_rw` is unsupported but seeking inside a file is
+    /// still meaningful.
+    ///
+    /// Default: returns `Unsupported`. Implementations override —
+    /// most can do so by reusing the same extent / runlist walker
+    /// that powers [`Self::read_file`].
+    fn open_file_ro<'a>(
+        &'a mut self,
+        _dev: &'a mut dyn crate::block::BlockDevice,
+        _path: &Path,
+    ) -> crate::Result<Box<dyn FileReadHandle + 'a>> {
+        Err(crate::Error::Unsupported(
+            "this filesystem does not yet implement open_file_ro".into(),
+        ))
+    }
 
     /// Open a regular file for **in-place reads + writes** at byte
     /// granularity. The returned handle is `Read + Write + Seek`;

@@ -76,7 +76,16 @@ impl Source {
                 return Ok(single);
             }
         }
-        let bare = spec.split(':').next().unwrap_or(spec);
+        // Strip the partition suffix (`:N`) only when `N` is purely
+        // numeric — otherwise a Windows drive letter (`C:\foo.tar`)
+        // gets mistaken for a `path:partition` spec and the rest of
+        // the detection logic loses the file extension.
+        let bare = match spec.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+                head
+            }
+            _ => spec,
+        };
         let bare_path = Path::new(bare);
         if bare == spec
             && let Ok(meta) = std::fs::metadata(bare_path)

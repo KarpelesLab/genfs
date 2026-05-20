@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/fstool/compare/v0.1.0...v0.2.0) - 2026-05-20
+
+### Added
+
+- *(inspect)* variant-agnostic public surface — inspect::open + summary
+- *(fs)* Filesystem::supports_mutation() gates add/rm cleanly
+- *(cli)* repack accepts positional sources — `repack a b … out`
+- *(repack)* layered sources with tar-OCI + overlayfs whiteouts
+- *(iso9660)* writer + Filesystem trait + repack-to-ISO wiring
+- *(iso9660)* read support — PVD + Joliet + Rock Ridge + El Torito
+- *(cli,docs)* wire repack to write XFS/HFS+/NTFS/F2FS/SquashFS via the trait
+- *(fs)* wire all writable FSes (XFS/HFS+/NTFS/F2FS/SquashFS/FAT32) through one trait
+
+### Other
+
+- collapse sum_*_file_bytes into Filesystem::total_file_bytes
+- *(readme)* cover ISO 9660 + layered merge with whiteouts
+
 ## [0.1.0](https://github.com/KarpelesLab/fstool/compare/v0.0.5...v0.1.0) - 2026-05-20
 
 ### Added

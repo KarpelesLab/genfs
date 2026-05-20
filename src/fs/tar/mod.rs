@@ -346,6 +346,98 @@ impl Tar {
     }
 }
 
+/// Read-only `Filesystem` adapter so `inspect::open(dev)` can return a
+/// `Box<dyn Filesystem>` that walks a tar archive. Writes return
+/// `Unsupported` — tar archives are sequential and `repack` is the
+/// only way to produce a new one.
+impl crate::fs::Filesystem for Tar {
+    fn create_file(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _src: crate::fs::FileSource,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "tar: archives are sequential — use `repack` to produce a new tar".into(),
+        ))
+    }
+
+    fn create_dir(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "tar: archives are sequential — use `repack` to produce a new tar".into(),
+        ))
+    }
+
+    fn create_symlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _target: &std::path::Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "tar: archives are sequential — use `repack` to produce a new tar".into(),
+        ))
+    }
+
+    fn create_device(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _kind: crate::fs::DeviceKind,
+        _major: u32,
+        _minor: u32,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "tar: archives are sequential — use `repack` to produce a new tar".into(),
+        ))
+    }
+
+    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "tar: archives are sequential — use `repack` to produce a new tar".into(),
+        ))
+    }
+
+    fn list(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
+        Tar::list_path(self, dev, s)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn flush(&mut self, _dev: &mut dyn BlockDevice) -> Result<()> {
+        Ok(())
+    }
+
+    fn supports_mutation(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Default, Debug)]
 struct PaxOverrides {
     path: Option<String>,

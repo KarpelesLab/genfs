@@ -1159,6 +1159,97 @@ impl Exfat {
     }
 }
 
+/// Read-only `Filesystem` adapter so `inspect::open(dev)` can return a
+/// `Box<dyn Filesystem>` that walks an exFAT image. Writes return
+/// `Unsupported` — the exFAT writer is not yet trait wired.
+impl crate::fs::Filesystem for Exfat {
+    fn create_file(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _src: crate::fs::FileSource,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "exfat: read-only on this trait surface".into(),
+        ))
+    }
+
+    fn create_dir(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "exfat: read-only on this trait surface".into(),
+        ))
+    }
+
+    fn create_symlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _target: &std::path::Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "exfat: read-only on this trait surface".into(),
+        ))
+    }
+
+    fn create_device(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _kind: crate::fs::DeviceKind,
+        _major: u32,
+        _minor: u32,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "exfat: read-only on this trait surface".into(),
+        ))
+    }
+
+    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "exfat: read-only on this trait surface".into(),
+        ))
+    }
+
+    fn list(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        Exfat::list_path(self, dev, s)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn flush(&mut self, _dev: &mut dyn BlockDevice) -> Result<()> {
+        Ok(())
+    }
+
+    fn supports_mutation(&self) -> bool {
+        false
+    }
+}
+
 /// Set or clear bit `cluster - 2` in the allocation bitmap. No-op if the
 /// cluster index is outside the bitmap.
 fn set_bitmap_bit(bitmap: &mut [u8], cluster: u32, used: bool) {

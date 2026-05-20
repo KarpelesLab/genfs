@@ -26,7 +26,14 @@ use crate::fs::xfs::Xfs;
 use crate::part::{Gpt, Mbr, Partition, PartitionTable, slice_partition};
 
 /// Which filesystem an image carries.
+///
+/// `#[non_exhaustive]` because new filesystems get added over time;
+/// external code that needs to dispatch on the kind should keep a
+/// fallback arm. Most callers want [`open`] or [`summary`] instead —
+/// those return a `Box<dyn Filesystem>` / [`Summary`] that hide the
+/// concrete backend entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FsKind {
     /// ext2 / ext3 / ext4 — distinguished further by feature flags.
     Ext,
@@ -143,12 +150,14 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
 }
 
 /// A unified read-side handle. Hides whether the underlying filesystem
-/// is ext, FAT32, tar, XFS, exFAT, HFS+, or APFS — the CLI calls
-/// `list` / `read_file` / `summary` and the right backend dispatches.
+/// is ext, FAT32, tar, XFS, exFAT, HFS+, APFS, or any of the other
+/// backends.
 ///
-/// Of these, ext, FAT32, and tar support full read/write; the other
-/// four are read-only. Write-side operations on a read-only variant
-/// return [`crate::Error::Unsupported`].
+/// Most external callers should prefer [`open`] (returns a
+/// `Box<dyn Filesystem>`) and [`summary`] (returns a [`Summary`]) —
+/// those don't ask you to know the variant list. `AnyFs` is the
+/// in-crate dispatch helper they build on; matching on its variants
+/// is fine in-crate but isn't a stable surface.
 pub enum AnyFs {
     Ext(Box<Ext>),
     Fat32(Box<Fat32>),
@@ -549,6 +558,69 @@ pub fn open_image_file(path: &Path) -> Result<(Box<dyn BlockDevice>, AnyFs)> {
     Ok((dev, fs))
 }
 
+/// Open `dev` as whatever filesystem it contains, returning the result
+/// as a `Box<dyn Filesystem>` — the stable external entry point. The
+/// concrete backend is hidden; callers interact through the
+/// [`crate::fs::Filesystem`] trait (`list`, `read_file`, `create_*`,
+/// `remove`, `flush`, `supports_mutation`).
+///
+/// Read-only filesystems (tar, APFS, exFAT, SquashFS, ISO 9660, etc.)
+/// still parse and walk; their write methods return
+/// [`crate::Error::Unsupported`] and `supports_mutation()` returns
+/// `false`.
+pub fn open(dev: &mut dyn BlockDevice) -> Result<Box<dyn crate::fs::Filesystem>> {
+    Ok(AnyFs::open(dev)?.into_dyn_filesystem())
+}
+
+/// Read-only digest of what a filesystem image carries, suitable for
+/// `info`-style introspection without taking a write handle to the FS.
+///
+/// Extends with new fields as backends grow; consumers should treat
+/// unknown fields as informational only.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Summary {
+    /// Short identifier (`"ext4"`, `"fat32"`, `"iso9660"`, …) — same
+    /// string returned by [`AnyFs::kind_string`].
+    pub kind: &'static str,
+    /// Whether this filesystem can mutate an already-flushed image
+    /// (`add` / `rm`). False for sequential / read-only formats.
+    pub supports_mutation: bool,
+}
+
+/// Probe `dev` and return a [`Summary`] describing the filesystem it
+/// carries. Cheaper than [`open`] when the caller only needs the kind
+/// — though today it still performs a full open under the hood. The
+/// API contract is "fast enough for `fstool info`".
+pub fn summary(dev: &mut dyn BlockDevice) -> Result<Summary> {
+    let fs = AnyFs::open(dev)?;
+    Ok(Summary {
+        kind: fs.kind_string(),
+        supports_mutation: fs.supports_mutation(),
+    })
+}
+
+impl AnyFs {
+    /// Consume `self` and return the inner filesystem as a
+    /// `Box<dyn Filesystem>`. Every variant satisfies the trait
+    /// (read-only backends return `Unsupported` from write methods).
+    fn into_dyn_filesystem(self) -> Box<dyn crate::fs::Filesystem> {
+        match self {
+            Self::Ext(b) => b,
+            Self::Fat32(b) => b,
+            Self::Tar(b) => b,
+            Self::Xfs(b) => b,
+            Self::Exfat(b) => b,
+            Self::HfsPlus(b) => b,
+            Self::Apfs(b) => b,
+            Self::Ntfs(b) => b,
+            Self::F2fs(b) => b,
+            Self::Squashfs(b) => b,
+            Self::Iso9660(b) => b,
+        }
+    }
+}
+
 // -- partition-aware target plumbing ------------------------------------
 
 /// A parsed CLI image target. The user can write `disk.img` for the
@@ -742,5 +814,34 @@ mod tests {
         let entries = fs.list(dev.as_mut(), "/").unwrap();
         // Default ext format includes lost+found.
         assert!(entries.iter().any(|e| e.name == "lost+found"));
+    }
+
+    #[test]
+    fn open_returns_dyn_filesystem() {
+        let opts = FormatOpts::default();
+        let mut dev = MemoryBackend::new(opts.blocks_count as u64 * opts.block_size as u64);
+        let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+        ext.flush(&mut dev).unwrap();
+        drop(ext);
+
+        let mut fs: Box<dyn crate::fs::Filesystem> = open(&mut dev).unwrap();
+        assert!(fs.supports_mutation());
+        let entries = fs
+            .list(&mut dev, std::path::Path::new("/"))
+            .expect("list /");
+        assert!(entries.iter().any(|e| e.name == "lost+found"));
+    }
+
+    #[test]
+    fn summary_reports_kind_and_mutability() {
+        let opts = FormatOpts::default();
+        let mut dev = MemoryBackend::new(opts.blocks_count as u64 * opts.block_size as u64);
+        let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+        ext.flush(&mut dev).unwrap();
+        drop(ext);
+
+        let s = summary(&mut dev).unwrap();
+        assert_eq!(s.kind, "ext2");
+        assert!(s.supports_mutation);
     }
 }

@@ -780,6 +780,98 @@ impl Apfs {
     }
 }
 
+/// Read-only `Filesystem` adapter so `inspect::open(dev)` can return a
+/// `Box<dyn Filesystem>` that walks an APFS container. Writes return
+/// `Unsupported` — the APFS writer is library-only and not yet trait
+/// wired.
+impl crate::fs::Filesystem for Apfs {
+    fn create_file(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _src: crate::fs::FileSource,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "apfs: read-only on this trait surface".into(),
+        ))
+    }
+
+    fn create_dir(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "apfs: read-only on this trait surface".into(),
+        ))
+    }
+
+    fn create_symlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _target: &std::path::Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "apfs: read-only on this trait surface".into(),
+        ))
+    }
+
+    fn create_device(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _kind: crate::fs::DeviceKind,
+        _major: u32,
+        _minor: u32,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "apfs: read-only on this trait surface".into(),
+        ))
+    }
+
+    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "apfs: read-only on this trait surface".into(),
+        ))
+    }
+
+    fn list(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+        Apfs::list_path(self, dev, s)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn flush(&mut self, _dev: &mut dyn BlockDevice) -> Result<()> {
+        Ok(())
+    }
+
+    fn supports_mutation(&self) -> bool {
+        false
+    }
+}
+
 /// Read a physical block (by block number) from `dev` into `buf`.
 fn read_at_paddr(
     dev: &mut dyn BlockDevice,

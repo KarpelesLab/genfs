@@ -1127,18 +1127,33 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     // Journal stub: one block for the JournalInfoBlock, plus N blocks
     // of journal buffer. Reserved up-front so the bitmap reflects the
     // usage from format time onward.
+    //
+    // The buffer must be large enough to hold a single transaction
+    // covering all metadata writes a full `flush` emits — catalog +
+    // extents-overflow + bitmap + 2 VHs + journal-stub. We size it
+    // generously: at least `DEFAULT_JOURNAL_BUFFER_BLOCKS`, but at
+    // least as big as the catalog + extents + bitmap fork space plus
+    // a [`super::journal::BLHDR_SIZE`] block-list-header per recorded
+    // run. Each metadata block we journal carries an extra 16-byte
+    // [`super::journal::PendingBlock`] info entry, but those costs are
+    // negligible at the granularity we work in. A small constant
+    // headroom (16 blocks) covers VH writes, alt-VH, journal stub,
+    // and a couple of partial-sector slop allowances.
     let (journal_info_block, journal_buffer_start, journal_buffer_blocks) = if opts.journaled {
         let info_start = cursor;
         cursor = cursor.checked_add(1).ok_or_else(|| {
             crate::Error::InvalidArgument("hfs+ format: journal layout overflow".into())
         })?;
         let buf_start = cursor;
-        cursor = cursor
-            .checked_add(DEFAULT_JOURNAL_BUFFER_BLOCKS)
-            .ok_or_else(|| {
-                crate::Error::InvalidArgument("hfs+ format: journal buffer overflow".into())
-            })?;
-        (info_start, buf_start, DEFAULT_JOURNAL_BUFFER_BLOCKS)
+        let metadata_blocks = alloc_blocks_needed
+            .saturating_add(ext_blocks)
+            .saturating_add(cat_blocks)
+            .saturating_add(16);
+        let jbuf_blocks = DEFAULT_JOURNAL_BUFFER_BLOCKS.max(metadata_blocks);
+        cursor = cursor.checked_add(jbuf_blocks).ok_or_else(|| {
+            crate::Error::InvalidArgument("hfs+ format: journal buffer overflow".into())
+        })?;
+        (info_start, buf_start, jbuf_blocks)
     } else {
         (0, 0, 0)
     };
@@ -2214,10 +2229,58 @@ pub(crate) fn remove_entry(writer: &mut Writer, parent_id: u32, name: &UniStr) -
 /// Serialise the in-memory state (catalog tree, extents-overflow tree,
 /// allocation bitmap, volume header) to disk. Idempotent: calling it
 /// twice is a no-op after the first success.
+///
+/// ## Journal routing (Path A for `flush`)
+///
+/// On a volume whose on-disk journal header was already valid at flush
+/// entry — i.e. a re-opened, journaled HFS+ image — the metadata writes
+/// (catalog B-tree pages, extents-overflow pages, allocation bitmap
+/// blocks, primary VH at offset 1024, alternate VH near end-of-volume)
+/// are collected into a single [`super::journal::FlushSink::Buffered`]
+/// batch and committed through [`super::journal::JournalLog::commit`].
+/// The journal-commit sequence (write tx body → advance `end` → apply
+/// blocks → advance `start = end`) means a crash mid-flush leaves the
+/// transaction on disk and the next [`super::journal::replay`] re-applies
+/// it.
+///
+/// On a fresh-build flush — when [`super::journal::JournalLog::load`]
+/// returns `None` because the on-disk journal header doesn't exist yet —
+/// writes go straight through. The journal stub itself, including the
+/// initial journal header, is written in this same flush pass (its
+/// existence and validity are what `JournalLog::load` will detect on the
+/// next reopen).
 pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevice) -> Result<()> {
     if writer.flushed {
         return Ok(());
     }
+    // Decide whether this flush should be journaled. Path A applies only
+    // when the volume already carries a valid journal header — a fresh
+    // build is *creating* that header in this same flush, so it can't
+    // route its own writes through a journal that doesn't exist yet.
+    //
+    // We snapshot `start`/`end`/`buf_off`/`buf_size` now instead of
+    // re-loading after our writes, because the buffered journal blocks
+    // (which we'll write into the ring at commit time) need the
+    // pre-flush ring cursor, not whatever state the in-place writes left
+    // behind.
+    let mut journal = super::journal::JournalLog::load(dev, vh)?;
+    // If the loaded journal carries unreplayed work we must not start
+    // layering new transactions on top of it — replay first. In practice
+    // the caller drains the journal via `open_file_rw` before any flush
+    // path that mutates the live image, so this is belt-and-braces.
+    if let Some(log) = journal.as_ref()
+        && log.is_dirty()
+    {
+        super::journal::replay(dev, vh)?;
+        journal = super::journal::JournalLog::load(dev, vh)?;
+    }
+    let route_through_journal = journal.is_some();
+    let mut sink: super::journal::FlushSink<'_> = if route_through_journal {
+        super::journal::FlushSink::Buffered(Vec::new())
+    } else {
+        super::journal::FlushSink::Direct(dev)
+    };
+
     // 1. Build catalog records list in key order.
     let mut records: Vec<PackedRecord> = Vec::with_capacity(writer.catalog.len());
     for (key, body) in &writer.catalog {
@@ -2236,7 +2299,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
 
     let built = build_btree(records, writer.node_size, cat_total_nodes)?;
     write_btree_to_fork(
-        dev,
+        &mut sink,
         &built.nodes,
         &writer.catalog_file,
         writer.node_size,
@@ -2279,7 +2342,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         }
     }
     write_btree_to_fork(
-        dev,
+        &mut sink,
         &ext_nodes_owned,
         &writer.extents_file,
         writer.node_size,
@@ -2289,7 +2352,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     // 3. Allocation bitmap.
     let bm_off =
         u64::from(writer.allocation_file.extents[0].start_block) * u64::from(writer.block_size);
-    dev.write_at(bm_off, &writer.bitmap)?;
+    sink.write_at(bm_off, &writer.bitmap)?;
     // Pad the rest of the allocation-file blocks with zero already done
     // by zero_range at format time.
 
@@ -2299,15 +2362,21 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     //    first 512 bytes carry a clean journal header (no transactions
     //    to replay). The kernel will see a journaled volume that does
     //    not need replay on mount.
+    //
+    // The journal stub is only written when `writer.journal_buffer_blocks
+    // > 0`, which is only true on a fresh format-and-flush (the
+    // re-opened-image flush path leaves these fields zero). So in this
+    // branch `sink` is always `Direct` — the on-disk journal header is
+    // being created here and cannot be routed through itself.
     if writer.journal_buffer_blocks > 0 {
         let bs = u64::from(writer.block_size);
         let jbuf_offset = u64::from(writer.journal_buffer_start) * bs;
         let jbuf_size = u64::from(writer.journal_buffer_blocks) * bs;
         let info_off = u64::from(writer.journal_info_block) * bs;
         let info = encode_journal_info_block(jbuf_offset, jbuf_size);
-        dev.write_at(info_off, &info)?;
+        sink.write_at(info_off, &info)?;
         let hdr = encode_journal_header(jbuf_size);
-        dev.write_at(jbuf_offset, &hdr)?;
+        sink.write_at(jbuf_offset, &hdr)?;
         // Mark the journaled attribute in the volume header.
         vh.attributes |= VOL_ATTR_JOURNALED;
     }
@@ -2350,7 +2419,7 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         writer.create_date,
         jib,
     );
-    dev.write_at(VOLUME_HEADER_OFFSET, &buf)?;
+    sink.write_at(VOLUME_HEADER_OFFSET, &buf)?;
 
     // Alternate volume header lives in the volume's last 1024-byte
     // sector. Compute the offset as (total_size - 1024); pad sector 1024
@@ -2359,10 +2428,26 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     let total = u64::from(writer.total_blocks) * u64::from(writer.block_size);
     if total >= 1024 {
         let alt_off = total - 1024;
-        dev.write_at(alt_off, &buf)?;
+        sink.write_at(alt_off, &buf)?;
     }
 
-    dev.sync()?;
+    // 6. Drain the sink. Direct sinks are already-applied; buffered
+    //    sinks hand their accumulated blocks to the journal log, which
+    //    writes them atomically as a single transaction.
+    match sink {
+        super::journal::FlushSink::Direct(d) => {
+            d.sync()?;
+        }
+        super::journal::FlushSink::Buffered(blocks) => {
+            // `route_through_journal` was true to land here, so
+            // `journal` must be `Some`.
+            let log = journal
+                .as_mut()
+                .expect("FlushSink::Buffered implies journal loaded successfully");
+            log.add_batch(blocks);
+            log.commit(dev)?;
+        }
+    }
     writer.flushed = true;
     Ok(())
 }
@@ -2449,10 +2534,12 @@ fn journal_header_checksum(buf: &[u8]) -> u32 {
 }
 
 /// Write a sequence of pre-encoded B-tree nodes into the fork's first
-/// extent on disk. Panics if the nodes don't fit (the caller has
-/// already validated capacity).
+/// extent through the supplied [`super::journal::FlushSink`]. On a
+/// `Direct` sink the writes hit `dev` immediately; on a `Buffered` sink
+/// they're collected for a single journal-committed transaction.
+/// Panics-equivalent (returns an error) if the nodes don't fit.
 fn write_btree_to_fork(
-    dev: &mut dyn BlockDevice,
+    sink: &mut super::journal::FlushSink<'_>,
     nodes: &[Vec<u8>],
     fork: &ForkData,
     node_size: u32,
@@ -2473,7 +2560,7 @@ fn write_btree_to_fork(
             if node_idx >= nodes.len() {
                 return Ok(());
             }
-            dev.write_at(off, &nodes[node_idx])?;
+            sink.write_at(off, &nodes[node_idx])?;
             off += u64::from(node_size);
             node_idx += 1;
         }

@@ -83,6 +83,54 @@ pub(crate) struct PendingBlock {
     pub data: Vec<u8>,
 }
 
+/// Sink used by the metadata-flush path to route writes either straight
+/// through to the device or through the journal as a single transaction.
+///
+/// * [`FlushSink::Direct`] — writes are applied to `dev` immediately. Used
+///   on fresh builds where the volume has no pre-existing journal header
+///   yet, so there is no transaction log to thread through.
+/// * [`FlushSink::Buffered`] — writes accumulate in memory. The caller is
+///   responsible for handing the collected blocks to a [`JournalLog`] and
+///   calling [`JournalLog::commit`] so the transaction is journaled
+///   atomically before the in-place blocks land.
+///
+/// The split is necessary because, during a fresh format, the on-disk
+/// journal header is itself one of the things `flush` writes — we cannot
+/// route that write through a journal that doesn't exist yet.
+pub(crate) enum FlushSink<'d> {
+    Direct(&'d mut dyn BlockDevice),
+    Buffered(Vec<PendingBlock>),
+}
+
+impl<'d> FlushSink<'d> {
+    /// Apply `data` at `dev_off`. In `Direct` mode this immediately calls
+    /// through to `dev.write_at`; in `Buffered` mode the block is recorded
+    /// in memory and later committed via the journal.
+    pub fn write_at(&mut self, dev_off: u64, data: &[u8]) -> Result<()> {
+        match self {
+            FlushSink::Direct(dev) => dev.write_at(dev_off, data),
+            FlushSink::Buffered(blocks) => {
+                // Coalesce identical-range writes so the latest one wins
+                // — mirrors `JournalLog::add` so a flush that touches the
+                // same block twice (e.g. allocation bitmap before vs.
+                // after journal-stub emission) doesn't double-record.
+                for slot in blocks.iter_mut() {
+                    if slot.dev_off == dev_off && slot.data.len() == data.len() {
+                        slot.data.clear();
+                        slot.data.extend_from_slice(data);
+                        return Ok(());
+                    }
+                }
+                blocks.push(PendingBlock {
+                    dev_off,
+                    data: data.to_vec(),
+                });
+                Ok(())
+            }
+        }
+    }
+}
+
 /// In-memory journal log. Constructed from the on-disk journal-info
 /// block; collects pending writes via [`JournalLog::add`] and emits
 /// one transaction per [`JournalLog::commit`].
@@ -162,6 +210,16 @@ impl JournalLog {
             }
         }
         self.pending.push(PendingBlock { dev_off, data });
+    }
+
+    /// Bulk-add a list of pending blocks (as collected by
+    /// [`FlushSink::Buffered`]). Equivalent to calling [`Self::add`] in a
+    /// loop, but moves the buffers in place so we don't double-copy the
+    /// (potentially large) catalog / extents / bitmap payloads.
+    pub fn add_batch(&mut self, blocks: Vec<PendingBlock>) {
+        for b in blocks {
+            self.add(b.dev_off, b.data);
+        }
     }
 
     /// Search pending writes for the byte at `dev_off`. Used by the

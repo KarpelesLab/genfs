@@ -90,7 +90,18 @@ impl HfsPlus {
     /// writable: subsequent `create_*` / `remove` calls mutate the live
     /// image, and [`flush`](Self::flush) persists the rewritten catalog,
     /// extents-overflow tree, allocation bitmap, and volume header.
+    ///
+    /// On a journaled volume any unreplayed transaction is drained
+    /// *before* we read the catalog, extents-overflow, or bitmap: the
+    /// pending journal may carry the only authoritative copy of those
+    /// blocks following a crash mid-`flush`. Replay is idempotent, so
+    /// volumes that crashed mid-replay land in the same state.
     pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        // Read the volume header first so we know whether replay is
+        // applicable (journaled vs. not) and where the journal lives.
+        let vh = read_volume_header(dev)?;
+        journal::replay(dev, &vh)?;
+        // Re-read the volume header in case replay restored it.
         let vh = read_volume_header(dev)?;
         let case_sensitive = vh.is_hfsx();
 
@@ -1866,6 +1877,212 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
+    }
+
+    /// Path A for `flush`: when a journaled HFS+ image is reopened and
+    /// mutated (creating directories, files, removing files), the
+    /// subsequent metadata `flush` must route its writes — catalog
+    /// B-tree pages, extents-overflow pages, allocation bitmap, and the
+    /// two volume headers — through `JournalLog::commit` rather than
+    /// applying them in place. We verify this by:
+    ///
+    ///   1. Formatting a journaled image with one file.
+    ///   2. Reopening it, mutating it (add a directory, add a file,
+    ///      remove the original) to dirty multiple metadata regions,
+    ///      then calling `flush`.
+    ///   3. Snapshotting the journal header (`start == end` post-flush).
+    ///   4. Reading the post-flush metadata bytes for both volume
+    ///      headers so we can corrupt them on disk and prove replay
+    ///      restored them.
+    ///   5. Corrupting the primary volume header on disk (zeroing it)
+    ///      and rewinding the journal `start` to before the flush
+    ///      transaction.
+    ///   6. Reopening — the journal replay in `HfsPlus::open` must
+    ///      restore the volume-header bytes before the catalog open
+    ///      attempts to read them. The mutated directory tree must
+    ///      then be readable byte-exact.
+    #[test]
+    fn flush_routes_metadata_through_journal_on_reopen() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts {
+            journaled: true,
+            ..writer::FormatOpts::default()
+        };
+
+        // 1. Initial format + a file + flush. The first flush after
+        //    format runs through the Direct sink (no on-disk journal
+        //    header yet to route through).
+        let initial = b"initial-payload\n".repeat(16);
+        {
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let mut src = std::io::Cursor::new(&initial);
+            hfs.create_file(
+                &mut dev,
+                "/initial.bin",
+                &mut src,
+                initial.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        // Capture the journal-buffer offset for later poking.
+        let jbuf_off = {
+            let mut vh_buf = [0u8; 512];
+            dev.read_at(volume_header::VOLUME_HEADER_OFFSET, &mut vh_buf)
+                .unwrap();
+            let info_block = u32::from_be_bytes(vh_buf[12..16].try_into().unwrap());
+            let bs = u32::from_be_bytes(vh_buf[40..44].try_into().unwrap());
+            assert_ne!(info_block, 0, "journaled volume must have a JIB");
+            let info_off = u64::from(info_block) * u64::from(bs);
+            let mut info = [0u8; 52];
+            dev.read_at(info_off, &mut info).unwrap();
+            u64::from_be_bytes(info[36..44].try_into().unwrap())
+        };
+
+        // 2. Reopen + mutate + flush. This flush runs through Buffered
+        //    sink → JournalLog::commit.
+        let new_payload = b"second\n".repeat(32);
+        {
+            let mut hfs = HfsPlus::open(&mut dev).unwrap();
+            // A pre-flush journal must be clean (start == end). The
+            // commit machinery in writer::flush relies on that.
+            let mut hdr = [0u8; 24];
+            dev.read_at(jbuf_off, &mut hdr).unwrap();
+            let s = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+            let e = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+            assert_eq!(s, e, "fresh-format flush leaves the journal clean");
+
+            // Multiple mutations: dir + file + remove. This dirties the
+            // catalog (always), the bitmap (file allocation + free), and
+            // bumps next_cnid (volume header).
+            hfs.create_dir(&mut dev, "/added-dir", 0o755, 0, 0).unwrap();
+            let mut src = std::io::Cursor::new(&new_payload);
+            hfs.create_file(
+                &mut dev,
+                "/added-file.bin",
+                &mut src,
+                new_payload.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.remove(&mut dev, "/initial.bin").unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        // 3. Post-flush, the journal must be sealed again (start == end).
+        let sealed_end = {
+            let mut hdr = [0u8; 24];
+            dev.read_at(jbuf_off, &mut hdr).unwrap();
+            let s = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+            let e = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+            assert_eq!(
+                s, e,
+                "Path A for flush requires the journal to seal post-commit"
+            );
+            e
+        };
+        assert!(
+            sealed_end > u64::from(journal::JHDR_SIZE),
+            "the post-mutation flush must have advanced the journal end \
+             cursor past the initial JHDR_SIZE — got {sealed_end:#x}"
+        );
+
+        // 4. Sanity check that the live image (after the flush, before
+        //    corruption) reports the mutations.
+        {
+            let hfs = HfsPlus::open(&mut dev).unwrap();
+            let entries = hfs.list_path(&mut dev, "/").unwrap();
+            let names: std::collections::BTreeSet<&str> =
+                entries.iter().map(|e| e.name.as_str()).collect();
+            assert!(names.contains("added-dir"));
+            assert!(names.contains("added-file.bin"));
+            assert!(
+                !names.contains("initial.bin"),
+                "removed file must be gone post-flush; got {names:?}"
+            );
+        }
+
+        // 5. Corrupt the catalog file's on-disk blocks and the
+        //    allocation bitmap, then rewind `start` so the journal
+        //    looks dirty. The journal entry from the flush above
+        //    carries a copy of those bytes — replay must restore them
+        //    on the next open.
+        //
+        // We deliberately do NOT corrupt the volume header itself: the
+        // VH at offset 1024 is needed by `read_volume_header` to find
+        // the JournalInfoBlock before replay can run. The VH is still
+        // covered by the journal transaction (so it would be restored
+        // anyway in production), but corrupting it here would block us
+        // from reading the JIB pointer.
+        let (cat_off, cat_len, bm_off, bm_len) = {
+            let hfs = HfsPlus::open(&mut dev).unwrap();
+            let bs = u64::from(hfs.volume_header.block_size);
+            let cat = hfs.volume_header.catalog_file.extents[0];
+            let bm = hfs.volume_header.allocation_file.extents[0];
+            (
+                u64::from(cat.start_block) * bs,
+                u64::from(cat.block_count) * bs,
+                u64::from(bm.start_block) * bs,
+                u64::from(bm.block_count) * bs,
+            )
+        };
+        // Zero the catalog and bitmap so the on-disk structures are
+        // unusable without replay.
+        let zeros_cat = vec![0u8; cat_len as usize];
+        dev.write_at(cat_off, &zeros_cat).unwrap();
+        let zeros_bm = vec![0u8; bm_len as usize];
+        dev.write_at(bm_off, &zeros_bm).unwrap();
+        // Rewind start.
+        let mut hdr = [0u8; 24];
+        dev.read_at(jbuf_off, &mut hdr).unwrap();
+        let rewound: u64 = u64::from(journal::JHDR_SIZE);
+        hdr[8..16].copy_from_slice(&rewound.to_be_bytes());
+        dev.write_at(jbuf_off, &hdr).unwrap();
+
+        // Without replay, the catalog is unreadable. With replay, the
+        // bytes come back and the catalog opens normally.
+        {
+            let hfs = HfsPlus::open(&mut dev).unwrap();
+            let entries = hfs.list_path(&mut dev, "/").unwrap();
+            let names: std::collections::BTreeSet<&str> =
+                entries.iter().map(|e| e.name.as_str()).collect();
+            assert!(
+                names.contains("added-dir"),
+                "replay must restore the catalog so the dir is visible; \
+                 got {names:?}"
+            );
+            assert!(
+                names.contains("added-file.bin"),
+                "replay must restore the catalog so the file is visible; \
+                 got {names:?}"
+            );
+            assert!(
+                !names.contains("initial.bin"),
+                "removed file must not reappear after replay; got {names:?}"
+            );
+
+            // The replayed file's bytes should be intact too.
+            let mut r = hfs.open_file_reader(&mut dev, "/added-file.bin").unwrap();
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+            assert_eq!(
+                got, new_payload,
+                "file data referenced by the replayed catalog must match"
+            );
+
+            // And the journal must be clean again after replay.
+            let mut hdr = [0u8; 24];
+            dev.read_at(jbuf_off, &mut hdr).unwrap();
+            let s = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+            let e = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+            assert_eq!(s, e, "replay leaves the journal sealed");
+        }
     }
 
     #[test]

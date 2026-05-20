@@ -149,11 +149,11 @@ fn merge_two_tars_override_and_whiteout() {
     );
 
     let out_tar = work.path().join("merged.tar");
-    let spec = format!("{}+{}", base.display(), top.display());
 
     let status = Command::new(fstool())
         .arg("repack")
-        .arg(&spec)
+        .arg(&base)
+        .arg(&top)
         .arg(&out_tar)
         .status()
         .expect("spawn fstool repack");
@@ -194,11 +194,11 @@ fn merge_opaque_dir_drops_lower_children() {
     );
 
     let out_tar = work.path().join("merged.tar");
-    let spec = format!("{}+{}", base.display(), top.display());
 
     let status = Command::new(fstool())
         .arg("repack")
-        .arg(&spec)
+        .arg(&base)
+        .arg(&top)
         .arg(&out_tar)
         .status()
         .expect("spawn fstool repack");

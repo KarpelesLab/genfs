@@ -200,12 +200,14 @@ enum Command {
     /// shrink an image — `convert` can only do byte copies, while
     /// `repack` actually rewrites the filesystem.
     Repack {
-        /// Source image, optionally with `:N` to select a partition.
-        #[arg(value_name = "SRC[:N]")]
-        src: String,
-        /// Destination image (raw or qcow2 per extension).
-        #[arg(value_name = "DST")]
-        dst: PathBuf,
+        /// One or more sources followed by a destination. With one
+        /// source, repacks normally. With two or more, the sources are
+        /// merged bottom→top before repacking: later layers override
+        /// earlier ones, and tar-OCI / overlayfs whiteouts are honoured.
+        /// Globs like `repack data* out.tar` work as long as the shell
+        /// expands them in source-then-destination order.
+        #[arg(value_name = "PATH", num_args = 2.., required = true)]
+        paths: Vec<String>,
         /// Destination size. Default: same as source's filesystem size.
         /// Mutually exclusive with `--shrink`.
         #[arg(long, value_name = "SIZE", conflicts_with = "shrink")]
@@ -312,22 +314,26 @@ fn run(cli: Cli) -> fstool::Result<()> {
             cluster_size,
         } => convert_cmd(&src, &dst, size.as_deref(), &cluster_size),
         Command::Repack {
-            src,
-            dst,
+            mut paths,
             size,
             shrink,
             fs_type,
             block_size,
             cluster_size,
-        } => repack_cmd(
-            &src,
-            &dst,
-            size.as_deref(),
-            shrink,
-            fs_type.as_deref(),
-            block_size,
-            &cluster_size,
-        ),
+        } => {
+            let dst_str = paths.pop().expect("clap enforces num_args >= 2");
+            let dst = PathBuf::from(dst_str);
+            let srcs = paths;
+            repack_cmd(
+                &srcs,
+                &dst,
+                size.as_deref(),
+                shrink,
+                fs_type.as_deref(),
+                block_size,
+                &cluster_size,
+            )
+        }
     }
 }
 
@@ -379,7 +385,7 @@ fn convert_cmd(
 }
 
 fn repack_cmd(
-    src: &str,
+    srcs: &[String],
     dst: &std::path::Path,
     size_arg: Option<&str>,
     shrink: bool,
@@ -389,31 +395,39 @@ fn repack_cmd(
 ) -> fstool::Result<()> {
     let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
 
-    // Layered source: spec contains `+`. Flatten all layers to a
-    // single uncompressed tar in a tempfile, then recurse with that
-    // tempfile as the source. The tempfile lives until repack
-    // completes; the recursive call inherits the same `dst` and
-    // options, so the merged tar drives the rest of the pipeline
-    // exactly as a single tar source would.
-    if src.contains('+') {
-        let source = fstool::repack::Source::detect(src)?;
-        if let fstool::repack::Source::Layered(layers) = source {
-            let tmp = fstool::merge::flatten_to_tempfile(&layers)?;
-            let merged = tmp.path().to_string_lossy().into_owned();
-            let res = repack_cmd(
-                &merged,
-                dst,
-                size_arg,
-                shrink,
-                fs_type_override,
-                block_size,
-                cluster_size,
-            );
-            drop(tmp);
-            return res;
-        }
+    if srcs.is_empty() {
+        return Err(fstool::Error::InvalidArgument(
+            "repack: at least one source is required".into(),
+        ));
     }
 
+    // Multi-source: flatten all layers to a single uncompressed tar in
+    // a tempfile, then recurse with that tempfile as the sole source.
+    // The tempfile lives until the inner repack completes; the
+    // recursive call inherits the same `dst` and options, so the merged
+    // tar drives the rest of the pipeline exactly as a single tar
+    // source would.
+    if srcs.len() > 1 {
+        let layers: Vec<fstool::repack::Source> = srcs
+            .iter()
+            .map(|s| fstool::repack::Source::detect(s))
+            .collect::<fstool::Result<_>>()?;
+        let tmp = fstool::merge::flatten_to_tempfile(&layers)?;
+        let merged = tmp.path().to_string_lossy().into_owned();
+        let res = repack_cmd(
+            std::slice::from_ref(&merged),
+            dst,
+            size_arg,
+            shrink,
+            fs_type_override,
+            block_size,
+            cluster_size,
+        );
+        drop(tmp);
+        return res;
+    }
+
+    let src = srcs[0].as_str();
     let src_target = fstool::inspect::Target::parse(src);
 
     // Compressed-tar source: stream the archive directly into the

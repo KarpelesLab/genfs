@@ -18,6 +18,7 @@ fstool ext-build --kind ext4 ./src -o out.img    # build an ext4 image from a di
 fstool info out.img                              # what's inside
 fstool ls   out.img /                            # walk it
 fstool repack out.img out.tar                    # convert ext4 → tar (and back)
+fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .wh.* whiteouts
 ```
 
 ## Filesystem support
@@ -36,12 +37,13 @@ fstool repack out.img out.tar                    # convert ext4 → tar (and bac
 | NTFS       | ✅    | 🚧    | MFT, attributes, $DATA + ADS, indexes; xattr map; writer passes `ntfsfix --no-action` but isn't `ntfs-3g`-mountable yet (system files in root `$I30` pending) |
 | F2FS       | ✅    | ✅     | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs` |
 | SquashFS   | ✅    | ✅     | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs` |
+| ISO 9660   | ✅    | ✅     | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only writer (no in-place modify) |
 | qcow2      | ✅    | ✅     | v2 + v3, allocate-on-write writer                                    |
 | dmg        | 🚧   | —     | UDIF v4 trailer parsed; chunk decoder TBD                            |
 
 `🚧` marks writers that exist at the library level but have known
-gaps (see Limitations). All seven writable filesystems — ext2/3/4,
-FAT32, XFS, HFS+, NTFS, F2FS, SquashFS — implement a single
+gaps (see Limitations). All writable filesystems — ext2/3/4, FAT32,
+exFAT, XFS, HFS+, NTFS, F2FS, SquashFS, ISO 9660 — implement a single
 `Filesystem` trait, so the CLI (`build`, `repack`, `add`, `rm`) and
 the TOML `[filesystem] type = "…"` spec dispatch through one
 codepath; pick a target FS by setting `--fs-type` on `repack` or
@@ -69,7 +71,7 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 | `rm`          | Unlink a file, symlink, device, or empty directory.                     |
 | `shell`       | SFTP-style REPL — `ls cd pwd cat put rm mkdir info`.                    |
 | `convert`     | Byte-level raw ↔ qcow2 conversion with optional grow.                   |
-| `repack`      | Walk source FS, rebuild into a fresh image, optionally a different FS.  |
+| `repack`      | Walk one or more source FSes, merge bottom→top with whiteouts, rebuild into a fresh image. |
 | `fstool …`    | Plus `ext-build`, `fat-build`, partition-aware `disk.img:N` targets.    |
 
 All inspection / modification commands accept a `disk.img:N` (1-indexed)
@@ -208,12 +210,83 @@ direction round-trips content + mode + uid/gid + mtime + symlinks + device
 nodes + xattrs.
 
 `fstool repack` writes any destination implementing the `Filesystem`
-trait — `ext2/3/4`, FAT32, tar, XFS, HFS+, NTFS, F2FS, SquashFS. APFS
-isn't yet trait-implemented (its `Builder` API hasn't been mapped),
-so it remains library-only. `add` / `rm` go through the same trait,
-which means they work on any FS whose writer can re-open an existing
-image; today that's ext, FAT32, and F2FS — the others can `format` +
-populate but can't `add` to an already-flushed image yet.
+trait — `ext2/3/4`, FAT32, tar, XFS, HFS+, NTFS, F2FS, SquashFS,
+ISO 9660. APFS isn't yet trait-implemented (its `Builder` API hasn't
+been mapped), so it remains library-only. `add` / `rm` go through
+the same trait, which means they work on any FS whose writer can
+re-open an existing image; today that's ext, FAT32, and F2FS — the
+others can `format` + populate but can't `add` to an already-flushed
+image yet.
+
+## Layered merge with whiteouts
+
+`repack` takes one or more source positional arguments followed by the
+destination. With one source it behaves as before; with two or more
+it merges the sources bottom→top before writing — later layers
+override files of the same path, and tombstones from the upper
+layer remove paths from the lower one. Two tombstone conventions are
+auto-detected:
+
+| Convention | Marker | Effect |
+|------------|--------|--------|
+| tar-OCI    | `.wh.<name>` in directory D | delete `D/<name>` |
+| tar-OCI    | `.wh..wh..opq` in directory D | drop all lower-layer children of D before this layer's own land |
+| OverlayFS  | character device with major=0, minor=0 | delete this path |
+| OverlayFS  | xattr `trusted.overlay.opaque = "y"` on a dir | opaque-dir semantics on that dir |
+
+The tombstones themselves never appear in the output. Sources may be
+host directories, tar archives (compressed or plain), or filesystem
+images — any mix works.
+
+```sh
+# OCI-style: rebuild a stack of layers into a flat tar
+fstool repack base.tar layer1.tar layer2.tar flat.tar
+
+# Patch an ISO with a tar of replacement files
+fstool repack disc.iso patch.tar updated.iso --fs-type iso
+
+# Shell globs work — last positional is the destination
+fstool repack layer*.tar merged.tar
+```
+
+Internally the merge folds all layers into a single uncompressed tar
+held in a tempfile, then drives the existing single-source repack
+pipeline; the destination FS doesn't know it came from multiple
+sources.
+
+## ISO 9660
+
+ISO 9660 reads cover the bare ECMA-119 layout plus three of the four
+common extensions:
+
+- **Joliet** (Microsoft) — UCS-2 BE long names via the supplementary
+  volume descriptor.
+- **Rock Ridge** (IEEE P1282) — POSIX mode + uid + gid via `PX`, long
+  names via `NM`, symlinks via `SL`, timestamps via `TF`. Continuation
+  areas (`CE`) are followed across sector boundaries.
+- **El Torito** — boot catalog: validation entry, default entry, and
+  section headers (`0x90` / `0x91`); the parsed catalog is surfaced
+  in `fstool info`.
+
+The writer is repack-only — ISO is sequential and a single `flush()`
+writes the whole image. It emits a PVD plus optional Joliet SVD,
+both L-type and M-type path tables, dual directory record trees (one
+for PVD, one for Joliet), and Rock Ridge System Use Areas (`NM` /
+`PX` / `SL`) attached to the PVD records. The output round-trips
+through `isoinfo -lR` and back through fstool's own reader.
+
+```sh
+# Build an ISO from a host directory
+fstool repack ./rootfs disc.iso --fs-type iso
+
+# Walk an existing ISO
+fstool ls   disc.iso /
+fstool cat  disc.iso /README.TXT
+
+# Round-trip ISO → tar → ISO
+fstool repack disc.iso plain.tar
+fstool repack plain.tar disc2.iso --fs-type iso
+```
 
 ## Compression
 
@@ -247,9 +320,14 @@ cargo install fstool --no-default-features --features gzip,lz4,xz,lzma
 Things explicitly out of scope today, in rough order of likely-to-change:
 
 - `add` / `rm` on existing images: only ext, FAT32, and F2FS can be
-  re-opened as writable. HFS+ / NTFS / XFS / SquashFS / APFS writers
-  format + populate fine but can't yet mutate an already-flushed
-  image. APFS isn't trait-wired at all (Builder pattern).
+  re-opened as writable. HFS+ / NTFS / XFS / SquashFS / ISO / APFS
+  writers format + populate fine but can't yet mutate an
+  already-flushed image. ISO is sequential by design (repack-only);
+  APFS isn't trait-wired at all (Builder pattern).
+- ISO 9660 writer does not yet emit the Rock Ridge `SP` marker on the
+  root's `.` entry, so `isoinfo -d` reports "No SUSP/Rock Ridge
+  present" even though `NM` / `PX` / `SL` entries are written and our
+  reader (and the Linux kernel iso9660 driver) parse them correctly.
 - NTFS writer: produced image isn't `ntfs-3g`-mountable — root `$I30`
   doesn't index the system files yet; `ntfsfix --no-action` is clean.
 - NTFS reader: compressed and encrypted `$DATA`, `$ATTRIBUTE_LIST`

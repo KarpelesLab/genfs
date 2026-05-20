@@ -445,6 +445,31 @@ impl crate::fs::Filesystem for Tar {
     fn supports_mutation(&self) -> bool {
         false
     }
+
+    fn read_symlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
+        let entry = self.lookup(s).ok_or_else(|| {
+            crate::Error::InvalidArgument(format!("tar: no entry at {s:?}"))
+        })?;
+        if !matches!(entry.kind, EntryKind::Symlink) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "tar: {s:?} is not a symlink"
+            )));
+        }
+        entry
+            .link_target
+            .clone()
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("tar: symlink {s:?} has no link target"))
+            })
+    }
 }
 
 #[derive(Default, Debug)]

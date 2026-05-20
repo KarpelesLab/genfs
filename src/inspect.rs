@@ -248,6 +248,17 @@ impl AnyFs {
         self.as_filesystem_dyn(|fs| fs.total_file_bytes(dev))
     }
 
+    /// Read a symbolic link's target as a UTF-8 string. Delegates to
+    /// the inner backend's [`crate::fs::Filesystem::read_symlink`].
+    /// Returns `Unsupported` for filesystems that don't carry symlinks
+    /// (FAT32, exFAT) or whose symlink support isn't wired through
+    /// the trait yet (APFS, F2FS, NTFS, ISO 9660 Rock Ridge).
+    pub fn read_symlink(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<String> {
+        let p = std::path::Path::new(path);
+        let target = self.as_filesystem_dyn(|fs| fs.read_symlink(dev, p))?;
+        Ok(target.to_string_lossy().into_owned())
+    }
+
     /// Stream a regular file's bytes into `out`. The file is read in
     /// 64 KiB chunks; nothing larger than that buffer is ever resident.
     /// Takes `&mut self` for the same reason as [`AnyFs::list`].
@@ -408,7 +419,7 @@ impl AnyFs {
     /// [`crate::fs::Filesystem`]. Centralises the per-variant `match`
     /// so callers like [`Self::add_file`] / [`Self::mkdir`] /
     /// [`Self::remove`] aren't 10-arm long.
-    fn as_filesystem_dyn<R>(
+    pub(crate) fn as_filesystem_dyn<R>(
         &mut self,
         f: impl FnOnce(&mut dyn crate::fs::Filesystem) -> Result<R>,
     ) -> Result<R> {

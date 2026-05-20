@@ -727,6 +727,19 @@ impl crate::fs::Filesystem for Squashfs {
     fn supports_mutation(&self) -> bool {
         false
     }
+
+    fn read_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        Ok(std::path::PathBuf::from(Squashfs::read_symlink(
+            self, dev, s,
+        )?))
+    }
 }
 
 #[cfg(test)]

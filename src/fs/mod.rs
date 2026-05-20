@@ -254,6 +254,19 @@ pub trait Filesystem {
         true
     }
 
+    /// Read a symbolic link's target. Default returns `Unsupported`
+    /// — filesystems that have symlinks (ext, tar, xfs, hfs+, ntfs,
+    /// squashfs, iso 9660 via Rock Ridge) override.
+    fn read_symlink(
+        &mut self,
+        _dev: &mut dyn crate::block::BlockDevice,
+        _path: &Path,
+    ) -> crate::Result<std::path::PathBuf> {
+        Err(crate::Error::Unsupported(
+            "this filesystem does not implement read_symlink".into(),
+        ))
+    }
+
     /// Recursive sum of all regular-file sizes in the filesystem.
     /// Uses the `size` field on [`DirEntry`] returned by [`Self::list`]
     /// — filesystems that don't surface size from a listing return 0

@@ -228,14 +228,14 @@ pub fn ext_build_plan_for_source(
         Source::TarArchive { path, codec: None } => {
             let target = crate::inspect::Target::parse(&path.to_string_lossy());
             crate::inspect::with_target_device(&target, |src_dev| {
-                let src_fs = crate::inspect::AnyFs::open(src_dev)?;
-                build_ext_plan_inner(src_dev, &src_fs, &mut plan)
+                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                build_ext_plan_inner(src_dev, &mut src_fs, &mut plan)
             })?;
         }
         Source::Image(target) => {
             crate::inspect::with_target_device(target, |src_dev| {
-                let src_fs = crate::inspect::AnyFs::open(src_dev)?;
-                build_ext_plan_inner(src_dev, &src_fs, &mut plan)
+                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                build_ext_plan_inner(src_dev, &mut src_fs, &mut plan)
             })?;
         }
         Source::Layered(layers) => {
@@ -245,8 +245,8 @@ pub fn ext_build_plan_for_source(
             let merged_path = tmp.path().to_string_lossy().into_owned();
             let target = crate::inspect::Target::parse(&merged_path);
             crate::inspect::with_target_device(&target, |src_dev| {
-                let src_fs = crate::inspect::AnyFs::open(src_dev)?;
-                build_ext_plan_inner(src_dev, &src_fs, &mut plan)
+                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+                build_ext_plan_inner(src_dev, &mut src_fs, &mut plan)
             })?;
             drop(tmp);
         }
@@ -439,41 +439,7 @@ fn read_symlink_via_anyfs(
     src_fs: &mut crate::inspect::AnyFs,
     path: &str,
 ) -> Result<String> {
-    use crate::inspect::AnyFs;
-    match src_fs {
-        AnyFs::Ext(_) => Err(crate::Error::Unsupported(
-            "repack: ext symlinks via the generic walker are not yet wired".into(),
-        )),
-        AnyFs::Fat32(_) => Err(crate::Error::Unsupported(
-            "repack: FAT32 source has no symlinks".into(),
-        )),
-        AnyFs::Tar(t) => t
-            .lookup(path)
-            .and_then(|e| e.link_target.clone())
-            .ok_or_else(|| {
-                crate::Error::InvalidArgument(format!(
-                    "repack: tar source has no symlink at {path:?}"
-                ))
-            }),
-        AnyFs::Xfs(x) => x.read_symlink(src_dev, path),
-        AnyFs::HfsPlus(h) => h.read_symlink_target_path(src_dev, path),
-        AnyFs::Apfs(_) => Err(crate::Error::Unsupported(
-            "repack: APFS symlink reading via repack not yet wired".into(),
-        )),
-        AnyFs::Ntfs(_) => Err(crate::Error::Unsupported(
-            "repack: NTFS symlink reading via repack not yet wired".into(),
-        )),
-        AnyFs::F2fs(_) => Err(crate::Error::Unsupported(
-            "repack: F2FS symlink reading via repack not yet wired".into(),
-        )),
-        AnyFs::Squashfs(s) => s.read_symlink(src_dev, path),
-        AnyFs::Exfat(_) => Err(crate::Error::Unsupported(
-            "repack: exFAT source has no symlinks".into(),
-        )),
-        AnyFs::Iso9660(_) => Err(crate::Error::Unsupported(
-            "repack: ISO9660 symlink reading via repack not yet wired".into(),
-        )),
-    }
+    src_fs.read_symlink(src_dev, path)
 }
 
 /// Convert host `Metadata` into a public [`crate::fs::FileMeta`].
@@ -571,23 +537,71 @@ fn sum_host_dir_bytes(root: &Path) -> Result<u64> {
     Ok(total)
 }
 
-/// Drive [`walk_ext_for_plan`] / [`walk_fat_for_plan`] /
-/// [`walk_tar_for_plan`] based on the source FS type.
+/// Drive a BuildPlan from any source filesystem through the
+/// [`crate::fs::Filesystem`] trait — no per-FS arms. Walks via
+/// [`crate::fs::Filesystem::list`], using `DirEntry::size` for files
+/// and [`crate::fs::Filesystem::read_symlink`] for each symlink's
+/// target length (so the long-symlink branch fires only when needed).
 fn build_ext_plan_inner(
     src_dev: &mut dyn crate::block::BlockDevice,
-    src_fs: &crate::inspect::AnyFs,
+    src_fs: &mut crate::inspect::AnyFs,
     plan: &mut crate::fs::ext::BuildPlan,
 ) -> Result<()> {
-    use crate::inspect::AnyFs;
-    match src_fs {
-        AnyFs::Ext(src_ext) => walk_ext_for_plan(src_dev, src_ext, 2, plan),
-        AnyFs::Fat32(src_fat) => walk_fat_for_plan(src_dev, src_fat, "/", plan),
-        AnyFs::Tar(src_tar) => {
-            walk_tar_for_plan(src_tar, plan);
-            Ok(())
+    build_ext_plan_through_trait(src_dev, src_fs, plan)
+}
+
+/// Public counterpart of [`build_ext_plan_inner`] for the binary
+/// crate's `build_ext_plan`. Walks the source through the
+/// [`crate::fs::Filesystem`] trait, no AnyFs match.
+pub fn build_ext_plan_through_trait(
+    src_dev: &mut dyn crate::block::BlockDevice,
+    src_fs: &mut crate::inspect::AnyFs,
+    plan: &mut crate::fs::ext::BuildPlan,
+) -> Result<()> {
+    src_fs.as_filesystem_dyn(|fs| scan_into_build_plan(src_dev, fs, plan))
+}
+
+/// Filesystem-trait-driven recursive scan that fills a BuildPlan.
+/// Same shape as the old per-FS walkers; symlink target length is
+/// resolved via `Filesystem::read_symlink` (FSes that don't carry
+/// symlinks return `Unsupported`, which gets degraded to "assume
+/// long symlink — one block").
+pub(crate) fn scan_into_build_plan(
+    dev: &mut dyn crate::block::BlockDevice,
+    fs: &mut dyn crate::fs::Filesystem,
+    plan: &mut crate::fs::ext::BuildPlan,
+) -> Result<()> {
+    use crate::fs::EntryKind;
+    let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("/")];
+    while let Some(dir) = stack.pop() {
+        let entries = fs.list(dev, &dir)?;
+        for e in entries {
+            if e.name == "." || e.name == ".." || e.name == "lost+found" {
+                continue;
+            }
+            let child = dir.join(&e.name);
+            match e.kind {
+                EntryKind::Dir => {
+                    plan.add_dir();
+                    stack.push(child);
+                }
+                EntryKind::Regular => plan.add_file(e.size),
+                EntryKind::Symlink => {
+                    let len = fs
+                        .read_symlink(dev, &child)
+                        .map(|t| t.as_os_str().len())
+                        .unwrap_or(usize::MAX);
+                    plan.add_symlink(len);
+                }
+                EntryKind::Char
+                | EntryKind::Block
+                | EntryKind::Fifo
+                | EntryKind::Socket => plan.add_device(),
+                EntryKind::Unknown => {}
+            }
         }
-        _ => Err(unsupported_repack_src(src_fs)),
     }
+    Ok(())
 }
 
 /// TarStreamIndex variant of [`walk_tar_for_plan`] — adds one entry
@@ -1391,65 +1405,6 @@ pub(crate) fn fstool_mode_kind(mode_type: u16) -> &'static str {
 
 // ─── shrink sizing ───────────────────────────────────────────────────────
 
-pub(crate) fn walk_ext_for_plan(
-    src_dev: &mut dyn crate::block::BlockDevice,
-    src: &crate::fs::ext::Ext,
-    src_ino: u32,
-    plan: &mut crate::fs::ext::BuildPlan,
-) -> crate::Result<()> {
-    let entries = src.list_inode(src_dev, src_ino)?;
-    for e in entries {
-        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
-            continue;
-        }
-        let inode = src.read_inode(src_dev, e.inode)?;
-        let mode_type = inode.mode & crate::fs::ext::constants::S_IFMT;
-        match mode_type {
-            t if t == crate::fs::ext::constants::S_IFREG => plan.add_file(inode.size as u64),
-            t if t == crate::fs::ext::constants::S_IFDIR => {
-                plan.add_dir();
-                walk_ext_for_plan(src_dev, src, e.inode, plan)?;
-            }
-            t if t == crate::fs::ext::constants::S_IFLNK => plan.add_symlink(inode.size as usize),
-            t if t
-                == crate::fs::ext::constants::S_IFCHR
-                    | crate::fs::ext::constants::S_IFBLK
-                    | crate::fs::ext::constants::S_IFIFO
-                    | crate::fs::ext::constants::S_IFSOCK =>
-            {
-                plan.add_device()
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn walk_fat_for_plan(
-    src_dev: &mut dyn crate::block::BlockDevice,
-    src: &crate::fs::fat::Fat32,
-    src_path: &str,
-    plan: &mut crate::fs::ext::BuildPlan,
-) -> crate::Result<()> {
-    use crate::fs::EntryKind;
-    let entries = src.list_path(src_dev, src_path)?;
-    for e in entries {
-        let child = join_fs_path(src_path, &e.name);
-        match e.kind {
-            EntryKind::Dir => {
-                plan.add_dir();
-                walk_fat_for_plan(src_dev, src, &child, plan)?;
-            }
-            EntryKind::Regular => {
-                let (entry, _) = src.resolve_entry(src_dev, &child)?;
-                plan.add_file(entry.file_size as u64);
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 /// Sum the size of every regular file in the source filesystem — used
 /// by FAT32 shrink sizing.
 pub(crate) fn sum_source_file_bytes(
@@ -1457,21 +1412,5 @@ pub(crate) fn sum_source_file_bytes(
     src_fs: &mut crate::inspect::AnyFs,
 ) -> crate::Result<u64> {
     src_fs.total_file_bytes(src_dev)
-}
-
-/// Fold a tar archive's entries into a BuildPlan suitable for sizing an
-/// ext destination.
-pub(crate) fn walk_tar_for_plan(tar: &crate::fs::tar::Tar, plan: &mut crate::fs::ext::BuildPlan) {
-    use crate::fs::tar::EntryKind;
-    for e in tar.entries() {
-        match e.kind {
-            EntryKind::Regular | EntryKind::HardLink => plan.add_file(e.size),
-            EntryKind::Dir => plan.add_dir(),
-            EntryKind::Symlink => {
-                plan.add_symlink(e.link_target.as_deref().map(|s| s.len()).unwrap_or(0))
-            }
-            EntryKind::CharDev | EntryKind::BlockDev | EntryKind::Fifo => plan.add_device(),
-        }
-    }
 }
 

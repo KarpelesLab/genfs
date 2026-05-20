@@ -724,6 +724,17 @@ impl crate::fs::Filesystem for Xfs {
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         self.flush_writes(dev)
     }
+
+    fn read_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        Ok(std::path::PathBuf::from(Xfs::read_symlink(self, dev, s)?))
+    }
 }
 
 /// Convert public [`crate::fs::FileMeta`] to XFS's private

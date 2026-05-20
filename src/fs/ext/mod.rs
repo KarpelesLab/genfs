@@ -2150,6 +2150,19 @@ impl crate::fs::Filesystem for Ext {
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         Self::flush(self, dev)
     }
+
+    fn read_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        let ino = self.path_to_inode(dev, s)?;
+        let target = self.read_symlink_target(dev, ino)?;
+        Ok(std::path::PathBuf::from(target))
+    }
 }
 
 /// Translate an ext mode word into a [`crate::fs::EntryKind`].

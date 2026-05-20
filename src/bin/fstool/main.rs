@@ -481,7 +481,7 @@ fn repack_cmd(
             (Some(s), _) => fstool::spec::parse_size(s)?,
             (None, true) => match lower.as_str() {
                 "ext2" | "ext3" | "ext4" => {
-                    let plan = build_ext_plan(src_dev, &src_fs, block_size, &lower)?;
+                    let plan = build_ext_plan(src_dev, &mut src_fs, block_size, &lower)?;
                     plan.blocks_count() as u64 * plan.block_size as u64
                 }
                 "fat32" | "vfat" => {
@@ -552,7 +552,7 @@ fn repack_cmd(
         )?;
         match lower.as_str() {
             "ext2" | "ext3" | "ext4" => {
-                let plan = build_ext_plan(src_dev, &src_fs, block_size, &lower)?;
+                let plan = build_ext_plan(src_dev, &mut src_fs, block_size, &lower)?;
                 let mut opts = plan.to_format_opts();
                 // Grow to fill the destination if the user requested an
                 // explicit size larger than the auto-min.
@@ -1846,15 +1846,15 @@ fn fstool_mode_kind(mode_type: u16) -> &'static str {
 // ─── shrink sizing ───────────────────────────────────────────────────────
 
 /// Build a BuildPlan that reflects the source filesystem's content,
-/// without touching the host filesystem.
+/// without touching the host filesystem. Trait-driven via
+/// [`fstool::repack::scan_into_build_plan`] — no per-FS arms.
 fn build_ext_plan(
     src_dev: &mut dyn fstool::block::BlockDevice,
-    src_fs: &fstool::inspect::AnyFs,
+    src_fs: &mut fstool::inspect::AnyFs,
     block_size: u32,
     fs_kind_str: &str,
 ) -> fstool::Result<fstool::fs::ext::BuildPlan> {
     use fstool::fs::ext::{BuildPlan, FsKind};
-    use fstool::inspect::AnyFs;
     let kind = match fs_kind_str {
         "ext2" => FsKind::Ext2,
         "ext3" => FsKind::Ext3,
@@ -1866,72 +1866,8 @@ fn build_ext_plan(
         }
     };
     let mut plan = BuildPlan::new(block_size, kind);
-    match src_fs {
-        AnyFs::Ext(src_ext) => walk_ext_for_plan(src_dev, src_ext, 2, &mut plan)?,
-        AnyFs::Fat32(src_fat) => walk_fat_for_plan(src_dev, src_fat, "/", &mut plan)?,
-        AnyFs::Tar(src_tar) => walk_tar_for_plan(src_tar, &mut plan),
-        _ => return Err(unsupported_repack_src(src_fs)),
-    }
+    fstool::repack::build_ext_plan_through_trait(src_dev, src_fs, &mut plan)?;
     Ok(plan)
-}
-
-fn walk_ext_for_plan(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::ext::Ext,
-    src_ino: u32,
-    plan: &mut fstool::fs::ext::BuildPlan,
-) -> fstool::Result<()> {
-    let entries = src.list_inode(src_dev, src_ino)?;
-    for e in entries {
-        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
-            continue;
-        }
-        let inode = src.read_inode(src_dev, e.inode)?;
-        let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
-        match mode_type {
-            t if t == fstool::fs::ext::constants::S_IFREG => plan.add_file(inode.size as u64),
-            t if t == fstool::fs::ext::constants::S_IFDIR => {
-                plan.add_dir();
-                walk_ext_for_plan(src_dev, src, e.inode, plan)?;
-            }
-            t if t == fstool::fs::ext::constants::S_IFLNK => plan.add_symlink(inode.size as usize),
-            t if t
-                == fstool::fs::ext::constants::S_IFCHR
-                    | fstool::fs::ext::constants::S_IFBLK
-                    | fstool::fs::ext::constants::S_IFIFO
-                    | fstool::fs::ext::constants::S_IFSOCK =>
-            {
-                plan.add_device()
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn walk_fat_for_plan(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::fat::Fat32,
-    src_path: &str,
-    plan: &mut fstool::fs::ext::BuildPlan,
-) -> fstool::Result<()> {
-    use fstool::fs::EntryKind;
-    let entries = src.list_path(src_dev, src_path)?;
-    for e in entries {
-        let child = join_fs_path(src_path, &e.name);
-        match e.kind {
-            EntryKind::Dir => {
-                plan.add_dir();
-                walk_fat_for_plan(src_dev, src, &child, plan)?;
-            }
-            EntryKind::Regular => {
-                let (entry, _) = src.resolve_entry(src_dev, &child)?;
-                plan.add_file(entry.file_size as u64);
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 /// Sum the size of every regular file in the source filesystem — used
@@ -2247,22 +2183,6 @@ fn tar_replay_tar(
         }
     }
     Ok(())
-}
-
-/// Fold a tar archive's entries into a BuildPlan suitable for sizing an
-/// ext destination.
-fn walk_tar_for_plan(tar: &fstool::fs::tar::Tar, plan: &mut fstool::fs::ext::BuildPlan) {
-    use fstool::fs::tar::EntryKind;
-    for e in tar.entries() {
-        match e.kind {
-            EntryKind::Regular | EntryKind::HardLink => plan.add_file(e.size),
-            EntryKind::Dir => plan.add_dir(),
-            EntryKind::Symlink => {
-                plan.add_symlink(e.link_target.as_deref().map(|s| s.len()).unwrap_or(0))
-            }
-            EntryKind::CharDev | EntryKind::BlockDev | EntryKind::Fifo => plan.add_device(),
-        }
-    }
 }
 
 fn shell_cmd(image: &str) -> fstool::Result<()> {

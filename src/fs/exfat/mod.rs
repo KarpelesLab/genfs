@@ -1164,31 +1164,38 @@ impl Exfat {
     }
 }
 
-/// Read-only `Filesystem` adapter so `inspect::open(dev)` can return a
-/// `Box<dyn Filesystem>` that walks an exFAT image. Writes return
-/// `Unsupported` — the exFAT writer is not yet trait wired.
+/// `Filesystem` adapter so `inspect::open(dev)` can return a
+/// `Box<dyn Filesystem>` that walks and mutates an exFAT image. Symlinks
+/// and device nodes have no representation in exFAT and return
+/// `Unsupported`. The caller must call `flush` to persist FAT + bitmap
+/// changes before dropping the volume.
 impl crate::fs::Filesystem for Exfat {
     fn create_file(
         &mut self,
-        _dev: &mut dyn BlockDevice,
-        _path: &std::path::Path,
-        _src: crate::fs::FileSource,
-        _meta: crate::fs::FileMeta,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        src: crate::fs::FileSource,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "exfat: write support is not yet implemented".into(),
-        ))
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let (mut reader, len) = src.open()?;
+        let ts = unix_to_exfat_timestamp(meta.mtime);
+        Exfat::create_file(self, dev, s, &mut reader, len, ts).map(|_| ())
     }
 
     fn create_dir(
         &mut self,
-        _dev: &mut dyn BlockDevice,
-        _path: &std::path::Path,
-        _meta: crate::fs::FileMeta,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "exfat: write support is not yet implemented".into(),
-        ))
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let ts = unix_to_exfat_timestamp(meta.mtime);
+        Exfat::create_dir(self, dev, s, ts).map(|_| ())
     }
 
     fn create_symlink(
@@ -1199,7 +1206,7 @@ impl crate::fs::Filesystem for Exfat {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "exfat: write support is not yet implemented".into(),
+            "exfat: filesystem does not support symbolic links".into(),
         ))
     }
 
@@ -1213,14 +1220,15 @@ impl crate::fs::Filesystem for Exfat {
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
         Err(crate::Error::Unsupported(
-            "exfat: write support is not yet implemented".into(),
+            "exfat: filesystem does not support device / FIFO / socket nodes".into(),
         ))
     }
 
-    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "exfat: write support is not yet implemented".into(),
-        ))
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        Exfat::remove(self, dev, s)
     }
 
     fn list(
@@ -1246,13 +1254,78 @@ impl crate::fs::Filesystem for Exfat {
         Ok(Box::new(r))
     }
 
-    fn flush(&mut self, _dev: &mut dyn BlockDevice) -> Result<()> {
-        Ok(())
+    fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        Exfat::flush(self, dev)
     }
+}
 
-    fn supports_mutation(&self) -> bool {
-        false
+/// Convert a Unix epoch seconds value into the exFAT timestamp word
+/// (date in the upper 16 bits, time in the lower 16). Values before
+/// 1980-01-01 00:00:00 UTC are clamped to zero (exFAT can't represent
+/// them).
+///
+/// Layout (per Microsoft's exFAT spec, identical to FAT's timestamp):
+/// ```text
+///   bits  0..=4   2-second increments (0..=29)
+///   bits  5..=10  minutes             (0..=59)
+///   bits 11..=15  hours               (0..=23)
+///   bits 16..=20  day                 (1..=31)
+///   bits 21..=24  month               (1..=12)
+///   bits 25..=31  years since 1980    (0..=127)
+/// ```
+fn unix_to_exfat_timestamp(unix_secs: u32) -> u32 {
+    // 1980-01-01 00:00:00 UTC is 315_532_800 seconds after the Unix epoch.
+    const EXFAT_EPOCH: u32 = 315_532_800;
+    if unix_secs < EXFAT_EPOCH {
+        return 0;
     }
+    let secs = unix_secs - EXFAT_EPOCH;
+    let (h, m, s) = {
+        let day_secs = secs % 86_400;
+        (day_secs / 3600, (day_secs / 60) % 60, day_secs % 60)
+    };
+    // Day of the year using a civil calendar walk; cheap because we cap
+    // at 127 years (exFAT only encodes through 2107).
+    let mut days = (secs / 86_400) as i64;
+    let mut year: u32 = 1980;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+        if year > 2107 {
+            return 0; // out of range — give up
+        }
+    }
+    const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month: u32 = 1;
+    for (i, m_days) in MONTH_DAYS.iter().enumerate() {
+        let dim = if i == 1 && is_leap(year) {
+            29
+        } else {
+            *m_days
+        };
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    let day: u32 = days as u32 + 1;
+    let year_off = year - 1980;
+
+    let time = (h << 11) | (m << 5) | (s / 2);
+    let date = (year_off << 9) | (month << 5) | day;
+    (date << 16) | time
+}
+
+/// True if `year` is a Gregorian leap year. exFAT only spans 1980..=2107
+/// (none of which are century-boundary edge cases, but we keep the full
+/// rule for clarity).
+fn is_leap(year: u32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 /// Set or clear bit `cluster - 2` in the allocation bitmap. No-op if the
@@ -1890,6 +1963,84 @@ mod tests {
         let fs2 = Exfat::open(&mut dev).unwrap();
         let entries = fs2.list_path(&mut dev, "/").unwrap();
         assert_eq!(entries.len(), 60);
+    }
+
+    #[test]
+    fn unix_to_exfat_timestamp_known_values() {
+        // Pre-1980 → zero (Unix epoch is way before exFAT epoch).
+        assert_eq!(unix_to_exfat_timestamp(0), 0);
+        assert_eq!(unix_to_exfat_timestamp(315_532_799), 0);
+        // Exactly 1980-01-01 00:00:00 UTC → date = (0 year, 1 month, 1 day)
+        // in the upper word, time = 0 in the lower.
+        let ts = unix_to_exfat_timestamp(315_532_800);
+        let date = (ts >> 16) as u16;
+        let time = (ts & 0xFFFF) as u16;
+        assert_eq!(time, 0);
+        let year = (date >> 9) & 0x7F;
+        let month = (date >> 5) & 0x0F;
+        let day = date & 0x1F;
+        assert_eq!((year, month, day), (0, 1, 1));
+        // A 2020-01-01 00:00:00 UTC timestamp (=1577836800) round-trips.
+        let ts = unix_to_exfat_timestamp(1_577_836_800);
+        let date = (ts >> 16) as u16;
+        let year = (date >> 9) & 0x7F;
+        let month = (date >> 5) & 0x0F;
+        let day = date & 0x1F;
+        assert_eq!((year, month, day), (40, 1, 1));
+    }
+
+    #[test]
+    fn filesystem_trait_create_file_round_trip() {
+        // Exercise the dyn-compatible `Filesystem` trait surface: create
+        // a file via `create_file`, flush, re-open, then list+read via
+        // the same trait methods.
+        use crate::fs::Filesystem;
+        let (mut dev, mut fs) = fresh_volume("TRAIT");
+        let meta = crate::fs::FileMeta::default();
+        let src = crate::fs::FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"trait-wired!".to_vec())),
+            len: 12,
+        };
+        Filesystem::create_file(
+            &mut fs,
+            &mut dev,
+            std::path::Path::new("/t.txt"),
+            src,
+            meta,
+        )
+        .unwrap();
+        Filesystem::flush(&mut fs, &mut dev).unwrap();
+
+        let mut fs2 = Exfat::open(&mut dev).unwrap();
+        let entries = Filesystem::list(&mut fs2, &mut dev, std::path::Path::new("/")).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "t.txt");
+
+        assert!(fs2.supports_mutation());
+        use std::io::Read;
+        let mut r =
+            Filesystem::read_file(&mut fs2, &mut dev, std::path::Path::new("/t.txt")).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"trait-wired!");
+    }
+
+    #[test]
+    fn filesystem_trait_symlink_unsupported() {
+        use crate::fs::Filesystem;
+        let (mut dev, mut fs) = fresh_volume("NOSYM");
+        let err = Filesystem::create_symlink(
+            &mut fs,
+            &mut dev,
+            std::path::Path::new("/link"),
+            std::path::Path::new("/target"),
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap_err();
+        match err {
+            crate::Error::Unsupported(_) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]

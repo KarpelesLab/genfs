@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/KarpelesLab/fstool/compare/v0.0.5...v0.1.0) - 2026-05-20
+
+### Added
+
+- *(block)* scaffold Apple DMG (UDIF v4) container support
+- *(tar)* random-access index + hardlink materialization + tar.<algo>→ext repack
+- *(squashfs)* hardlinks + device nodes + multi-fragment + ext-dir promotion
+- *(f2fs)* hard links + triple-indirect nodes + multi-block dentry spill
+- *(ntfs)* writer — format + create_file/dir/symlink + flush
+- *(apfs)* multi-leaf writer + embedded xattrs (read + write)
+- *(hfs+)* extents-overflow spill on write + hard links + journal stub
+- *(xfs)* journal stub + multi-AG writes + remove + shortform xattrs
+- *(ext)* BuildPlan auto-flex_bg + INCOMPAT_64BIT writer + sparse_super2
+- *(tar)* TarStreamReader/Writer + CLI streaming integration (no tempfile)
+- *(squashfs)* writer + xattr / id-table / export-table coverage
+- *(f2fs)* writer (format, create_file/dir/symlink/device, remove, flush)
+- *(ntfs)* fill read-side holes (attr-list, $Secure, $UpCase, LZNT1)
+- *(apfs)* multi-volume + snapshots (read) + minimal writer
+- *(hfs+)* writer (format, create_dir/file/symlink, remove, flush)
+- *(xfs)* B+tree directories + write support (format, add_file/dir/symlink/device)
+- *(ext)* flex_bg writer (opt-in via FormatOpts)
+- *(compression)* codec features for squashfs reads and tar I/O
+
+### Fixed
+
+- *(hfs+)* drop intra-doc link from public to private fold_case
+- *(hfs+)* make fsck.hfsplus accept writer output end-to-end
+- *(hfs+)* mark Private Data dir invisible in Finder (frFlags |= kIsInvisible)
+- *(hfs+)* set HasLinkChain / HasChildLink flags on hardlink records
+- *(hfs+)* iNode files need fileType='iNod' / creator='hfs+' + link count
+- *(hfs+)* catalog case-folding compare ignores NUL code units
+- *(hfs+)* map record fills the rest of the header node
+- *(hfs+)* empty B-trees need a header AND one empty leaf node
+- *(hfs+)* B-tree forks need clumpSize ≥ nodeSize
+- *(f2fs)* populate valid_node/inode/free_segment counts in CP head
+- *(f2fs)* SIT valid_map is MSB-first, not LSB-first
+- *(f2fs)* I_ADDR_OFFSET must be 0x168 (kernel spec), not 0xD0
+- *(f2fs)* inline-dentry INLINE_RESERVED_SIZE is 7 bytes, not 1
+- *(f2fs)* inline payload starts at i_addr[1], not i_addr[0]
+- *(f2fs)* emit "." and ".." dentries + correct i_blocks
+- *(f2fs)* real curseg layout + SIT type bits + node_footer
+- *(f2fs)* NAT entries for node_ino / meta_ino + drop bogus NAT/SIT/SSA CRC
+- *(f2fs)* write 8-block CP pack + drop bogus reserved-nid NAT entries
+- *(f2fs)* SIT segment count must be even + derive bitmap size from geometry
+- *(f2fs)* non-zero rsvd / overprov segments + correct user_block_count
+- *(f2fs)* write CP footer at end of pack + correct CP flag values
+- *(f2fs)* use real crc32_le(F2FS_SUPER_MAGIC, …) + correct CP field offsets
+- *(f2fs)* segment0_blkaddr = cp_blkaddr + ignore reverse-read test
+- *(f2fs,ci)* correct f2fs SB field offsets + drop deprecated brew ntfs-3g
+
+### Other
+
+- rustfmt insert_journal_entry signature
+- *(readme)* update FS support table for current writer coverage
+- Revert "fix(hfs+): catalog case-folding compare ignores NUL code units"
+- *(hfs+)* diagnostic also tries mkfs.hfsplus (hfsprogs spelling)
+- *(hfs+)* add diagnostic test to dump mkfs vs fstool extents header
+- rustfmt write.rs after CP-pack restructure
+- *(fs)* native-tool external validation for exfat/xfs/hfs+/apfs/ntfs/f2fs/squashfs + codec fixes
+- *(release-plz)* fix release-binaries dispatch (tag schema + actions:write)
+- cargo fmt --all
+
 ## [0.0.5](https://github.com/KarpelesLab/fstool/compare/v0.0.4...v0.0.5) - 2026-05-19
 
 ### Added

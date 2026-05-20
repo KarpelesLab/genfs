@@ -292,13 +292,21 @@ impl Fat32 {
             volume_label,
         };
         let mut fs = Self::format(dev, &opts)?;
-        let root_cluster = fs.boot.root_cluster;
-        // Root is its own "parent" placeholder; parent_cluster is unused when
-        // is_root = true.
-        fs.write_dir_tree(dev, src, root_cluster, true, root_cluster)?;
+        fs.populate_from_host_dir(dev, src)?;
         fs.flush(dev)?;
         dev.sync()?;
         Ok(())
+    }
+
+    /// Populate an already-formatted FAT32 root with the contents of
+    /// `src`. The volume label set at format time stays in place;
+    /// callers that want to re-set it should re-format. Used by the
+    /// repack flow where the destination has been formatted already.
+    pub fn populate_from_host_dir(&mut self, dev: &mut dyn BlockDevice, src: &Path) -> Result<()> {
+        let root_cluster = self.boot.root_cluster;
+        // Root is its own "parent" placeholder; parent_cluster is unused when
+        // is_root = true.
+        self.write_dir_tree(dev, src, root_cluster, true, root_cluster)
     }
 
     /// Recursively populate the directory whose data starts at `dir_cluster`

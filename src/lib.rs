@@ -17,6 +17,7 @@ pub mod error;
 pub mod fs;
 pub mod inspect;
 pub mod part;
+pub mod repack;
 pub mod spec;
 
 pub use error::{Error, Result};

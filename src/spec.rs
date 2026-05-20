@@ -197,13 +197,22 @@ fn build_bare_ext(fs: &FilesystemSpec, output: &Path) -> Result<()> {
 }
 
 fn build_bare_fat32(fs: &FilesystemSpec, output: &Path) -> Result<()> {
-    let size_str = fs.size.as_deref().ok_or_else(|| {
-        crate::Error::InvalidArgument(
-            "spec: FAT32 requires an explicit `size` (no streaming auto-size; minimum ~33 MiB)"
-                .into(),
-        )
-    })?;
-    let bytes = parse_size(size_str)?;
+    // Sizing precedence: explicit `size` → use as-is. Otherwise size
+    // from the source (directory / tar archive / image walk). FAT32
+    // has a ~33 MiB minimum we have to honour; the sizing helper
+    // already floors at that.
+    let bytes = match (fs.size.as_deref(), &fs.source) {
+        (Some(s), _) => parse_size(s)?,
+        (None, Some(src)) => {
+            let source = source_from_spec(src)?;
+            crate::repack::fat32_min_bytes_for_source(&source)?
+        }
+        (None, None) => {
+            return Err(crate::Error::InvalidArgument(
+                "spec: FAT32 needs either `size` or `source` (no streaming auto-size; minimum ~33 MiB)".into(),
+            ));
+        }
+    };
     let total_sectors: u32 = (bytes / SECTOR).try_into().map_err(|_| {
         crate::Error::InvalidArgument(
             "spec: FAT32 image size doesn't fit in a u32 sector count".into(),
@@ -225,17 +234,31 @@ fn format_fat32_into(
     label: [u8; 11],
 ) -> Result<()> {
     use crate::fs::fat::Fat32;
+    let opts = crate::fs::fat::FatFormatOpts {
+        total_sectors,
+        volume_id,
+        volume_label: label,
+    };
+    let mut fat = Fat32::format(dev, &opts)?;
     if let Some(src) = &fs.source {
-        Fat32::build_from_host_dir(dev, total_sectors, src, volume_id, label)?;
-    } else {
-        let opts = crate::fs::fat::FatFormatOpts {
-            total_sectors,
-            volume_id,
-            volume_label: label,
-        };
-        Fat32::format(dev, &opts)?;
+        let source = source_from_spec(src)?;
+        crate::repack::populate_fat32_from_source(dev, &mut fat, &source)?;
     }
+    fat.flush(dev)?;
     Ok(())
+}
+
+/// Convert a `FilesystemSpec.source` value into a [`crate::repack::Source`].
+/// The path is interpreted the same way [`crate::repack::Source::detect`]
+/// interprets a CLI argument: a directory becomes `HostDir`, a tar
+/// archive (by extension) becomes `TarArchive`, and any other string
+/// — including the `disk.img:N` partition selector — falls through
+/// to `Image`.
+fn source_from_spec(src: &Path) -> Result<crate::repack::Source> {
+    let s = src.to_str().ok_or_else(|| {
+        crate::Error::InvalidArgument(format!("spec: source path {src:?} is not valid UTF-8"))
+    })?;
+    crate::repack::Source::detect(s)
 }
 
 /// Space-pad and truncate `label` to exactly 11 bytes for FAT32. ASCII only;
@@ -271,12 +294,15 @@ fn ext_format_opts(
     let rootdevs = parse_rootdevs(fs.rootdevs.as_deref())?;
     let mtime = fs.mtime.unwrap_or(0);
 
-    let mut plan = crate::fs::ext::BuildPlan::new(block_size, kind);
+    let mut plan = match &fs.source {
+        Some(src) => {
+            let source = source_from_spec(src)?;
+            crate::repack::ext_build_plan_for_source(&source, block_size, kind)?
+        }
+        None => crate::fs::ext::BuildPlan::new(block_size, kind),
+    };
     if let Some(j) = fs.journal_blocks {
         plan.journal_blocks = j;
-    }
-    if let Some(src) = &fs.source {
-        plan.scan_host_path(src)?;
     }
     for _ in 0..rootdevs_entry_count(rootdevs) {
         plan.add_device();
@@ -320,7 +346,8 @@ fn format_ext_into(
     let rootdevs = parse_rootdevs(fs.rootdevs.as_deref())?;
     let mut ext = Ext::format_with(dev, opts)?;
     if let Some(src) = &fs.source {
-        ext.populate_from_host_dir(dev, 2, src)?;
+        let source = source_from_spec(src)?;
+        crate::repack::populate_ext_from_source(dev, &mut ext, &source)?;
     }
     if rootdevs != RootDevs::None {
         ext.populate_rootdevs(dev, rootdevs, 0, 0, opts.mtime)?;
@@ -695,5 +722,148 @@ mod tests {
             PartitionKind::LinuxFilesystem
         );
         assert!(parse_partition_kind("nonsense").is_err());
+    }
+
+    /// End-to-end test of `source = "*.tar"` inside a bare-FS spec.
+    /// The tar file is built in-memory, the spec is parsed, and the
+    /// built image is re-opened to verify the tar's contents landed
+    /// inside the ext4 root. Exercises `repack::Source::detect →
+    /// TarArchive → populate_ext_from_source` in the spec path.
+    #[test]
+    fn build_bare_ext4_from_tar_source() {
+        // Stage a tar archive in a tempfile.
+        let tmp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let tar_path = tmp_dir.join(format!("fstool-spec-src-{pid}.tar"));
+        let _ = std::fs::remove_file(&tar_path);
+        write_minimal_tar(&tar_path);
+
+        let img = tmp_dir.join(format!("fstool-spec-tar-{pid}.img"));
+        let _ = std::fs::remove_file(&img);
+        let toml = format!(
+            r#"
+                [filesystem]
+                type = "ext4"
+                source = {src:?}
+                block_size = 4096
+            "#,
+            src = tar_path.to_string_lossy(),
+        );
+        let spec = Spec::parse(&toml).unwrap();
+        build(&spec, &img).unwrap();
+
+        // Re-open the image and confirm the tar entries are present
+        // under root.
+        let mut dev = crate::block::FileBackend::open(&img).unwrap();
+        let ext = crate::fs::ext::Ext::open(&mut dev).unwrap();
+        let entries = ext.list_inode(&mut dev, 2).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"hello.txt"),
+            "expected hello.txt in root, got {names:?}"
+        );
+        drop(ext);
+        drop(dev);
+        let _ = std::fs::remove_file(&tar_path);
+        let _ = std::fs::remove_file(&img);
+    }
+
+    /// Same idea, but the source is an *existing ext4 image* instead
+    /// of a tar archive. Goes through `repack::Source::detect →
+    /// Image → AnyFs walker → copy_into_ext`.
+    #[test]
+    fn build_bare_ext4_from_existing_image_source() {
+        let tmp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let donor = tmp_dir.join(format!("fstool-spec-donor-{pid}.img"));
+        let dst = tmp_dir.join(format!("fstool-spec-img-{pid}.img"));
+        let _ = std::fs::remove_file(&donor);
+        let _ = std::fs::remove_file(&dst);
+
+        // Build the donor with `fstool` itself: a 4 MiB ext4 image
+        // with one file at /greeting.txt.
+        {
+            let host_src = tmp_dir.join(format!("fstool-spec-donor-src-{pid}"));
+            let _ = std::fs::remove_dir_all(&host_src);
+            std::fs::create_dir_all(&host_src).unwrap();
+            std::fs::write(host_src.join("greeting.txt"), b"hi from donor\n").unwrap();
+            let mut plan = crate::fs::ext::BuildPlan::new(4096, crate::fs::ext::FsKind::Ext4);
+            plan.scan_host_path(&host_src).unwrap();
+            let opts = plan.to_format_opts();
+            let sz = opts.blocks_count as u64 * opts.block_size as u64;
+            let mut d = crate::block::FileBackend::create(&donor, sz).unwrap();
+            let mut e = crate::fs::ext::Ext::format_with(&mut d, &opts).unwrap();
+            e.populate_from_host_dir(&mut d, 2, &host_src).unwrap();
+            e.flush(&mut d).unwrap();
+            d.sync().unwrap();
+            let _ = std::fs::remove_dir_all(&host_src);
+        }
+
+        let toml = format!(
+            r#"
+                [filesystem]
+                type = "ext4"
+                source = {src:?}
+                block_size = 4096
+            "#,
+            src = donor.to_string_lossy(),
+        );
+        let spec = Spec::parse(&toml).unwrap();
+        build(&spec, &dst).unwrap();
+
+        let mut dev = crate::block::FileBackend::open(&dst).unwrap();
+        let ext = crate::fs::ext::Ext::open(&mut dev).unwrap();
+        let entries = ext.list_inode(&mut dev, 2).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"greeting.txt"),
+            "expected greeting.txt in root, got {names:?}"
+        );
+        drop(ext);
+        drop(dev);
+        let _ = std::fs::remove_file(&donor);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    /// Build a minimal ustar archive at `path` with one regular file
+    /// `hello.txt` containing `"hi\n"`. Hand-rolled so the test
+    /// doesn't depend on host `tar`.
+    fn write_minimal_tar(path: &std::path::Path) {
+        use std::io::Write;
+        // 512-byte ustar header + one 512-byte body block + two
+        // 512-byte zero terminators.
+        let mut hdr = [0u8; 512];
+        let name = b"hello.txt";
+        hdr[..name.len()].copy_from_slice(name);
+        // mode = 0644 (NUL-terminated octal in 8 bytes)
+        hdr[100..107].copy_from_slice(b"0000644");
+        // uid / gid
+        hdr[108..115].copy_from_slice(b"0000000");
+        hdr[116..123].copy_from_slice(b"0000000");
+        // size = 3 (octal "0000003")
+        hdr[124..135].copy_from_slice(b"00000000003");
+        // mtime = 0
+        hdr[136..147].copy_from_slice(b"00000000000");
+        // typeflag = '0' (regular)
+        hdr[156] = b'0';
+        // magic + version
+        hdr[257..263].copy_from_slice(b"ustar\0");
+        hdr[263..265].copy_from_slice(b"00");
+        // checksum: spaces first, then octal sum.
+        for b in &mut hdr[148..156] {
+            *b = b' ';
+        }
+        let sum: u32 = hdr.iter().map(|&b| b as u32).sum();
+        let cksum = format!("{sum:06o}\0 ");
+        hdr[148..148 + cksum.len()].copy_from_slice(cksum.as_bytes());
+
+        let body = b"hi\n";
+        let mut body_block = [0u8; 512];
+        body_block[..body.len()].copy_from_slice(body);
+
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&hdr).unwrap();
+        f.write_all(&body_block).unwrap();
+        f.write_all(&[0u8; 1024]).unwrap();
     }
 }

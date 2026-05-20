@@ -254,7 +254,7 @@ fn fat32_bare_requires_explicit_size() {
     let err = fstool::spec::build(&spec, out.path()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("FAT32 requires an explicit `size`"),
+        msg.contains("FAT32 needs either `size` or `source`"),
         "unexpected error: {msg}"
     );
 }

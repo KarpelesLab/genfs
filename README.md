@@ -117,6 +117,38 @@ fstool build disk.toml -o disk.img
 sgdisk -v disk.img             # "No problems found."
 ```
 
+### `source` — what to populate the FS with
+
+`source` accepts three shapes, auto-detected by what the string points at:
+
+```toml
+[partitions.filesystem]
+type = "ext4"
+source = "./rootfs"            # a host directory — walk it recursively
+```
+
+```toml
+[partitions.filesystem]
+type = "ext4"
+source = "./rootfs.tar.gz"     # a tar archive — repack entries into the FS
+```
+
+```toml
+[partitions.filesystem]
+type = "ext4"
+source = "./old-disk.img:2"    # an existing image, optional :N partition
+                               # — walks the source FS, copies every
+                               # entry into the new partition
+```
+
+Recognised tar extensions: `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`,
+`.tar.zst`, `.tar.lz4`, `.tar.lzma`, `.tar.lzo` (codecs gated on the
+matching Cargo feature). For images, the `:N` suffix selects partition
+*N* (1-indexed); without it, the source is opened as a bare filesystem.
+The source FS may be any readable type — `ext{2,3,4}`, `fat32`, or tar
+on the inside of an image — and the destination is sized automatically
+to fit unless `size` is set explicitly.
+
 ## Architecture
 
 ```

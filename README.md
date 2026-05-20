@@ -326,10 +326,6 @@ Things explicitly out of scope today, in rough order of likely-to-change:
   (repack-only — `Filesystem::supports_mutation()` returns `false`,
   so `add`/`rm` fail fast with an actionable error); APFS isn't
   trait-wired at all (Builder pattern).
-- ISO 9660 writer does not yet emit the Rock Ridge `SP` marker on the
-  root's `.` entry, so `isoinfo -d` reports "No SUSP/Rock Ridge
-  present" even though `NM` / `PX` / `SL` entries are written and our
-  reader (and the Linux kernel iso9660 driver) parse them correctly.
 - NTFS writer: produced image isn't `ntfs-3g`-mountable — root `$I30`
   doesn't index the system files yet; `ntfsfix --no-action` is clean.
 - NTFS reader: compressed and encrypted `$DATA`, `$ATTRIBUTE_LIST`

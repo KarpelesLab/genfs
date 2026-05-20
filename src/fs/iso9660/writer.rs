@@ -380,7 +380,8 @@ fn compute_layout(root: &Node, opts: &FormatOpts) -> Layout {
     let mut dir_lba: BTreeMap<PathBuf, (u32, u64)> = BTreeMap::new();
     for (path, _) in pvd_dirs.iter() {
         let n = find_node(root, path).unwrap();
-        let size = dir_records_byte_size(n, opts, /*joliet*/ false);
+        let is_root = path == &PathBuf::from("/");
+        let size = dir_records_byte_size(n, opts, /*joliet*/ false, is_root);
         dir_lba.insert(path.clone(), (cursor, size));
         cursor += sectors_for(size);
     }
@@ -390,7 +391,7 @@ fn compute_layout(root: &Node, opts: &FormatOpts) -> Layout {
     if joliet {
         for (path, _) in pvd_dirs.iter() {
             let n = find_node(root, path).unwrap();
-            let size = dir_records_byte_size(n, opts, /*joliet*/ true);
+            let size = dir_records_byte_size(n, opts, /*joliet*/ true, /*is_root*/ false);
             joliet_dir_lba.insert(path.clone(), (cursor, size));
             cursor += sectors_for(size);
         }
@@ -504,10 +505,14 @@ fn iso_name_bytes(name: &str, joliet: bool, directory: bool) -> usize {
 /// Sum of the on-disk directory record bytes for `dir` and its
 /// immediate children (i.e. one directory's worth of records, not
 /// recursive).
-fn dir_records_byte_size(dir: &Node, opts: &FormatOpts, joliet: bool) -> u64 {
+fn dir_records_byte_size(dir: &Node, opts: &FormatOpts, joliet: bool, is_root: bool) -> u64 {
     let mut sum: u64 = 0;
     // "." and ".." entries — both 34 bytes (no name overhead).
     sum += 34 * 2;
+    // Root's "." gets the 7-byte SP SUSP indicator under Rock Ridge.
+    if is_root && opts.rock_ridge && !joliet {
+        sum += 7;
+    }
     let want_rr = opts.rock_ridge && !joliet;
     for child in &dir.children {
         sum += dir_record_size(child, want_rr, joliet) as u64;
@@ -528,8 +533,9 @@ fn dir_record_size(node: &Node, rock_ridge: bool, joliet: bool) -> usize {
     let name_pad = if name_bytes % 2 == 0 { 1 } else { 0 };
     let base = 33 + name_bytes + name_pad;
     if rock_ridge {
-        // Rock Ridge SUA size: NM (5 + name) + PX (36). Plus 7 for SP
-        // on the "." entry — only the dir-walking layout, not per-child.
+        // Rock Ridge SUA size per child: NM (5 + name) + PX (36) +
+        // optional SL for symlinks. The SP marker is on the root's "."
+        // record only — `dir_records_byte_size` accounts for that.
         let nm = 5 + node.name.len();
         let px = 36;
         let sl = if let NodeKind::Symlink { target } = &node.kind {
@@ -605,6 +611,7 @@ fn write_image(
         let parent_node = find_node(root, &parent_path).unwrap();
         let parent_lba = layout.dir_lba.get(&parent_path).copied().unwrap().0;
         let self_lba = lba;
+        let is_root = path == &PathBuf::from("/");
         let stream = encode_dir_records(
             node,
             parent_node,
@@ -614,6 +621,7 @@ fn write_image(
             &layout.file_lba,
             opts,
             /*joliet*/ false,
+            /*is_root*/ is_root,
         );
         dev.write_at(u64::from(lba) * SECTOR, &stream)?;
     }
@@ -635,6 +643,7 @@ fn write_image(
                 &layout.file_lba,
                 opts,
                 /*joliet*/ true,
+                /*is_root*/ false,
             );
             dev.write_at(u64::from(lba) * SECTOR, &stream)?;
         }
@@ -905,6 +914,13 @@ fn iso_identifier_bytes(name: &str, joliet: bool, directory: bool) -> Vec<u8> {
 
 /// Encode the directory record stream for `dir`: "." + ".." + each
 /// child. Total length is padded to a sector boundary.
+///
+/// When `is_root` is true and Rock Ridge is active on this stream
+/// (PVD, not Joliet), the "." record carries an extra 7-byte `SP`
+/// System Use entry per IEEE P1282 §5.3. The `SP` entry announces to
+/// conformant SUSP parsers (e.g. `isoinfo -d`) that Rock Ridge entries
+/// follow; without it, those parsers report "No SUSP/Rock Ridge
+/// present" and skip the per-record `NM` / `PX` / `SL`.
 #[allow(clippy::too_many_arguments)]
 fn encode_dir_records(
     dir: &Node,
@@ -915,11 +931,18 @@ fn encode_dir_records(
     file_lba: &BTreeMap<PathBuf, (u32, u64)>,
     opts: &FormatOpts,
     joliet: bool,
+    is_root: bool,
 ) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
-    // "." entry
+    // "." entry — for the root directory under Rock Ridge we append the
+    // SP System Use entry so SUSP-aware parsers pick up the RR fields.
     let self_size = dir_lba.get(&dir.path).copied().unwrap().1;
-    buf.extend_from_slice(&encode_dot_record(self_lba, self_size, 0x00));
+    let want_sp_on_dot = is_root && opts.rock_ridge && !joliet;
+    if want_sp_on_dot {
+        buf.extend_from_slice(&encode_dot_record_with_sp(self_lba, self_size, 0x00));
+    } else {
+        buf.extend_from_slice(&encode_dot_record(self_lba, self_size, 0x00));
+    }
     // ".." entry
     let parent_size = dir_lba.get(&parent.path).copied().unwrap().1;
     buf.extend_from_slice(&encode_dot_record(parent_lba, parent_size, 0x01));
@@ -952,6 +975,28 @@ fn encode_dot_record(lba: u32, size: u64, ident: u8) -> [u8; 34] {
     put_both_u16(&mut r[28..32], 1);
     r[32] = 1;
     r[33] = ident;
+    r
+}
+
+/// The 7-byte SP entry that lives in the SUA of the root's "." record.
+/// Layout per IEEE P1282 §5.3 / SUSP §5.3:
+///   "SP" + len=7 + version=1 + 0xBE + 0xEF + bytes_skipped=0
+const SP_ENTRY: [u8; 7] = *b"SP\x07\x01\xBE\xEF\x00";
+
+/// Encode the "." record with an SP System Use entry appended. The
+/// identifier is one byte (0x00) so the SUA starts at offset 34 with no
+/// padding (ECMA-119 §9.1.12). Total length: 34 + 7 = 41 bytes.
+fn encode_dot_record_with_sp(lba: u32, size: u64, ident: u8) -> [u8; 41] {
+    let mut r = [0u8; 41];
+    r[0] = 41; // len_dr including SUA
+    put_both_u32(&mut r[2..10], lba);
+    put_both_u32(&mut r[10..18], size as u32);
+    r[25] = 0x02; // directory flag
+    put_both_u16(&mut r[28..32], 1);
+    r[32] = 1;
+    r[33] = ident;
+    // SUA starts at offset 34 (len_fi=1 is odd → no pad byte).
+    r[34..41].copy_from_slice(&SP_ENTRY);
     r
 }
 
@@ -1067,9 +1112,62 @@ fn normalize(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::MemoryBackend;
+    use crate::block::{BlockDevice, MemoryBackend};
     use crate::fs::FileMeta;
     use std::io::Cursor;
+
+    #[test]
+    fn root_dot_record_carries_sp_marker() {
+        // Build a minimal RR-enabled image, then re-read the first
+        // directory record of the root extent and confirm its SUA opens
+        // with the canonical SP signature.
+        let mut dev = MemoryBackend::new(4 * 1024 * 1024);
+        let opts = FormatOpts {
+            volume_id: "SPCHECK".into(),
+            joliet: false,
+            rock_ridge: true,
+            ..FormatOpts::default()
+        };
+        let mut w = Iso9660Writer::new(opts);
+        w.add_dir(Path::new("/sub"), FileMeta::default()).unwrap();
+        w.flush(&mut dev).unwrap();
+
+        let iso = super::super::Iso9660::open(&mut dev).unwrap();
+        // Root extent LBA from the PVD's embedded root dir record.
+        let root_lba = iso.pvd.root.extent_lba;
+        let mut buf = vec![0u8; super::super::SECTOR_SIZE as usize];
+        dev.read_at(u64::from(root_lba) * u64::from(super::super::SECTOR_SIZE), &mut buf)
+            .unwrap();
+        let len_dr = buf[0] as usize;
+        let dot = super::super::directory::DirRecord::decode(&buf[..len_dr]).unwrap();
+        // Identifier is the single 0x00 byte for "." per ECMA-119.
+        assert_eq!(dot.identifier, vec![0x00]);
+        // SUA begins with the SP entry.
+        assert!(
+            dot.system_use.len() >= 7,
+            "root '.' record SUA too short: {} bytes",
+            dot.system_use.len(),
+        );
+        assert_eq!(
+            &dot.system_use[..7],
+            b"SP\x07\x01\xBE\xEF\x00",
+            "root '.' SUA does not begin with the SP marker",
+        );
+
+        // Sanity: child records on the root must NOT carry SP. Walk to
+        // the second record in the stream and confirm its SUA starts
+        // with NM (or anything else but SP).
+        let second_off = len_dr;
+        let len2 = buf[second_off] as usize;
+        let dotdot = super::super::directory::DirRecord::decode(
+            &buf[second_off..second_off + len2],
+        )
+        .unwrap();
+        assert!(
+            dotdot.system_use.len() < 2 || &dotdot.system_use[..2] != b"SP",
+            "'..' record unexpectedly carries an SP entry",
+        );
+    }
 
     #[test]
     fn write_then_read_round_trip() {

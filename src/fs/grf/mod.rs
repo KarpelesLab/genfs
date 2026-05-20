@@ -421,12 +421,63 @@ impl crate::fs::Filesystem for Grf {
         Ok(Box::new(std::io::Cursor::new(bytes)))
     }
 
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
+        // GRF stores each file as a single zlib stream (optionally
+        // per-block encrypted). Seek-friendly access requires the
+        // whole inflated body in RAM — the alternative would be
+        // re-decompressing from the start on every backward seek.
+        // For typical GRF assets (sub-MB sprites, sounds, scripts)
+        // this is fine; documented here so callers don't expect
+        // streaming-style memory bounds.
+        let key = normalise_path(
+            path.to_str()
+                .ok_or_else(|| crate::Error::InvalidArgument("grf: non-UTF-8 path".into()))?,
+        );
+        let entry =
+            self.entries.get(&key).cloned().ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("grf: no entry at {key:?}"))
+            })?;
+        let bytes = self.read_entry(dev, &entry)?;
+        Ok(Box::new(GrfFileReadHandle {
+            cursor: std::io::Cursor::new(bytes),
+        }))
+    }
+
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         writer::flush(self, dev)
     }
 
     fn mutation_capability(&self) -> MutationCapability {
         MutationCapability::Mutable
+    }
+}
+
+/// Random-access (`Read + Seek + len`) view of a GRF entry's
+/// inflated body. Holds the decompressed bytes in RAM because GRF
+/// stores each file as a single zlib stream.
+struct GrfFileReadHandle {
+    cursor: std::io::Cursor<Vec<u8>>,
+}
+
+impl Read for GrfFileReadHandle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.cursor.read(buf)
+    }
+}
+
+impl std::io::Seek for GrfFileReadHandle {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.cursor.seek(pos)
+    }
+}
+
+impl crate::fs::FileReadHandle for GrfFileReadHandle {
+    fn len(&self) -> u64 {
+        self.cursor.get_ref().len() as u64
     }
 }
 
@@ -474,6 +525,40 @@ mod tests {
         let entry = reopen.entries.get("data/info.txt").cloned().unwrap();
         let bytes = reopen.read_entry(&mut dev, &entry).unwrap();
         assert_eq!(bytes, body);
+    }
+
+    #[test]
+    fn open_file_ro_random_seek() {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut dev = MemoryBackend::new(64 * 1024);
+        let mut grf = Grf::format(&mut dev, &FormatOpts::default()).unwrap();
+        let body: Vec<u8> = (0..1024u32).map(|i| (i & 0xff) as u8).collect();
+        grf.create_file(
+            &mut dev,
+            std::path::Path::new("/blob.bin"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(body.clone())),
+                len: body.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        grf.flush(&mut dev).unwrap();
+
+        let mut grf = Grf::open(&mut dev).unwrap();
+        let mut h = grf
+            .open_file_ro(&mut dev, std::path::Path::new("/blob.bin"))
+            .unwrap();
+        assert_eq!(h.len(), body.len() as u64);
+        // Seek mid-body, read 32 bytes, verify.
+        h.seek(SeekFrom::Start(500)).unwrap();
+        let mut chunk = [0u8; 32];
+        h.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk[..], &body[500..532]);
+        // Backward seek and reread.
+        h.seek(SeekFrom::Current(-32)).unwrap();
+        h.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk[..], &body[500..532]);
     }
 
     #[test]

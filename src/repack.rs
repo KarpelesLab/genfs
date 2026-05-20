@@ -559,7 +559,7 @@ fn build_ext_plan_inner(
     build_ext_plan_through_trait(src_dev, src_fs, plan)
 }
 
-/// Public counterpart of [`build_ext_plan_inner`] for the binary
+/// Public counterpart of `build_ext_plan_inner` for the binary
 /// crate's `build_ext_plan`. Walks the source through the
 /// [`crate::fs::Filesystem`] trait, no AnyFs match.
 pub fn build_ext_plan_through_trait(

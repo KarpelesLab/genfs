@@ -11,8 +11,8 @@
 //! - **`0x102` / `0x103`**: file table is RAW (not zlib) and each
 //!   filename inside it is encrypted with a fixed-key permutation
 //!   cipher ([`crypt::decode_filename`]). The on-disk `len` /
-//!   `len_aligned` fields carry magic offsets that
-//!   [`table::decode_v102`] strips. File bodies can also be encrypted
+//!   `len_aligned` fields carry magic offsets that the v0x102 decoder
+//!   in the `table` module strips. File bodies can also be encrypted
 //!   per-entry via the `MIXCRYPT` / `DES` flags.
 //! - **`0x200`**: file table is zlib-compressed but filenames are
 //!   plain CP949. Magic offsets removed. This is what the writer
@@ -54,10 +54,10 @@ use crate::fs::{FileMeta, FileSource, MutationCapability};
 
 pub(crate) const HEADER_SIZE: usize = 0x2e;
 
-/// Public format-side options for [`FilesystemFactory::format`]. The
-/// writer always emits version 0x200 today; older versions are
-/// readable but not writeable (they're rarely useful outside legacy
-/// game clients).
+/// Public format-side options for
+/// [`crate::fs::FilesystemFactory::format`]. The writer always emits
+/// version 0x200 today; older versions are readable but not writeable
+/// (they're rarely useful outside legacy game clients).
 #[derive(Debug, Clone)]
 pub struct FormatOpts {
     /// GRF version word to write. Only 0x200 is supported by the
@@ -103,7 +103,8 @@ pub struct Grf {
 
 impl Grf {
     /// Build a `Grf` handle that represents a freshly-formatted empty
-    /// archive. The header isn't written until [`Self::flush`].
+    /// archive. The header isn't written until
+    /// [`<Self as crate::fs::Filesystem>::flush`](crate::fs::Filesystem::flush).
     pub fn format_with(_dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Self> {
         if opts.version != 0x200 {
             return Err(crate::Error::Unsupported(format!(

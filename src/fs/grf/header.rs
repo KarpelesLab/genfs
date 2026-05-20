@@ -24,7 +24,8 @@ pub struct Header {
     /// ever set this; v0x200 GRFs never do.
     pub encrypted_header: bool,
     /// Byte offset of the file table, counted from the end of the
-    /// header (i.e. add [`HEADER_SIZE`] for an absolute file offset).
+    /// header (i.e. add 46 — the header size — for an absolute file
+    /// offset).
     pub table_offset: u32,
     /// Seed used to obfuscate `filecount_enc`. Modern writers leave
     /// this at zero.

@@ -13,13 +13,13 @@
 //! | 4     | `padded_fn_len + 2` (u32 LE)                                   |
 //! | 2     | skip / padding (zero)                                          |
 //! | N     | encrypted filename (N = `padded_fn_len`, multiple of 8)        |
-//! | 17    | [`RawEntry`] — the 17-byte `grf_table_entry_data` C struct      |
+//! | 17    | `RawEntry` — the 17-byte `grf_table_entry_data` C struct       |
 //!
 //! Filename encryption is the three-pass transform in
 //! [`crate::fs::grf::crypt::decode_filename`]. The stored `len` and
-//! `len_aligned` fields carry magic offsets (-`size`-715 and -37579
-//! respectively) on top of the actual compressed lengths;
-//! [`RawEntry::to_resolved`] undoes these.
+//! `len_aligned` fields carry magic offsets (`-size-715` and `-37579`
+//! respectively) on top of the actual compressed lengths; the table
+//! decoder strips them before producing an [`Entry`].
 //!
 //! ## v0x200 (zlib-compressed, plain filenames)
 //!
@@ -30,7 +30,7 @@
 //! | bytes | field                                          |
 //! |-------|------------------------------------------------|
 //! | var   | null-terminated CP949 filename                 |
-//! | 17    | [`RawEntry`] — same struct as above             |
+//! | 17    | `RawEntry` — same struct as above              |
 //!
 //! No magic offsets on `len` / `len_aligned` in v0x200.
 //!
@@ -106,8 +106,8 @@ pub struct Entry {
     /// Compressed length rounded up to the GRF 4-byte alignment.
     pub len_aligned: u32,
     /// Byte offset of the compressed body, relative to the end of
-    /// the GRF header (i.e. add [`crate::fs::grf::HEADER_SIZE`] for
-    /// an absolute file offset).
+    /// the GRF header (i.e. add 46 — the header size — for an
+    /// absolute file offset).
     pub pos: u32,
     /// File-level flags: `GRF_FLAG_FILE | GRF_FLAG_MIXCRYPT |
     /// GRF_FLAG_DES`. The cipher cycle is recomputed by readers as

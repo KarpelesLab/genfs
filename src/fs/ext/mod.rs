@@ -3194,11 +3194,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn open_file_rw_refused_on_ext4_extents() {
-        // ext4 files use the extent tree, which the indirect-block writer
-        // can't handle. Even with a clean journal, open_file_rw must
-        // refuse with Unsupported at the inode-level extents check.
+    /// Build a fresh ext4 image (4 KiB blocks, depth-0 inline extents) with
+    /// a clean JBD2 journal and one regular file written via the populate
+    /// API. Used by the ext4 extent-write tests below.
+    fn ext4_with_file(name: &[u8], payload: &[u8]) -> (Ext, MemoryBackend) {
         let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
         let opts = FormatOpts {
             kind: FsKind::Ext4,
@@ -3209,26 +3208,243 @@ mod tests {
             ..FormatOpts::default()
         };
         let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
+        if !payload.is_empty() {
+            ext.add_file_to_streaming(
+                &mut dev,
+                constants::INO_ROOT_DIR,
+                name,
+                &mut std::io::Cursor::new(payload.to_vec()),
+                payload.len() as u64,
+                FileMeta::default(),
+            )
+            .expect("add file");
+        }
+        ext.flush(&mut dev).expect("flush");
+        (ext, dev)
+    }
+
+    #[test]
+    fn open_file_rw_round_trip_ext4_extents() {
+        // Write at an offset inside an existing extent, reopen the FS,
+        // and verify the modification persists. The image is built on a
+        // file-backed device so we can hand it to `e2fsck -fn` at the
+        // end (skipped when e2fsck isn't installed).
+        use std::process::Command;
+        let e2fsck = match Command::new("sh")
+            .arg("-c")
+            .arg("command -v e2fsck")
+            .output()
+        {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+                Some(String::from_utf8(o.stdout).unwrap().trim().to_string())
+            }
+            _ => {
+                eprintln!(
+                    "open_file_rw_round_trip_ext4_extents: e2fsck not installed; skipping fsck check"
+                );
+                None
+            }
+        };
+
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let size = opts.blocks_count as u64 * opts.block_size as u64;
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let mut dev =
+            crate::block::FileBackend::create(tmp.path(), size).expect("create FileBackend");
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
+
+        let payload = vec![b'a'; 16 * 1024]; // 4 blocks at 4 KiB
         ext.add_file_to_streaming(
             &mut dev,
             constants::INO_ROOT_DIR,
-            b"foo.bin",
-            &mut std::io::Cursor::new(b"hi".to_vec()),
-            2,
+            b"hello.bin",
+            &mut std::io::Cursor::new(payload.clone()),
+            payload.len() as u64,
             FileMeta::default(),
         )
-        .unwrap();
-        ext.flush(&mut dev).unwrap();
+        .expect("add file");
+        ext.flush(&mut dev).expect("flush");
+
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/hello.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open_file_rw on ext4 extents");
+            assert_eq!(h.len(), payload.len() as u64);
+            // Patch 4 bytes inside block 0 and 4 bytes inside block 2.
+            h.seek(SeekFrom::Start(1000)).unwrap();
+            h.write_all(b"XXXX").unwrap();
+            h.seek(SeekFrom::Start(8500)).unwrap();
+            h.write_all(b"YYYY").unwrap();
+            h.sync().expect("sync");
+        }
+
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let got = {
+            let mut h = reopened
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/hello.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open_file_rw");
+            let mut out = Vec::new();
+            h.read_to_end(&mut out).expect("read");
+            out
+        };
+        assert_eq!(got.len(), payload.len());
+        for (i, b) in got.iter().enumerate() {
+            let expected = if (1000..1004).contains(&i) {
+                b'X'
+            } else if (8500..8504).contains(&i) {
+                b'Y'
+            } else {
+                b'a'
+            };
+            assert_eq!(*b, expected, "mismatch at byte {i}");
+        }
+
+        // Hand the on-disk image to e2fsck if available. `-fn` forces a
+        // full check in read-only mode.
+        if let Some(e2fsck) = e2fsck {
+            BlockDevice::sync(&mut dev).expect("sync");
+            drop(dev);
+            let out = Command::new(&e2fsck)
+                .arg("-fn")
+                .arg(tmp.path())
+                .output()
+                .expect("run e2fsck");
+            assert!(
+                out.status.success(),
+                "e2fsck failed on ext4 image after rw:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+    }
+
+    #[test]
+    fn open_file_rw_extends_ext4_file() {
+        // Append past EOF; this must allocate a new physical block and
+        // (depending on contiguity with the existing tail extent) either
+        // grow that extent or add a new one.
+        let payload = vec![b'a'; 4096]; // exactly one block
+        let (mut ext, mut dev) = ext4_with_file(b"grow.bin", &payload);
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/grow.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open");
+            h.seek(SeekFrom::End(0)).unwrap();
+            // Write 5 KiB past EOF — spans into a new block.
+            let extra = vec![b'b'; 5000];
+            h.write_all(&extra).unwrap();
+            h.sync().unwrap();
+            assert_eq!(h.len(), 4096 + 5000);
+        }
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let got = read_full_via_handle(&mut reopened, &mut dev, "/grow.bin");
+        assert_eq!(got.len(), 4096 + 5000);
+        assert!(got[..4096].iter().all(|&b| b == b'a'));
+        assert!(got[4096..].iter().all(|&b| b == b'b'));
+    }
+
+    #[test]
+    fn open_file_rw_set_len_grow_and_shrink_ext4() {
+        // Exercise grow + shrink via set_len on an extent inode.
+        let payload = vec![b'q'; 4096]; // one block
+        let (mut ext, mut dev) = ext4_with_file(b"flex.bin", &payload);
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/flex.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            // Grow to 5 blocks. New region must read as zero.
+            h.set_len(5 * 4096).unwrap();
+            assert_eq!(h.len(), 5 * 4096);
+            let mut buf = vec![0u8; 4 * 4096];
+            h.seek(SeekFrom::Start(4096)).unwrap();
+            h.read_exact(&mut buf).unwrap();
+            assert!(buf.iter().all(|&b| b == 0), "grown region must be zero");
+            // Shrink back to 100 bytes.
+            h.set_len(100).unwrap();
+            assert_eq!(h.len(), 100);
+            h.sync().unwrap();
+        }
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let got = read_full_via_handle(&mut reopened, &mut dev, "/flex.bin");
+        assert_eq!(got.len(), 100);
+        assert!(got.iter().all(|&b| b == b'q'));
+        // The trailing data blocks should have been returned to the
+        // bitmap — sanity-check the FS still reports free space.
+        assert!(reopened.sb.free_blocks_count > 0);
+    }
+
+    #[test]
+    fn open_file_rw_refused_ext4_when_extent_depth_too_deep() {
+        // Synthesise an inode whose extent header claims depth > 0. The
+        // writer must refuse cleanly at open time rather than trying to
+        // walk an index it can't allocate.
+        let (ext, mut dev) = ext4_with_file(b"deep.bin", b"hello");
+
+        // Locate the file's inode and patch its i_block header so eh_depth = 1.
+        let ino = ext
+            .path_to_inode(&mut dev, "/deep.bin")
+            .expect("path lookup");
+        let mut inode = ext.read_inode(&mut dev, ino).expect("read inode");
+        let mut bytes = extent::iblock_to_bytes(&inode.block);
+        // eh_depth lives at bytes 6..8 (little-endian).
+        bytes[6..8].copy_from_slice(&1u16.to_le_bytes());
+        inode.block = extent::bytes_to_iblock(&bytes);
+
+        // Write the patched inode straight to disk; we want the
+        // subsequent open_file_rw to see the on-disk state, not anything
+        // cached by `ext`.
+        let (group, idx) = ext.inode_location(ino);
+        let table_block = ext.layout.groups[group as usize].inode_table;
+        let bs = ext.layout.block_size as u64;
+        let off = table_block as u64 * bs + idx as u64 * ext.layout.inode_size as u64;
+        let mut enc = inode.encode().to_vec();
+        if ext.layout.inode_size as usize > enc.len() {
+            enc.resize(ext.layout.inode_size as usize, 0);
+        }
+        dev.write_at(off, &enc).expect("write patched inode");
+
+        // Reopen the FS so the staged-inode cache is empty.
+        let mut ext = Ext::open(&mut dev).expect("reopen");
         let res = ext.open_file_rw(
             &mut dev,
-            std::path::Path::new("/foo.bin"),
+            std::path::Path::new("/deep.bin"),
             OpenFlags::default(),
             None,
         );
         match res {
-            Ok(_) => panic!("must refuse on ext4 extents"),
+            Ok(_) => panic!("must refuse on deeper extent tree"),
             Err(crate::Error::Unsupported(msg)) => {
-                assert!(msg.contains("extents"), "unexpected message: {msg}");
+                assert!(
+                    msg.contains("depth"),
+                    "unexpected message: {msg}"
+                );
             }
             Err(other) => panic!("expected Unsupported, got {other}"),
         }

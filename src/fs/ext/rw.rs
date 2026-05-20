@@ -20,8 +20,16 @@
 //! is dirty (the image was previously interrupted) we refuse with
 //! [`crate::Error::Unsupported`].
 //!
-//! Inodes that use the ext4 extent tree (`EXT4_EXTENTS_FL`) are still
-//! refused: the indirect-block writer here doesn't understand extents.
+//! ## Extent-tree support
+//!
+//! Inodes with `EXT4_EXTENTS_FL` are read/written through a depth-0
+//! inline extent tree (up to 4 leaves stored directly in `i_block`).
+//! Allocation extends an existing leaf when the new physical block is
+//! contiguous with it; otherwise it appends a new leaf. Free shrinks or
+//! drops trailing leaves and returns their physical runs to the block
+//! bitmap. Inodes whose extent tree has `depth > 0` (a multi-level tree
+//! pointing at external index/leaf blocks) are still refused at open
+//! time — that path involves allocating index blocks, which is deferred.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -30,6 +38,7 @@ use super::constants::{
     self, EXT4_EXTENTS_FL, IDX_DOUBLE_INDIRECT, IDX_INDIRECT, IDX_TRIPLE_INDIRECT, N_DIRECT, S_IFMT,
     S_IFREG,
 };
+use super::extent::{self, ExtentRun, MAX_EXTENTS_IN_INODE, MAX_LEN_PER_EXTENT};
 use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::FileHandle;
@@ -83,11 +92,19 @@ impl<'a> Ext2FileHandle<'a> {
         Ok(())
     }
 
+    /// True if the underlying inode uses an ext4 extent tree.
+    fn is_extent(&self) -> bool {
+        self.staged_inode().flags & EXT4_EXTENTS_FL != 0
+    }
+
     /// Recompute `i_blocks_512` from the current set of allocated blocks
     /// (direct + indirect tree). Walks the tree, counts every populated
     /// pointer (data) and every indirection-metadata block, multiplies by
     /// `block_size / 512`.
     fn recompute_blocks_512(&mut self) -> Result<()> {
+        if self.is_extent() {
+            return self.recompute_blocks_512_extent();
+        }
         let bs = self.ext.layout.block_size;
         let ptrs = (bs / 4) as u64;
         let inode = *self.staged_inode();
@@ -163,6 +180,211 @@ impl<'a> Ext2FileHandle<'a> {
         Ok(())
     }
 
+    /// Decode the current depth-0 inline extent tree from the staged
+    /// inode's `i_block` into a list of runs. Returns `Unsupported` if
+    /// the tree is deeper than the writer can handle.
+    fn read_extent_runs(&self) -> Result<Vec<ExtentRun>> {
+        let inode = self.staged_inode();
+        let bytes = extent::iblock_to_bytes(&inode.block);
+        let (header, runs) = extent::decode_depth0_iblock(&bytes)?;
+        if header.depth != 0 {
+            return Err(crate::Error::Unsupported(format!(
+                "ext4: cannot mutate extent tree of depth {} (writer supports depth 0 only)",
+                header.depth
+            )));
+        }
+        Ok(runs)
+    }
+
+    /// Stamp a new depth-0 extent run list onto the staged inode's
+    /// `i_block`. Rejects with `Unsupported` if it would overflow the
+    /// 4-leaf inline cap.
+    fn write_extent_runs(&mut self, runs: &[ExtentRun]) -> Result<()> {
+        let packed = extent::pack_into_iblock(runs)?;
+        let slots = extent::bytes_to_iblock(&packed);
+        let inode = self.staged_inode_mut();
+        inode.block = slots;
+        Ok(())
+    }
+
+    /// Sum the lengths of every leaf extent in the inline tree. Used to
+    /// update `blocks_512`.
+    fn recompute_blocks_512_extent(&mut self) -> Result<()> {
+        let runs = self.read_extent_runs()?;
+        let bs = self.ext.layout.block_size as u64;
+        let mut data = 0u64;
+        for r in &runs {
+            let len = if r.len > MAX_LEN_PER_EXTENT {
+                // Uninitialized extents (not emitted by us; tolerate on
+                // read). The length encoded in ee_len - 32768.
+                (r.len - MAX_LEN_PER_EXTENT) as u64
+            } else {
+                r.len as u64
+            };
+            data += len;
+        }
+        let sectors = data * (bs / 512);
+        self.staged_inode_mut().blocks_512 = sectors as u32;
+        Ok(())
+    }
+
+    /// Resolve logical block `n` against the inline extent tree without
+    /// allocating. Returns 0 for a sparse hole (no extent covers `n`).
+    fn read_logical_block_extent(&self, n: u32) -> Result<u32> {
+        let runs = self.read_extent_runs()?;
+        for r in &runs {
+            let len = if r.len > MAX_LEN_PER_EXTENT {
+                r.len - MAX_LEN_PER_EXTENT
+            } else {
+                r.len
+            };
+            if n >= r.logical && n < r.logical + len as u32 {
+                let phys = r.physical + (n - r.logical) as u64;
+                return Ok(phys as u32);
+            }
+        }
+        Ok(0)
+    }
+
+    /// Resolve logical block `n` against the inline extent tree,
+    /// allocating a new physical block if `n` is uncovered. Merges with
+    /// an adjacent extent when the freshly-allocated block lies right
+    /// before / after one; otherwise appends a new leaf (subject to the
+    /// 4-leaf cap).
+    fn get_or_alloc_block_extent(&mut self, n: u32) -> Result<u32> {
+        let mut runs = self.read_extent_runs()?;
+
+        // Already mapped?
+        for r in &runs {
+            let len = if r.len > MAX_LEN_PER_EXTENT {
+                r.len - MAX_LEN_PER_EXTENT
+            } else {
+                r.len
+            };
+            if n >= r.logical && n < r.logical + len as u32 {
+                let phys = r.physical + (n - r.logical) as u64;
+                return Ok(phys as u32);
+            }
+        }
+
+        // Need a fresh physical block.
+        let new_phys = self.ext.alloc_data_block()? as u64;
+        self.zero_block_on_disk(new_phys as u32)?;
+
+        // Try to extend an existing extent whose tail meets the new block
+        // both logically and physically. Only "initialized" extents are
+        // mutable here — leave any (unexpected) uninitialised extents
+        // alone.
+        let mut merged = false;
+        for r in runs.iter_mut() {
+            if r.len >= MAX_LEN_PER_EXTENT {
+                continue;
+            }
+            let tail_logical = r.logical + r.len as u32;
+            let tail_phys = r.physical + r.len as u64;
+            if tail_logical == n && tail_phys == new_phys {
+                r.len += 1;
+                merged = true;
+                break;
+            }
+        }
+
+        // If not, try to prepend to an extent that starts immediately
+        // after the new block.
+        if !merged {
+            for r in runs.iter_mut() {
+                if r.len >= MAX_LEN_PER_EXTENT {
+                    continue;
+                }
+                if n + 1 == r.logical && new_phys + 1 == r.physical {
+                    r.logical = n;
+                    r.physical = new_phys;
+                    r.len += 1;
+                    merged = true;
+                    break;
+                }
+            }
+        }
+
+        if !merged {
+            if runs.len() >= MAX_EXTENTS_IN_INODE {
+                // Roll back the speculatively-allocated block so the
+                // bitmap stays accurate.
+                self.ext.free_block(new_phys as u32);
+                return Err(crate::Error::Unsupported(format!(
+                    "ext4: file would need more than {} extents (depth-0 inline cap); multi-level trees not yet implemented",
+                    MAX_EXTENTS_IN_INODE
+                )));
+            }
+            runs.push(ExtentRun {
+                logical: n,
+                len: 1,
+                physical: new_phys,
+            });
+            runs.sort_by_key(|r| r.logical);
+        }
+
+        // After a merge two adjacent extents may now meet; coalesce
+        // whenever the tail of [i] meets the head of [i+1].
+        let mut i = 0;
+        while i + 1 < runs.len() {
+            let (a, b) = (runs[i], runs[i + 1]);
+            let a_len = if a.len > MAX_LEN_PER_EXTENT {
+                a.len - MAX_LEN_PER_EXTENT
+            } else {
+                a.len
+            };
+            if a.len < MAX_LEN_PER_EXTENT
+                && a.logical + a_len as u32 == b.logical
+                && a.physical + a_len as u64 == b.physical
+                && a.len.saturating_add(b.len) <= MAX_LEN_PER_EXTENT
+            {
+                runs[i].len += b.len;
+                runs.remove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+
+        self.write_extent_runs(&runs)?;
+        Ok(new_phys as u32)
+    }
+
+    /// Free every block at logical index >= `from` from an inline extent
+    /// tree. Updates the leaf list, freeing trailing extents entirely and
+    /// shrinking the one (if any) that straddles `from`.
+    fn free_blocks_from_extent(&mut self, from: u32) -> Result<()> {
+        let mut runs = self.read_extent_runs()?;
+        let mut kept: Vec<ExtentRun> = Vec::with_capacity(runs.len());
+        for r in runs.drain(..) {
+            let len = if r.len > MAX_LEN_PER_EXTENT {
+                r.len - MAX_LEN_PER_EXTENT
+            } else {
+                r.len
+            };
+            if r.logical >= from {
+                // Entirely beyond the new EOF — free the whole run.
+                for off in 0..len as u32 {
+                    self.ext.free_block((r.physical + off as u64) as u32);
+                }
+            } else if r.logical + len as u32 > from {
+                // Straddles `from`. Keep [logical .. from), free the rest.
+                let new_len = from - r.logical;
+                for off in new_len..len as u32 {
+                    self.ext.free_block((r.physical + off as u64) as u32);
+                }
+                let mut shortened = r;
+                shortened.len = new_len as u16;
+                kept.push(shortened);
+            } else {
+                // Entirely below `from` — keep as is.
+                kept.push(r);
+            }
+        }
+        self.write_extent_runs(&kept)?;
+        Ok(())
+    }
+
     fn staged_inode(&self) -> &super::Inode {
         self.ext
             .inodes
@@ -212,6 +434,9 @@ impl<'a> Ext2FileHandle<'a> {
     /// data blocks are zeroed on disk before being returned so a
     /// partial-block write can RMW safely.
     fn get_or_alloc_block(&mut self, n: u32) -> Result<u32> {
+        if self.is_extent() {
+            return self.get_or_alloc_block_extent(n);
+        }
         let bs = self.ext.layout.block_size;
         let ptrs = bs / 4;
 
@@ -327,6 +552,9 @@ impl<'a> Ext2FileHandle<'a> {
     /// double/triple-indirect on the read path so writes that allocated
     /// deep blocks can be read back through the same handle.
     fn read_logical_block(&mut self, n: u32) -> Result<u32> {
+        if self.is_extent() {
+            return self.read_logical_block_extent(n);
+        }
         let bs = self.ext.layout.block_size;
         let ptrs = bs / 4;
         let inode = *self.staged_inode();
@@ -384,6 +612,9 @@ impl<'a> Ext2FileHandle<'a> {
     /// or freeing indirect blocks that no longer have any populated
     /// entries.
     fn free_blocks_from(&mut self, from: u32) -> Result<()> {
+        if self.is_extent() {
+            return self.free_blocks_from_extent(from);
+        }
         let bs = self.ext.layout.block_size;
         let ptrs = bs / 4;
         let inode = *self.staged_inode();
@@ -776,7 +1007,8 @@ impl<'a> Drop for Ext2FileHandle<'a> {
 /// `INCOMPAT_RECOVER`). Returns [`crate::Error::Unsupported`] if:
 /// - the image is a journal device (`INCOMPAT_JOURNAL_DEV`)
 /// - the image has a journal that still has unreplayed work, or
-/// - the inode itself uses the ext4 extent tree (`EXT4_EXTENTS_FL`).
+/// - the inode's extent tree has `depth > 0` (multi-level trees are not
+///   yet implemented; depth-0 inline trees are supported).
 pub(crate) fn open_file_rw_ext<'a>(
     ext: &'a mut Ext,
     dev: &'a mut dyn BlockDevice,
@@ -813,9 +1045,19 @@ pub(crate) fn open_file_rw_ext<'a>(
                 )));
             }
             if inode.flags & EXT4_EXTENTS_FL != 0 {
-                return Err(crate::Error::Unsupported(
-                    "ext: inode uses ext4 extents — partial writes through the indirect-block path don't apply".into(),
-                ));
+                // Extent inodes are accepted as long as the tree is the
+                // depth-0 inline variant (up to 4 leaves stored in
+                // i_block). Multi-level extent trees still require
+                // index-block allocation, which the writer doesn't do
+                // yet — reject those cleanly up front.
+                let bytes = extent::iblock_to_bytes(&inode.block);
+                let (header, _) = extent::decode_depth0_iblock(&bytes)?;
+                if header.depth != 0 {
+                    return Err(crate::Error::Unsupported(format!(
+                        "ext4: extent tree depth {} not yet supported by open_file_rw (depth-0 only)",
+                        header.depth
+                    )));
+                }
             }
             ino
         }

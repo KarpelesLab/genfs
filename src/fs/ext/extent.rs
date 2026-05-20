@@ -129,6 +129,92 @@ pub fn pack_into_iblock(runs: &[ExtentRun]) -> crate::Result<[u8; 60]> {
     Ok(out)
 }
 
+/// Convert the 15 `u32` slots of an inode's `i_block` array into the
+/// 60-byte view used by extent-tree encoders / decoders.
+pub fn iblock_to_bytes(slots: &[u32; super::constants::N_BLOCKS]) -> [u8; 60] {
+    let mut out = [0u8; 60];
+    for (i, slot) in slots.iter().enumerate() {
+        let off = i * 4;
+        out[off..off + 4].copy_from_slice(&slot.to_le_bytes());
+    }
+    out
+}
+
+/// Inverse of [`iblock_to_bytes`]. Repacks a 60-byte extent-tree view
+/// back into the 15-slot `i_block` array.
+pub fn bytes_to_iblock(bytes: &[u8; 60]) -> [u32; super::constants::N_BLOCKS] {
+    let mut out = [0u32; super::constants::N_BLOCKS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let off = i * 4;
+        *slot = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+    }
+    out
+}
+
+/// Decoded extent-tree header.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtentHeader {
+    pub entries: u16,
+    pub max: u16,
+    pub depth: u16,
+}
+
+/// Decode the 12-byte header at the start of an extent block / `i_block`.
+/// Returns `Err` if the magic doesn't match.
+pub fn decode_header(buf: &[u8]) -> crate::Result<ExtentHeader> {
+    if buf.len() < 12 {
+        return Err(crate::Error::InvalidImage(
+            "ext4: extent header buffer too small".into(),
+        ));
+    }
+    let magic = u16::from_le_bytes(buf[0..2].try_into().unwrap());
+    if magic != EXT4_EXT_MAGIC {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext4: extent header magic {magic:#06x} != {:#06x}",
+            EXT4_EXT_MAGIC
+        )));
+    }
+    Ok(ExtentHeader {
+        entries: u16::from_le_bytes(buf[2..4].try_into().unwrap()),
+        max: u16::from_le_bytes(buf[4..6].try_into().unwrap()),
+        depth: u16::from_le_bytes(buf[6..8].try_into().unwrap()),
+    })
+}
+
+/// Decode one 12-byte leaf-extent record at `buf`.
+pub fn decode_leaf(buf: &[u8]) -> ExtentRun {
+    let ee_block = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let ee_len = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+    let ee_start_hi = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as u64;
+    let ee_start_lo = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as u64;
+    ExtentRun {
+        logical: ee_block,
+        len: ee_len,
+        physical: (ee_start_hi << 32) | ee_start_lo,
+    }
+}
+
+/// Decode a depth-0 extent tree from a 60-byte `i_block` view. Returns
+/// `(header, runs)`. Caller must verify `header.depth == 0` before
+/// treating `runs` as leaf entries.
+pub fn decode_depth0_iblock(buf: &[u8; 60]) -> crate::Result<(ExtentHeader, Vec<ExtentRun>)> {
+    let header = decode_header(&buf[..12])?;
+    if header.entries as usize > MAX_EXTENTS_IN_INODE {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext4: inline extent header claims {} entries, max is {}",
+            header.entries, MAX_EXTENTS_IN_INODE
+        )));
+    }
+    let mut runs = Vec::with_capacity(header.entries as usize);
+    if header.depth == 0 {
+        for i in 0..header.entries as usize {
+            let off = 12 + i * 12;
+            runs.push(decode_leaf(&buf[off..off + 12]));
+        }
+    }
+    Ok((header, runs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

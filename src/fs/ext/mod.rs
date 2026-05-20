@@ -2164,7 +2164,7 @@ impl crate::fs::Filesystem for Ext {
         flags: crate::fs::OpenFlags,
         meta: Option<FileMeta>,
     ) -> Result<Box<dyn crate::fs::FileHandle + 'a>> {
-        rw::open_file_rw_ext2(self, dev, path, flags, meta)
+        rw::open_file_rw_ext(self, dev, path, flags, meta)
     }
 
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
@@ -2984,10 +2984,11 @@ mod tests {
         assert_eq!(got, b"short");
     }
 
-    #[test]
-    fn open_file_rw_refused_on_ext3() {
-        // ext3 image carries COMPAT_HAS_JOURNAL → open_file_rw must
-        // refuse with Unsupported before touching any data block.
+    /// Build a fresh ext3 image (1 KiB blocks, indirect-tree files) with a
+    /// 1024-block clean JBD2 journal, write one regular file via the
+    /// populate API, flush, and return the live `Ext` + backing device.
+    /// Used by the clean-journal round-trip + dirty-journal refusal tests.
+    fn ext3_with_file(name: &[u8], payload: &[u8]) -> (Ext, MemoryBackend) {
         let mut dev = MemoryBackend::new(8 * 1024 * 1024);
         let opts = FormatOpts {
             kind: FsKind::Ext3,
@@ -2999,36 +3000,167 @@ mod tests {
             ..FormatOpts::default()
         };
         let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext3");
+        if !payload.is_empty() {
+            ext.add_file_to_streaming(
+                &mut dev,
+                constants::INO_ROOT_DIR,
+                name,
+                &mut std::io::Cursor::new(payload.to_vec()),
+                payload.len() as u64,
+                FileMeta::default(),
+            )
+            .expect("add file");
+        }
+        ext.flush(&mut dev).expect("flush");
+        (ext, dev)
+    }
+
+    #[test]
+    fn open_file_rw_round_trip_ext3_clean_journal() {
+        // ext3 has a JBD2 journal; freshly-formatted images have
+        // s_start = 0 (clean). open_file_rw must accept the image,
+        // perform the partial write in place, and on sync produce a
+        // filesystem that round-trips through a fresh `Ext::open`.
+        let payload = vec![b'a'; 4096];
+        let (mut ext, mut dev) = ext3_with_file(b"hello.bin", &payload);
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/hello.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open_file_rw on clean-journal ext3");
+            assert_eq!(h.len(), 4096);
+            h.seek(SeekFrom::Start(1000)).unwrap();
+            h.write_all(b"ZZZZ").unwrap();
+            h.sync().unwrap();
+        }
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let got = read_full_via_handle(&mut reopened, &mut dev, "/hello.bin");
+        let mut expect = payload.clone();
+        expect[1000..1004].copy_from_slice(b"ZZZZ");
+        assert_eq!(got, expect);
+    }
+
+    /// Format an ext3 image, run `e2fsck -fn` on it after an in-place
+    /// partial-write through `open_file_rw`. Skipped silently when
+    /// e2fsck isn't installed.
+    #[test]
+    fn open_file_rw_ext3_clean_journal_passes_e2fsck() {
+        use std::process::Command;
+        let e2fsck = match Command::new("sh")
+            .arg("-c")
+            .arg("command -v e2fsck")
+            .output()
+        {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+                String::from_utf8(o.stdout).unwrap().trim().to_string()
+            }
+            _ => {
+                eprintln!("skipping open_file_rw_ext3_clean_journal_passes_e2fsck: e2fsck not installed");
+                return;
+            }
+        };
+        let opts = FormatOpts {
+            kind: FsKind::Ext3,
+            block_size: 1024,
+            blocks_count: 8192,
+            inodes_count: 256,
+            journal_blocks: 1024,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let size = opts.blocks_count as u64 * opts.block_size as u64;
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let mut dev =
+            crate::block::FileBackend::create(tmp.path(), size).expect("create FileBackend");
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext3");
+        let payload = vec![b'a'; 4096];
         ext.add_file_to_streaming(
             &mut dev,
             constants::INO_ROOT_DIR,
-            b"foo.bin",
-            &mut std::io::Cursor::new(b"hi".to_vec()),
-            2,
+            b"hello.bin",
+            &mut std::io::Cursor::new(payload.clone()),
+            payload.len() as u64,
             FileMeta::default(),
         )
-        .unwrap();
-        ext.flush(&mut dev).unwrap();
+        .expect("add file");
+        ext.flush(&mut dev).expect("flush");
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/hello.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open_file_rw on clean-journal ext3");
+            h.seek(SeekFrom::Start(1000)).unwrap();
+            h.write_all(b"ZZZZ").unwrap();
+            h.sync().unwrap();
+        }
+        BlockDevice::sync(&mut dev).expect("sync");
+        drop(dev);
+
+        let out = Command::new(&e2fsck)
+            .arg("-fn")
+            .arg(tmp.path())
+            .output()
+            .expect("run e2fsck");
+        assert!(
+            out.status.success(),
+            "e2fsck failed on ext3 image after rw:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn open_file_rw_refused_on_ext3_dirty_journal() {
+        // Mark the journal dirty by writing a non-zero s_start (offset 28,
+        // big-endian) into the JBD2 superblock at the first block of the
+        // journal. open_file_rw must then refuse with Unsupported.
+        let payload = b"hi";
+        let (mut ext, mut dev) = ext3_with_file(b"foo.bin", payload);
+
+        // Locate the journal SB block and dirty it.
+        let jino = ext.sb.journal_inum;
+        assert_ne!(jino, 0, "ext3 image should have a journal inode");
+        let jinode = ext.read_inode(&mut dev, jino).expect("journal inode");
+        let blk0 = ext.file_block(&mut dev, &jinode, 0).expect("journal blk 0");
+        let bs = ext.layout.block_size as u64;
+        let abs = blk0 as u64 * bs;
+        let mut buf = vec![0u8; bs as usize];
+        dev.read_at(abs, &mut buf).expect("read jsb");
+        // s_start at offset 28, big-endian.
+        buf[28..32].copy_from_slice(&7u32.to_be_bytes());
+        dev.write_at(abs, &buf).expect("write jsb");
+
         let res = ext.open_file_rw(
             &mut dev,
             std::path::Path::new("/foo.bin"),
             OpenFlags::default(),
             None,
         );
-        let err = match res {
-            Ok(_) => panic!("must refuse on ext3"),
-            Err(e) => e,
-        };
-        match err {
-            crate::Error::Unsupported(msg) => {
-                assert!(msg.contains("JBD2"), "unexpected message: {msg}");
+        match res {
+            Ok(_) => panic!("must refuse on dirty journal"),
+            Err(crate::Error::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("journal is dirty"),
+                    "unexpected message: {msg}"
+                );
             }
-            other => panic!("expected Unsupported, got {other}"),
+            Err(other) => panic!("expected Unsupported, got {other}"),
         }
     }
 
     #[test]
-    fn open_file_rw_refused_on_ext4() {
+    fn open_file_rw_refused_on_ext4_extents() {
+        // ext4 files use the extent tree, which the indirect-block writer
+        // can't handle. Even with a clean journal, open_file_rw must
+        // refuse with Unsupported at the inode-level extents check.
         let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
         let opts = FormatOpts {
             kind: FsKind::Ext4,
@@ -3055,15 +3187,12 @@ mod tests {
             OpenFlags::default(),
             None,
         );
-        let err = match res {
-            Ok(_) => panic!("must refuse on ext4"),
-            Err(e) => e,
-        };
-        match err {
-            crate::Error::Unsupported(msg) => {
-                assert!(msg.contains("JBD2"), "unexpected message: {msg}");
+        match res {
+            Ok(_) => panic!("must refuse on ext4 extents"),
+            Err(crate::Error::Unsupported(msg)) => {
+                assert!(msg.contains("extents"), "unexpected message: {msg}");
             }
-            other => panic!("expected Unsupported, got {other}"),
+            Err(other) => panic!("expected Unsupported, got {other}"),
         }
     }
 }

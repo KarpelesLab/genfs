@@ -1,21 +1,27 @@
-//! In-place read/write file handle for ext2 images.
+//! In-place read/write file handle for ext2/3/4 images (clean-journal bypass).
 //!
-//! Backs [`crate::fs::Filesystem::open_file_rw`] when the underlying ext
-//! image is ext2 (no journal, no extents). Writes go straight to the
-//! device for data blocks; metadata updates (inode, bitmaps, group
-//! descriptors, superblock) ride the existing staging vectors and become
-//! durable on [`FileHandle::sync`] / [`Ext::flush`].
+//! Backs [`crate::fs::Filesystem::open_file_rw`] for any ext family image
+//! whose journal (if present) is clean. Writes go straight to the device
+//! for data blocks; metadata updates (inode, bitmaps, group descriptors,
+//! superblock) ride the existing staging vectors and become durable on
+//! [`FileHandle::sync`] / [`Ext::flush`].
 //!
-//! ## Why ext2 only
+//! ## Journal handling (Path B: clean-shutdown bypass)
 //!
-//! ext3 and ext4 carry a JBD2 journal (`COMPAT_HAS_JOURNAL`). Partial
-//! writes that don't update the journal leave the image in a "needs
-//! replay" state that `e2fsck` flags as dirty. Until JBD2 transactions
-//! are wired (a separate PR), [`Ext::open_file_rw`] refuses any image
-//! whose superblock carries `COMPAT_HAS_JOURNAL`, `INCOMPAT_EXTENTS`,
-//! or `INCOMPAT_JOURNAL_DEV`. ext2 has none of those, so eager
-//! data-block writes + metadata staging match the format's "best
-//! effort, fsck on crash" guarantee.
+//! ext3 and ext4 carry a JBD2 journal (`COMPAT_HAS_JOURNAL`). The proper
+//! way to mutate metadata is to wrap the change in a journal transaction
+//! (descriptor + data + commit block, `s_sequence` bump). genfs doesn't
+//! emit transactions yet. Instead we observe that a freshly-formatted
+//! image's journal is **clean** (`s_start == 0`, no `INCOMPAT_RECOVER`):
+//! there's nothing to replay, so an in-place metadata mutation that
+//! leaves the journal untouched yields the same visible state as if a
+//! no-op transaction had committed and been checkpointed. The reader
+//! verifies that precondition before opening the handle; if the journal
+//! is dirty (the image was previously interrupted) we refuse with
+//! [`crate::Error::Unsupported`].
+//!
+//! Inodes that use the ext4 extent tree (`EXT4_EXTENTS_FL`) are still
+//! refused: the indirect-block writer here doesn't understand extents.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -28,7 +34,8 @@ use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::FileHandle;
 
-/// Read/write file handle on an ext2 image. Implements [`FileHandle`] via
+/// Read/write file handle on an ext family image. Drives the
+/// indirect-block tree (no extents). Implements [`FileHandle`] via
 /// [`Read`] + [`Write`] + [`Seek`].
 pub struct Ext2FileHandle<'a> {
     ext: &'a mut Ext,
@@ -764,28 +771,31 @@ impl<'a> Drop for Ext2FileHandle<'a> {
     }
 }
 
-/// Open an ext2 regular file for read/write at `path`. Returns
-/// [`crate::Error::Unsupported`] if the underlying image is ext3 or ext4
-/// (any of `COMPAT_HAS_JOURNAL`, `INCOMPAT_EXTENTS`, `INCOMPAT_JOURNAL_DEV`
-/// set, or the inode itself has `EXT4_EXTENTS_FL`).
-pub(crate) fn open_file_rw_ext2<'a>(
+/// Open a regular file for read/write at `path`. Accepts ext2/3/4 images
+/// provided any JBD2 journal is clean (`s_start == 0`, no
+/// `INCOMPAT_RECOVER`). Returns [`crate::Error::Unsupported`] if:
+/// - the image is a journal device (`INCOMPAT_JOURNAL_DEV`)
+/// - the image has a journal that still has unreplayed work, or
+/// - the inode itself uses the ext4 extent tree (`EXT4_EXTENTS_FL`).
+pub(crate) fn open_file_rw_ext<'a>(
     ext: &'a mut Ext,
     dev: &'a mut dyn BlockDevice,
     path: &std::path::Path,
     flags: crate::fs::OpenFlags,
     meta: Option<crate::fs::FileMeta>,
 ) -> Result<Box<dyn FileHandle + 'a>> {
-    // Reject ext3/ext4 images at the superblock-feature level.
-    let fc = ext.sb.feature_compat;
     let fi = ext.sb.feature_incompat;
-    if fc & constants::feature::COMPAT_HAS_JOURNAL != 0
-        || fi & constants::feature::INCOMPAT_EXTENTS != 0
-        || fi & constants::feature::INCOMPAT_JOURNAL_DEV != 0
-    {
+    if fi & constants::feature::INCOMPAT_JOURNAL_DEV != 0 {
         return Err(crate::Error::Unsupported(
-            "ext: in-place partial writes require JBD2 — pending; this image has a journal"
-                .into(),
+            "ext: image is an external journal device — partial writes not applicable".into(),
         ));
+    }
+    // If the image has a journal, only proceed when it's clean. genfs
+    // doesn't emit JBD2 transactions yet, so a dirty journal would be
+    // mishandled (we'd leave unreplayed work in place while mutating
+    // the FS in-place).
+    if ext.sb.feature_compat & constants::feature::COMPAT_HAS_JOURNAL != 0 {
+        ensure_journal_clean(ext, dev)?;
     }
 
     let path_str = path.to_str().ok_or_else(|| {
@@ -851,4 +861,73 @@ fn read_u32_le(buf: &[u8], off: usize) -> u32 {
 #[inline]
 fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+/// JBD2 v2 superblock magic at offset 0 of the journal's first block.
+const JBD2_MAGIC: u32 = 0xC03B_3998;
+/// JBD2 block-type for a superblock v1 record.
+const JBD2_BLOCKTYPE_SB_V1: u32 = 3;
+/// JBD2 block-type for a superblock v2 record.
+const JBD2_BLOCKTYPE_SB_V2: u32 = 4;
+
+/// Verify the on-disk JBD2 journal is in a clean state — no committed
+/// work needs replay. The kernel marks a journal clean by writing
+/// `s_start = 0` into its superblock at unmount time. While the image
+/// still has work to replay, `s_start` points at the head of the
+/// in-progress transaction list and the FS superblock carries
+/// `INCOMPAT_RECOVER`.
+///
+/// We require:
+/// - FS superblock: `INCOMPAT_RECOVER` is clear.
+/// - Journal SB at journal block 0: JBD2 magic, blocktype is v1 or v2,
+///   `s_start == 0`.
+fn ensure_journal_clean(ext: &Ext, dev: &mut dyn BlockDevice) -> Result<()> {
+    if ext.sb.feature_incompat & constants::feature::INCOMPAT_RECOVER != 0 {
+        return Err(crate::Error::Unsupported(
+            "ext: journal needs recovery (INCOMPAT_RECOVER set) — refusing in-place writes"
+                .into(),
+        ));
+    }
+    let jino = ext.sb.journal_inum;
+    if jino == 0 {
+        return Err(crate::Error::InvalidImage(
+            "ext: COMPAT_HAS_JOURNAL set but s_journal_inum is 0".into(),
+        ));
+    }
+    let inode = ext.read_inode(dev, jino)?;
+    let blk0 = ext.file_block(dev, &inode, 0)?;
+    if blk0 == 0 {
+        return Err(crate::Error::InvalidImage(
+            "ext: journal inode has no block 0".into(),
+        ));
+    }
+    let bs = ext.layout.block_size as usize;
+    let mut buf = vec![0u8; bs];
+    // Read straight from the device (not the staged-block cache): we
+    // want the on-disk journal state, which is what a future mount /
+    // e2fsck will see. Staged copies haven't been replayed onto the FS
+    // yet anyway.
+    dev.read_at(blk0 as u64 * bs as u64, &mut buf)?;
+    // JBD2 on-disk fields are big-endian.
+    let magic = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+    if magic != JBD2_MAGIC {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext: bad JBD2 magic {magic:#010x} on journal block 0"
+        )));
+    }
+    let blocktype = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+    if blocktype != JBD2_BLOCKTYPE_SB_V1 && blocktype != JBD2_BLOCKTYPE_SB_V2 {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext: journal block 0 has blocktype {blocktype} (expected v1=3 or v2=4 SB)"
+        )));
+    }
+    // s_start lives at offset 28 of the JBD2 superblock (after the 12-byte
+    // journal_header_s + s_blocksize + s_maxlen + s_first).
+    let s_start = u32::from_be_bytes(buf[28..32].try_into().unwrap());
+    if s_start != 0 {
+        return Err(crate::Error::Unsupported(format!(
+            "ext: journal is dirty (s_start={s_start}) — refusing in-place writes until JBD2 replay is implemented"
+        )));
+    }
+    Ok(())
 }

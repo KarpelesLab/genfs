@@ -1997,6 +1997,31 @@ impl<'a> Read for FileReader<'a> {
     }
 }
 
+impl<'a> std::io::Seek for FileReader<'a> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let total = self.inode.size as i128;
+        let new = match pos {
+            std::io::SeekFrom::Start(n) => n as i128,
+            std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
+            std::io::SeekFrom::End(d) => total + d as i128,
+        };
+        if new < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ext: seek to negative offset",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+impl<'a> crate::fs::FileReadHandle for FileReader<'a> {
+    fn len(&self) -> u64 {
+        self.inode.size as u64
+    }
+}
+
 /// Build a JBD2 v2 journal superblock for a clean (never-mounted) journal.
 /// Layout per linux/include/linux/jbd2.h; note that JBD2 fields are
 /// **big-endian** on disk, unlike the rest of the ext filesystem.
@@ -2149,6 +2174,19 @@ impl crate::fs::Filesystem for Ext {
         dev: &'a mut dyn BlockDevice,
         path: &std::path::Path,
     ) -> Result<Box<dyn Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        let ino = self.path_to_inode(dev, s)?;
+        let reader = self.open_file_reader(dev, ino)?;
+        Ok(Box::new(reader))
+    }
+
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
@@ -3194,5 +3232,55 @@ mod tests {
             }
             Err(other) => panic!("expected Unsupported, got {other}"),
         }
+    }
+
+    #[test]
+    fn open_file_ro_random_seek_ext() {
+        // open_file_ro must work for both ext2 (indirect blocks) and ext4
+        // (extents); the file_block walker handles both formats. Test on
+        // ext4 to lock in the case open_file_rw can't satisfy.
+        use crate::fs::Filesystem;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 4096,
+            blocks_count: 16 * 1024,
+            inodes_count: 1024,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
+        // Multi-block file to exercise the extent walker.
+        let data: Vec<u8> = (0..15_000u32).map(|i| (i & 0xFF) as u8).collect();
+        ext.add_file_to_streaming(
+            &mut dev,
+            constants::INO_ROOT_DIR,
+            b"ro.bin",
+            &mut std::io::Cursor::new(data.clone()),
+            data.len() as u64,
+            FileMeta::default(),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+
+        // Reopen and exercise the read-only path through the trait.
+        let mut ext = Ext::open(&mut dev).expect("reopen ext4");
+        let mut h = ext
+            .open_file_ro(&mut dev, std::path::Path::new("/ro.bin"))
+            .expect("open_file_ro on ext4 extent file");
+        assert_eq!(h.len(), data.len() as u64);
+        assert!(!h.is_empty());
+
+        h.seek(SeekFrom::Start(9876)).unwrap();
+        let mut buf = [0u8; 200];
+        h.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], &data[9876..10076]);
+
+        h.seek(SeekFrom::Start(42)).unwrap();
+        let mut buf2 = [0u8; 64];
+        h.read_exact(&mut buf2).unwrap();
+        assert_eq!(&buf2[..], &data[42..106]);
     }
 }

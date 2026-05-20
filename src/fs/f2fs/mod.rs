@@ -359,6 +359,18 @@ impl F2fs {
         dev: &'a mut dyn BlockDevice,
         path: &str,
     ) -> Result<Box<dyn Read + 'a>> {
+        let r = self.open_file_seekable(dev, path)?;
+        Ok(Box::new(r))
+    }
+
+    /// Like [`Self::open_file_reader`] but returns the concrete
+    /// [`FileReader`] type so callers can `Seek` on it. Backs
+    /// [`crate::fs::Filesystem::open_file_ro`].
+    pub fn open_file_seekable<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<FileReader<'a>> {
         let ino = self.resolve_path(dev, path)?;
         let (inode_block, inode) = self.read_inode(dev, ino)?;
         if inode.mode & S_IFMT != S_IFREG {
@@ -366,11 +378,8 @@ impl F2fs {
                 "f2fs: '{path}' is not a regular file"
             )));
         }
-        // FileReader::new re-decodes the inode from the block so it
-        // also caches the raw block (for inline-data payload).
         let _ = inode;
-        let reader = FileReader::new(dev, self.sb.clone(), self.cp.clone(), inode_block)?;
-        Ok(Box::new(reader))
+        FileReader::new(dev, self.sb.clone(), self.cp.clone(), inode_block)
     }
 }
 
@@ -453,6 +462,18 @@ impl crate::fs::Filesystem for F2fs {
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("f2fs: non-UTF-8 path".into()))?;
         self.open_file_reader(dev, s)
+    }
+
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("f2fs: non-UTF-8 path".into()))?;
+        let r = self.open_file_seekable(dev, s)?;
+        Ok(Box::new(r))
     }
 
     fn open_file_rw<'a>(
@@ -1644,5 +1665,53 @@ mod tests {
         for i in 0..n {
             assert!(names.contains(&format!("file_with_name_{i:03}")));
         }
+    }
+
+    #[test]
+    fn open_file_ro_random_seek_f2fs() {
+        use crate::fs::Filesystem;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut dev = MemoryBackend::new(2 * 1024 * 1024);
+        let opts = super::FormatOpts {
+            log_blocks_per_seg: 2,
+            ..super::FormatOpts::default()
+        };
+        let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+        // Multi-block file so the read driver walks the pointer tree.
+        let data: Vec<u8> = (0..(F2FS_BLKSIZE * 2 + 137))
+            .map(|i| (i as u8).wrapping_mul(7))
+            .collect();
+        fs.create_file(
+            &mut dev,
+            std::path::Path::new("/ro.bin"),
+            crate::fs::FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(data.clone())),
+                len: data.len() as u64,
+            },
+            crate::fs::FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        // Re-open the on-disk image (no live writer) and exercise the
+        // read-only path.
+        let mut fs2 = F2fs::open(&mut dev).unwrap();
+        let mut h = fs2
+            .open_file_ro(&mut dev, std::path::Path::new("/ro.bin"))
+            .expect("open_file_ro");
+        assert_eq!(h.len(), data.len() as u64);
+        assert!(!h.is_empty());
+
+        let off = F2FS_BLKSIZE as u64 + 257;
+        h.seek(SeekFrom::Start(off)).unwrap();
+        let mut buf = [0u8; 64];
+        h.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], &data[off as usize..off as usize + 64]);
+
+        h.seek(SeekFrom::Start(11)).unwrap();
+        let mut buf2 = [0u8; 32];
+        h.read_exact(&mut buf2).unwrap();
+        assert_eq!(&buf2[..], &data[11..43]);
     }
 }

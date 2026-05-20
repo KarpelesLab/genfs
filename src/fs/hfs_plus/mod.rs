@@ -850,6 +850,33 @@ impl<'a> Read for HfsPlusFileReader<'a> {
     }
 }
 
+impl<'a> std::io::Seek for HfsPlusFileReader<'a> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let total = self.fork.logical_size as i128;
+        let new = match pos {
+            std::io::SeekFrom::Start(n) => n as i128,
+            std::io::SeekFrom::Current(d) => self.position as i128 + d as i128,
+            std::io::SeekFrom::End(d) => total + d as i128,
+        };
+        if new < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hfs+: seek to negative offset",
+            ));
+        }
+        self.position = new as u64;
+        // Recompute remaining relative to the new cursor.
+        self.remaining = self.fork.logical_size.saturating_sub(self.position);
+        Ok(self.position)
+    }
+}
+
+impl<'a> crate::fs::FileReadHandle for HfsPlusFileReader<'a> {
+    fn len(&self) -> u64 {
+        self.fork.logical_size
+    }
+}
+
 /// Probe for the HFS+ volume-header signature `"H+"` (or `"HX"` for HFSX)
 /// at offset 1024 of the volume.
 pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
@@ -1025,6 +1052,18 @@ impl crate::fs::Filesystem for HfsPlus {
         dev: &'a mut dyn BlockDevice,
         path: &std::path::Path,
     ) -> Result<Box<dyn std::io::Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
@@ -1561,5 +1600,47 @@ mod tests {
             Err(other) => panic!("expected Error::Unsupported, got: {other}"),
             Ok(_) => panic!("expected open_file_rw to refuse on a dirty journal"),
         }
+    }
+
+    #[test]
+    fn open_file_ro_random_seek_hfs_plus() {
+        use crate::fs::Filesystem;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+        let data: Vec<u8> = (0..6000u32).map(|i| (i & 0xFF) as u8).collect();
+        {
+            let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+            let mut src = std::io::Cursor::new(&data);
+            hfs.create_file(
+                &mut dev,
+                "/ro.bin",
+                &mut src,
+                data.len() as u64,
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+            hfs.flush(&mut dev).unwrap();
+        }
+
+        let mut hfs = HfsPlus::open(&mut dev).unwrap();
+        let mut h = hfs
+            .open_file_ro(&mut dev, std::path::Path::new("/ro.bin"))
+            .expect("open_file_ro");
+        assert_eq!(h.len(), data.len() as u64);
+        assert!(!h.is_empty());
+
+        h.seek(SeekFrom::Start(3333)).unwrap();
+        let mut buf = [0u8; 96];
+        h.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], &data[3333..3429]);
+
+        h.seek(SeekFrom::Start(40)).unwrap();
+        let mut buf2 = [0u8; 64];
+        h.read_exact(&mut buf2).unwrap();
+        assert_eq!(&buf2[..], &data[40..104]);
     }
 }

@@ -719,6 +719,127 @@ impl Ntfs {
         }))
     }
 
+    /// Open the default unnamed $DATA stream of `path` as a seekable
+    /// reader. Backs [`crate::fs::Filesystem::open_file_ro`]. The
+    /// returned reader is one of resident / non-resident / compressed
+    /// depending on how the stream is stored; all three implement
+    /// `Read + Seek + FileReadHandle`.
+    pub fn open_file_seekable<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<NtfsSeekableReader<'a>> {
+        let rec_no = self.lookup_path(dev, path)?;
+        let records = self.load_record_set(dev, rec_no)?;
+        let hdr = mft::RecordHeader::parse(&records[0].1)?;
+        if !hdr.is_in_use() {
+            return Err(crate::Error::InvalidImage(format!(
+                "ntfs: record {rec_no} is not in use"
+            )));
+        }
+        if hdr.is_directory() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ntfs: {path:?} is a directory"
+            )));
+        }
+
+        let stream_name = "";
+        let mut resident_bytes: Option<Vec<u8>> = None;
+        type Segment = (u64, u64, u64, u64, u64, u8, Vec<Extent>);
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut is_encrypted = false;
+        let mut is_compressed = false;
+        for (_rec, rec_buf) in &records {
+            let h = mft::RecordHeader::parse(rec_buf)?;
+            for attr_res in AttributeIter::new(rec_buf, h.first_attribute_offset as usize) {
+                let attr = attr_res?;
+                if attr.type_code != TYPE_DATA {
+                    continue;
+                }
+                if attr.name != stream_name {
+                    continue;
+                }
+                if attr.flags & ATTR_FLAG_ENCRYPTED != 0 {
+                    is_encrypted = true;
+                }
+                if attr.flags & ATTR_FLAG_COMPRESSED != 0 {
+                    is_compressed = true;
+                }
+                match attr.kind {
+                    AttributeKind::Resident { value, .. } => {
+                        resident_bytes = Some(value.to_vec());
+                    }
+                    AttributeKind::NonResident {
+                        starting_vcn,
+                        last_vcn,
+                        allocated_size,
+                        real_size,
+                        initialized_size,
+                        compression_unit,
+                        runs,
+                    } => {
+                        segments.push((
+                            starting_vcn,
+                            last_vcn,
+                            allocated_size,
+                            real_size,
+                            initialized_size,
+                            compression_unit,
+                            runs,
+                        ));
+                    }
+                }
+            }
+        }
+        if is_encrypted {
+            return Err(crate::Error::Unsupported(
+                "ntfs: encrypted $DATA (EFS) is not supported".into(),
+            ));
+        }
+        if let Some(bytes) = resident_bytes {
+            return Ok(NtfsSeekableReader::Resident(ResidentReader {
+                bytes,
+                pos: 0,
+            }));
+        }
+        if segments.is_empty() {
+            return Err(crate::Error::InvalidImage(format!(
+                "ntfs: stream {stream_name:?} not found on record {rec_no}"
+            )));
+        }
+        segments.sort_by_key(|s| s.0);
+        let real_size = segments[0].3;
+        let initialized_size = segments[0].4;
+        let compression_unit = segments[0].5;
+        let mut runs: Vec<Extent> = Vec::new();
+        for seg in &segments {
+            runs.extend(seg.6.iter().copied());
+        }
+        let cluster_size = self.boot.cluster_size() as u64;
+        if is_compressed && compression_unit > 0 {
+            let cu_clusters = 1u64 << compression_unit;
+            return Ok(NtfsSeekableReader::Compressed(CompressedReader::new(
+                dev,
+                cluster_size,
+                cu_clusters,
+                runs,
+                real_size,
+                initialized_size,
+            )));
+        }
+        Ok(NtfsSeekableReader::NonResident(NonResidentReader {
+            dev,
+            cluster_size,
+            runs,
+            real_size,
+            initialized_size,
+            pos: 0,
+            cluster_buf: vec![0u8; cluster_size as usize],
+            cached_vcn: u64::MAX,
+            cached_cluster_filled: false,
+        }))
+    }
+
     /// Collect cross-FS xattr metadata for `path` using the
     /// `xattr_keys` mapping. Note: streams (ADS) bigger than memory
     /// would be a problem; we cap them at 1 MiB and surface
@@ -1053,7 +1174,7 @@ impl Ntfs {
 
 /// Streaming reader over a resident $DATA value (whole payload already in
 /// the MFT record).
-struct ResidentReader {
+pub struct ResidentReader {
     bytes: Vec<u8>,
     pos: usize,
 }
@@ -1067,11 +1188,30 @@ impl Read for ResidentReader {
     }
 }
 
+impl std::io::Seek for ResidentReader {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let total = self.bytes.len() as i128;
+        let new = match pos {
+            std::io::SeekFrom::Start(n) => n as i128,
+            std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
+            std::io::SeekFrom::End(d) => total + d as i128,
+        };
+        if new < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ntfs: seek to negative offset",
+            ));
+        }
+        self.pos = new as usize;
+        Ok(self.pos as u64)
+    }
+}
+
 /// Streaming reader over a non-resident $DATA stream. Reads at most one
 /// cluster from disk at a time into `cluster_buf`. Bytes past
 /// `initialized_size` (but before `real_size`) read as zero — that's the
 /// NTFS "valid data length" semantics.
-struct NonResidentReader<'a> {
+pub struct NonResidentReader<'a> {
     dev: &'a mut dyn BlockDevice,
     cluster_size: u64,
     runs: Vec<Extent>,
@@ -1099,6 +1239,25 @@ impl<'a> NonResidentReader<'a> {
             std::io::ErrorKind::UnexpectedEof,
             format!("ntfs: VCN {vcn} past end of run list"),
         ))
+    }
+}
+
+impl<'a> std::io::Seek for NonResidentReader<'a> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let total = self.real_size as i128;
+        let new = match pos {
+            std::io::SeekFrom::Start(n) => n as i128,
+            std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
+            std::io::SeekFrom::End(d) => total + d as i128,
+        };
+        if new < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ntfs: seek to negative offset",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
     }
 }
 
@@ -1161,7 +1320,7 @@ impl<'a> Read for NonResidentReader<'a> {
 ///
 /// The reader keeps one decoded compression unit cached so reads inside
 /// the same unit are zero-cost after the initial fetch.
-struct CompressedReader<'a> {
+pub struct CompressedReader<'a> {
     dev: &'a mut dyn BlockDevice,
     cluster_size: u64,
     cu_clusters: u64,
@@ -1285,6 +1444,25 @@ impl<'a> CompressedReader<'a> {
     }
 }
 
+impl<'a> std::io::Seek for CompressedReader<'a> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let total = self.real_size as i128;
+        let new = match pos {
+            std::io::SeekFrom::Start(n) => n as i128,
+            std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
+            std::io::SeekFrom::End(d) => total + d as i128,
+        };
+        if new < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ntfs: seek to negative offset",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
 impl<'a> Read for CompressedReader<'a> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if self.pos >= self.real_size {
@@ -1308,6 +1486,46 @@ impl<'a> Read for CompressedReader<'a> {
         }
         self.pos += n as u64;
         Ok(n)
+    }
+}
+
+/// Seekable wrapper over NTFS's three flavours of $DATA reader.
+/// Returned by [`Ntfs::open_file_seekable`] and used to back
+/// [`crate::fs::Filesystem::open_file_ro`]. Implements
+/// `Read + Seek + FileReadHandle`, dispatching to the variant.
+pub enum NtfsSeekableReader<'a> {
+    Resident(ResidentReader),
+    NonResident(NonResidentReader<'a>),
+    Compressed(CompressedReader<'a>),
+}
+
+impl<'a> Read for NtfsSeekableReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Resident(r) => r.read(buf),
+            Self::NonResident(r) => r.read(buf),
+            Self::Compressed(r) => r.read(buf),
+        }
+    }
+}
+
+impl<'a> std::io::Seek for NtfsSeekableReader<'a> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::Resident(r) => r.seek(pos),
+            Self::NonResident(r) => r.seek(pos),
+            Self::Compressed(r) => r.seek(pos),
+        }
+    }
+}
+
+impl<'a> crate::fs::FileReadHandle for NtfsSeekableReader<'a> {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Resident(r) => r.bytes.len() as u64,
+            Self::NonResident(r) => r.real_size,
+            Self::Compressed(r) => r.real_size,
+        }
     }
 }
 
@@ -1437,6 +1655,18 @@ impl crate::fs::Filesystem for Ntfs {
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("ntfs: non-UTF-8 path".into()))?;
         let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ntfs: non-UTF-8 path".into()))?;
+        let r = self.open_file_seekable(dev, s)?;
         Ok(Box::new(r))
     }
 

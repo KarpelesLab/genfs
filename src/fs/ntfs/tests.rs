@@ -1317,3 +1317,42 @@ fn writer_root_index_keeps_system_files_after_user_files_added() {
         assert!(names.contains(&want), "user file {want:?} missing");
     }
 }
+
+#[test]
+fn open_file_ro_random_seek_ntfs() {
+    use crate::fs::Filesystem;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    // Large enough that the $DATA goes non-resident (one cluster is 4 KiB).
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i & 0xFF) as u8).collect();
+    ntfs.create_file(
+        &mut dev,
+        "/ro.bin",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(data.clone())),
+            len: data.len() as u64,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    // Reopen — the read-only path doesn't need writer state.
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let mut h = ntfs2
+        .open_file_ro(&mut dev, std::path::Path::new("/ro.bin"))
+        .expect("open_file_ro");
+    assert_eq!(h.len(), data.len() as u64);
+    assert!(!h.is_empty());
+
+    h.seek(SeekFrom::Start(9000)).unwrap();
+    let mut buf = [0u8; 256];
+    h.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf[..], &data[9000..9256]);
+
+    h.seek(SeekFrom::Start(50)).unwrap();
+    let mut buf2 = [0u8; 100];
+    h.read_exact(&mut buf2).unwrap();
+    assert_eq!(&buf2[..], &data[50..150]);
+}

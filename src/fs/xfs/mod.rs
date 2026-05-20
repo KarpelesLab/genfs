@@ -589,6 +589,31 @@ impl<'a> std::io::Read for XfsFileReader<'a> {
     }
 }
 
+impl<'a> std::io::Seek for XfsFileReader<'a> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let total = self.size as i128;
+        let new = match pos {
+            std::io::SeekFrom::Start(n) => n as i128,
+            std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
+            std::io::SeekFrom::End(d) => total + d as i128,
+        };
+        if new < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "xfs: seek to negative offset",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+impl<'a> crate::fs::FileReadHandle for XfsFileReader<'a> {
+    fn len(&self) -> u64 {
+        self.size
+    }
+}
+
 /// Probe for the XFS superblock magic `"XFSB"` at offset 0 of LBA 0.
 pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
     if dev.total_size() < 512 {
@@ -724,6 +749,18 @@ impl crate::fs::Filesystem for Xfs {
 
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         self.flush_writes(dev)
+    }
+
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
     }
 
     fn open_file_rw<'a>(

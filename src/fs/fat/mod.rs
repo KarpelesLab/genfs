@@ -932,6 +932,36 @@ impl crate::fs::Filesystem for Fat32 {
         Ok(Box::new(r))
     }
 
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        let (parent_cluster, leaf) = self.resolve_parent(dev, s)?;
+        let found = self
+            .find_entry(dev, parent_cluster, &leaf)?
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("fat32: {s:?} not found"))
+            })?;
+        if found.entry.attr & dir::ATTR_DIRECTORY != 0 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fat32: {s:?} is a directory, not a file"
+            )));
+        }
+        let mutate::FoundEntry {
+            chain: dir_chain,
+            entry_pos,
+            entry,
+            ..
+        } = found;
+        let inner =
+            handle::FatFileHandle::open_existing(self, dev, dir_chain, entry_pos, entry)?;
+        Ok(Box::new(handle::ReadOnlyFatHandle::new(inner)))
+    }
+
     fn open_file_rw<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,
@@ -1281,5 +1311,42 @@ mod tests {
             Err(crate::Error::InvalidArgument(_)) => {}
             Err(e) => panic!("unexpected error: {e:?}"),
         }
+    }
+
+    #[test]
+    fn open_file_ro_random_seek_fat() {
+        use std::io::Read as _;
+        let (mut dev, mut fs) = fresh_volume();
+        // Write a file spanning a couple clusters with a recognisable pattern.
+        let data: Vec<u8> = (0..16_384u32).map(|i| (i & 0xFF) as u8).collect();
+        fs.create_file(
+            &mut dev,
+            Path::new("ro.bin"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(data.clone())),
+                len: data.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut h = fs
+            .open_file_ro(&mut dev, Path::new("ro.bin"))
+            .expect("open_file_ro");
+        assert_eq!(h.len(), data.len() as u64);
+        assert!(!h.is_empty());
+
+        // Read at offset 9000 — a non-zero, non-cluster-aligned position.
+        h.seek(SeekFrom::Start(9000)).unwrap();
+        let mut buf = [0u8; 64];
+        h.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], &data[9000..9064]);
+
+        // Seek back to a different offset and re-read.
+        h.seek(SeekFrom::Start(123)).unwrap();
+        let mut buf2 = [0u8; 32];
+        h.read_exact(&mut buf2).unwrap();
+        assert_eq!(&buf2[..], &data[123..155]);
     }
 }

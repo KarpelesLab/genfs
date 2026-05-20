@@ -9,7 +9,7 @@
 //! Streaming invariant: at most one 4 KiB block plus one node block plus
 //! one indirect node block resident at any time (under 16 KiB heap).
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 use super::constants::{
     ADDRS_PER_BLOCK, ADDRS_PER_INODE, F2FS_BLKSIZE, NEW_ADDR, NID_DIRECT_1, NID_DIRECT_2,
@@ -202,5 +202,37 @@ impl<'a> Read for FileReader<'a> {
         out[..n].copy_from_slice(&self.block_buf[off..off + n]);
         self.pos += n as u64;
         Ok(n)
+    }
+}
+
+impl<'a> Seek for FileReader<'a> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let total = self.inode.size as i128;
+        let new = match pos {
+            SeekFrom::Start(n) => n as i128,
+            SeekFrom::Current(d) => self.pos as i128 + d as i128,
+            SeekFrom::End(d) => total + d as i128,
+        };
+        if new < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "f2fs: seek to negative offset",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+impl<'a> FileReader<'a> {
+    /// Logical file length in bytes (for [`crate::fs::FileReadHandle`]).
+    pub fn file_len(&self) -> u64 {
+        self.inode.size
+    }
+}
+
+impl<'a> crate::fs::FileReadHandle for FileReader<'a> {
+    fn len(&self) -> u64 {
+        self.inode.size
     }
 }

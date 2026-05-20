@@ -17,7 +17,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use super::{Fat32, SECTOR, dir, table};
 use crate::Result;
 use crate::block::BlockDevice;
-use crate::fs::FileHandle;
+use crate::fs::{FileHandle, FileReadHandle};
 
 /// A FAT32 file handle: eager byte-granular reads + writes, with on-write
 /// directory-entry updates.
@@ -373,5 +373,41 @@ impl<'a> Drop for FatFileHandle<'a> {
             let _ = self.fs.flush(self.dev);
             self.dirty = false;
         }
+    }
+}
+
+/// Read-only adapter over a [`FatFileHandle`]. Erases the `Write` half
+/// of the underlying handle, exposing only `Read + Seek + len()` — the
+/// shape required by [`crate::fs::FileReadHandle`].
+///
+/// Constructed by [`crate::fs::Filesystem::open_file_ro`]. Because the
+/// adapter never calls into the inner handle's mutating paths and the
+/// inner handle stays clean (`dirty = false`), its `Drop` is a no-op
+/// — no spurious FAT / FSInfo writes happen at end-of-scope.
+pub struct ReadOnlyFatHandle<'a> {
+    inner: FatFileHandle<'a>,
+}
+
+impl<'a> ReadOnlyFatHandle<'a> {
+    pub(super) fn new(inner: FatFileHandle<'a>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<'a> Read for ReadOnlyFatHandle<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<'a> Seek for ReadOnlyFatHandle<'a> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl<'a> FileReadHandle for ReadOnlyFatHandle<'a> {
+    fn len(&self) -> u64 {
+        FileHandle::len(&self.inner)
     }
 }

@@ -993,5 +993,39 @@ mod tests {
         let bytes = read_file(&mut xfs2, &mut dev, "/n.txt");
         assert_eq!(bytes, b"freshly created");
     }
+
+    #[test]
+    fn open_file_ro_random_seek_xfs() {
+        let (mut dev, mut xfs) = fresh_image();
+        // Multi-block file (4 KiB blocks default) to exercise the extent walker.
+        let data: Vec<u8> = (0..12_000u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut src: &[u8] = &data;
+        xfs.add_file_path(
+            &mut dev,
+            "/ro.bin",
+            EntryMeta::default(),
+            data.len() as u64,
+            &mut src,
+        )
+        .unwrap();
+        xfs.flush_writes(&mut dev).unwrap();
+
+        let mut xfs2 = Xfs::open(&mut dev).unwrap();
+        let mut h = xfs2
+            .open_file_ro(&mut dev, Path::new("/ro.bin"))
+            .expect("open_file_ro");
+        assert_eq!(h.len(), data.len() as u64);
+        assert!(!h.is_empty());
+
+        h.seek(SeekFrom::Start(7777)).unwrap();
+        let mut buf = [0u8; 200];
+        h.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], &data[7777..7977]);
+
+        h.seek(SeekFrom::Start(13)).unwrap();
+        let mut buf2 = [0u8; 96];
+        h.read_exact(&mut buf2).unwrap();
+        assert_eq!(&buf2[..], &data[13..109]);
+    }
 }
 

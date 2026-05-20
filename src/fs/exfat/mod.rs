@@ -1255,6 +1255,17 @@ impl crate::fs::Filesystem for Exfat {
         Ok(Box::new(r))
     }
 
+    fn open_file_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn crate::fs::FileReadHandle + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        Exfat::open_ro(self, dev, s)
+    }
+
     fn open_file_rw<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,
@@ -2400,5 +2411,39 @@ mod tests {
             crate::Error::InvalidArgument(msg) => assert!(msg.contains("no such")),
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn open_file_ro_random_seek_exfat() {
+        use std::io::{Read, Seek, SeekFrom};
+        let (mut dev, mut fs) = fresh_volume("RO");
+        // ~10 KiB file — larger than one 4 KiB cluster, so the read path
+        // exercises chain walking.
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut reader: &[u8] = &data;
+        fs.create_file(&mut dev, "/ro.bin", &mut reader, data.len() as u64, 0)
+            .unwrap();
+        fs.flush(&mut dev).unwrap();
+
+        let mut h = Filesystem::open_file_ro(
+            &mut fs,
+            &mut dev,
+            std::path::Path::new("/ro.bin"),
+        )
+        .expect("open_file_ro");
+        assert_eq!(h.len(), data.len() as u64);
+        assert!(!h.is_empty());
+
+        // Seek to a mid-file, non-cluster-aligned offset and read.
+        h.seek(SeekFrom::Start(5000)).unwrap();
+        let mut buf = [0u8; 128];
+        h.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], &data[5000..5128]);
+
+        // Seek backwards.
+        h.seek(SeekFrom::Start(17)).unwrap();
+        let mut buf2 = [0u8; 32];
+        h.read_exact(&mut buf2).unwrap();
+        assert_eq!(&buf2[..], &data[17..49]);
     }
 }

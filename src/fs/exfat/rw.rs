@@ -24,7 +24,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::Result;
 use crate::block::BlockDevice;
-use crate::fs::FileHandle;
+use crate::fs::{FileHandle, FileReadHandle};
 
 use super::dir::{self, ENTRY_SIZE, FileEntrySet, SECFLAG_ALLOC_POSSIBLE, SECFLAG_NO_FAT_CHAIN};
 use super::fat;
@@ -546,6 +546,54 @@ impl Exfat {
         }
     }
 
+    /// Open `path` for read-only access. Implements
+    /// [`crate::fs::Filesystem::open_file_ro`].
+    pub(super) fn open_ro<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<Box<dyn FileReadHandle + 'a>> {
+        let parts = split_path(path);
+        if parts.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "exfat: cannot open root as a file".into(),
+            ));
+        }
+        let (leaf, prefix) = parts.split_last().unwrap();
+        let mut parent_cluster = self.boot.first_cluster_of_root_directory;
+        for part in prefix {
+            let bytes = self.read_dir_bytes(dev, parent_cluster)?;
+            let next = super::iter_file_sets(&bytes)?
+                .into_iter()
+                .find(|e| self.name_matches(&e.name_utf16, part))
+                .ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "exfat: no such entry {part:?} under {path:?}"
+                    ))
+                })?;
+            if !next.is_directory {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "exfat: {part:?} is not a directory"
+                )));
+            }
+            parent_cluster = next.first_cluster;
+        }
+        let (pos, set, total) = self
+            .find_entry_in_dir(dev, parent_cluster, leaf)?
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("exfat: no such file {path:?}"))
+            })?;
+        if set.is_directory {
+            return Err(crate::Error::InvalidArgument(format!(
+                "exfat: {path:?} is a directory"
+            )));
+        }
+        let chain =
+            self.build_data_chain(set.first_cluster, set.no_fat_chain(), set.data_length)?;
+        let inner = self.handle_from_existing(dev, parent_cluster, pos, total, set, chain)?;
+        Ok(Box::new(ReadOnlyExfatHandle { inner }))
+    }
+
     /// Construct an [`ExfatFileHandle`] for an entry we already resolved.
     /// Reads the on-disk entry-set bytes so the handle can mutate +
     /// rewrite them on sync.
@@ -595,5 +643,31 @@ impl Exfat {
             pos: 0,
             entry_dirty: false,
         })
+    }
+}
+
+/// Read-only adapter over [`ExfatFileHandle`]. Forwards `Read` + `Seek`
+/// to the inner handle; never invokes any mutating method, so the
+/// underlying handle stays clean — its `Drop` is a no-op because
+/// `entry_dirty` was never set.
+pub struct ReadOnlyExfatHandle<'a> {
+    inner: ExfatFileHandle<'a>,
+}
+
+impl<'a> Read for ReadOnlyExfatHandle<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<'a> Seek for ReadOnlyExfatHandle<'a> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl<'a> FileReadHandle for ReadOnlyExfatHandle<'a> {
+    fn len(&self) -> u64 {
+        FileHandle::len(&self.inner)
     }
 }

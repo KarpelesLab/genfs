@@ -29,7 +29,7 @@
 //!
 //! ## xp_desc area sizing
 //!
-//! The writer reserves [`XP_DESC_BLOCKS`] (16) blocks for the checkpoint
+//! The writer reserves `XP_DESC_BLOCKS` (16) blocks for the checkpoint
 //! descriptor area instead of the bare minimum (2). The extra slots are
 //! never used by `finish()` — they stay zeroed and are valid "no-op"
 //! entries that the reader ignores when scanning for the latest-xid

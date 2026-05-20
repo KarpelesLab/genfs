@@ -398,7 +398,7 @@ impl Apfs {
     /// Current scope: works on a freshly-formatted-then-flushed image
     /// and supports up to `XP_DESC_BLOCKS - 2` subsequent checkpoint
     /// commits before the xp_desc area fills up; create / remove are
-    /// still refused. See [`mod@rw`] for the per-feature limits.
+    /// still refused. See the `rw` module for the per-feature limits.
     pub fn open_writable(dev: &mut dyn BlockDevice) -> Result<Self> {
         let read_only = Apfs::open(dev)?;
         // Re-decode the container so we can pull the checkpoint

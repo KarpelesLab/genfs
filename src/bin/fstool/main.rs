@@ -2076,6 +2076,8 @@ fn tar_walk_grf(
         ..meta.clone()
     };
     for (name, entry) in &src.entries {
+        let path = format!("/{name}");
+        fstool::repack::note(&path);
         // Emit each prefix directory exactly once.
         let mut acc = String::new();
         for part in name.split('/').collect::<Vec<_>>().split_last().unwrap().1 {
@@ -2090,7 +2092,7 @@ fn tar_walk_grf(
         let bytes = src.read_entry(src_dev, entry)?;
         let len = bytes.len() as u64;
         let mut reader = std::io::Cursor::new(bytes);
-        writer.add_file(&format!("/{name}"), &mut reader, len, meta.clone(), &[])?;
+        writer.add_file(&path, &mut reader, len, meta.clone(), &[])?;
     }
     Ok(())
 }
@@ -2117,6 +2119,7 @@ fn tar_walk_ext(
         } else {
             format!("{prefix}/{}", e.name)
         };
+        fstool::repack::note(&path);
         let meta = TarEntryMeta {
             mode: inode.mode & 0o7777,
             uid: inode.uid as u32,
@@ -2171,6 +2174,7 @@ fn tar_walk_fat(
     use fstool::fs::tar::TarEntryMeta;
     for e in src.list_path(src_dev, src_path)? {
         let child = join_fs_path(src_path, &e.name);
+        fstool::repack::note(&child);
         let meta = TarEntryMeta::default();
         match e.kind {
             EntryKind::Dir => {
@@ -2197,6 +2201,7 @@ fn tar_replay_tar(
     use fstool::fs::tar::{EntryKind, TarEntryMeta};
     let entries: Vec<fstool::fs::tar::Entry> = src.entries().to_vec();
     for e in entries {
+        fstool::repack::note(&e.path);
         let meta = TarEntryMeta {
             mode: e.mode,
             uid: e.uid,

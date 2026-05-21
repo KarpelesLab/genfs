@@ -953,20 +953,33 @@ impl HfsPlus {
     }
 }
 
-/// Reader for a regular HFS+ file. Two storage variants:
+/// Reader for a regular HFS+ file. Two storage strategies sit
+/// behind the same public type so callers don't have to branch:
 ///
-/// * [`HfsPlusFileReader::Streaming`] — the common case. Holds the
-///   data-fork extent list in a [`ForkReader`] and walks it on
-///   demand from the borrowed [`BlockDevice`].
-/// * [`HfsPlusFileReader::Buffered`] — used when the on-disk file
-///   carries `UF_COMPRESSED` and its logical content has to be
+/// * **Streaming** — the common case. Holds the data-fork extent
+///   list in a [`ForkReader`] and walks it on demand from the
+///   borrowed [`BlockDevice`].
+/// * **Buffered** — used when the on-disk file carries
+///   `UF_COMPRESSED` and its logical content has to be
 ///   reconstructed from the `com.apple.decmpfs` extended attribute
-///   (and optionally the resource fork) up front. Once we've inflated
-///   the payload we hold it in RAM and serve reads from a cursor — a
-///   single decmpfs file decompresses to at most a few MiB per leaf
-///   record and the resource-fork path is bounded by 64 KiB blocks,
-///   so this is fine for the workloads we care about.
-pub enum HfsPlusFileReader<'a> {
+///   (and optionally the resource fork) up front. Once we've
+///   inflated the payload we hold it in RAM and serve reads from a
+///   cursor — a single decmpfs file decompresses to at most a few
+///   MiB per leaf record and the resource-fork path is bounded by
+///   64 KiB blocks, so this is fine for the workloads we care
+///   about.
+///
+/// The variant lives in a private inner enum so the public type
+/// remains a fieldless struct — matching the surface this type
+/// exposed before HFSCompression support was added.
+pub struct HfsPlusFileReader<'a> {
+    inner: HfsPlusFileReaderInner<'a>,
+}
+
+/// Private storage for [`HfsPlusFileReader`]. Hidden behind the
+/// public struct so adding / renaming variants stays a non-breaking
+/// change.
+enum HfsPlusFileReaderInner<'a> {
     /// On-disk data fork; reads stream from `dev`.
     Streaming {
         dev: &'a mut dyn BlockDevice,
@@ -994,11 +1007,13 @@ impl<'a> HfsPlusFileReader<'a> {
         fork: ForkReader,
         logical_size: u64,
     ) -> Self {
-        Self::Streaming {
-            dev,
-            fork,
-            remaining: logical_size,
-            position: 0,
+        Self {
+            inner: HfsPlusFileReaderInner::Streaming {
+                dev,
+                fork,
+                remaining: logical_size,
+                position: 0,
+            },
         }
     }
 
@@ -1006,18 +1021,20 @@ impl<'a> HfsPlusFileReader<'a> {
     /// Used by the HFSCompression path so the public reader interface
     /// looks identical to the data-fork case.
     pub(crate) fn buffered(bytes: Vec<u8>) -> Self {
-        Self::Buffered {
-            bytes,
-            position: 0,
-            _phantom: std::marker::PhantomData,
+        Self {
+            inner: HfsPlusFileReaderInner::Buffered {
+                bytes,
+                position: 0,
+                _phantom: std::marker::PhantomData,
+            },
         }
     }
 }
 
 impl<'a> Read for HfsPlusFileReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            HfsPlusFileReader::Streaming {
+        match &mut self.inner {
+            HfsPlusFileReaderInner::Streaming {
                 dev,
                 fork,
                 remaining,
@@ -1033,7 +1050,7 @@ impl<'a> Read for HfsPlusFileReader<'a> {
                 *remaining -= want as u64;
                 Ok(want)
             }
-            HfsPlusFileReader::Buffered {
+            HfsPlusFileReaderInner::Buffered {
                 bytes, position, ..
             } => {
                 let len = bytes.len() as u64;
@@ -1053,8 +1070,8 @@ impl<'a> Read for HfsPlusFileReader<'a> {
 
 impl<'a> std::io::Seek for HfsPlusFileReader<'a> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        match self {
-            HfsPlusFileReader::Streaming {
+        match &mut self.inner {
+            HfsPlusFileReaderInner::Streaming {
                 fork,
                 remaining,
                 position,
@@ -1076,7 +1093,7 @@ impl<'a> std::io::Seek for HfsPlusFileReader<'a> {
                 *remaining = fork.logical_size.saturating_sub(*position);
                 Ok(*position)
             }
-            HfsPlusFileReader::Buffered {
+            HfsPlusFileReaderInner::Buffered {
                 bytes, position, ..
             } => {
                 let total = bytes.len() as i128;
@@ -1100,9 +1117,9 @@ impl<'a> std::io::Seek for HfsPlusFileReader<'a> {
 
 impl<'a> crate::fs::FileReadHandle for HfsPlusFileReader<'a> {
     fn len(&self) -> u64 {
-        match self {
-            HfsPlusFileReader::Streaming { fork, .. } => fork.logical_size,
-            HfsPlusFileReader::Buffered { bytes, .. } => bytes.len() as u64,
+        match &self.inner {
+            HfsPlusFileReaderInner::Streaming { fork, .. } => fork.logical_size,
+            HfsPlusFileReaderInner::Buffered { bytes, .. } => bytes.len() as u64,
         }
     }
 }

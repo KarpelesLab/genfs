@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/KarpelesLab/fstool/compare/v0.3.0...v0.3.1) - 2026-05-21
+
+### Added
+
+- *(ext)* real JBD2 transactions for open_file_rw (Path A)
+- *(apfs)* open_file_rw on flushed images via fresh checkpoint COW
+- *(xfs)* leaf-form xattrs (read+write) + remove_xattr
+- *(hfs+)* decmpfs read support (types 3 + 4 zlib)
+- *(ntfs)* real $LogFile LFS records (Path A) for open_file_rw
+- *(dmg)* encrcdsa v2 encrypted DMG read support
+
+### Fixed
+
+- *(hfs+)* keep HfsPlusFileReader as struct to preserve public API
+
+### Other
+
+- drop intra-doc links to private items in apfs
+
 ## [0.3.0](https://github.com/KarpelesLab/fstool/compare/v0.2.0...v0.3.0) - 2026-05-20
 
 ### Added

@@ -78,6 +78,12 @@ pub const DX_ENTRY_LEN: usize = 8;
 /// table: `.` (12) + `..` (12) + `dx_root_info` (8).
 pub const DX_ROOT_HEADER_LEN: usize = 32;
 
+/// Static bytes consumed by the dx_node prefix before the dx_entry
+/// table: a single 12-byte fake dirent (inode=0, rec_len=block_size,
+/// name_len=0) so legacy readers stop right after the dirent and
+/// don't try to decode the index entries as more dirents.
+pub const DX_NODE_HEADER_LEN: usize = 12;
+
 /// One slot in the dx_root / dx_node entry table.
 #[derive(Debug, Clone, Copy)]
 pub struct DxEntry {
@@ -95,6 +101,18 @@ pub struct DxEntry {
 /// `dx_tail`.
 pub fn dx_root_limit(block_size: u32, csum_tail: bool) -> usize {
     let mut entry_space = block_size as usize - DX_ROOT_HEADER_LEN;
+    if csum_tail {
+        entry_space -= DX_TAIL_LEN;
+    }
+    entry_space / DX_ENTRY_LEN
+}
+
+/// Number of dx_entry slots a dx_node holds, after subtracting the
+/// 12-byte fake-dirent prefix and the optional 8-byte dx_tail.
+/// Larger than `dx_root_limit` because dx_node skips the `..` +
+/// dx_root_info block (20 bytes of overhead).
+pub fn dx_node_limit(block_size: u32, csum_tail: bool) -> usize {
+    let mut entry_space = block_size as usize - DX_NODE_HEADER_LEN;
     if csum_tail {
         entry_space -= DX_TAIL_LEN;
     }
@@ -280,6 +298,7 @@ pub fn make_dx_root_block(
     parent_inode: u32,
     block_size: u32,
     hash_version: u8,
+    indirect_levels: u8,
     entries: &[DxEntry],
     with_filetype: bool,
     csum_tail: bool,
@@ -325,7 +344,7 @@ pub fn make_dx_root_block(
     buf[24..28].copy_from_slice(&0u32.to_le_bytes());
     buf[28] = hash_version;
     buf[29] = 8;
-    buf[30] = 0; // indirect_levels
+    buf[30] = indirect_levels;
     buf[31] = 0; // unused_flags
 
     // dx_entry table starting at offset 32. entries[0] is the
@@ -340,6 +359,51 @@ pub fn make_dx_root_block(
 
     // dx_tail placeholder when metadata_csum is on; the 4-byte CRC is
     // stamped at flush time.
+    if csum_tail {
+        let tail_off = block_size as usize - DX_TAIL_LEN;
+        for b in buf[tail_off..].iter_mut() {
+            *b = 0;
+        }
+    }
+    buf
+}
+
+/// Build a dx_node intermediate block — used at `indirect_levels = 1`
+/// to fan dx_root entries out to multiple leaves. Layout: a single
+/// 12-byte fake dirent (inode=0, rec_len=block_size, name_len=0) so
+/// legacy linear-walk readers stop immediately at the dirent
+/// boundary, followed by a `dx_countlimit` slot and the real
+/// `dx_entry` rows that map a hash range to a leaf block.
+///
+/// `entries[0]` is the dx_countlimit slot — its `hash` field is the
+/// packed `(limit, count)` value, its `block` field is the leftmost
+/// leaf at this node. `entries[1..]` are real `{hash, block}` rows
+/// sorted by ascending hash. Same convention as
+/// [`make_dx_root_block`].
+pub fn make_dx_node_block(
+    block_size: u32,
+    entries: &[DxEntry],
+    csum_tail: bool,
+) -> Vec<u8> {
+    assert!(
+        !entries.is_empty(),
+        "dx_node must have at least the countlimit slot"
+    );
+    let mut buf = vec![0u8; block_size as usize];
+    // Single fake dirent at offset 0, spanning the whole block so a
+    // linear reader walks it once and stops. Same trick as dx_root's
+    // ".." entry, but here it's the only dirent (no inode for `.`).
+    buf[0..4].copy_from_slice(&0u32.to_le_bytes()); // inode = 0
+    buf[4..6].copy_from_slice(&(block_size as u16).to_le_bytes()); // rec_len
+    buf[6] = 0; // name_len
+    buf[7] = 0; // file_type
+    // 8..12 zero (no name)
+    // dx_entry table starts at offset 12. Same layout as in dx_root.
+    for (i, e) in entries.iter().enumerate() {
+        let off = DX_NODE_HEADER_LEN + i * DX_ENTRY_LEN;
+        buf[off..off + 4].copy_from_slice(&e.hash.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&e.block.to_le_bytes());
+    }
     if csum_tail {
         let tail_off = block_size as usize - DX_TAIL_LEN;
         for b in buf[tail_off..].iter_mut() {
@@ -415,7 +479,7 @@ mod tests {
             hash: pack_countlimit(508, 1),
             block: 1,
         }];
-        let buf = make_dx_root_block(12, 2, 4096, DX_HASH_HALF_MD4_UNSIGNED, &entries, true, false);
+        let buf = make_dx_root_block(12, 2, 4096, DX_HASH_HALF_MD4_UNSIGNED, 0, &entries, true, false);
         // "." at offset 0
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 12);
         assert_eq!(u16::from_le_bytes(buf[4..6].try_into().unwrap()), 12);
@@ -499,6 +563,143 @@ mod tests {
         let v = pack_countlimit(508, 2);
         assert_eq!(v & 0xffff, 508);
         assert_eq!(v >> 16, 2);
+    }
+
+    /// dx_node_limit must be larger than dx_root_limit at the same block
+    /// size: dx_node skips the 20 extra bytes of ./.. + dx_root_info,
+    /// trading them for two more dx_entry slots at 4 KiB blocks.
+    #[test]
+    fn dx_node_limit_larger_than_root_limit() {
+        for &bs in &[1024u32, 2048, 4096] {
+            for &csum in &[false, true] {
+                let r = dx_root_limit(bs, csum);
+                let n = dx_node_limit(bs, csum);
+                assert!(
+                    n > r,
+                    "dx_node should fit more slots than dx_root at bs={bs} csum={csum}: \
+                     root={r} node={n}"
+                );
+            }
+        }
+    }
+
+    /// Build a depth-1 layout — dx_root → dx_node → leaf — by hand and
+    /// route a sample hash through it via the same byte-level scheme
+    /// the writer uses, confirming the two-tier table walks land on
+    /// the expected leaf block. Verifies dx_node header offset (12),
+    /// dx_countlimit field layout, and the dx_lookup_logical contract
+    /// in `mod.rs` (not directly callable here, so the test inlines
+    /// the same arithmetic).
+    #[test]
+    fn dx_node_routing_two_level_layout() {
+        let bs: u32 = 4096;
+        // Sample hash boundaries: dx_root has 2 dx_node slots
+        // (countlimit + slot1), dx_node has 3 leaf slots
+        // (countlimit + slot1 + slot2).
+        //
+        //   dx_root entries:
+        //     slot 0: countlimit, block = node0 (logical 1)
+        //     slot 1: hash = 0x50000000, block = node1 (logical 2)
+        //
+        //   dx_node #0 entries (covers hashes 0..0x50000000):
+        //     slot 0: countlimit, block = leaf_a (logical 3)
+        //     slot 1: hash = 0x20000000, block = leaf_b (logical 4)
+        //     slot 2: hash = 0x40000000, block = leaf_c (logical 5)
+        //
+        //   dx_node #1 entries (covers hashes 0x50000000..):
+        //     slot 0: countlimit, block = leaf_d (logical 6)
+        //     slot 1: hash = 0x80000000, block = leaf_e (logical 7)
+        //     slot 2: hash = 0xC0000000, block = leaf_f (logical 8)
+        let root_entries = vec![
+            DxEntry {
+                hash: pack_countlimit(dx_root_limit(bs, true) as u16, 2),
+                block: 1,
+            },
+            DxEntry {
+                hash: 0x50000000,
+                block: 2,
+            },
+        ];
+        let root = make_dx_root_block(2, 2, bs, DX_HASH_HALF_MD4, 1, &root_entries, true, true);
+        // Confirm indirect_levels stamped at offset 30.
+        assert_eq!(root[30], 1);
+
+        let node0_entries = vec![
+            DxEntry {
+                hash: pack_countlimit(dx_node_limit(bs, true) as u16, 3),
+                block: 3,
+            },
+            DxEntry {
+                hash: 0x20000000,
+                block: 4,
+            },
+            DxEntry {
+                hash: 0x40000000,
+                block: 5,
+            },
+        ];
+        let node0 = make_dx_node_block(bs, &node0_entries, true);
+        // dx_node starts with one 12-byte fake dirent: inode=0,
+        // rec_len=bs, name_len=0.
+        assert_eq!(u32::from_le_bytes(node0[0..4].try_into().unwrap()), 0);
+        assert_eq!(
+            u16::from_le_bytes(node0[4..6].try_into().unwrap()),
+            bs as u16
+        );
+
+        let node1_entries = vec![
+            DxEntry {
+                hash: pack_countlimit(dx_node_limit(bs, true) as u16, 3),
+                block: 6,
+            },
+            DxEntry {
+                hash: 0x80000000,
+                block: 7,
+            },
+            DxEntry {
+                hash: 0xC0000000,
+                block: 8,
+            },
+        ];
+        let node1 = make_dx_node_block(bs, &node1_entries, true);
+
+        // Inline routing arithmetic mirroring `dx_lookup_logical` in
+        // `mod.rs`. Verifies the byte layout the writer emits matches
+        // what the reader (kernel / e2fsck / our own walker) expects.
+        let route = |buf: &[u8], header_len: usize, target: u32| -> u32 {
+            let cl = u32::from_le_bytes(buf[header_len..header_len + 4].try_into().unwrap());
+            let count = (cl >> 16) as usize;
+            let mut chosen = 0usize;
+            for slot in 1..count {
+                let off = header_len + slot * 8;
+                let h = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                if h <= target {
+                    chosen = slot;
+                } else {
+                    break;
+                }
+            }
+            let block_off = header_len + chosen * 8 + 4;
+            u32::from_le_bytes(buf[block_off..block_off + 4].try_into().unwrap())
+        };
+
+        // Hash 0x10000000 → routes to dx_root slot 0 (countlimit, block=1, node0),
+        // then to node0 slot 0 (countlimit, block=3, leaf_a).
+        assert_eq!(route(&root, DX_ROOT_HEADER_LEN, 0x10000000), 1);
+        assert_eq!(route(&node0, DX_NODE_HEADER_LEN, 0x10000000), 3);
+
+        // Hash 0x30000000 → root slot 0 (node0), then node0 slot 1 (leaf_b).
+        assert_eq!(route(&root, DX_ROOT_HEADER_LEN, 0x30000000), 1);
+        assert_eq!(route(&node0, DX_NODE_HEADER_LEN, 0x30000000), 4);
+
+        // Hash 0x50000000 → root slot 1 (node1, exact boundary), then
+        // node1 slot 0 (leaf_d, since 0x50 < 0x80).
+        assert_eq!(route(&root, DX_ROOT_HEADER_LEN, 0x50000000), 2);
+        assert_eq!(route(&node1, DX_NODE_HEADER_LEN, 0x50000000), 6);
+
+        // Hash 0xF0000000 → root slot 1 (node1), then node1 slot 2 (leaf_f).
+        assert_eq!(route(&root, DX_ROOT_HEADER_LEN, 0xF0000000), 2);
+        assert_eq!(route(&node1, DX_NODE_HEADER_LEN, 0xF0000000), 8);
     }
 
     /// Bit-exact agreement with `libext2fs::ext2fs_dirhash` for

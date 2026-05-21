@@ -1169,3 +1169,16 @@ fn ext4_repack_replays_pending_journal() {
         String::from_utf8_lossy(&fsck.stderr)
     );
 }
+
+// Depth-1 HTree integration is exercised by the unit tests in
+// src/fs/ext/htree.rs (`dx_node_*` and the depth-1 encoder/route
+// round-trip). A full e2fsck-driven integration test for a depth-1
+// directory needs > root_limit leaves, which means staging > 124 dir
+// blocks (at 1 KiB blocks) in one JBD2 transaction — but the v1 writer
+// emits at most one descriptor block per commit and therefore caps a
+// single transaction's tag count at ~124. Once the journal commit can
+// split a transaction across multiple descriptor blocks, this test can
+// be reinstated by allocating a 60 K-entry dir at 1 KiB blocks
+// (≈148 leaves × ~44 entries) and confirming `debugfs htree_dump`
+// reports `Indirect levels: 1`. Tracked alongside the multi-level-HTree
+// work.

@@ -289,6 +289,11 @@ pub struct Ext {
     /// distinct from both the dir-block tail csum and the extent_tail
     /// csum.
     dx_root_blocks: Vec<(u32, u32, u16)>,
+    /// HTree dx_node intermediate blocks staged in `data_blocks`,
+    /// used only when a directory's index has `indirect_levels = 1`.
+    /// Same csum scheme as dx_root but with the smaller 12-byte
+    /// fake-dirent prefix (no `.` / `..` / dx_root_info overhead).
+    dx_node_blocks: Vec<(u32, u32, u16)>,
     /// True until the first flush after a `format_with` lands. The
     /// initial flush is a "blast everything fresh" write that doesn't
     /// ride a journal transaction (there's nothing yet to be consistent
@@ -429,6 +434,7 @@ impl Ext {
             dir_blocks: Vec::new(),
             extent_leaf_blocks: Vec::new(),
             dx_root_blocks: Vec::new(),
+            dx_node_blocks: Vec::new(),
             // During format the journal SB is staged in `data_blocks`
             // and the file system as a whole is being assembled fresh;
             // the initial flush is a "blast everything" write rather
@@ -1388,6 +1394,7 @@ impl Ext {
         self.dir_blocks.clear();
         self.extent_leaf_blocks.clear();
         self.dx_root_blocks.clear();
+        self.dx_node_blocks.clear();
         Ok(())
     }
 
@@ -1427,6 +1434,32 @@ impl Ext {
                     generation,
                     bytes,
                     htree::DX_ROOT_HEADER_LEN,
+                    count as usize,
+                );
+                htree::stamp_dx_csum(bytes, c);
+                continue;
+            }
+            // dx_node: same csum scheme but smaller header (12 bytes
+            // for the fake dirent vs 32 for dx_root's `.`/`..`/info).
+            if let Some((_, owner_ino, count)) = self
+                .dx_node_blocks
+                .iter()
+                .find(|(b, _, _)| b == blk)
+                .copied()
+            {
+                let generation = self
+                    .inodes
+                    .iter()
+                    .find(|(i, _)| *i == owner_ino)
+                    .map(|(_, i)| i.generation)
+                    .unwrap_or(0);
+                let c = htree::compute_dx_csum(
+                    csum::raw_update,
+                    seed,
+                    owner_ino,
+                    generation,
+                    bytes,
+                    htree::DX_NODE_HEADER_LEN,
                     count as usize,
                 );
                 htree::stamp_dx_csum(bytes, c);
@@ -1956,8 +1989,8 @@ impl Ext {
         let with_filetype = self.has_filetype();
         let usable = dir::usable_dir_len(bs, csum_tail);
 
-        // Hash every expected name, including `.`/`..` is unnecessary
-        // because those live in the dx_root's fake-dirent prefix.
+        // Hash every expected name, sort, then bucket by byte budget
+        // (87.5% target fill so post-creation appends have slack).
         let mut hashes: Vec<(u32, usize)> = expected_names
             .iter()
             .enumerate()
@@ -1965,15 +1998,9 @@ impl Ext {
             .collect();
         hashes.sort_by_key(|(h, _)| *h);
 
-        // Bucket entries into leaves of `usable` byte capacity each.
-        // Each entry costs `min_rec_len(name.len())` bytes plus a
-        // small reserved slack for future appends (we keep ~15% spare
-        // so post-creation adds don't immediately overflow a leaf).
-        // Leaf 0 covers hashes 0..first_real_hash; subsequent leaves
-        // partition by hash range.
-        let mut leaves: Vec<Vec<usize>> = vec![Vec::new()]; // indices into expected_names, per leaf
+        let mut leaves: Vec<Vec<usize>> = vec![Vec::new()];
         let mut current_bytes: usize = 0;
-        let cap = usable.saturating_sub(usable / 8); // 87.5% target
+        let cap = usable.saturating_sub(usable / 8);
         for &(_, idx) in &hashes {
             let need = dir::min_rec_len(expected_names[idx].len());
             if current_bytes + need > cap && !leaves.last().unwrap().is_empty() {
@@ -1984,18 +2011,44 @@ impl Ext {
             current_bytes += need;
         }
         let n_leaves = leaves.len();
-        let total_blocks = 1 + n_leaves; // 1 dx_root + N leaves
+        // First hash of each leaf — the dx_entry boundary key for the
+        // routing layers. Leaf 0's boundary is 0 (implicit leftmost).
+        let leaf_first_hash: Vec<u32> = leaves
+            .iter()
+            .map(|leaf| {
+                let idx = leaf[0];
+                htree::half_md4_hash(expected_names[idx]).0
+            })
+            .collect();
 
-        // Sanity-check against the dx_root's slot capacity.
-        let limit = htree::dx_root_limit(bs, csum_tail);
-        if n_leaves > limit {
-            return Err(crate::Error::Unsupported(format!(
-                "ext: HTree dir {:?} would need {n_leaves} leaves, dx_root limit is {limit} \
-                 (multi-level dx_node not implemented)",
-                String::from_utf8_lossy(name)
-            )));
-        }
+        let root_limit = htree::dx_root_limit(bs, csum_tail);
+        let node_limit = htree::dx_node_limit(bs, csum_tail);
 
+        // Decide tree shape:
+        //   indirect_levels = 0 — dx_root entries point at leaves.
+        //                         Cap: root_limit leaves.
+        //   indirect_levels = 1 — dx_root entries point at dx_nodes,
+        //                         dx_node entries point at leaves.
+        //                         Cap: root_limit * node_limit leaves.
+        let (indirect_levels, n_nodes) = if n_leaves <= root_limit {
+            (0u8, 0usize)
+        } else {
+            // Partition leaves across as few dx_nodes as possible,
+            // each holding up to `node_limit` leaves.
+            let need_nodes = n_leaves.div_ceil(node_limit);
+            if need_nodes > root_limit {
+                return Err(crate::Error::Unsupported(format!(
+                    "ext: HTree dir {:?} needs {n_leaves} leaves, exceeds the depth-1 cap \
+                     (root_limit={root_limit} * node_limit={node_limit} = {}); depth >= 2 \
+                     not implemented",
+                    String::from_utf8_lossy(name),
+                    root_limit * node_limit
+                )));
+            }
+            (1u8, need_nodes)
+        };
+
+        let total_blocks = 1 + n_nodes + n_leaves; // dx_root + dx_nodes + leaves
         let ino = self.alloc_inode()?;
         let mut blocks = Vec::with_capacity(total_blocks);
         for _ in 0..total_blocks {
@@ -2012,62 +2065,104 @@ impl Ext {
         inode.blocks_512 = (total_blocks as u32 + allocated_meta) * (bs / 512);
         inode.flags |= constants::EXT4_INDEX_FL;
 
-        // Build the dx_entry table: slot 0 is the countlimit (with
-        // leaf-0 pointer in its block field), slots 1..n point at
-        // leaves 1..n-1.
-        let count = n_leaves as u16; // entries occupied (incl. countlimit slot)
-        let mut entries: Vec<htree::DxEntry> = Vec::with_capacity(n_leaves);
-        // countlimit slot
-        entries.push(htree::DxEntry {
-            hash: htree::pack_countlimit(limit as u16, count),
-            block: 1, // logical block #1 = first leaf
-        });
-        // Real slots — one per additional leaf, hash = first-name hash in that leaf
-        for (logical_idx, leaf_entries) in leaves.iter().enumerate().skip(1) {
-            let first_name_idx = leaf_entries[0];
-            let first_hash = expected_names[first_name_idx];
-            let h = htree::half_md4_hash(first_hash).0;
+        // Logical-block layout (for the inode's view of the dir body):
+        //   [0]               dx_root
+        //   [1 .. 1+n_nodes]  dx_nodes (only when indirect_levels = 1)
+        //   [1+n_nodes ..]    leaves
+        let nodes_start_logical: u32 = 1;
+        let leaves_start_logical: u32 = (1 + n_nodes) as u32;
+
+        if indirect_levels == 0 {
+            // Single-level: dx_root entries map directly to leaves.
+            // Slot 0 is the countlimit (with leftmost leaf in its
+            // block field); slots 1..n carry (hash, leaf_logical_blk).
+            let mut entries: Vec<htree::DxEntry> = Vec::with_capacity(n_leaves);
             entries.push(htree::DxEntry {
-                hash: h,
-                block: (logical_idx + 1) as u32, // +1 because dx_root is logical block 0
+                hash: htree::pack_countlimit(root_limit as u16, n_leaves as u16),
+                block: leaves_start_logical,
             });
+            for (i, &h) in leaf_first_hash.iter().enumerate().skip(1) {
+                entries.push(htree::DxEntry {
+                    hash: h,
+                    block: leaves_start_logical + i as u32,
+                });
+            }
+            let dx_root_buf = htree::make_dx_root_block(
+                ino,
+                parent_ino,
+                bs,
+                htree::DX_HASH_HALF_MD4,
+                0,
+                &entries,
+                with_filetype,
+                csum_tail,
+            );
+            self.data_blocks.push((blocks[0], dx_root_buf));
+            self.dx_root_blocks
+                .push((blocks[0], ino, n_leaves as u16));
+        } else {
+            // Two-level: dx_root entries map to dx_nodes; dx_node
+            // entries map to leaves. We chunk leaves into groups of
+            // `node_limit`, one group per dx_node.
+            let mut leaf_idx = 0usize;
+            let mut node_first_hashes: Vec<u32> = Vec::with_capacity(n_nodes);
+            for node_i in 0..n_nodes {
+                let chunk_start = leaf_idx;
+                let chunk_end = (chunk_start + node_limit).min(n_leaves);
+                let chunk_len = chunk_end - chunk_start;
+                node_first_hashes.push(leaf_first_hash[chunk_start]);
+
+                // dx_node entries: countlimit + (chunk_len - 1) real slots.
+                let mut node_entries: Vec<htree::DxEntry> = Vec::with_capacity(chunk_len);
+                node_entries.push(htree::DxEntry {
+                    hash: htree::pack_countlimit(node_limit as u16, chunk_len as u16),
+                    block: leaves_start_logical + chunk_start as u32,
+                });
+                for off in 1..chunk_len {
+                    node_entries.push(htree::DxEntry {
+                        hash: leaf_first_hash[chunk_start + off],
+                        block: leaves_start_logical + (chunk_start + off) as u32,
+                    });
+                }
+                let node_buf = htree::make_dx_node_block(bs, &node_entries, csum_tail);
+                let phys = blocks[(nodes_start_logical as usize) + node_i];
+                self.data_blocks.push((phys, node_buf));
+                self.dx_node_blocks.push((phys, ino, chunk_len as u16));
+
+                leaf_idx = chunk_end;
+            }
+
+            // dx_root: slot 0 is countlimit pointing at the first
+            // dx_node; slots 1..n point at subsequent dx_nodes.
+            let mut root_entries: Vec<htree::DxEntry> = Vec::with_capacity(n_nodes);
+            root_entries.push(htree::DxEntry {
+                hash: htree::pack_countlimit(root_limit as u16, n_nodes as u16),
+                block: nodes_start_logical,
+            });
+            for (i, &h) in node_first_hashes.iter().enumerate().skip(1) {
+                root_entries.push(htree::DxEntry {
+                    hash: h,
+                    block: nodes_start_logical + i as u32,
+                });
+            }
+            let dx_root_buf = htree::make_dx_root_block(
+                ino,
+                parent_ino,
+                bs,
+                htree::DX_HASH_HALF_MD4,
+                1,
+                &root_entries,
+                with_filetype,
+                csum_tail,
+            );
+            self.data_blocks.push((blocks[0], dx_root_buf));
+            self.dx_root_blocks
+                .push((blocks[0], ino, n_nodes as u16));
         }
 
-        // Wait — re-examine: `block` is logical, not physical, in
-        // dx_entries. logical block 0 = dx_root, logical block 1 =
-        // first leaf, logical block N = N-th leaf. Adjust.
-        // (The loop above already uses `logical_idx + 1` so leaf at
-        // position 1 in `leaves` → logical block 2. Hmm, that skips
-        // leaf 0 which is the countlimit's `block: 1`. Let me re-walk:
-        //   entries[0] = countlimit, block field = 1 (logical leaf 0)
-        //   entries[1] = first real slot, block = 2 (logical leaf 1)
-        //   entries[k] = block = k+1
-        // That matches what `logical_idx + 1` does for skip(1), since
-        // `enumerate()` yields (1, leaf1) → block=2. Good.
-
-        let dx_root_buf = htree::make_dx_root_block(
-            ino,
-            parent_ino,
-            bs,
-            // Declare the signed variant. For ASCII names (bytes <
-            // 0x80) the unsigned-byte path we run produces identical
-            // hashes to the signed-byte path, so the index round-trips
-            // correctly. Old e2fsprogs builds reject the _UNSIGNED
-            // version code (4) even when valid, so 1 is the safer
-            // declaration unless the FS actually contains non-ASCII
-            // filenames. (Multi-byte UTF-8 starts at 0xC2; if those
-            // ever appear we'll switch to a true signed-byte hash.)
-            htree::DX_HASH_HALF_MD4,
-            &entries,
-            with_filetype,
-            csum_tail,
-        );
-        self.data_blocks.push((blocks[0], dx_root_buf));
-        self.dx_root_blocks.push((blocks[0], ino, count));
-
-        // Each leaf starts as an empty dir block. The router will
-        // append entries to the right leaf as add_*_to runs.
-        for &blk in &blocks[1..] {
+        // Leaves start empty; the router fills them as entries arrive.
+        for i in 0..n_leaves {
+            let blk = blocks[(leaves_start_logical as usize) + i];
             self.data_blocks
                 .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
             self.dir_blocks.push((blk, ino));
@@ -2082,50 +2177,59 @@ impl Ext {
     }
 
     /// Resolve a name to the logical block index of its HTree leaf.
-    /// Reads the dx_root from staged storage (or disk via
-    /// `ensure_block_staged`) and binary-searches the dx_entry table.
+    /// Walks dx_root → (dx_node)* → leaf, picking the rightmost
+    /// dx_entry whose hash is ≤ the target hash at each level (with
+    /// the countlimit slot serving as the implicit "leftmost"
+    /// catch-all for hashes that precede the first real boundary).
     fn dx_route_logical_leaf(
         &mut self,
         dev: &mut dyn BlockDevice,
         dir_inode: u32,
         name: &[u8],
     ) -> Result<u32> {
-        // Resolve dx_root: it's logical block 0 of the dir.
         let inode_copy = self
             .inodes
             .iter()
             .find(|(i, _)| *i == dir_inode)
             .map(|(_, i)| *i)
             .unwrap();
+        // Read dx_root from logical block 0.
         let dx_root_blk = self.file_block(dev, &inode_copy, 0)?;
         self.ensure_block_staged(dev, dx_root_blk)?;
-        let buf = self
+        let root_buf = self
             .data_blocks
             .iter()
             .find(|(b, _)| *b == dx_root_blk)
             .map(|(_, bytes)| bytes.clone())
             .unwrap();
-        // dx_entry table starts at offset 32; first slot is countlimit.
-        let cl_hash = u32::from_le_bytes(buf[32..36].try_into().unwrap());
-        let count = (cl_hash >> 16) as usize;
-        // Compute hash of the name we're routing.
+        // dx_root_info.indirect_levels lives at offset 30.
+        let indirect_levels = root_buf[30];
         let (hash, _minor) = htree::half_md4_hash(name);
-        // Binary-search slots 1..count for the rightmost slot whose
-        // hash ≤ target. Fall through to slot 0 (the leftmost leaf
-        // covering hash=0..first_real_hash) when none match.
-        let mut chosen_slot = 0usize;
-        for slot in 1..count {
-            let off = 32 + slot * 8;
-            let slot_hash = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-            if slot_hash <= hash {
-                chosen_slot = slot;
-            } else {
-                break;
-            }
+
+        // Walk dx_root's dx_entry table to pick the child (leaf or
+        // dx_node, depending on indirect_levels).
+        let next_logical = dx_lookup_logical(&root_buf, htree::DX_ROOT_HEADER_LEN, hash);
+
+        if indirect_levels == 0 {
+            return Ok(next_logical);
         }
-        let block_off = 32 + chosen_slot * 8 + 4;
-        let logical_leaf = u32::from_le_bytes(buf[block_off..block_off + 4].try_into().unwrap());
-        Ok(logical_leaf)
+        if indirect_levels != 1 {
+            return Err(crate::Error::Unsupported(format!(
+                "ext4: HTree indirect_levels={indirect_levels} not supported (writer caps at 1)"
+            )));
+        }
+        // Depth-1: next_logical is the logical block of a dx_node.
+        // Read it and walk its dx_entry table to find the leaf.
+        let dx_node_phys = self.file_block(dev, &inode_copy, next_logical)?;
+        self.ensure_block_staged(dev, dx_node_phys)?;
+        let node_buf = self
+            .data_blocks
+            .iter()
+            .find(|(b, _)| *b == dx_node_phys)
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap();
+        let leaf_logical = dx_lookup_logical(&node_buf, htree::DX_NODE_HEADER_LEN, hash);
+        Ok(leaf_logical)
     }
 
     /// Create a symbolic link. Targets ≤ 60 bytes are stored inline in
@@ -2710,6 +2814,7 @@ impl Ext {
             dir_blocks: Vec::new(),
             extent_leaf_blocks: Vec::new(),
             dx_root_blocks: Vec::new(),
+            dx_node_blocks: Vec::new(),
             // Opened (vs. just-formatted) images go through the journal
             // path on flush. `open()` itself runs JBD2 replay before
             // returning, so by the time we land here the on-disk journal
@@ -3492,6 +3597,32 @@ fn try_append_dir_entry(
 
 fn popcount_bits(bm: &[u8], start: u32, end: u32) -> u32 {
     (start..end).filter(|&i| test_bit(bm, i)).count() as u32
+}
+
+/// Walk a dx_root or dx_node's dx_entry table to find the child block
+/// whose hash range covers `target`. `header_len` is the byte offset
+/// where the dx_entry table starts (32 for dx_root, 12 for dx_node).
+/// Slot 0 is the countlimit (high half of its hash field is `count`,
+/// low half is `limit`); slots 1..count carry real `(hash, block)`
+/// rows sorted by ascending hash, and the rightmost slot whose hash
+/// ≤ target wins. The countlimit slot's `block` field is the
+/// catch-all for hashes preceding any real boundary.
+fn dx_lookup_logical(buf: &[u8], header_len: usize, target: u32) -> u32 {
+    let cl_hash =
+        u32::from_le_bytes(buf[header_len..header_len + 4].try_into().unwrap());
+    let count = (cl_hash >> 16) as usize;
+    let mut chosen_slot = 0usize;
+    for slot in 1..count {
+        let off = header_len + slot * 8;
+        let slot_hash = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        if slot_hash <= target {
+            chosen_slot = slot;
+        } else {
+            break;
+        }
+    }
+    let block_off = header_len + chosen_slot * 8 + 4;
+    u32::from_le_bytes(buf[block_off..block_off + 4].try_into().unwrap())
 }
 
 #[cfg(test)]

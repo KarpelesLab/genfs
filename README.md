@@ -23,31 +23,36 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 
 ## Filesystem support
 
-| Filesystem | Read | Write | Notes                                                                |
-|------------|------|-------|----------------------------------------------------------------------|
-| ext2       | ✅    | ✅     | byte-exact with `genext2fs` on the same input                        |
-| ext3       | ✅    | ✅     | + JBD2 journal                                                       |
-| ext4       | ✅    | ✅     | extents, FILETYPE, `metadata_csum`, xattrs                           |
-| FAT32      | ✅    | ✅     | VFAT LFN entries, 8.3 short-name aliases                             |
-| exFAT      | ✅    | ✅     | format + create + remove + flush                                     |
-| tar        | ✅    | ✅     | ustar + PAX, `SCHILY.xattr.*` for xattrs                             |
-| XFS        | ✅    | ✅     | shortform + block / leaf / node + single-level B-tree dirs + BMBT; writer passes `xfs_repair -n` single + multi-AG |
-| HFS+/HFSX  | ✅    | ✅     | inline + extents-overflow, symlinks, hard links; writer passes `fsck.hfsplus` with optional journal stub |
-| APFS       | ✅    | 🚧    | multi-level omap + fs-tree; writer is single-volume with a structurally-correct spaceman bitmap (no internal-pool ring / free-queues, no snapshots / encryption); not yet `fsck_apfs` clean |
-| NTFS       | ✅    | 🚧    | MFT, attributes, $DATA + ADS, indexes; xattr map; writer indexes system files (records 0..=15) in root `$I30`; `$Secure` indirection still empty so `ntfs-3g` mount remains blocked |
-| F2FS       | ✅    | ✅     | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs` |
-| SquashFS   | ✅    | ✅     | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs` |
-| ISO 9660   | ✅    | ✅     | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only writer (no in-place modify) |
-| qcow2      | ✅    | ✅     | v2 + v3, allocate-on-write writer                                    |
-| dmg        | 🚧   | —     | UDIF v4 trailer + mish chunk decoder (zero / raw / zlib); ADC / bzip2 / LZFSE / LZMA TBD |
+| Filesystem | Read | Write | In-place edits | Notes                                                                                                              |
+|------------|------|-------|----------------|--------------------------------------------------------------------------------------------------------------------|
+| ext2       | ✅    | ✅     | ✅              | byte-exact with `genext2fs` on the same input                                                                      |
+| ext3       | ✅    | ✅     | ✅              | + JBD2 journal — real transactions on `open_file_rw` (Path A)                                                      |
+| ext4       | ✅    | ✅     | ✅              | extents (read: any depth; write: depth ≤ 1), FILETYPE, `metadata_csum`, xattrs, JBD2                               |
+| FAT32      | ✅    | ✅     | ✅              | VFAT LFN entries, 8.3 short-name aliases                                                                           |
+| exFAT      | ✅    | ✅     | ✅              | format + create + remove + flush + `open_file_rw`                                                                  |
+| tar        | ✅    | ✅     | —              | ustar + PAX, `SCHILY.xattr.*` for xattrs; streaming-only                                                           |
+| XFS        | ✅    | ✅     | ✅              | shortform + block / leaf / node + multi-level B-tree dirs + BMBT; leaf-form xattrs; real XLOG transactions (Path A); passes `xfs_repair -n` single + multi-AG |
+| HFS+/HFSX  | ✅    | ✅     | ✅              | inline + extents-overflow, symlinks, hard links; decmpfs read (zlib types 3 + 4); real journal (Path A); passes `fsck.hfsplus` |
+| APFS       | ✅    | ✅     | 🚧             | multi-level omap + fs-tree; spaceman with IP ring + SFQ free-queues; `open_file_rw` rebuilds a fresh COW checkpoint (whole-file overwrite only — no partial-extent COW yet); not yet `fsck_apfs` clean |
+| NTFS       | ✅    | ✅     | ✅              | MFT, attributes, $DATA + ADS, indexes; xattr map; multi-class `$Secure` ($SDS/$SDH/$SII); real `$LogFile` LFS records (Path A) |
+| F2FS       | ✅    | ✅     | ✅              | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs`                                              |
+| SquashFS   | ✅    | ✅     | —              | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs`; repack-only           |
+| ISO 9660   | ✅    | ✅     | —              | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only                              |
+| GRF        | ✅    | ✅     | ✅              | Gravity Ragnarok Online archive — v0x102 / v0x103 / v0x200; permutation cipher (`MIXCRYPT` / `DES`); CP949 filenames |
+| qcow2      | ✅    | ✅     | ✅              | v2 + v3 backend, allocate-on-write writer                                                                          |
+| dmg        | ✅    | —     | —              | UDIF v4 trailer + mish chunks (zero / raw / zlib / ADC / bzip2 / LZFSE / LZMA); encrypted v2 (`encrcdsa`) read with PBKDF2 unlock |
 
-`🚧` marks writers that exist at the library level but have known
-gaps (see Limitations). All writable filesystems — ext2/3/4, FAT32,
-exFAT, XFS, HFS+, NTFS, F2FS, SquashFS, ISO 9660 — implement a single
+`🚧` marks writers / mutation paths with known gaps (see Limitations).
+All writable filesystems — ext2/3/4, FAT32, exFAT, XFS, HFS+, NTFS,
+APFS, F2FS, SquashFS, ISO 9660, GRF — implement a single
 `Filesystem` trait, so the CLI (`build`, `repack`, `add`, `rm`) and
 the TOML `[filesystem] type = "…"` spec dispatch through one
 codepath; pick a target FS by setting `--fs-type` on `repack` or
-`type = "hfsplus"` (etc.) in the TOML spec.
+`type = "hfsplus"` (etc.) in the TOML spec. "In-place edits"
+means an already-flushed image can be re-opened for `add` / `rm` /
+`open_file_rw` — for filesystems with a journal, that path commits
+through a real transaction so a crash mid-write leaves an image the
+host's `fsck` can replay.
 
 The reader for each FS streams: file contents are never fully resident in
 memory regardless of size. The writers do the same, two-pass: scan to size
@@ -67,7 +72,7 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 | `info`        | Print partition table (whole-disk) or FS summary + root listing.        |
 | `ls`          | List a directory inside an image.                                       |
 | `cat`         | Stream a file's bytes out of an image to stdout.                        |
-| `add`         | Copy a host file / tree into an existing image (ext or FAT).            |
+| `add`         | Copy a host file / tree into an existing image (any mutable FS).        |
 | `rm`          | Unlink a file, symlink, device, or empty directory.                     |
 | `shell`       | SFTP-style REPL — `ls cd pwd cat put rm mkdir info`.                    |
 | `convert`     | Byte-level raw ↔ qcow2 conversion with optional grow.                   |
@@ -151,9 +156,10 @@ Recognised tar extensions: `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`,
 `.tar.zst`, `.tar.lz4`, `.tar.lzma`, `.tar.lzo` (codecs gated on the
 matching Cargo feature). For images, the `:N` suffix selects partition
 *N* (1-indexed); without it, the source is opened as a bare filesystem.
-The source FS may be any readable type — `ext{2,3,4}`, `fat32`, or tar
-on the inside of an image — and the destination is sized automatically
-to fit unless `size` is set explicitly.
+The source FS may be any readable type — `ext{2,3,4}`, FAT32, exFAT,
+XFS, HFS+, APFS, NTFS, F2FS, SquashFS, ISO 9660, tar, or GRF — and the
+destination is sized automatically to fit unless `size` is set
+explicitly.
 
 ## Architecture
 
@@ -176,14 +182,18 @@ to fit unless `size` is set explicitly.
                                   │
               ┌────────────────────────────────────────────┐
               │  BlockDevice trait → File, Mem, Sliced,    │
-              │                       Qcow2                │
+              │                       Qcow2, Dmg           │
               └────────────────────────────────────────────┘
 ```
 
 Each layer is substitutable. A filesystem implementation talks only to a
 `BlockDevice`; it doesn't know or care whether the device is a real file,
 an in-memory buffer in a test, a slice carved out of a larger disk by a
-partition table, or a qcow2-backed sparse container.
+partition table, or a qcow2-backed sparse container. DMG (`.dmg`) is
+treated the same way: open the image, walk the mish table for the
+chunk layout, and the rest of the stack reads through it as if it were
+a flat block device — including the encrypted (`encrcdsa` v2) variant
+when an unlock password is supplied.
 
 ## ext-specific niceties
 
@@ -210,13 +220,14 @@ direction round-trips content + mode + uid/gid + mtime + symlinks + device
 nodes + xattrs.
 
 `fstool repack` writes any destination implementing the `Filesystem`
-trait — `ext2/3/4`, FAT32, tar, XFS, HFS+, NTFS, F2FS, SquashFS,
-ISO 9660. APFS isn't yet trait-implemented (its `Builder` API hasn't
-been mapped), so it remains library-only. `add` / `rm` go through
-the same trait, which means they work on any FS whose writer can
-re-open an existing image; today that's ext, FAT32, and F2FS — the
-others can `format` + populate but can't `add` to an already-flushed
-image yet.
+trait — `ext2/3/4`, FAT32, exFAT, tar, XFS, HFS+, APFS, NTFS, F2FS,
+SquashFS, ISO 9660, GRF. `add` / `rm` go through the same trait,
+which means they work on any FS whose writer can re-open an existing
+image; today that's all of the mutable backends — ext, FAT32, exFAT,
+F2FS, XFS, HFS+, NTFS, APFS, and GRF. SquashFS, ISO 9660, and tar
+are repack-only (their `MutationCapability` is `Immutable` or
+`Streaming`, so `add` / `rm` fail fast with an actionable error and
+the user is steered to `repack`).
 
 ## Layered merge with whiteouts
 
@@ -319,40 +330,40 @@ cargo install fstool --no-default-features --features gzip,lz4,xz,lzma
 
 Things explicitly out of scope today, in rough order of likely-to-change:
 
-- `add` / `rm` on existing images: only ext, FAT32, and F2FS can be
-  re-opened as writable. HFS+ / NTFS / XFS / SquashFS / ISO / APFS
-  writers format + populate fine but can't yet mutate an
-  already-flushed image. ISO and SquashFS are sequential by design
-  (repack-only — `Filesystem::supports_mutation()` returns `false`,
-  so `add`/`rm` fail fast with an actionable error); APFS isn't
-  trait-wired at all (Builder pattern).
-- NTFS writer: produced image isn't `ntfs-3g`-mountable. Root `$I30`
-  now indexes the canonical system files (records 0..=15) on `format()`,
-  but the empty `$Secure:$SDS` / `$SDH` / `$SII` indexes still block
-  the `ntfs-3g` mount path (it opens `$Secure` early and refuses the
-  volume when the indexes are empty).
-- NTFS reader: compressed and encrypted `$DATA`, `$ATTRIBUTE_LIST`
-  spill, and `$Secure` security-descriptor indirection beyond what
-  the resident path handles all return `Unsupported`.
-- APFS writer: single volume. The space manager now emits a real
-  `spaceman_phys_t` + chunk-info-block + per-chunk allocation bitmap
-  that agrees with the writer's allocations, and the checkpoint map
-  resolves the ephemeral spaceman oid. The internal-pool ring and
-  free-queue B-trees are still empty, so a strict `fsck_apfs` may
-  still flag those areas; `mount_apfs` typically refuses the image.
-- APFS reader: snapshots, encryption, and sealed-volume integrity
+- **ext4 write path**: extent trees deeper than depth 1 (the reader
+  handles arbitrary depth); `flex_bg` on the write path (reader is
+  fine).
+- **APFS in-place edits**: `open_file_rw` rebuilds a fresh COW
+  checkpoint over the entire file content, so it's whole-file
+  granularity — partial-extent COW is not yet implemented, and
+  `create_file` / `remove` over the rw path piggyback on the same
+  checkpoint. Multiple back-to-back commits are bounded by the
+  `xp_desc` ring (the reader doesn't rotate it yet).
+- **APFS reader**: snapshots, encryption, and sealed-volume integrity
   are out of scope.
-- XFS reader: B-tree-format (`di_format=BTREE`) directories deeper
-  than one level above the leaves return `Error::Unsupported`
+- **APFS / NTFS strict-checker pass**: the spaceman + `$Secure` /
+  `$LogFile` structures are now populated, but `fsck_apfs` and
+  `ntfs-3g` mount can still flag the images for finer points
+  (free-queue B-trees, journal metadata layout). Read + write work
+  end-to-end; the host-tool gate is the remaining polish.
+- **NTFS reader**: compressed and encrypted `$DATA`, `$ATTRIBUTE_LIST`
+  spill, and security-descriptor indirection through `$Secure`
+  beyond what the resident path handles all return `Unsupported`.
+- **XFS reader**: B-tree-format (`di_format=BTREE`) directories
+  deeper than one level above the leaves return `Error::Unsupported`
   (shortform / block / leaf / node and single-level B-tree dirs are
-  covered); writer assumes shortform / extent dirs.
-- ext4 `flex_bg` on the *write* path (the reader handles it).
-- Partial-file rewrites — in-place modification is whole-file granularity.
-- DMG chunk decoder: zero-fill / raw / zlib only. ADC, bzip2, LZFSE,
-  and LZMA chunks are recognised in the mish table but return
-  `Unsupported` from `read_at` until the codecs are wired up.
-  Multi-segment images and `koly` versions other than 4 are also
-  rejected at open time.
+  covered); writer assumes shortform / extent dirs. Node-form
+  (multi-leaf dabtree) xattrs are read-only.
+- **HFS+ decmpfs**: type 3 (zlib inline) + type 4 (zlib resource
+  fork) work. LZVN (types 7/8) and LZFSE (types 11/12) return
+  `Unsupported`.
+- **DMG**: read-only — no DMG writer / `convert` path. Encrypted v1
+  (`cdsaencr` legacy 3DES) chunks return `Unsupported`; v2 is
+  covered.
+- **Partial-file rewrites** on the trait surface — `open_file_rw`
+  exists everywhere it's safe, but a typed "patch this byte range
+  on a known-large file" API is not surfaced beyond `Read + Write +
+  Seek` on the handle.
 
 ## Try it
 

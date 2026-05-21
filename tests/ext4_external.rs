@@ -1076,6 +1076,8 @@ fn ext4_repack_replays_pending_journal() {
             bytes: payload.clone(),
         }],
         &jsb.uuid,
+        true,
+        true,
     );
     let commit = jbd2::encode_commit_block(bs, tid, 0, 0);
 
@@ -1170,15 +1172,105 @@ fn ext4_repack_replays_pending_journal() {
     );
 }
 
-// Depth-1 HTree integration is exercised by the unit tests in
-// src/fs/ext/htree.rs (`dx_node_*` and the depth-1 encoder/route
-// round-trip). A full e2fsck-driven integration test for a depth-1
-// directory needs > root_limit leaves, which means staging > 124 dir
-// blocks (at 1 KiB blocks) in one JBD2 transaction — but the v1 writer
-// emits at most one descriptor block per commit and therefore caps a
-// single transaction's tag count at ~124. Once the journal commit can
-// split a transaction across multiple descriptor blocks, this test can
-// be reinstated by allocating a 60 K-entry dir at 1 KiB blocks
-// (≈148 leaves × ~44 entries) and confirming `debugfs htree_dump`
-// reports `Indirect levels: 1`. Tracked alongside the multi-level-HTree
-// work.
+/// Build an HTree-indexed directory big enough to force a two-level
+/// tree (`indirect_levels = 1`): a dx_root pointing at multiple
+/// dx_node intermediate blocks, each pointing at the actual leaves.
+/// 1024-byte blocks shrink the single-level cap from ~90 K entries
+/// to ~5400, so a 6500-entry dir is enough to cross it without
+/// ballooning the test image. Also exercises the multi-descriptor
+/// JBD2 commit path: > 124 dir blocks staged at 1 KiB blocks doesn't
+/// fit in one descriptor.
+#[test]
+fn ext4_indexed_directory_two_level_passes_e2fsck() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+    use fstool::fs::ext::FormatOpts;
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 1024,
+        blocks_count: 64 * 1024,
+        inodes_count: 8192,
+        journal_blocks: 8192,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    let names: Vec<String> = (0..6500).map(|i| format!("entry_{i:05}")).collect();
+    let name_bytes: Vec<&[u8]> = names.iter().map(|s| s.as_bytes()).collect();
+    let bigdir = ext
+        .add_dir_indexed(
+            &mut dev,
+            2,
+            b"big",
+            FileMeta::with_mode(0o755),
+            &name_bytes,
+        )
+        .unwrap();
+    for name in &name_bytes {
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(b"x\n").unwrap();
+        ext.add_file_to(
+            &mut dev,
+            bigdir,
+            name,
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Our reader must enumerate every name via the legacy linear-scan
+    // path (dx_root/dx_node fake-dirent prefixes are designed to stop
+    // it after one bogus dirent per index block, leaving real entries
+    // discoverable in the leaves).
+    let entries = ext.list_inode(&mut dev, bigdir).unwrap();
+    let got: std::collections::HashSet<String> = entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    assert_eq!(
+        got.len(),
+        names.len(),
+        "fstool ls miscounted on two-level indexed dir"
+    );
+
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected two-level indexed dir:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    // debugfs's htree_dump on a depth-1 tree shows "Indirect levels: 1".
+    let dump = Command::new("debugfs")
+        .arg("-R")
+        .arg("htree_dump /big")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&dump.stdout);
+    assert!(
+        out.contains("Indirect levels: 1"),
+        "debugfs didn't see /big as depth-1:\n{out}"
+    );
+}

@@ -154,28 +154,41 @@ pub struct JournalBlock {
     pub bytes: Vec<u8>,
 }
 
-/// Build the descriptor block bytes (`block_size` long) listing every
-/// entry in `blocks`. Layout: 12-byte header, then one tag per entry. The
-/// first tag carries `uuid`; the remaining tags set `SAME_UUID`. The very
-/// last tag sets `LAST_TAG`.
+/// Build the descriptor block bytes (`block_size` long) listing one
+/// chunk of a (potentially multi-descriptor) transaction.
 ///
-/// Tag size is 24 bytes for the first tag (with UUID) and 8 bytes for
-/// each subsequent tag.
+/// `is_first_descriptor` is true when this is the very first descriptor
+/// in the transaction — its first tag carries the 16-byte UUID payload
+/// and clears `SAME_UUID`. Continuation descriptors set `SAME_UUID`
+/// on every tag, dropping the 16-byte overhead.
+///
+/// `is_last_descriptor` is true when this is the final descriptor in
+/// the transaction — its last tag gets `LAST_TAG` so the reader knows
+/// to expect a commit block after this descriptor's data payloads.
+/// Continuation descriptors don't set `LAST_TAG`; the reader probes
+/// the next block to decide whether to keep walking or finalise.
+///
+/// Tag capacity is `(bs - 12 - 16) / 8` for the first descriptor and
+/// `(bs - 12) / 8` for continuations; see [`descriptor_tag_capacity`].
 pub fn encode_descriptor_block(
     block_size: u32,
     sequence: u32,
     blocks: &[JournalBlock],
     uuid: &[u8; 16],
+    is_first_descriptor: bool,
+    is_last_descriptor: bool,
 ) -> Vec<u8> {
     let mut out = vec![0u8; block_size as usize];
     out[..12].copy_from_slice(&encode_header(JBD2_DESCRIPTOR_BLOCK, sequence));
     let mut off = 12usize;
     for (i, jb) in blocks.iter().enumerate() {
+        let is_very_first_tag = is_first_descriptor && i == 0;
+        let is_very_last_tag = is_last_descriptor && i + 1 == blocks.len();
         let mut flags: u16 = 0;
-        if i != 0 {
+        if !is_very_first_tag {
             flags |= JBD2_FLAG_SAME_UUID;
         }
-        if i + 1 == blocks.len() {
+        if is_very_last_tag {
             flags |= JBD2_FLAG_LAST_TAG;
         }
         // t_blocknr (low 32 bits)
@@ -185,13 +198,21 @@ pub fn encode_descriptor_block(
         // t_flags (BE)
         out[off + 6..off + 8].copy_from_slice(&flags.to_be_bytes());
         off += 8;
-        if i == 0 {
-            // First tag carries the 16-byte UUID payload.
+        if is_very_first_tag {
             out[off..off + 16].copy_from_slice(uuid);
             off += 16;
         }
     }
     out
+}
+
+/// Number of tags one descriptor block can hold at `block_size`. The
+/// first descriptor in a transaction loses 16 bytes to the UUID
+/// payload after its first tag; continuation descriptors don't.
+pub fn descriptor_tag_capacity(block_size: u32, is_first_descriptor: bool) -> usize {
+    let header = 12usize;
+    let uuid_overhead = if is_first_descriptor { 16 } else { 0 };
+    (block_size as usize - header - uuid_overhead) / 8
 }
 
 /// Build the commit block bytes (`block_size` long). Without any
@@ -322,7 +343,7 @@ pub(crate) fn replay_journal(ext: &super::Ext, dev: &mut dyn BlockDevice) -> Res
     let mut idx = jsb.start;
     let mut expected_tid = jsb.sequence;
     let mut replayed = false;
-    loop {
+    'transactions: loop {
         let blk = read_journal_block(ext, dev, &journal_inode, idx)?;
         let magic = u32::from_be_bytes(blk[0..4].try_into().unwrap());
         if magic != JBD2_MAGIC {
@@ -342,38 +363,61 @@ pub(crate) fn replay_journal(ext: &super::Ext, dev: &mut dyn BlockDevice) -> Res
             break;
         }
 
-        // Parse tags and identify the trailing commit block.
-        let (data_targets, payload_count) = parse_descriptor_tags(&blk, bs)?;
-        idx = ring_next(idx, &jsb);
-        // Data payload blocks: as many as tags.
-        let mut commit_seen = false;
-        for tag in &data_targets {
-            // Each data block is one journal block at `idx`.
-            let mut payload = read_journal_block(ext, dev, &journal_inode, idx)?;
-            // If the tag has ESCAPE set, the first 4 bytes were overwritten
-            // by us to avoid the magic — restore them.
-            if tag.flags & JBD2_FLAG_ESCAPE != 0 {
-                payload[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
-            }
-            // Write the block to its target FS location.
-            dev.write_at(tag.fs_block as u64 * bs as u64, &payload)?;
+        // Walk descriptor blocks for this transaction until LAST_TAG
+        // appears or the next block stops being a descriptor. Apply
+        // every tag's data payload to its FS-home block as we go.
+        let mut current_desc = blk;
+        loop {
+            let (data_targets, _) = parse_descriptor_tags(&current_desc, bs)?;
+            let saw_last_tag = data_targets
+                .iter()
+                .any(|t| t.flags & JBD2_FLAG_LAST_TAG != 0);
             idx = ring_next(idx, &jsb);
+            for tag in &data_targets {
+                let mut payload = read_journal_block(ext, dev, &journal_inode, idx)?;
+                if tag.flags & JBD2_FLAG_ESCAPE != 0 {
+                    payload[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+                }
+                dev.write_at(tag.fs_block as u64 * bs as u64, &payload)?;
+                idx = ring_next(idx, &jsb);
+            }
+            if saw_last_tag {
+                break;
+            }
+            // Peek the next block: if it's another descriptor with the
+            // same tid, keep going; if it's a commit, finalise; if
+            // neither, bail.
+            let peek = read_journal_block(ext, dev, &journal_inode, idx)?;
+            let peek_magic = u32::from_be_bytes(peek[0..4].try_into().unwrap());
+            if peek_magic != JBD2_MAGIC {
+                break 'transactions;
+            }
+            let peek_type = u32::from_be_bytes(peek[4..8].try_into().unwrap());
+            let peek_tid = u32::from_be_bytes(peek[8..12].try_into().unwrap());
+            if peek_tid != tid {
+                break 'transactions;
+            }
+            if peek_type == JBD2_COMMIT_BLOCK {
+                break;
+            }
+            if peek_type != JBD2_DESCRIPTOR_BLOCK {
+                break 'transactions;
+            }
+            current_desc = peek;
         }
-        let _ = payload_count;
 
         // Next block must be a commit block with the same tid.
         let commit_buf = read_journal_block(ext, dev, &journal_inode, idx)?;
         let cmagic = u32::from_be_bytes(commit_buf[0..4].try_into().unwrap());
         let ctype = u32::from_be_bytes(commit_buf[4..8].try_into().unwrap());
         let ctid = u32::from_be_bytes(commit_buf[8..12].try_into().unwrap());
-        if cmagic == JBD2_MAGIC && ctype == JBD2_COMMIT_BLOCK && ctid == tid {
-            commit_seen = true;
-        }
+        let commit_seen =
+            cmagic == JBD2_MAGIC && ctype == JBD2_COMMIT_BLOCK && ctid == tid;
         idx = ring_next(idx, &jsb);
 
         if !commit_seen {
-            // Descriptor without a matching commit — partial transaction,
-            // don't apply it (replay is atomic).
+            // Descriptor sequence without a matching commit — partial
+            // transaction, don't apply it (replay is atomic).
             break;
         }
 
@@ -458,12 +502,21 @@ pub(crate) fn write_transaction(
     commit_nsec: u32,
 ) -> Result<u32> {
     let bs = ext.layout.block_size;
-    // Capacity check: descriptor + N data + commit must fit in the log
-    // ring. We're not doing wraparound in v1 — for a freshly-clean
-    // journal with `start_idx = first`, this is always fine for a small
-    // transaction. Refuse with a clear error if the caller exceeds the
-    // ring; the writer should fall back to splitting.
-    let need = 2 + blocks.len() as u32;
+    let first_cap = descriptor_tag_capacity(bs, true);
+    let next_cap = descriptor_tag_capacity(bs, false);
+
+    // Total journal blocks: one descriptor per chunk + every data
+    // block + one trailing commit. First chunk holds up to `first_cap`
+    // tags (it carries the UUID payload), subsequent chunks up to
+    // `next_cap` each.
+    let n_descs = if blocks.is_empty() {
+        1
+    } else if blocks.len() <= first_cap {
+        1
+    } else {
+        1 + (blocks.len() - first_cap).div_ceil(next_cap)
+    };
+    let need = (n_descs + blocks.len() + 1) as u32;
     let avail = jsb.maxlen.saturating_sub(jsb.first);
     if need > avail {
         return Err(crate::Error::Unsupported(format!(
@@ -472,24 +525,44 @@ pub(crate) fn write_transaction(
         )));
     }
 
-    // Descriptor.
-    let desc = encode_descriptor_block(bs, tid, blocks, &jsb.uuid);
-    write_journal_block(ext, dev, journal_inode, start_idx, &desc)?;
-    let mut idx = ring_next(start_idx, jsb);
+    let mut idx = start_idx;
+    let mut chunk_start = 0usize;
+    let mut is_first_desc = true;
+    while chunk_start < blocks.len().max(1) {
+        let cap = if is_first_desc { first_cap } else { next_cap };
+        let chunk_end = (chunk_start + cap).min(blocks.len());
+        let chunk = if blocks.is_empty() {
+            &[][..]
+        } else {
+            &blocks[chunk_start..chunk_end]
+        };
+        let is_last_desc = chunk_end == blocks.len();
 
-    // Data payload — one block per tag. If a payload's first 4 bytes
-    // happen to match the JBD2 magic we'd confuse a future replay; the
-    // kernel handles this with the ESCAPE flag. We don't expect any of
-    // our metadata block images to start with that pattern (it'd require
-    // a magic-collision inside an inode-table / bitmap / GDT block), so
-    // detect-and-warn would be premature here; just blast the bytes
-    // through. If we ever journal a block that *could* start with the
-    // magic (e.g. backup-journal-SB images), this is the spot to set
-    // ESCAPE and zero the first 4 bytes in the journaled copy.
-    for jb in blocks {
-        debug_assert_eq!(jb.bytes.len(), bs as usize, "journal payload wrong size");
-        write_journal_block(ext, dev, journal_inode, idx, &jb.bytes)?;
+        let desc = encode_descriptor_block(
+            bs,
+            tid,
+            chunk,
+            &jsb.uuid,
+            is_first_desc,
+            is_last_desc,
+        );
+        write_journal_block(ext, dev, journal_inode, idx, &desc)?;
         idx = ring_next(idx, jsb);
+
+        for jb in chunk {
+            debug_assert_eq!(jb.bytes.len(), bs as usize, "journal payload wrong size");
+            write_journal_block(ext, dev, journal_inode, idx, &jb.bytes)?;
+            idx = ring_next(idx, jsb);
+        }
+
+        chunk_start = chunk_end;
+        is_first_desc = false;
+        if blocks.is_empty() {
+            // Special case: an empty transaction emits one empty
+            // descriptor followed by the commit. Break to skip the
+            // outer loop's bounds bump (which would underflow).
+            break;
+        }
     }
 
     // Commit.
@@ -535,7 +608,7 @@ mod tests {
             },
         ];
         let uuid = [0xAA; 16];
-        let buf = encode_descriptor_block(1024, 7, &blocks, &uuid);
+        let buf = encode_descriptor_block(1024, 7, &blocks, &uuid, true, true);
         // Header.
         assert_eq!(
             u32::from_be_bytes(buf[0..4].try_into().unwrap()),
@@ -576,7 +649,7 @@ mod tests {
             },
         ];
         let uuid = [0x42; 16];
-        let buf = encode_descriptor_block(1024, 9, &blocks, &uuid);
+        let buf = encode_descriptor_block(1024, 9, &blocks, &uuid, true, true);
         let (tags, n) = parse_descriptor_tags(&buf, 1024).unwrap();
         assert_eq!(n, 3);
         assert_eq!(tags[0].fs_block, 100);

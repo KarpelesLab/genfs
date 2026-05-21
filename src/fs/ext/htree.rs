@@ -79,10 +79,13 @@ pub const DX_ENTRY_LEN: usize = 8;
 pub const DX_ROOT_HEADER_LEN: usize = 32;
 
 /// Static bytes consumed by the dx_node prefix before the dx_entry
-/// table: a single 12-byte fake dirent (inode=0, rec_len=block_size,
-/// name_len=0) so legacy readers stop right after the dirent and
-/// don't try to decode the index entries as more dirents.
-pub const DX_NODE_HEADER_LEN: usize = 12;
+/// table: a single 8-byte fake dirent (inode + rec_len + name_len +
+/// file_type) with `name_len = 0` so no name bytes follow. `rec_len`
+/// spans the whole block, so legacy linear-walk readers consume one
+/// dirent and stop. The dx_entry table follows immediately after,
+/// matching the kernel's `struct dx_node { struct fake_dirent fake;
+/// struct dx_entry entries[0]; }` layout.
+pub const DX_NODE_HEADER_LEN: usize = 8;
 
 /// One slot in the dx_root / dx_node entry table.
 #[derive(Debug, Clone, Copy)]
@@ -390,15 +393,13 @@ pub fn make_dx_node_block(
         "dx_node must have at least the countlimit slot"
     );
     let mut buf = vec![0u8; block_size as usize];
-    // Single fake dirent at offset 0, spanning the whole block so a
-    // linear reader walks it once and stops. Same trick as dx_root's
-    // ".." entry, but here it's the only dirent (no inode for `.`).
+    // Single 8-byte fake dirent at offset 0, spanning the whole block
+    // so a linear-walk reader consumes one dirent and stops. The
+    // dx_entry table follows immediately at offset 8.
     buf[0..4].copy_from_slice(&0u32.to_le_bytes()); // inode = 0
     buf[4..6].copy_from_slice(&(block_size as u16).to_le_bytes()); // rec_len
     buf[6] = 0; // name_len
     buf[7] = 0; // file_type
-    // 8..12 zero (no name)
-    // dx_entry table starts at offset 12. Same layout as in dx_root.
     for (i, e) in entries.iter().enumerate() {
         let off = DX_NODE_HEADER_LEN + i * DX_ENTRY_LEN;
         buf[off..off + 4].copy_from_slice(&e.hash.to_le_bytes());

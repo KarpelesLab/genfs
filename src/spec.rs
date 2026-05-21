@@ -88,8 +88,17 @@ pub struct PartitionSpec {
 
 /// Filesystem configuration. Used both as the top-level `[filesystem]`
 /// table (bare-FS mode) and as the nested `[partitions.filesystem]` table.
+///
+/// Marked `#[non_exhaustive]` because the legacy flat tunables (`block_size`,
+/// `volume_label`, `mtime`, …) are progressively being replaced by the
+/// free-form [`Self::options`] table — new FS-specific knobs land there
+/// without needing a new flat field, but the door is kept open for either
+/// route. External crates should construct `FilesystemSpec` only through
+/// `toml::from_str` (or one of the [`Spec`] parse helpers), not via a
+/// struct literal.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct FilesystemSpec {
     /// `"ext2"`, `"ext3"`, `"ext4"`, or `"fat32"`.
     #[serde(rename = "type")]

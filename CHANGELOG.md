@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/KarpelesLab/fstool/compare/v0.3.1...v0.4.0) - 2026-05-21
+
+### Added
+
+- *(cli)* unify create + add -O / [filesystem.options] for FS knobs
+
+### Fixed
+
+- *(spec)* mark FilesystemSpec #[non_exhaustive]
+
+### Other
+
+- *(readme)* refresh FS matrix + limitations for current state
+
 ## [0.3.1](https://github.com/KarpelesLab/fstool/compare/v0.3.0...v0.3.1) - 2026-05-21
 
 ### Added

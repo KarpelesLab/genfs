@@ -87,6 +87,42 @@ impl Default for FormatOpts {
     }
 }
 
+impl FormatOpts {
+    /// Apply a generic option-bag (CLI `-O key=val` / TOML
+    /// `[filesystem.options]`) on top of these opts. Unknown keys are
+    /// left in the map for the caller to flag.
+    pub fn apply_options(
+        &mut self,
+        map: &mut crate::format_opts::OptionMap,
+    ) -> crate::Result<()> {
+        if let Some(s) = map.take_str("volume_label") {
+            self.volume_label = s;
+        }
+        if let Some(n) = map.take_u32("log_blocks_per_seg")? {
+            self.log_blocks_per_seg = n;
+        }
+        if let Some(n) = map.take_u32("segs_per_sec")? {
+            self.segs_per_sec = n;
+        }
+        if let Some(n) = map.take_u32("secs_per_zone")? {
+            self.secs_per_zone = n;
+        }
+        if let Some(n) = map.take_u16("root_mode")? {
+            self.root_mode = n;
+        }
+        if let Some(n) = map.take_u32("root_uid")? {
+            self.root_uid = n;
+        }
+        if let Some(n) = map.take_u32("root_gid")? {
+            self.root_gid = n;
+        }
+        if let Some(t) = map.take_u32("mtime")? {
+            self.mtime = t;
+        }
+        Ok(())
+    }
+}
+
 /// Resolved geometry of the volume we're about to write. Every field is
 /// in 4 KiB blocks unless noted.
 #[derive(Debug, Clone, Copy)]

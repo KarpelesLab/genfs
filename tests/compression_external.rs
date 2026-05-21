@@ -37,8 +37,8 @@ fn repack_into_tar_gz_then_inspect() {
     let src_img = NamedTempFile::new().unwrap();
     let out = Command::new(FSTOOL)
         .args([
-            "ext-build",
-            "--kind",
+            "create",
+            "-t",
             "ext2",
             srcdir.path().to_str().unwrap(),
             "-o",
@@ -48,7 +48,7 @@ fn repack_into_tar_gz_then_inspect() {
         .unwrap();
     assert!(
         out.status.success(),
-        "ext-build failed: {}",
+        "create failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 

@@ -96,6 +96,47 @@ impl Default for FormatOpts {
     }
 }
 
+impl FormatOpts {
+    /// Apply a generic option-bag (CLI `-O key=val` / TOML
+    /// `[filesystem.options]`) on top of these opts. Unknown keys are
+    /// left in the map for the caller to flag.
+    pub fn apply_options(
+        &mut self,
+        map: &mut crate::format_opts::OptionMap,
+    ) -> crate::Result<()> {
+        if let Some(sz) = map.take_size("bytes_per_sector")? {
+            self.bytes_per_sector = sz as u16;
+        }
+        if let Some(n) = map.take_u8("sectors_per_cluster")? {
+            self.sectors_per_cluster = n;
+        }
+        if let Some(sz) = map.take_size("cluster_size")? {
+            // Convenience: derive sectors_per_cluster from a byte cluster
+            // size (must be a multiple of bytes_per_sector).
+            let bps = self.bytes_per_sector as u64;
+            if bps == 0 || sz % bps != 0 {
+                return Err(crate::Error::InvalidImage(format!(
+                    "cluster_size {sz} is not a multiple of bytes_per_sector {bps}"
+                )));
+            }
+            let spc = sz / bps;
+            if spc == 0 || spc > 128 {
+                return Err(crate::Error::InvalidImage(format!(
+                    "sectors_per_cluster {spc} out of range (1..=128)"
+                )));
+            }
+            self.sectors_per_cluster = spc as u8;
+        }
+        if let Some(s) = map.take_str("volume_label") {
+            self.volume_label = s;
+        }
+        if let Some(n) = map.take_u64("volume_serial")? {
+            self.volume_serial = n;
+        }
+        Ok(())
+    }
+}
+
 /// Produce a non-zero 64-bit value from the running clock — used as a
 /// volume serial number. We avoid pulling `uuid` here because the bytes
 /// don't need to be a UUID, just unique-per-format.

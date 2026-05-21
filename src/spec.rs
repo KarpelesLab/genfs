@@ -117,6 +117,15 @@ pub struct FilesystemSpec {
     pub size: Option<String>,
     /// FAT32 volume ID / serial number. Default 0 for reproducible output.
     pub volume_id: Option<u32>,
+    /// Filesystem-specific options, as a free-form TOML table. Keyed by
+    /// the same names accepted by the CLI's `-O key=val` flag and by
+    /// each backend's `FormatOpts::apply_options`. Values must be
+    /// scalars (string / int / bool / float). The legacy flat fields
+    /// above are still honoured and pre-loaded into the same bag —
+    /// `options` lets you reach knobs that don't have a dedicated flat
+    /// field (e.g. squashfs `compression`, ntfs `bytes_per_sector`,
+    /// hfs+ `journaled`).
+    pub options: Option<toml::Table>,
 }
 
 impl Spec {
@@ -182,36 +191,63 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
         "hfsplus" | "hfs+" => build_bare_via_trait::<crate::fs::hfs_plus::HfsPlus>(
             fs,
             output,
-            hfs_plus_format_opts(fs),
+            hfs_plus_format_opts(fs)?,
         ),
         "ntfs" => build_bare_via_trait::<crate::fs::ntfs::Ntfs>(fs, output, ntfs_format_opts(fs)?),
-        "f2fs" => build_bare_via_trait::<crate::fs::f2fs::F2fs>(fs, output, f2fs_format_opts(fs)),
+        "f2fs" => build_bare_via_trait::<crate::fs::f2fs::F2fs>(fs, output, f2fs_format_opts(fs)?),
         "squashfs" => build_bare_via_trait::<crate::fs::squashfs::Squashfs>(
             fs,
             output,
-            squashfs_format_opts(fs),
+            squashfs_format_opts(fs)?,
         ),
         "xfs" => build_bare_via_trait::<crate::fs::xfs::Xfs>(fs, output, xfs_format_opts(fs)?),
-        "iso" | "iso9660" => {
-            build_bare_via_trait::<crate::fs::iso9660::Iso9660>(fs, output, iso9660_format_opts(fs))
-        }
-        "grf" => build_bare_via_trait::<crate::fs::grf::Grf>(fs, output, grf_format_opts(fs)),
+        "iso" | "iso9660" => build_bare_via_trait::<crate::fs::iso9660::Iso9660>(
+            fs,
+            output,
+            iso9660_format_opts(fs)?,
+        ),
+        "grf" => build_bare_via_trait::<crate::fs::grf::Grf>(fs, output, grf_format_opts(fs)?),
         other => Err(crate::Error::InvalidArgument(format!(
             "spec: unknown filesystem type {other:?}"
         ))),
     }
 }
 
-fn grf_format_opts(_fs: &FilesystemSpec) -> crate::fs::grf::FormatOpts {
-    crate::fs::grf::FormatOpts::default()
+/// Build a fresh [`OptionMap`] from the FS spec for use by a backend's
+/// `FormatOpts::apply_options`. Pre-loads `volume_label` from the flat
+/// legacy field (other flat fields are FS-specific and live on the
+/// respective helpers), then merges the optional `[filesystem.options]`
+/// table on top. Caller is responsible for `check_empty` after taking
+/// the keys it recognises.
+fn options_bag_for(fs: &FilesystemSpec) -> Result<crate::format_opts::OptionMap> {
+    let mut bag = crate::format_opts::OptionMap::new();
+    if let Some(label) = &fs.volume_label {
+        bag.insert("volume_label", label);
+    }
+    if let Some(table) = &fs.options {
+        bag.merge_toml(table)?;
+    }
+    Ok(bag)
 }
 
-fn iso9660_format_opts(fs: &FilesystemSpec) -> crate::fs::iso9660::FormatOpts {
-    crate::fs::iso9660::FormatOpts {
-        volume_id: fs.volume_label.clone().unwrap_or_else(|| "FSTOOL".into()),
+fn grf_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::grf::FormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::grf::FormatOpts::default();
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("grf")?;
+    Ok(opts)
+}
+
+fn iso9660_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::iso9660::FormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::iso9660::FormatOpts {
+        volume_id: "FSTOOL".into(),
         application_id: "fstool".into(),
         ..crate::fs::iso9660::FormatOpts::default()
-    }
+    };
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("iso9660")?;
+    Ok(opts)
 }
 
 /// Generic "create the backing file, format `F`, populate from
@@ -255,38 +291,52 @@ fn format_in_partition_via_trait<F: crate::fs::FilesystemFactory>(
     Ok(())
 }
 
-fn hfs_plus_format_opts(fs: &FilesystemSpec) -> crate::fs::hfs_plus::FormatOpts {
-    crate::fs::hfs_plus::FormatOpts {
-        volume_name: fs
-            .volume_label
-            .clone()
-            .unwrap_or_else(|| "Untitled".to_string()),
+fn hfs_plus_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::hfs_plus::FormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::hfs_plus::FormatOpts {
+        volume_name: "Untitled".to_string(),
         ..crate::fs::hfs_plus::FormatOpts::default()
-    }
+    };
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("hfs+")?;
+    Ok(opts)
 }
 
 fn ntfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::ntfs::format::FormatOpts> {
-    Ok(crate::fs::ntfs::format::FormatOpts {
-        volume_label: fs.volume_label.clone().unwrap_or_default(),
-        ..crate::fs::ntfs::format::FormatOpts::default()
-    })
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::ntfs::format::FormatOpts::default();
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("ntfs")?;
+    Ok(opts)
 }
 
-fn f2fs_format_opts(_fs: &FilesystemSpec) -> crate::fs::f2fs::FormatOpts {
-    crate::fs::f2fs::FormatOpts::default()
+fn f2fs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::f2fs::FormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::f2fs::FormatOpts::default();
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("f2fs")?;
+    Ok(opts)
 }
 
-fn squashfs_format_opts(fs: &FilesystemSpec) -> crate::fs::squashfs::FormatOpts {
-    crate::fs::squashfs::FormatOpts {
+fn squashfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::squashfs::FormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::squashfs::FormatOpts {
         block_size: fs
             .block_size
             .unwrap_or(crate::fs::squashfs::DEFAULT_BLOCK_SIZE),
         ..crate::fs::squashfs::FormatOpts::default()
-    }
+    };
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("squashfs")?;
+    Ok(opts)
 }
 
-fn xfs_format_opts(_fs: &FilesystemSpec) -> Result<crate::fs::xfs::format::FormatOpts> {
-    Ok(crate::fs::xfs::format::FormatOpts::default())
+fn xfs_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::xfs::format::FormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let mut opts = crate::fs::xfs::format::FormatOpts::default();
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("xfs")?;
+    Ok(opts)
 }
 
 fn build_bare_ext(fs: &FilesystemSpec, output: &Path) -> Result<()> {
@@ -596,7 +646,7 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                 format_in_partition_via_trait::<crate::fs::hfs_plus::HfsPlus>(
                     &mut slice,
                     fs,
-                    hfs_plus_format_opts(fs),
+                    hfs_plus_format_opts(fs)?,
                 )?;
             }
             "ntfs" => {
@@ -610,14 +660,14 @@ fn build_partitioned(image: &ImageSpec, partitions: &[PartitionSpec], output: &P
                 format_in_partition_via_trait::<crate::fs::f2fs::F2fs>(
                     &mut slice,
                     fs,
-                    f2fs_format_opts(fs),
+                    f2fs_format_opts(fs)?,
                 )?;
             }
             "squashfs" => {
                 format_in_partition_via_trait::<crate::fs::squashfs::Squashfs>(
                     &mut slice,
                     fs,
-                    squashfs_format_opts(fs),
+                    squashfs_format_opts(fs)?,
                 )?;
             }
             "xfs" => {
@@ -821,6 +871,51 @@ mod tests {
         let root_fs = spec.partitions[1].filesystem.as_ref().unwrap();
         assert_eq!(root_fs.fs_type, "ext4");
         assert_eq!(root_fs.block_size, Some(4096));
+    }
+
+    #[test]
+    fn options_table_parses_and_flows_into_format_opts() {
+        // `[filesystem.options]` is a free-form scalar table; the
+        // backend's `apply_options` consumes the keys it knows. Here
+        // we feed squashfs `compression` + `block_size` and verify
+        // both land on the resulting FormatOpts.
+        let toml = r#"
+            [filesystem]
+            type = "squashfs"
+            source = "./rootfs"
+
+            [filesystem.options]
+            compression = "gzip"
+            block_size = 65536
+        "#;
+        let spec = Spec::parse(toml).unwrap();
+        let fs = spec.filesystem.as_ref().unwrap();
+        let opts = squashfs_format_opts(fs).unwrap();
+        assert_eq!(opts.block_size, 65536);
+        assert!(matches!(
+            opts.compression,
+            crate::fs::squashfs::Compression::Gzip
+        ));
+    }
+
+    #[test]
+    fn options_table_rejects_unknown_keys() {
+        // hfs+'s `apply_options` doesn't know `widgetsize`, so the
+        // overall spec parse-and-format step should fail with a clear
+        // error citing the unrecognised key.
+        let toml = r#"
+            [filesystem]
+            type = "hfs+"
+
+            [filesystem.options]
+            widgetsize = 42
+        "#;
+        let spec = Spec::parse(toml).unwrap();
+        let fs = spec.filesystem.as_ref().unwrap();
+        let err = hfs_plus_format_opts(fs).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("hfs+"), "msg: {msg}");
+        assert!(msg.contains("widgetsize"), "msg: {msg}");
     }
 
     #[test]

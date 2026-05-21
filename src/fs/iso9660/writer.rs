@@ -69,6 +69,46 @@ impl Default for FormatOpts {
     }
 }
 
+impl FormatOpts {
+    /// Apply a generic option-bag (CLI `-O key=val` / TOML
+    /// `[filesystem.options]`) on top of these opts. Unknown keys are
+    /// left in the map for the caller to flag. El Torito boot config is
+    /// not yet plumbable through the bag — set it directly on
+    /// `FormatOpts`.
+    pub fn apply_options(
+        &mut self,
+        map: &mut crate::format_opts::OptionMap,
+    ) -> crate::Result<()> {
+        if let Some(s) = map.take_str("volume_id") {
+            self.volume_id = s;
+        }
+        // Accept "volume_label" as a synonym so the same CLI key works
+        // across filesystems.
+        if let Some(s) = map.take_str("volume_label") {
+            self.volume_id = s;
+        }
+        if let Some(s) = map.take_str("publisher_id") {
+            self.publisher_id = s;
+        }
+        if let Some(s) = map.take_str("data_preparer_id") {
+            self.data_preparer_id = s;
+        }
+        if let Some(s) = map.take_str("application_id") {
+            self.application_id = s;
+        }
+        if let Some(b) = map.take_bool("joliet")? {
+            self.joliet = b;
+        }
+        if let Some(b) = map.take_bool("rock_ridge")? {
+            self.rock_ridge = b;
+        }
+        if let Some(t) = map.take_u32("create_date")? {
+            self.create_date = t;
+        }
+        Ok(())
+    }
+}
+
 /// One in-memory entry the writer is buffering. Kept private — the
 /// public API speaks through [`crate::fs::Filesystem`].
 ///

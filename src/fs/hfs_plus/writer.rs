@@ -136,6 +136,44 @@ impl Default for FormatOpts {
     }
 }
 
+impl FormatOpts {
+    /// Apply a generic option-bag (CLI `-O key=val` / TOML
+    /// `[filesystem.options]`) on top of these opts. Unknown keys are
+    /// left in the map for the caller to flag.
+    pub fn apply_options(
+        &mut self,
+        map: &mut crate::format_opts::OptionMap,
+    ) -> crate::Result<()> {
+        if let Some(sz) = map.take_size("block_size")? {
+            self.block_size = sz as u32;
+        }
+        if let Some(sz) = map.take_size("node_size")? {
+            self.node_size = sz as u32;
+        }
+        if let Some(n) = map.take_u32("extents_nodes")? {
+            self.extents_nodes = n;
+        }
+        if let Some(n) = map.take_u32("catalog_nodes")? {
+            self.catalog_nodes = n;
+        }
+        if let Some(s) = map.take_str("volume_name") {
+            self.volume_name = s;
+        }
+        // Accept "volume_label" as a synonym for "volume_name" so the
+        // same CLI key works across filesystems.
+        if let Some(s) = map.take_str("volume_label") {
+            self.volume_name = s;
+        }
+        if let Some(t) = map.take_u32("create_date")? {
+            self.create_date = t;
+        }
+        if let Some(b) = map.take_bool("journaled")? {
+            self.journaled = b;
+        }
+        Ok(())
+    }
+}
+
 /// A catalog key in the form we keep in memory while building. We
 /// store the raw `UniStr` plus the case-folded form so the BTreeMap
 /// ordering matches the HFS+ ordering rules exactly. Always built in

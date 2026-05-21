@@ -4,7 +4,7 @@
 //! Three kinds of sources, exposed as [`Source`]:
 //!
 //! * A **host directory** (`Source::HostDir`) — the original
-//!   `ext-build` / `fat-build` flow, walks a directory tree.
+//!   `fstool create` flow, walks a directory tree.
 //! * A **tar archive** on disk (`Source::TarArchive`), with optional
 //!   compression codec. Compressed archives go through a two-pass
 //!   stream-index → replay flow; plain `.tar` falls through to the

@@ -14,7 +14,9 @@ Public API is **unstable** until v0.5.
 
 ```sh
 cargo install fstool
-fstool ext-build --kind ext4 ./src -o out.img    # build an ext4 image from a dir
+fstool create -t ext4 ./src -o out.img           # build an ext4 image from a dir
+fstool create -t squashfs ./src -o out.sqsh \
+       -O compression=zstd,block_size=128KiB     # FS-specific knobs via -O
 fstool info out.img                              # what's inside
 fstool ls   out.img /                            # walk it
 fstool repack out.img out.tar                    # convert ext4 → tar (and back)
@@ -66,9 +68,8 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 
 | Command       | What it does                                                            |
 |---------------|-------------------------------------------------------------------------|
+| `create`      | Build a bare image of any supported FS (`-t ext4` / `fat32` / `xfs` / `hfs+` / `ntfs` / `f2fs` / `squashfs` / `iso` / `apfs` / `exfat` / `grf`) from a host directory tree. FS-specific knobs go through `-O key=val,key=val`. |
 | `build`       | Build from a TOML spec — bare FS or a partitioned disk image.           |
-| `ext-build`   | Bare ext2 / ext3 / ext4 image from a host directory tree.               |
-| `fat-build`   | Bare FAT32 image from a host directory tree.                            |
 | `info`        | Print partition table (whole-disk) or FS summary + root listing.        |
 | `ls`          | List a directory inside an image.                                       |
 | `cat`         | Stream a file's bytes out of an image to stdout.                        |
@@ -77,11 +78,35 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 | `shell`       | SFTP-style REPL — `ls cd pwd cat put rm mkdir info`.                    |
 | `convert`     | Byte-level raw ↔ qcow2 conversion with optional grow.                   |
 | `repack`      | Walk one or more source FSes, merge bottom→top with whiteouts, rebuild into a fresh image. |
-| `fstool …`    | Plus `ext-build`, `fat-build`, partition-aware `disk.img:N` targets.    |
+
+All commands accept partition-aware `disk.img:N` targets (1-indexed) — see
+"Partitions, block devices, qcow2" below.
 
 All inspection / modification commands accept a `disk.img:N` (1-indexed)
 target to walk into a partition of a GPT or MBR disk image. `fstool info
 disk.img` without the suffix prints the partition table itself.
+
+### FS-specific options (`-O`)
+
+Most filesystems expose tunables (block size, label, compression codec,
+volume name, journaling on/off, etc.) through a generic `-O
+key=value,key=value` flag that is repeatable, modelled on `mke2fs -O`:
+
+```sh
+# 4 KiB blocks + custom label on ext4
+fstool create -t ext4 ./rootfs -o out.img -O block_size=4096,volume_label=ROOT
+
+# Pick a SquashFS codec and tighten the block size
+fstool create -t squashfs ./rootfs -o out.sqsh \
+       -O compression=zstd,block_size=128KiB
+
+# Force a v0x103 GRF with deflate level 9
+fstool create -t grf ./rootfs -o out.grf -O version=0x103,compression_level=9
+```
+
+Each backend's `apply_options` validates keys; unknown keys are rejected
+with a clear error citing the FS type. The same options are available
+through the TOML spec — see "[filesystem.options]" below.
 
 ## Partitions, block devices, qcow2
 
@@ -96,7 +121,7 @@ disk.img` without the suffix prints the partition table itself.
 - **qcow2** — `Qcow2Backend` reads QEMU v2 / v3 images and writes fresh v3
   ones with allocate-on-write. Path-based factories (`block::open_image`,
   `block::create_image`) auto-dispatch by qcow2 magic or file extension, so
-  `fstool ext-build src -o out.qcow2` Just Works.
+  `fstool create -t ext4 src -o out.qcow2` Just Works.
 
 ## TOML spec
 
@@ -160,6 +185,35 @@ The source FS may be any readable type — `ext{2,3,4}`, FAT32, exFAT,
 XFS, HFS+, APFS, NTFS, F2FS, SquashFS, ISO 9660, tar, or GRF — and the
 destination is sized automatically to fit unless `size` is set
 explicitly.
+
+### `[filesystem.options]` — FS-specific tunables
+
+The same `-O key=val` knobs the CLI exposes are available in TOML
+through a free-form `[filesystem.options]` table:
+
+```toml
+[filesystem]
+type = "squashfs"
+source = "./rootfs"
+
+[filesystem.options]
+compression = "zstd"
+block_size  = 131072
+
+[partitions.filesystem]
+type = "ext4"
+source = "./rootfs"
+
+[partitions.filesystem.options]
+block_size   = 4096
+volume_label = "ROOT"
+```
+
+Recognised keys are documented next to each backend's
+`FormatOpts::apply_options`; unknown keys are rejected at spec parse
+time with a clear error citing the FS type. The existing flat fields
+(`block_size`, `volume_label`, `mtime`, …) continue to work for
+backward compatibility.
 
 ## Architecture
 
@@ -370,7 +424,7 @@ Things explicitly out of scope today, in rough order of likely-to-change:
 ```sh
 cargo install fstool                          # or: cargo install --path .
 mkdir -p /tmp/src/etc && echo hi > /tmp/src/greeting.txt
-fstool ext-build --kind ext4 /tmp/src -o /tmp/out.img
+fstool create -t ext4 /tmp/src -o /tmp/out.img
 fstool info /tmp/out.img
 fstool ls   /tmp/out.img /
 fstool cat  /tmp/out.img /greeting.txt

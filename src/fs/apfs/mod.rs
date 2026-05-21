@@ -1344,6 +1344,32 @@ impl Default for ApfsFormatOpts {
     }
 }
 
+impl ApfsFormatOpts {
+    /// Apply a generic option-bag (CLI `-O key=val` / TOML
+    /// `[filesystem.options]`) on top of these opts. Unknown keys are
+    /// left in the map for the caller to flag.
+    pub fn apply_options(
+        &mut self,
+        map: &mut crate::format_opts::OptionMap,
+    ) -> crate::Result<()> {
+        if let Some(sz) = map.take_size("block_size")? {
+            self.block_size = sz as u32;
+        }
+        if let Some(n) = map.take_u64("total_blocks")? {
+            self.total_blocks = n;
+        }
+        if let Some(s) = map.take_str("volume_name") {
+            self.volume_name = s;
+        }
+        // Accept "volume_label" as a synonym so the same CLI key works
+        // across filesystems.
+        if let Some(s) = map.take_str("volume_label") {
+            self.volume_name = s;
+        }
+        Ok(())
+    }
+}
+
 /// Borrow the [`PendingWrite`] inside `state`, or return an error if
 /// the [`Apfs`] is in read or write mode.
 fn pending_write_mut(state: &mut ApfsState) -> Result<&mut PendingWrite> {

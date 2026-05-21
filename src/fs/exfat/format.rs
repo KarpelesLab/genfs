@@ -62,6 +62,35 @@ impl Default for FormatOpts {
     }
 }
 
+impl FormatOpts {
+    /// Pull exFAT-specific keys out of an
+    /// [`OptionMap`](crate::format_opts::OptionMap). Recognised keys:
+    ///
+    /// - `bytes_per_sector_shift` (u8, 9..=12)
+    /// - `sectors_per_cluster_shift` (u8)
+    /// - `volume_serial_number` (u32, decimal or `0x…`)
+    /// - `volume_label` (string, up to 11 UTF-16 code units; longer is
+    ///   silently truncated by the formatter)
+    pub fn apply_options(
+        &mut self,
+        map: &mut crate::format_opts::OptionMap,
+    ) -> crate::Result<()> {
+        if let Some(v) = map.take_u8("bytes_per_sector_shift")? {
+            self.bytes_per_sector_shift = v;
+        }
+        if let Some(v) = map.take_u8("sectors_per_cluster_shift")? {
+            self.sectors_per_cluster_shift = v;
+        }
+        if let Some(v) = map.take_u32("volume_serial_number")? {
+            self.volume_serial_number = v;
+        }
+        if let Some(v) = map.take_str("volume_label") {
+            self.volume_label = v;
+        }
+        Ok(())
+    }
+}
+
 /// Geometry that the formatter computed from the device size and options.
 /// Owned by [`super::Exfat`] after format so the writer doesn't have to
 /// re-derive things.

@@ -195,6 +195,36 @@ impl Default for FormatOpts {
     }
 }
 
+impl FormatOpts {
+    /// Apply a generic option-bag (CLI `-O key=val` / TOML
+    /// `[filesystem.options]`) on top of these opts. Unknown keys are
+    /// left in the map for the caller to flag.
+    pub fn apply_options(
+        &mut self,
+        map: &mut crate::format_opts::OptionMap,
+    ) -> crate::Result<()> {
+        if let Some(sz) = map.take_size("block_size")? {
+            self.block_size = sz as u32;
+        }
+        if let Some(s) = map.take_str("compression") {
+            self.compression = match s.to_ascii_lowercase().as_str() {
+                "gzip" | "zlib" | "deflate" => Compression::Gzip,
+                "lzma" => Compression::Lzma,
+                "lzo" => Compression::Lzo,
+                "xz" => Compression::Xz,
+                "lz4" => Compression::Lz4,
+                "zstd" | "zstandard" => Compression::Zstd,
+                other => {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "unknown squashfs compression `{other}`"
+                    )));
+                }
+            };
+        }
+        Ok(())
+    }
+}
+
 /// Resolved metadata for a single inode, returned by
 /// [`Squashfs::inode_meta`].
 #[derive(Debug, Clone)]

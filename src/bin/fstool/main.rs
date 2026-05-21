@@ -1,14 +1,18 @@
 //! fstool CLI — thin wrapper over the library.
 //!
-//! Subcommands (P5 first cut):
+//! Subcommands:
 //!
-//! - `fstool ext-build` — build a bare ext2/3/4 image from a host directory.
-//! - `fstool ls`        — list the contents of a directory inside an image.
-//! - `fstool cat`       — print a regular file's contents to stdout.
-//! - `fstool info`      — show a one-screen summary of an existing image.
-//!
-//! Full TOML-spec-driven `fstool build` and `fstool add` / `fstool rm` land
-//! in P5b / P5c — see the project README.
+//! - `fstool create` — build a bare filesystem image of any supported
+//!   type from an optional host directory. Pick the filesystem with
+//!   `--type/-t`; pass FS-specific knobs with `-O key=val,key=val`.
+//! - `fstool ls`     — list the contents of a directory inside an image.
+//! - `fstool cat`    — print a regular file's contents to stdout.
+//! - `fstool info`   — show a one-screen summary of an existing image.
+//! - `fstool repack` — rewrite an image into a possibly-different
+//!   filesystem at a different size; merge multiple sources.
+//! - `fstool build`  — drive a TOML spec.
+//! - `fstool add` / `fstool rm` / `fstool shell` — in-place mutation
+//!   on supported filesystems.
 
 mod shell;
 
@@ -16,9 +20,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 use fstool::block::{BlockDevice, FileBackend};
+use fstool::format_opts::OptionMap;
 use fstool::fs::ext::{Ext, FsKind};
 
 #[derive(Parser, Debug)]
@@ -34,26 +39,39 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Build a bare ext2 / ext3 / ext4 image from a host directory.
-    /// (Genext2fs-replacement mode — no partition table.)
-    ExtBuild {
-        /// Source directory on the host filesystem.
+    /// Create a fresh filesystem image of the chosen type, optionally
+    /// populated from a host directory tree. Replaces the older
+    /// `ext-build` / `fat-build` commands.
+    ///
+    /// Pass FS-specific knobs through `-O key=val,key=val` (repeatable).
+    /// The recognised keys are documented next to each backend's
+    /// `FormatOpts::apply_options`; unknown keys are rejected with a
+    /// clear error citing the FS type.
+    Create {
+        /// Filesystem type to format: ext2 / ext3 / ext4 / fat32 / vfat /
+        /// exfat / hfs+ / hfsplus / ntfs / f2fs / squashfs / xfs / iso /
+        /// iso9660 / grf / apfs.
+        #[arg(short = 't', long = "type", value_name = "TYPE")]
+        fs_type: String,
+        /// Optional source directory on the host. Omit to create an
+        /// empty filesystem (subject to per-FS minimum sizes).
         #[arg(value_name = "SRC_DIR")]
-        src_dir: PathBuf,
+        src_dir: Option<PathBuf>,
         /// Output image file or block device. Block devices are formatted
-        /// to their full capacity; regular files are auto-sized to the
-        /// source tree.
+        /// to their full capacity; regular files are auto-sized when the
+        /// FS supports it (ext / fat32 / iso / grf) or default to a
+        /// per-FS minimum otherwise. Explicit `--size` wins.
         #[arg(short = 'o', long = "output", value_name = "IMAGE")]
         output: PathBuf,
-        /// Which ext flavour to write.
-        #[arg(long, value_enum, default_value_t = ExtKindArg::Ext2)]
-        kind: ExtKindArg,
-        /// Block size in bytes (1024, 2048, or 4096).
-        #[arg(long, default_value_t = 1024)]
-        block_size: u32,
-        /// Write files sparsely: all-zero blocks become holes.
+        /// Image size, e.g. "64MiB" or "1GiB". Ignored when OUTPUT is a
+        /// block device (the device's capacity wins).
+        #[arg(long, value_name = "SIZE")]
+        size: Option<String>,
+        /// Shortcut for `-O volume_label=…`. Per-FS truncation /
+        /// case-folding rules apply (FAT32 upper-cases to 11 bytes,
+        /// HFS+ stores UTF-8, …).
         #[arg(long)]
-        sparse: bool,
+        label: Option<String>,
         /// Required when OUTPUT is a block device — refuses to format
         /// a real device without an explicit opt-in.
         #[arg(long)]
@@ -63,37 +81,12 @@ enum Command {
         /// bare byte count; must be a power of two ≥ 512. Default 64 KiB.
         #[arg(long, value_name = "SIZE", default_value = "64KiB")]
         cluster_size: String,
-    },
-
-    /// Build a bare FAT32 image from a host directory. FAT32 has no
-    /// streaming auto-size (it needs ≥ 65525 clusters → ~33 MiB minimum),
-    /// so `--size` is required for regular-file output; block-device
-    /// output uses the device's full capacity instead.
-    FatBuild {
-        /// Source directory on the host filesystem.
-        #[arg(value_name = "SRC_DIR")]
-        src_dir: PathBuf,
-        /// Output image file or block device.
-        #[arg(short = 'o', long = "output", value_name = "IMAGE")]
-        output: PathBuf,
-        /// Image size, e.g. "64MiB" or "1GiB". Ignored when OUTPUT is a
-        /// block device (the device's capacity wins).
-        #[arg(long, value_name = "SIZE")]
-        size: Option<String>,
-        /// Volume label (up to 11 ASCII bytes, upper-cased).
-        #[arg(long, default_value = "NO NAME")]
-        label: String,
-        /// Volume ID / serial number. Default 0 for reproducible output.
-        #[arg(long, default_value_t = 0)]
-        volume_id: u32,
-        /// Required when OUTPUT is a block device — refuses to format
-        /// a real device without an explicit opt-in.
-        #[arg(long)]
-        force: bool,
-        /// qcow2 cluster size (only honoured when OUTPUT is a qcow2
-        /// path). Default 64 KiB.
-        #[arg(long, value_name = "SIZE", default_value = "64KiB")]
-        cluster_size: String,
+        /// FS-specific options as `key=val[,key=val]…`. Repeatable.
+        /// Examples: `-O block_size=4096,sparse=true` (ext),
+        /// `-O volume_id=0xCAFEBABE` (fat32),
+        /// `-O compression=zstd,block_size=128KiB` (squashfs).
+        #[arg(short = 'O', long = "options", value_name = "KEY=VAL", action = clap::ArgAction::Append)]
+        options: Vec<String>,
     },
 
     /// List a directory inside an image. One entry per line:
@@ -232,23 +225,6 @@ enum Command {
     },
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ExtKindArg {
-    Ext2,
-    Ext3,
-    Ext4,
-}
-
-impl From<ExtKindArg> for FsKind {
-    fn from(a: ExtKindArg) -> Self {
-        match a {
-            ExtKindArg::Ext2 => FsKind::Ext2,
-            ExtKindArg::Ext3 => FsKind::Ext3,
-            ExtKindArg::Ext4 => FsKind::Ext4,
-        }
-    }
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
@@ -262,40 +238,25 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> fstool::Result<()> {
     match cli.command {
-        Command::ExtBuild {
-            src_dir,
-            output,
-            kind,
-            block_size,
-            sparse,
-            force,
-            cluster_size,
-        } => ext_build(
-            &src_dir,
-            &output,
-            kind.into(),
-            block_size,
-            sparse,
-            force,
-            &cluster_size,
-        ),
-        Command::FatBuild {
+        Command::Create {
+            fs_type,
             src_dir,
             output,
             size,
             label,
-            volume_id,
             force,
             cluster_size,
-        } => fat_build(
-            &src_dir,
-            &output,
-            size.as_deref(),
-            &label,
-            volume_id,
+            options,
+        } => create_cmd(CreateArgs {
+            fs_type: &fs_type,
+            src_dir: src_dir.as_deref(),
+            output: &output,
+            size: size.as_deref(),
+            label: label.as_deref(),
             force,
-            &cluster_size,
-        ),
+            cluster_size: &cluster_size,
+            options: &options,
+        }),
         Command::Ls { image, path } => ls(&image, &path),
         Command::Cat { image, path } => cat(&image, &path),
         Command::Info { image } => info(&image),
@@ -2307,40 +2268,315 @@ fn build(spec_path: &std::path::Path, output: &std::path::Path) -> fstool::Resul
     Ok(())
 }
 
-fn fat_build(
-    src_dir: &std::path::Path,
-    output: &std::path::Path,
-    size: Option<&str>,
-    label: &str,
-    volume_id: u32,
+/// Group of flag values plumbed into [`create_cmd`]. Keeps the
+/// callsite in `run` tidy and avoids a 10-parameter function signature.
+struct CreateArgs<'a> {
+    fs_type: &'a str,
+    src_dir: Option<&'a std::path::Path>,
+    output: &'a std::path::Path,
+    size: Option<&'a str>,
+    label: Option<&'a str>,
     force: bool,
-    cluster_size: &str,
-) -> fstool::Result<()> {
+    cluster_size: &'a str,
+    options: &'a [String],
+}
+
+/// `fstool create` — format a fresh filesystem image and optionally
+/// populate it from a host directory tree. The fs-type chooses the
+/// formatter; `-O key=val[,key=val]…` ferries FS-specific knobs through
+/// the [`OptionMap`] surface.
+fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
     use fstool::block::file::is_block_device;
+
+    let fs_type = args.fs_type.to_ascii_lowercase();
+    let is_device = is_block_device(args.output);
+    require_force_for_device(args.output, is_device, args.force)?;
+    let qcow2_cluster_size = parse_cluster_size(args.cluster_size)?;
+
+    // Build the option bag. `--label` is a shortcut for the standard
+    // `volume_label` key so the same flag works for every FS that
+    // accepts a label (even when the underlying field has a different
+    // name — each backend's `apply_options` translates).
+    let mut opts = OptionMap::new();
+    for o in args.options {
+        opts.merge_cli(o)?;
+    }
+    if let Some(label) = args.label {
+        opts.insert("volume_label", label);
+    }
+
+    // Resolve an optional source. The destination size is derived from
+    // it where the FS supports auto-sizing; otherwise --size wins.
+    let source = args
+        .src_dir
+        .map(|p| fstool::repack::Source::HostDir(p.to_path_buf()));
+
+    // Per-FS dispatch. Each arm consumes the relevant keys from `opts`,
+    // calls `check_empty`, sizes the destination, then formats +
+    // populates.
+    match fs_type.as_str() {
+        "ext2" | "ext3" | "ext4" => create_ext(
+            &fs_type,
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+        )?,
+        "fat32" | "vfat" => create_fat32(
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+        )?,
+        "exfat" => create_exfat(
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+        )?,
+        "hfs+" | "hfsplus" => create_via_factory::<fstool::fs::hfs_plus::HfsPlus>(
+            "hfs+",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::hfs_plus::FormatOpts::default(),
+            |o, m| o.apply_options(m),
+            DEFAULT_MIN_SIZE,
+        )?,
+        "ntfs" => create_via_factory::<fstool::fs::ntfs::Ntfs>(
+            "ntfs",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::ntfs::format::FormatOpts::default(),
+            |o, m| o.apply_options(m),
+            16 * 1024 * 1024,
+        )?,
+        "f2fs" => create_via_factory::<fstool::fs::f2fs::F2fs>(
+            "f2fs",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::f2fs::FormatOpts::default(),
+            |o, m| o.apply_options(m),
+            64 * 1024 * 1024,
+        )?,
+        "squashfs" => create_via_factory::<fstool::fs::squashfs::Squashfs>(
+            "squashfs",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::squashfs::FormatOpts::default(),
+            |o, m| o.apply_options(m),
+            DEFAULT_MIN_SIZE,
+        )?,
+        "xfs" => create_via_factory::<fstool::fs::xfs::Xfs>(
+            "xfs",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::xfs::format::FormatOpts::default(),
+            |o, m| o.apply_options(m),
+            16 * 1024 * 1024,
+        )?,
+        "iso" | "iso9660" => create_via_factory::<fstool::fs::iso9660::Iso9660>(
+            "iso9660",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::iso9660::FormatOpts::default(),
+            |o, m| o.apply_options(m),
+            DEFAULT_MIN_SIZE,
+        )?,
+        "grf" => create_via_factory::<fstool::fs::grf::Grf>(
+            "grf",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::grf::FormatOpts::default(),
+            |o, m| o.apply_options(m),
+            DEFAULT_MIN_SIZE,
+        )?,
+        "apfs" => create_via_factory::<fstool::fs::apfs::Apfs>(
+            "apfs",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::apfs::ApfsFormatOpts::default(),
+            |o, m| o.apply_options(m),
+            DEFAULT_MIN_SIZE,
+        )?,
+        other => {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "create: unknown --type {other:?} (try ext4, fat32, exfat, hfs+, ntfs, \
+                 f2fs, squashfs, xfs, iso, grf, apfs)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Conservative default `--size` for filesystems that don't auto-size
+/// today. 1 MiB is enough for an empty image; populated images bump up
+/// via the per-arm minimum.
+const DEFAULT_MIN_SIZE: u64 = 1024 * 1024;
+
+/// ext2 / ext3 / ext4 arm of `create`. Honours `block_size` from the
+/// option bag (default 1024), then uses [`BuildPlan`] to auto-size
+/// against the source. Falls back to a minimum-format on an empty FS.
+fn create_ext(
+    fs_kind: &str,
+    source: Option<&fstool::repack::Source>,
+    output: &std::path::Path,
+    size_arg: Option<&str>,
+    mut bag: OptionMap,
+    is_device: bool,
+    qcow2_cluster_size: u32,
+) -> fstool::Result<()> {
+    use fstool::fs::ext::BuildPlan;
+
+    let kind = match fs_kind {
+        "ext2" => FsKind::Ext2,
+        "ext3" => FsKind::Ext3,
+        "ext4" => FsKind::Ext4,
+        _ => unreachable!(),
+    };
+    // Block size is a `create_ext`-shaped knob: BuildPlan needs it
+    // before it can run, so we peel it off the bag here instead of
+    // letting the generic per-FS `apply_options` consume it.
+    let block_size = bag
+        .take_u32("block_size")?
+        .unwrap_or(1024);
+
+    let mut plan = BuildPlan::new(block_size, kind);
+    if let Some(src) = source {
+        match src {
+            fstool::repack::Source::HostDir(p) => plan.scan_host_path(p)?,
+            _ => {
+                return Err(fstool::Error::InvalidArgument(
+                    "create: ext only accepts a host directory as source".into(),
+                ));
+            }
+        }
+    }
+    let mut format_opts = plan.to_format_opts();
+    format_opts.apply_options(&mut bag)?;
+    bag.check_empty(fs_kind)?;
+
+    // Sizing: explicit --size beats the plan; on a block device the
+    // device's capacity wins.
+    let plan_size = format_opts.blocks_count as u64 * format_opts.block_size as u64;
+    let want_size = match size_arg {
+        Some(s) => fstool::spec::parse_size(s)?,
+        None => plan_size,
+    };
+    let mut dev = fstool::block::create_image(
+        output,
+        want_size,
+        &fstool::block::CreateOpts {
+            cluster_size: qcow2_cluster_size,
+        },
+    )?;
+    let actual_size = dev.total_size();
+    if actual_size > plan_size {
+        // Grow the FS to fill the device (block-device or larger
+        // explicit --size). blocks_count stays multiple-of-8 for the
+        // bitmap; inode density tracks mke2fs's 1-inode-per-16-KiB rule.
+        let max_blocks_u64 = actual_size / format_opts.block_size as u64;
+        let max_blocks = u32::try_from(max_blocks_u64).unwrap_or(u32::MAX);
+        format_opts.blocks_count = (max_blocks / 8) * 8;
+        let by_density =
+            (format_opts.blocks_count as u64 * format_opts.block_size as u64 / 16_384) as u32;
+        format_opts.inodes_count = format_opts.inodes_count.max(by_density);
+    }
+    let final_size = format_opts.blocks_count as u64 * format_opts.block_size as u64;
+
+    let mut ext = Ext::format_with(dev.as_mut(), &format_opts)?;
+    if let Some(src) = source {
+        fstool::repack::populate_ext_from_source(dev.as_mut(), &mut ext, src)?;
+    }
+    ext.flush(dev.as_mut())?;
+    dev.sync()?;
+    eprintln!(
+        "wrote {} ({} bytes, {fs_kind}{}{}, {} inodes, {} blocks)",
+        output.display(),
+        final_size,
+        if format_opts.sparse { ", sparse" } else { "" },
+        if is_device { ", block device" } else { "" },
+        format_opts.inodes_count,
+        format_opts.blocks_count
+    );
+    Ok(())
+}
+
+/// FAT32 arm of `create`. The 65 525-cluster floor means even an empty
+/// image needs ~33 MiB, so the device capacity (or an explicit --size)
+/// is mandatory.
+fn create_fat32(
+    source: Option<&fstool::repack::Source>,
+    output: &std::path::Path,
+    size_arg: Option<&str>,
+    mut bag: OptionMap,
+    is_device: bool,
+    qcow2_cluster_size: u32,
+) -> fstool::Result<()> {
     use fstool::fs::fat::Fat32;
 
-    let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
-    let is_device = is_block_device(output);
-    require_force_for_device(output, is_device, force)?;
+    // Defaults match the old `fat-build` behaviour: 11-byte ASCII
+    // label, 0 volume id. Keep the upper-casing + non-printable
+    // scrubbing so legacy CLI usage stays bit-identical.
+    let label_str = bag.take_str("volume_label").unwrap_or_else(|| "NO NAME".into());
+    let label_bytes = fat32_label_bytes(&label_str);
+    let volume_id = bag.take_u32("volume_id")?.unwrap_or(0);
+    bag.check_empty("fat32")?;
 
     let bytes = if is_device {
-        // Capacity comes from the device; --size is ignored.
         let dev = FileBackend::open(output)?;
         dev.total_size()
     } else {
-        let s = size.ok_or_else(|| {
+        let s = size_arg.ok_or_else(|| {
             fstool::Error::InvalidArgument(
-                "fat-build: --size is required when OUTPUT is a regular file".into(),
+                "create: --size is required for fat32 when OUTPUT is a regular file \
+                 (FAT32 needs ≥ ~33 MiB)".into(),
             )
         })?;
         fstool::spec::parse_size(s)?
     };
     let total_sectors: u32 = (bytes / 512).try_into().map_err(|_| {
         fstool::Error::InvalidArgument(
-            "fat-build: device size doesn't fit in a u32 sector count".into(),
+            "create: FAT32 device size doesn't fit in a u32 sector count".into(),
         )
     })?;
-    let label_bytes = fat32_label_bytes(label);
     let mut dev = fstool::block::create_image(
         output,
         bytes,
@@ -2348,16 +2584,129 @@ fn fat_build(
             cluster_size: qcow2_cluster_size,
         },
     )?;
-    Fat32::build_from_host_dir(dev.as_mut(), total_sectors, src_dir, volume_id, label_bytes)?;
+    let fat_opts = fstool::fs::fat::FatFormatOpts {
+        total_sectors,
+        volume_id,
+        volume_label: label_bytes,
+    };
+    let mut fat = Fat32::format(dev.as_mut(), &fat_opts)?;
+    if let Some(src) = source {
+        fstool::repack::populate_fat32_from_source(dev.as_mut(), &mut fat, src)?;
+    }
+    fat.flush(dev.as_mut())?;
     dev.sync()?;
     eprintln!(
         "wrote {} ({} bytes, fat32{}, label {:?})",
         output.display(),
         bytes,
         if is_device { ", block device" } else { "" },
-        label
+        label_str
     );
     Ok(())
+}
+
+/// exFAT arm of `create`. Routes through [`populate_fs_from_source_dyn`]
+/// since exFAT doesn't implement [`FilesystemFactory`] yet.
+fn create_exfat(
+    source: Option<&fstool::repack::Source>,
+    output: &std::path::Path,
+    size_arg: Option<&str>,
+    mut bag: OptionMap,
+    is_device: bool,
+    qcow2_cluster_size: u32,
+) -> fstool::Result<()> {
+    use fstool::fs::exfat::{Exfat, FormatOpts as ExFormat};
+
+    let mut format_opts = ExFormat::default();
+    format_opts.apply_options(&mut bag)?;
+    bag.check_empty("exfat")?;
+
+    let bytes = resolve_size_for_dev(output, size_arg, is_device, 16 * 1024 * 1024)?;
+    let mut dev = fstool::block::create_image(
+        output,
+        bytes,
+        &fstool::block::CreateOpts {
+            cluster_size: qcow2_cluster_size,
+        },
+    )?;
+    let mut exfat = Exfat::format(dev.as_mut(), &format_opts)?;
+    if let Some(src) = source {
+        fstool::repack::populate_fs_from_source_dyn(dev.as_mut(), &mut exfat, src)?;
+    }
+    exfat.flush(dev.as_mut())?;
+    dev.sync()?;
+    eprintln!(
+        "wrote {} ({} bytes, exfat{})",
+        output.display(),
+        bytes,
+        if is_device { ", block device" } else { "" }
+    );
+    Ok(())
+}
+
+/// Format + populate any FS that implements [`FilesystemFactory`].
+/// `apply` is the per-FS `FormatOpts::apply_options` closure (avoids
+/// adding the method to the trait surface).
+fn create_via_factory<F>(
+    label: &str,
+    source: Option<&fstool::repack::Source>,
+    output: &std::path::Path,
+    size_arg: Option<&str>,
+    mut bag: OptionMap,
+    is_device: bool,
+    qcow2_cluster_size: u32,
+    mut format_opts: F::FormatOpts,
+    apply: impl FnOnce(&mut F::FormatOpts, &mut OptionMap) -> fstool::Result<()>,
+    default_min_size: u64,
+) -> fstool::Result<()>
+where
+    F: fstool::fs::FilesystemFactory,
+{
+    apply(&mut format_opts, &mut bag)?;
+    bag.check_empty(label)?;
+
+    let bytes = resolve_size_for_dev(output, size_arg, is_device, default_min_size)?;
+    let mut dev = fstool::block::create_image(
+        output,
+        bytes,
+        &fstool::block::CreateOpts {
+            cluster_size: qcow2_cluster_size,
+        },
+    )?;
+    let mut fs = F::format(dev.as_mut(), &format_opts)?;
+    if let Some(src) = source {
+        fstool::repack::populate_fs_from_source(dev.as_mut(), &mut fs, src)?;
+    }
+    fs.flush(dev.as_mut())?;
+    dev.sync()?;
+    eprintln!(
+        "wrote {} ({} bytes, {label}{})",
+        output.display(),
+        bytes,
+        if is_device { ", block device" } else { "" }
+    );
+    Ok(())
+}
+
+/// Pick a size for the destination image. Block devices use their
+/// capacity; regular files honour --size if given, otherwise fall back
+/// to the FS's per-arm minimum (which exists because every FS but ext
+/// has a non-trivial floor — FAT32 ~33 MiB, NTFS / XFS / F2FS several
+/// MiB, …).
+fn resolve_size_for_dev(
+    output: &std::path::Path,
+    size_arg: Option<&str>,
+    is_device: bool,
+    default_min: u64,
+) -> fstool::Result<u64> {
+    if is_device {
+        let dev = FileBackend::open(output)?;
+        return Ok(dev.total_size());
+    }
+    match size_arg {
+        Some(s) => fstool::spec::parse_size(s),
+        None => Ok(default_min),
+    }
 }
 
 /// Pack a label into the 11-byte FAT32 short-label slot: ASCII upper-case,
@@ -2373,68 +2722,6 @@ fn fat32_label_bytes(label: &str) -> [u8; 11] {
         };
     }
     out
-}
-
-fn ext_build(
-    src_dir: &std::path::Path,
-    output: &std::path::Path,
-    kind: FsKind,
-    block_size: u32,
-    sparse: bool,
-    force: bool,
-    cluster_size: &str,
-) -> fstool::Result<()> {
-    use fstool::block::file::is_block_device;
-    use fstool::fs::ext::BuildPlan;
-
-    let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
-    let is_device = is_block_device(output);
-    require_force_for_device(output, is_device, force)?;
-
-    let mut plan = BuildPlan::new(block_size, kind);
-    plan.scan_host_path(src_dir)?;
-    let mut opts = plan.to_format_opts();
-    opts.sparse = sparse;
-    let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
-    let mut dev = fstool::block::create_image(
-        output,
-        plan_size,
-        &fstool::block::CreateOpts {
-            cluster_size: qcow2_cluster_size,
-        },
-    )?;
-
-    // On a block device the actual capacity is fixed by the hardware —
-    // expand the FS to fill it instead of leaving most of the device
-    // unused. blocks_count must stay a multiple of 8 for the block bitmap
-    // to be byte-aligned, and inode density gets scaled to mke2fs's
-    // 1-inode-per-16-KiB convention. (qcow2 always reports its virtual
-    // size as plan_size, so this branch only triggers for block devices.)
-    let actual_size = dev.total_size();
-    if actual_size > plan_size {
-        let max_blocks_u64 = actual_size / opts.block_size as u64;
-        let max_blocks = u32::try_from(max_blocks_u64).unwrap_or(u32::MAX);
-        opts.blocks_count = (max_blocks / 8) * 8;
-        let by_density = (opts.blocks_count as u64 * opts.block_size as u64 / 16_384) as u32;
-        opts.inodes_count = opts.inodes_count.max(by_density);
-    }
-    let final_size = opts.blocks_count as u64 * opts.block_size as u64;
-
-    let mut ext = Ext::format_with(dev.as_mut(), &opts)?;
-    ext.populate_from_host_dir(dev.as_mut(), 2, src_dir)?;
-    ext.flush(dev.as_mut())?;
-    dev.sync()?;
-    eprintln!(
-        "wrote {} ({} bytes, {:?}{}{}, {} inodes, {} blocks)",
-        output.display(),
-        final_size,
-        kind,
-        if sparse { ", sparse" } else { "" },
-        if is_device { ", block device" } else { "" },
-        opts.inodes_count,
-        opts.blocks_count
-    );
-    Ok(())
 }
 
 /// Parse the `--cluster-size` flag's value into a u32 byte count.

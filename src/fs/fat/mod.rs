@@ -54,6 +54,32 @@ impl Default for FatFormatOpts {
     }
 }
 
+impl FatFormatOpts {
+    /// Pull FAT32-specific keys out of an
+    /// [`OptionMap`](crate::format_opts::OptionMap) and apply them on
+    /// top of `self`. Recognised keys:
+    ///
+    /// - `total_sectors` (u32) — 512-byte sectors. Usually set from
+    ///   the device size by the caller, not by the user.
+    /// - `volume_id` (u32, decimal or `0x…`)
+    /// - `volume_label` (string, ≤ 11 ASCII bytes, space-padded)
+    pub fn apply_options(
+        &mut self,
+        map: &mut crate::format_opts::OptionMap,
+    ) -> crate::Result<()> {
+        if let Some(v) = map.take_u32("total_sectors")? {
+            self.total_sectors = v;
+        }
+        if let Some(v) = map.take_u32("volume_id")? {
+            self.volume_id = v;
+        }
+        if let Some(label) = map.take_label::<11>("volume_label", b' ')? {
+            self.volume_label = label;
+        }
+        Ok(())
+    }
+}
+
 /// An under-construction FAT32 filesystem.
 #[derive(Debug)]
 pub struct Fat32 {

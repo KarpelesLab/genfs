@@ -180,9 +180,9 @@ fn create_then_qemu_img_check() {
     assert!(zeros.iter().all(|&b| b == 0));
 }
 
-/// `fstool ext-build src -o out.qcow2` produces a valid qcow2 carrying
-/// an ext4 image. Verified with qemu-img check + (after convert-to-raw)
-/// e2fsck.
+/// `fstool create -t ext4 src -o out.qcow2` produces a valid qcow2
+/// carrying an ext4 image. Verified with qemu-img check + (after
+/// convert-to-raw) e2fsck.
 #[test]
 fn ext_build_into_qcow2() {
     if !which("qemu-img") || !which("e2fsck") {
@@ -199,7 +199,7 @@ fn ext_build_into_qcow2() {
     let out = dir.path().join("disk.qcow2");
     let bin = env!("CARGO_BIN_EXE_fstool");
     let r = Command::new(bin)
-        .args(["ext-build", "--kind", "ext4"])
+        .args(["create", "-t", "ext4"])
         .arg(srcdir.path())
         .arg("-o")
         .arg(&out)
@@ -207,7 +207,7 @@ fn ext_build_into_qcow2() {
         .unwrap();
     assert!(
         r.status.success(),
-        "ext-build failed:\n{}",
+        "create failed:\n{}",
         String::from_utf8_lossy(&r.stderr)
     );
 

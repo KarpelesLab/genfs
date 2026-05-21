@@ -14,6 +14,7 @@
 pub mod block;
 pub mod compression;
 pub mod error;
+pub mod format_opts;
 pub mod fs;
 pub mod inspect;
 pub mod merge;

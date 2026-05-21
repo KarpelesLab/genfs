@@ -66,6 +66,21 @@ pub struct FormatOpts {
     pub mtime: u32,
 }
 
+impl FormatOpts {
+    /// Apply a generic option-bag (CLI `-O key=val` / TOML
+    /// `[filesystem.options]`) on top of these opts. Unknown keys are
+    /// left in the map for the caller to flag.
+    pub fn apply_options(&mut self, map: &mut crate::format_opts::OptionMap) -> Result<()> {
+        if let Some(label) = map.take_label::<12>("volume_label", 0)? {
+            self.label = label;
+        }
+        if let Some(t) = map.take_u32("mtime")? {
+            self.mtime = t;
+        }
+        Ok(())
+    }
+}
+
 // ----- on-disk magic numbers (per the XFS Algorithms doc, chapter 7) ----
 
 /// AGF — "XAGF".

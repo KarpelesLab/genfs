@@ -157,6 +157,75 @@ impl FormatOpts {
         if num_groups < 16 { 0 } else { 4 }
     }
 
+    /// Pull ext-specific keys out of an [`OptionMap`] and apply them on
+    /// top of `self`. Recognised keys mirror the field names of this
+    /// struct verbatim (so `-O block_size=4096` does what you expect):
+    ///
+    /// - `block_size` (u32)
+    /// - `blocks_count` (u32)
+    /// - `inodes_count` (u32)
+    /// - `reserved_blocks_percent` (u8)
+    /// - `mtime` (u32, Unix epoch seconds)
+    /// - `journal_blocks` (u32)
+    /// - `sparse` (bool)
+    /// - `sparse_super` (bool)
+    /// - `sparse_super2` (bool)
+    /// - `use_64bit` (bool)
+    /// - `log_groups_per_flex` (u8, 0..=5)
+    /// - `volume_label` (string, ≤ 16 bytes; longer is rejected)
+    /// - `create_lost_found` (bool)
+    ///
+    /// Leaves `kind` and `uuid` alone — those are set by the caller
+    /// (the CLI's `--type` flag drives `kind`; the spec doesn't
+    /// surface a UUID knob yet).
+    ///
+    /// [`OptionMap`]: crate::format_opts::OptionMap
+    pub fn apply_options(
+        &mut self,
+        map: &mut crate::format_opts::OptionMap,
+    ) -> crate::Result<()> {
+        if let Some(v) = map.take_u32("block_size")? {
+            self.block_size = v;
+        }
+        if let Some(v) = map.take_u32("blocks_count")? {
+            self.blocks_count = v;
+        }
+        if let Some(v) = map.take_u32("inodes_count")? {
+            self.inodes_count = v;
+        }
+        if let Some(v) = map.take_u8("reserved_blocks_percent")? {
+            self.reserved_blocks_percent = v;
+        }
+        if let Some(v) = map.take_u32("mtime")? {
+            self.mtime = v;
+        }
+        if let Some(v) = map.take_u32("journal_blocks")? {
+            self.journal_blocks = v;
+        }
+        if let Some(v) = map.take_bool("sparse")? {
+            self.sparse = v;
+        }
+        if let Some(v) = map.take_bool("sparse_super")? {
+            self.sparse_super = v;
+        }
+        if let Some(v) = map.take_bool("sparse_super2")? {
+            self.sparse_super2 = v;
+        }
+        if let Some(v) = map.take_bool("use_64bit")? {
+            self.use_64bit = v;
+        }
+        if let Some(v) = map.take_u8("log_groups_per_flex")? {
+            self.log_groups_per_flex = v;
+        }
+        if let Some(v) = map.take_bool("create_lost_found")? {
+            self.create_lost_found = v;
+        }
+        if let Some(label) = map.take_label::<16>("volume_label", 0)? {
+            self.volume_label = label;
+        }
+        Ok(())
+    }
+
     /// Validate this opts' flex_bg setting before format. Returns Ok if
     /// flex_bg is disabled or in-range; an error if `log_groups_per_flex`
     /// exceeds the 5 (32-groups) cap defined by the on-disk format.

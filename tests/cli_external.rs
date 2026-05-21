@@ -144,7 +144,7 @@ fn cli_rm_file_and_empty_dir() {
 
     let img = NamedTempFile::new().unwrap();
     let out = Command::new(FSTOOL)
-        .args(["ext-build", "--kind", "ext4"])
+        .args(["create", "-t", "ext4"])
         .arg(srcdir.path())
         .arg("-o")
         .arg(img.path())
@@ -220,7 +220,7 @@ fn cli_info_reports_ext4() {
     let img = NamedTempFile::new().unwrap();
 
     let out = Command::new(FSTOOL)
-        .args(["ext-build", "--kind", "ext4"])
+        .args(["create", "-t", "ext4"])
         .arg(srcdir.path())
         .arg("-o")
         .arg(img.path())
@@ -455,13 +455,13 @@ fn cli_shell_navigates_and_mutates() {
 
     let img = NamedTempFile::new().unwrap();
     let out = Command::new(FSTOOL)
-        .args(["ext-build", "--kind", "ext4"])
+        .args(["create", "-t", "ext4"])
         .arg(srcdir.path())
         .arg("-o")
         .arg(img.path())
         .output()
         .unwrap();
-    assert!(out.status.success(), "ext-build failed");
+    assert!(out.status.success(), "create failed");
 
     // Drive the shell.
     let extra = NamedTempFile::new().unwrap();
@@ -559,7 +559,7 @@ fn cli_fat32_add_and_rm() {
 
     let img = NamedTempFile::new().unwrap();
     let out = Command::new(FSTOOL)
-        .args(["fat-build", "--size", "64MiB", "--label", "CLIRM"])
+        .args(["create", "-t", "fat32", "--size", "64MiB", "--label", "CLIRM"])
         .arg(srcdir.path())
         .arg("-o")
         .arg(img.path())
@@ -567,7 +567,7 @@ fn cli_fat32_add_and_rm() {
         .unwrap();
     assert!(
         out.status.success(),
-        "fat-build failed: {}",
+        "create failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -635,7 +635,7 @@ fn cli_fat32_add_and_rm() {
     assert!(!listing.contains("goodbye.txt"));
 }
 
-/// `fstool fat-build` → `ls` → `cat` → `info` on a FAT32 image. Exercises
+/// `fstool create -t fat32` → `ls` → `cat` → `info` on a FAT32 image. Exercises
 /// the unified inspection dispatch (the CLI doesn't know it's FAT32).
 #[test]
 fn cli_fat32_build_ls_cat_info_roundtrip() {
@@ -650,7 +650,7 @@ fn cli_fat32_build_ls_cat_info_roundtrip() {
 
     let img = NamedTempFile::new().unwrap();
     let out = Command::new(FSTOOL)
-        .args(["fat-build", "--size", "64MiB", "--label", "CLIFAT"])
+        .args(["create", "-t", "fat32", "--size", "64MiB", "--label", "CLIFAT"])
         .arg(srcdir.path())
         .arg("-o")
         .arg(img.path())
@@ -658,7 +658,7 @@ fn cli_fat32_build_ls_cat_info_roundtrip() {
         .unwrap();
     assert!(
         out.status.success(),
-        "fat-build failed:\n{}",
+        "create failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -727,13 +727,13 @@ fn cli_convert_raw_qcow2_roundtrip() {
     std::fs::write(srcdir.path().join("hello"), b"hello convert\n").unwrap();
     let raw = NamedTempFile::new().unwrap();
     let out = Command::new(FSTOOL)
-        .args(["ext-build", "--kind", "ext4"])
+        .args(["create", "-t", "ext4"])
         .arg(srcdir.path())
         .arg("-o")
         .arg(raw.path())
         .output()
         .unwrap();
-    assert!(out.status.success(), "ext-build failed");
+    assert!(out.status.success(), "create failed");
 
     let dir = tempfile::tempdir().unwrap();
     let qcow = dir.path().join("disk.qcow2");

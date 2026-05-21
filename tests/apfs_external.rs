@@ -628,6 +628,117 @@ fn apfs_chown_and_set_times_produce_clean_checkpoint() {
     );
 }
 
+/// End-to-end exercise of the Phase 2 mutation API: rename a file,
+/// hardlink it under a second name, unlink the rename target (one
+/// link drops; the inode survives), then unlink the last link
+/// (inode + extents are purged from subsequent checkpoints). Each
+/// step writes a fresh APFS checkpoint via the same COW machinery.
+#[test]
+fn apfs_rename_unlink_link_round_trips() {
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let bs = 4096u32;
+    let total_blocks = 4096u64;
+    let img = NamedTempFile::new().unwrap();
+    let payload = b"phase2\n";
+    {
+        let mut dev = FileBackend::create(img.path(), total_blocks * bs as u64).unwrap();
+        let mut w = ApfsWriter::new(&mut dev, total_blocks, bs, "P2VOL").unwrap();
+        let mut r = Cursor::new(payload.as_ref());
+        w.add_file_from_reader(2, "src.txt", 0o644, &mut r, payload.len() as u64)
+            .unwrap();
+        w.finish().unwrap();
+        dev.sync().unwrap();
+    }
+
+    // rename: src.txt → renamed.txt
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.rename(&mut dev, "/src.txt", "/renamed.txt").unwrap();
+        dev.sync().unwrap();
+    }
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let fs = Apfs::open(&mut dev).unwrap();
+        let names: Vec<String> = fs
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"renamed.txt".to_string()), "rename failed: {names:?}");
+        assert!(!names.contains(&"src.txt".to_string()), "old name lingers: {names:?}");
+    }
+
+    // link: add an alias under /alias.txt
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.link(&mut dev, "/renamed.txt", "/alias.txt").unwrap();
+        dev.sync().unwrap();
+    }
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let fs = Apfs::open(&mut dev).unwrap();
+        let names: Vec<String> = fs
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"renamed.txt".to_string()));
+        assert!(names.contains(&"alias.txt".to_string()), "link missing: {names:?}");
+    }
+
+    // unlink first link — second link survives, inode stays put
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.remove_path(&mut dev, "/renamed.txt").unwrap();
+        dev.sync().unwrap();
+    }
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let fs = Apfs::open(&mut dev).unwrap();
+        let names: Vec<String> = fs
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.contains(&"renamed.txt".to_string()));
+        assert!(
+            names.contains(&"alias.txt".to_string()),
+            "alias must survive the first unlink: {names:?}"
+        );
+    }
+
+    // unlink last link — file is gone
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.remove_path(&mut dev, "/alias.txt").unwrap();
+        dev.sync().unwrap();
+    }
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let fs = Apfs::open(&mut dev).unwrap();
+        let names: Vec<String> = fs
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            !names.contains(&"alias.txt".to_string()),
+            "alias should be gone: {names:?}"
+        );
+    }
+}
+
 // ---- Self-tests for the local plist parser ----
 
 #[cfg(test)]

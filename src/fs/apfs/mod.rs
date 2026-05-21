@@ -904,6 +904,165 @@ impl Apfs {
         })
     }
 
+    /// Remove a dirent. Mirrors POSIX `unlink` for files and
+    /// `rmdir` for empty directories. Decrements the target inode's
+    /// link count; when the last link is gone, drops the inode +
+    /// dstream + file_extent + xattr records (the bytes themselves
+    /// stay on disk — the COW allocator never frees, only forgets).
+    /// Refuses non-empty directories.
+    pub fn remove_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
+        rw::commit_with_mutator(self, dev, |records| {
+            let (target_oid, dtype) = find_drec(records, parent_oid, &name).ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "apfs: no such entry {name:?} under inode {parent_oid}"
+                ))
+            })?;
+            // Empty-dir check for directories.
+            if dtype == DT_DIR && drec_count_for(records, target_oid) > 0 {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "apfs: directory {name:?} is not empty"
+                )));
+            }
+            // Always drop the dirent.
+            remove_drec(records, parent_oid, &name);
+            // For dirs: drop the inode (always — POSIX dirs never
+            // hardlink); decrement parent's nchildren.
+            if dtype == DT_DIR {
+                remove_all_records_for_oid(records, target_oid);
+                patch_inode_record(records, parent_oid, |v| {
+                    if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
+                        let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
+                        v[56..60].copy_from_slice(&(cur - 1).to_le_bytes());
+                    }
+                });
+                return Ok(());
+            }
+            // Non-dir: hardlink-aware unlink. Decrement target's
+            // nlink; only purge the inode + payload when the last
+            // link goes.
+            let mut last_link = false;
+            patch_inode_record(records, target_oid, |v| {
+                if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
+                    let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
+                    let new = cur.saturating_sub(1);
+                    v[56..60].copy_from_slice(&new.to_le_bytes());
+                    if new <= 0 {
+                        last_link = true;
+                    }
+                }
+            });
+            if last_link {
+                remove_all_records_for_oid(records, target_oid);
+            }
+            // Decrement parent nchildren for non-dir removal too.
+            patch_inode_record(records, parent_oid, |v| {
+                if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
+                    let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
+                    v[56..60].copy_from_slice(&(cur - 1).to_le_bytes());
+                }
+            });
+            Ok(())
+        })
+    }
+
+    /// Rename a dirent. Cross-directory moves of a directory rewrite
+    /// the target inode's `parent_id` and adjust both parents'
+    /// nchildren. Hardlinks survive a rename (we never touch the
+    /// target inode's data).
+    pub fn rename(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<()> {
+        let (old_parent, old_name) = self.resolve_parent_and_name(dev, old_path)?;
+        let (new_parent, new_name) = self.resolve_parent_and_name(dev, new_path)?;
+        rw::commit_with_mutator(self, dev, |records| {
+            let (target_oid, dtype) =
+                find_drec(records, old_parent, &old_name).ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "apfs: rename source {old_name:?} not found"
+                    ))
+                })?;
+            if find_drec(records, new_parent, &new_name).is_some() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "apfs: rename target {new_name:?} already exists"
+                )));
+            }
+            remove_drec(records, old_parent, &old_name);
+            push_drec(records, new_parent, &new_name, target_oid, dtype);
+            if old_parent != new_parent {
+                // Update both parents' nchildren.
+                patch_inode_record(records, old_parent, |v| {
+                    if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
+                        let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
+                        v[56..60].copy_from_slice(&(cur - 1).to_le_bytes());
+                    }
+                });
+                patch_inode_record(records, new_parent, |v| {
+                    if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
+                        let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
+                        v[56..60].copy_from_slice(&(cur + 1).to_le_bytes());
+                    }
+                });
+                // Directory move also rewrites the target's parent
+                // pointer at offset 0..8 of its j_inode_val_t.
+                if dtype == DT_DIR {
+                    patch_inode_record(records, target_oid, |v| {
+                        if v.len() >= 8 {
+                            v[0..8].copy_from_slice(&new_parent.to_le_bytes());
+                        }
+                    });
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Create a hardlink to an existing non-directory inode. Writes
+    /// a fresh drec under `new_parent_path` pointing at the target
+    /// and bumps the target inode's nlink. POSIX disallows hardlinks
+    /// to directories — we refuse them up front.
+    pub fn link(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        existing_path: &str,
+        new_path: &str,
+    ) -> Result<()> {
+        let target_oid = self.resolve_path_to_oid(dev, existing_path)?;
+        let (new_parent, new_name) = self.resolve_parent_and_name(dev, new_path)?;
+        // Peek at the source's dtype before we commit so we can refuse
+        // dir hardlinks cleanly.
+        let target_dtype = self.lookup_inode_dtype(dev, target_oid)?;
+        if target_dtype == DT_DIR {
+            return Err(crate::Error::InvalidArgument(
+                "apfs: cannot hardlink to a directory".into(),
+            ));
+        }
+        rw::commit_with_mutator(self, dev, |records| {
+            if find_drec(records, new_parent, &new_name).is_some() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "apfs: link target {new_name:?} already exists"
+                )));
+            }
+            push_drec(records, new_parent, &new_name, target_oid, target_dtype);
+            patch_inode_record(records, target_oid, |v| {
+                if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
+                    let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
+                    v[56..60].copy_from_slice(&(cur + 1).to_le_bytes());
+                }
+            });
+            patch_inode_record(records, new_parent, |v| {
+                if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
+                    let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
+                    v[56..60].copy_from_slice(&(cur + 1).to_le_bytes());
+                }
+            });
+            Ok(())
+        })
+    }
+
     /// Total container capacity in bytes (`nx_block_count * nx_block_size`).
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
@@ -920,6 +1079,63 @@ impl Apfs {
     }
 
     // ---- internal walker helpers ----
+
+    /// Resolve the parent inode + leaf name of a path. Errors when
+    /// the path is "/" (which has no parent in our model) or any
+    /// intermediate component is missing.
+    fn resolve_parent_and_name(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<(u64, String)> {
+        let comps: Vec<&str> = split_path(path);
+        if comps.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "apfs: cannot operate on the root directory itself".into(),
+            ));
+        }
+        let leaf = comps.last().unwrap().to_string();
+        let mut cur = ROOT_DIR_INO;
+        for part in &comps[..comps.len() - 1] {
+            cur = self.find_drec_child(dev, cur, part)?.ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "apfs: no such entry {part:?} under {path:?}"
+                ))
+            })?;
+        }
+        Ok((cur, leaf))
+    }
+
+    /// Resolve an inode's dtype (DT_REG / DT_DIR / DT_LNK). Cheaper
+    /// than a full record dump and used as a pre-flight check for
+    /// link() (which refuses dirs without committing a checkpoint).
+    fn lookup_inode_dtype(&self, dev: &mut dyn BlockDevice, oid: u64) -> Result<u16> {
+        let rs = self.read_state()?;
+        let target = FsKeyTarget {
+            oid,
+            kind: APFS_TYPE_INODE,
+            tail: &[],
+            drec_layout: rs.drec_layout,
+        };
+        let block_size = self.block_size;
+        let mut ctx = rs.fs_ctx.borrow_mut();
+        let mut scan = RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })?;
+        if let Some((_kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })? {
+            let ino = InodeVal::decode(&vb)?;
+            return Ok(match ino.mode & 0o170_000 {
+                0o040_000 => DT_DIR,
+                0o120_000 => DT_LNK,
+                _ => DT_REG,
+            });
+        }
+        Err(crate::Error::InvalidArgument(format!(
+            "apfs: no inode record for oid {oid:#x}"
+        )))
+    }
 
     /// Walk path components, resolving each name through its parent's
     /// directory records. Returns the target's object id.
@@ -1623,6 +1839,125 @@ pub(crate) fn patch_inode_record<F>(
             return;
         }
     }
+}
+
+/// Find the drec record under `parent_oid` with `name`, returning
+/// `(target_oid, dtype)`. Uses the plain-layout drec key format
+/// (`hdr(8) + name_len(2) + name + NUL`); hashed-layout images
+/// already get normalized to plain when our writer emits them.
+pub(crate) fn find_drec(
+    records: &[(Vec<u8>, Vec<u8>)],
+    parent_oid: u64,
+    name: &str,
+) -> Option<(u64, u16)> {
+    for (k, v) in records {
+        if k.len() < 10 {
+            continue;
+        }
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        let oid = hdr & OBJ_ID_MASK;
+        let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
+        if oid != parent_oid || kind != APFS_TYPE_DIR_REC {
+            continue;
+        }
+        let nlen = u16::from_le_bytes(k[8..10].try_into().unwrap()) as usize;
+        if k.len() < 10 + nlen || nlen == 0 {
+            continue;
+        }
+        // The name is stored with a trailing NUL inside `nlen`.
+        let stored = &k[10..10 + nlen - 1];
+        if stored != name.as_bytes() {
+            continue;
+        }
+        if v.len() < 18 {
+            return None;
+        }
+        let target_oid = u64::from_le_bytes(v[0..8].try_into().unwrap());
+        let dtype = u16::from_le_bytes(v[16..18].try_into().unwrap());
+        return Some((target_oid, dtype));
+    }
+    None
+}
+
+/// Remove the drec under `parent_oid` matching `name`. No-op when
+/// not found.
+pub(crate) fn remove_drec(records: &mut Vec<(Vec<u8>, Vec<u8>)>, parent_oid: u64, name: &str) {
+    records.retain(|(k, _)| {
+        if k.len() < 10 {
+            return true;
+        }
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        let oid = hdr & OBJ_ID_MASK;
+        let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
+        if oid != parent_oid || kind != APFS_TYPE_DIR_REC {
+            return true;
+        }
+        let nlen = u16::from_le_bytes(k[8..10].try_into().unwrap()) as usize;
+        if k.len() < 10 + nlen || nlen == 0 {
+            return true;
+        }
+        let stored = &k[10..10 + nlen - 1];
+        stored != name.as_bytes()
+    });
+}
+
+/// Append a new drec record under `parent_oid`. Matches
+/// `ApfsWriter::add_drec` exactly so later checkpoints walk the new
+/// dirent the same way the writer would.
+pub(crate) fn push_drec(
+    records: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    parent_oid: u64,
+    name: &str,
+    target_oid: u64,
+    dtype: u16,
+) {
+    let nlen = name.len() + 1;
+    let mut key = Vec::with_capacity(10 + nlen);
+    let hdr = ((APFS_TYPE_DIR_REC as u64) << OBJ_TYPE_SHIFT) | (parent_oid & OBJ_ID_MASK);
+    key.extend_from_slice(&hdr.to_le_bytes());
+    key.extend_from_slice(&(nlen as u16).to_le_bytes());
+    key.extend_from_slice(name.as_bytes());
+    key.push(0);
+    let mut val = vec![0u8; 18];
+    val[0..8].copy_from_slice(&target_oid.to_le_bytes());
+    // date_added at 8..16 stays zero.
+    val[16..18].copy_from_slice(&dtype.to_le_bytes());
+    records.push((key, val));
+}
+
+/// Count direct children of a directory inode by scanning drec
+/// records keyed under `parent_oid`. Used by `remove_path` to
+/// reject non-empty directories.
+pub(crate) fn drec_count_for(records: &[(Vec<u8>, Vec<u8>)], parent_oid: u64) -> usize {
+    let mut n = 0usize;
+    for (k, _) in records {
+        if k.len() < 8 {
+            continue;
+        }
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        let oid = hdr & OBJ_ID_MASK;
+        let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
+        if oid == parent_oid && kind == APFS_TYPE_DIR_REC {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Drop every record keyed on `target_oid` — inode + dstream_id +
+/// file_extent + xattr — when the last hardlink to a file (or any
+/// dir) has been removed. The underlying data blocks stay on disk
+/// (APFS COW; nothing ever "frees"). Subsequent checkpoints will
+/// re-emit the surviving record set without these.
+pub(crate) fn remove_all_records_for_oid(records: &mut Vec<(Vec<u8>, Vec<u8>)>, target_oid: u64) {
+    records.retain(|(k, _)| {
+        if k.len() < 8 {
+            return true;
+        }
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        let oid = hdr & OBJ_ID_MASK;
+        oid != target_oid
+    });
 }
 
 /// Probe for the APFS container superblock magic `"NXSB"` at offset

@@ -1393,7 +1393,17 @@ fn copy_ext_dir(
     dst: &mut fstool::fs::ext::Ext,
     dst_ino: u32,
 ) -> fstool::Result<()> {
-    copy_ext_dir_at(src_dev, src, src_ino, dst_dev, dst, dst_ino, "")
+    let mut link_map = std::collections::HashMap::new();
+    copy_ext_dir_at(
+        src_dev,
+        src,
+        src_ino,
+        dst_dev,
+        dst,
+        dst_ino,
+        "",
+        &mut link_map,
+    )
 }
 
 fn copy_ext_dir_at(
@@ -1404,6 +1414,7 @@ fn copy_ext_dir_at(
     dst: &mut fstool::fs::ext::Ext,
     dst_ino: u32,
     parent_path: &str,
+    link_map: &mut std::collections::HashMap<u32, u32>,
 ) -> fstool::Result<()> {
     use fstool::fs::ext::dir as ext_dir;
     use fstool::fs::ext::inode::decode_devnum;
@@ -1433,6 +1444,19 @@ fn copy_ext_dir_at(
         entry_path.push('/');
         entry_path.push_str(&e.name);
         fstool::repack::note(&entry_path);
+
+        // Hard-link short circuit: subsequent encounters of a
+        // multi-link source inode reuse the dst inode that was
+        // created the first time, instead of duplicating the file
+        // body. Skipped for directories (POSIX disallows dir links).
+        if inode.links_count > 1
+            && mode_type != fstool::fs::ext::constants::S_IFDIR
+            && let Some(&existing_dst) = link_map.get(&e.inode)
+        {
+            dst.add_link_to(dst_dev, dst_ino, name, existing_dst)?;
+            continue;
+        }
+
         let new_ino = match mode_type {
             t if t == fstool::fs::ext::constants::S_IFREG => {
                 let mut reader = src.open_file_reader(src_dev, e.inode)?;
@@ -1473,7 +1497,9 @@ fn copy_ext_dir_at(
                     let child_blocks = bytes.div_ceil(usable).max(1) as u32;
                     dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?
                 };
-                copy_ext_dir_at(src_dev, src, e.inode, dst_dev, dst, child_ino, &entry_path)?;
+                copy_ext_dir_at(
+                    src_dev, src, e.inode, dst_dev, dst, child_ino, &entry_path, link_map,
+                )?;
                 child_ino
             }
             t if t == fstool::fs::ext::constants::S_IFLNK => {
@@ -1512,6 +1538,11 @@ fn copy_ext_dir_at(
         };
         if !xattrs.is_empty() {
             dst.set_xattrs(dst_dev, new_ino, &xattrs)?;
+        }
+        // Record src→dst for multi-link non-directory inodes so the
+        // hard-link short circuit above catches the next occurrence.
+        if inode.links_count > 1 && mode_type != fstool::fs::ext::constants::S_IFDIR {
+            link_map.insert(e.inode, new_ino);
         }
     }
     Ok(())

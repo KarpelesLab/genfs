@@ -2191,6 +2191,55 @@ impl Ext {
         Ok(ino)
     }
 
+    /// Create a hard link to an existing inode: add `name` under
+    /// `parent_ino` as a dirent pointing at `target_ino`, and bump
+    /// `target_ino`'s `links_count`. No inode is allocated and no data
+    /// is copied.
+    ///
+    /// Refuses to link a directory inode — POSIX disallows it and
+    /// e2fsck would flag the result. Refuses targets whose mode is
+    /// unset (already-freed or never-initialised inodes).
+    pub fn add_link_to(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_ino: u32,
+        name: &[u8],
+        target_ino: u32,
+    ) -> Result<()> {
+        self.ensure_inode_staged(dev, target_ino)?;
+        let target = self
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == target_ino)
+            .map(|(_, i)| *i)
+            .unwrap();
+        let mode_type = target.mode & constants::S_IFMT;
+        if mode_type == 0 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: cannot hardlink to uninitialised inode {target_ino}"
+            )));
+        }
+        if mode_type == constants::S_IFDIR {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: cannot hardlink to directory inode {target_ino} (POSIX disallows)"
+            )));
+        }
+        let file_type = match mode_type {
+            constants::S_IFREG => constants::DENT_REG,
+            constants::S_IFLNK => constants::DENT_LNK,
+            constants::S_IFCHR => constants::DENT_CHR,
+            constants::S_IFBLK => constants::DENT_BLK,
+            constants::S_IFIFO => constants::DENT_FIFO,
+            constants::S_IFSOCK => constants::DENT_SOCK,
+            _ => 0,
+        };
+        self.patch_inode(dev, target_ino, |i| {
+            i.links_count = i.links_count.saturating_add(1);
+        })?;
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, target_ino, file_type)?;
+        Ok(())
+    }
+
     /// Remove the file / empty directory / symlink / device node at the
     /// absolute path `path`. Frees its inode and data blocks and unlinks it
     /// from its parent directory. A non-empty directory is rejected.

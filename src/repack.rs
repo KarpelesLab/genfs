@@ -1098,7 +1098,17 @@ pub(crate) fn copy_ext_dir(
     dst: &mut crate::fs::ext::Ext,
     dst_ino: u32,
 ) -> crate::Result<()> {
-    copy_ext_dir_at(src_dev, src, src_ino, dst_dev, dst, dst_ino, "")
+    let mut link_map = std::collections::HashMap::new();
+    copy_ext_dir_at(
+        src_dev,
+        src,
+        src_ino,
+        dst_dev,
+        dst,
+        dst_ino,
+        "",
+        &mut link_map,
+    )
 }
 
 /// Walk the source directory at `src_ino` once and estimate how many
@@ -1134,8 +1144,16 @@ fn predict_dir_blocks(
 }
 
 /// Inner helper that threads the running path string for progress
-/// reporting. `parent_path` is the slash-joined source path of `src_ino`
-/// (empty for the source root); each child appends its own name.
+/// reporting and a src-inode → dst-inode map for hard-link
+/// deduplication. `parent_path` is the slash-joined source path of
+/// `src_ino` (empty for the source root); each child appends its own
+/// name.
+///
+/// `link_map` is keyed on the source inode number. The first time a
+/// multi-link inode is encountered we create it normally and record
+/// its destination inode number; every subsequent encounter (a hard
+/// link) goes through `add_link_to` and reuses the same dst inode
+/// instead of duplicating the file body.
 fn copy_ext_dir_at(
     src_dev: &mut dyn crate::block::BlockDevice,
     src: &crate::fs::ext::Ext,
@@ -1144,6 +1162,7 @@ fn copy_ext_dir_at(
     dst: &mut crate::fs::ext::Ext,
     dst_ino: u32,
     parent_path: &str,
+    link_map: &mut std::collections::HashMap<u32, u32>,
 ) -> crate::Result<()> {
     use crate::fs::ext::inode::decode_devnum;
     use crate::fs::{DeviceKind, FileMeta};
@@ -1172,6 +1191,20 @@ fn copy_ext_dir_at(
         entry_path.push('/');
         entry_path.push_str(&e.name);
         note(&entry_path);
+
+        // Hard-link short circuit: when the source inode has multiple
+        // links and we've already created it under a different name,
+        // reuse the destination inode instead of allocating a new one
+        // + duplicating data. Directories are skipped (POSIX hardlinks
+        // never apply, and `add_link_to` rejects them anyway).
+        if inode.links_count > 1
+            && mode_type != crate::fs::ext::constants::S_IFDIR
+            && let Some(&existing_dst) = link_map.get(&e.inode)
+        {
+            dst.add_link_to(dst_dev, dst_ino, name, existing_dst)?;
+            continue;
+        }
+
         let new_ino = match mode_type {
             t if t == crate::fs::ext::constants::S_IFREG => {
                 let mut reader = src.open_file_reader(src_dev, e.inode)?;
@@ -1213,7 +1246,9 @@ fn copy_ext_dir_at(
                     );
                     dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?
                 };
-                copy_ext_dir_at(src_dev, src, e.inode, dst_dev, dst, child_ino, &entry_path)?;
+                copy_ext_dir_at(
+                    src_dev, src, e.inode, dst_dev, dst, child_ino, &entry_path, link_map,
+                )?;
                 child_ino
             }
             t if t == crate::fs::ext::constants::S_IFLNK => {
@@ -1252,6 +1287,12 @@ fn copy_ext_dir_at(
         };
         if !xattrs.is_empty() {
             dst.set_xattrs(dst_dev, new_ino, &xattrs)?;
+        }
+        // Record the src→dst mapping for multi-link non-directory
+        // inodes so subsequent encounters of the same src inode go
+        // through the hard-link short circuit above.
+        if inode.links_count > 1 && mode_type != crate::fs::ext::constants::S_IFDIR {
+            link_map.insert(e.inode, new_ino);
         }
     }
     Ok(())

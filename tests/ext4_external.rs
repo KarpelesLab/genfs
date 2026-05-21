@@ -731,3 +731,152 @@ fn ext4_indexed_directory_passes_e2fsck() {
         "debugfs htree_dump didn't recognise /indexed:\n{out}"
     );
 }
+
+/// Build a source ext4 image via mke2fs that contains hard links, run
+/// `fstool repack` against it, and confirm the destination preserves
+/// the hardlink relationship (multiple names sharing one inode with
+/// `links_count > 1`) instead of materialising each link as a
+/// duplicated file body.
+#[test]
+fn ext4_repack_preserves_hardlinks() {
+    let Some(_) = which("mke2fs") else {
+        eprintln!("skipping: mke2fs not installed");
+        return;
+    };
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    // Source host tree with hardlinks. `ln a b` makes `b` a hardlink
+    // to `a`; mke2fs's `-d` flag preserves these as ext4 hardlinks
+    // (inode-shared dirents).
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        srcdir.path().join("primary"),
+        b"shared bytes for the hardlink test\n",
+    )
+    .unwrap();
+    std::fs::hard_link(
+        srcdir.path().join("primary"),
+        srcdir.path().join("alias_a"),
+    )
+    .unwrap();
+    std::fs::hard_link(
+        srcdir.path().join("primary"),
+        srcdir.path().join("alias_b"),
+    )
+    .unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    let mk = Command::new("mke2fs")
+        .args([
+            "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "1024",
+            "-L",
+            "",
+            "-U",
+            "00000000-0000-0000-0000-000000000000",
+            "-E",
+            "nodiscard",
+            "-d",
+        ])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .arg("8192")
+        .output()
+        .unwrap();
+    assert!(
+        mk.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&mk.stderr)
+    );
+
+    // Sanity-check the source: the three names share one inode.
+    let src_ext = {
+        let mut dev = FileBackend::open(src.path()).unwrap();
+        let ext = Ext::open(&mut dev).unwrap();
+        let root = ext.list_inode(&mut dev, 2).unwrap();
+        let mut shared_inos = std::collections::HashSet::new();
+        for n in ["primary", "alias_a", "alias_b"] {
+            let ino = root
+                .iter()
+                .find(|e| e.name == n)
+                .map(|e| e.inode)
+                .expect("primary/alias not found in source");
+            shared_inos.insert(ino);
+        }
+        assert_eq!(
+            shared_inos.len(),
+            1,
+            "expected one shared source inode, got {shared_inos:?}"
+        );
+        *shared_inos.iter().next().unwrap()
+    };
+    let _ = src_ext;
+
+    // Run repack via fstool. The binary is built by the test harness.
+    let dst = NamedTempFile::new().unwrap();
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_fstool"));
+    let out = Command::new(&bin)
+        .args(["repack", "--shrink"])
+        .arg(src.path())
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fstool repack failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Open the destination and confirm the three names share one
+    // inode with links_count == 3.
+    let mut dst_dev = FileBackend::open(dst.path()).unwrap();
+    let dst_ext = Ext::open(&mut dst_dev).unwrap();
+    let root = dst_ext.list_inode(&mut dst_dev, 2).unwrap();
+    let mut dst_inos = std::collections::HashSet::new();
+    for n in ["primary", "alias_a", "alias_b"] {
+        let ino = root
+            .iter()
+            .find(|e| e.name == n)
+            .map(|e| e.inode)
+            .unwrap_or_else(|| panic!("destination missing {n}: {root:?}"));
+        dst_inos.insert(ino);
+    }
+    assert_eq!(
+        dst_inos.len(),
+        1,
+        "expected destination's three names to share one inode, got {dst_inos:?}"
+    );
+    let shared = *dst_inos.iter().next().unwrap();
+    let shared_inode = dst_ext.read_inode(&mut dst_dev, shared).unwrap();
+    assert_eq!(
+        shared_inode.links_count, 3,
+        "shared inode {shared} should have links_count=3, got {}",
+        shared_inode.links_count
+    );
+
+    drop(dst_dev);
+
+    // e2fsck must be clean on the destination.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected hardlink-preserving repack:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}

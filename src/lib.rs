@@ -13,6 +13,7 @@
 
 pub mod block;
 pub mod compression;
+pub mod concurrent;
 pub mod error;
 pub mod format_opts;
 pub mod fs;

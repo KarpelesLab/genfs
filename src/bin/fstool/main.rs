@@ -322,10 +322,14 @@ fn run(cli: Cli) -> fstool::Result<()> {
 
 #[cfg(feature = "fuse")]
 fn mount_cmd(image: &str, mountpoint: &std::path::Path) -> fstool::Result<()> {
-    // FUSE adapter wants ownership of both `Ext` and a `Box<dyn
-    // BlockDevice>`. Partition selectors (`image:N`) and qcow2 sources
-    // go through `inspect::with_target_device` which doesn't give us
-    // ownership; for v1 we accept plain raw images only.
+    use fstool::fs::Filesystem;
+    use fstool::inspect::FsKind;
+
+    // FUSE adapter wants ownership of both the filesystem handle and
+    // the backing block device. Partition selectors (`image:N`) and
+    // qcow2 sources go through `inspect::with_target_device` which
+    // doesn't give us ownership; for v1 we accept plain raw images
+    // only.
     if image.contains(':') {
         return Err(fstool::Error::Unsupported(
             "fstool mount: partitioned-image selectors (`path:N`) and qcow2 sources \
@@ -336,16 +340,74 @@ fn mount_cmd(image: &str, mountpoint: &std::path::Path) -> fstool::Result<()> {
     let path = std::path::Path::new(image);
     let mut dev: Box<dyn fstool::block::BlockDevice> =
         Box::new(fstool::block::FileBackend::open(path)?);
-    let mut ext = fstool::fs::ext::Ext::open(dev.as_mut())?;
-    // Replay any pending journal so the mounted view matches what the
-    // kernel would see on first mount of an unclean shutdown.
-    let _ = ext.replay_pending_journal(dev.as_mut())?;
-    let fs = fstool::fuse_adapter::FstoolFs::new(ext, dev);
+    let kind = fstool::inspect::detect_fs(dev.as_mut())?;
+    let (fs, fs_name): (Box<dyn Filesystem>, &'static str) = match kind {
+        FsKind::Ext => {
+            let mut ext = fstool::fs::ext::Ext::open(dev.as_mut())?;
+            // Replay any pending journal so the mounted view matches
+            // what the kernel would see on first mount of an unclean
+            // shutdown.
+            let _ = ext.replay_pending_journal(dev.as_mut())?;
+            (Box::new(ext), "ext")
+        }
+        FsKind::Fat32 => (
+            Box::new(fstool::fs::fat::Fat32::open(dev.as_mut())?),
+            "fat32",
+        ),
+        FsKind::Exfat => (
+            Box::new(fstool::fs::exfat::Exfat::open(dev.as_mut())?),
+            "exfat",
+        ),
+        FsKind::Xfs => (Box::new(fstool::fs::xfs::Xfs::open(dev.as_mut())?), "xfs"),
+        FsKind::HfsPlus => (
+            Box::new(fstool::fs::hfs_plus::HfsPlus::open(dev.as_mut())?),
+            "hfs+",
+        ),
+        FsKind::Apfs => (
+            Box::new(fstool::fs::apfs::Apfs::open(dev.as_mut())?),
+            "apfs",
+        ),
+        FsKind::Ntfs => (
+            Box::new(fstool::fs::ntfs::Ntfs::open(dev.as_mut())?),
+            "ntfs",
+        ),
+        FsKind::F2fs => (
+            Box::new(fstool::fs::f2fs::F2fs::open(dev.as_mut())?),
+            "f2fs",
+        ),
+        FsKind::Squashfs => (
+            Box::new(fstool::fs::squashfs::Squashfs::open(dev.as_mut())?),
+            "squashfs",
+        ),
+        FsKind::Iso9660 => (
+            Box::new(fstool::fs::iso9660::Iso9660::open(dev.as_mut())?),
+            "iso9660",
+        ),
+        FsKind::Tar => (Box::new(fstool::fs::tar::Tar::open(dev.as_mut())?), "tar"),
+        FsKind::Grf => (
+            Box::new(fstool::fs::grf::Grf::open_dev(dev.as_mut())?),
+            "grf",
+        ),
+        // FsKind is #[non_exhaustive]; new variants added in the
+        // future error out here instead of silently falling through.
+        _ => {
+            return Err(fstool::Error::Unsupported(format!(
+                "fstool mount: filesystem {kind:?} is not wired through the FUSE adapter yet"
+            )));
+        }
+    };
+    let cap = fs.mutation_capability();
+    let ro_suffix = if cap.supports_add_remove() {
+        ""
+    } else {
+        " (read-only)"
+    };
+    let adapter = fstool::fuse_adapter::FstoolFs::new(fs, dev, fs_name);
     eprintln!(
-        "fstool: mounted {image} at {} (umount to detach)",
+        "fstool: mounted {image} as {fs_name}{ro_suffix} at {} (umount to detach)",
         mountpoint.display()
     );
-    fs.mount(mountpoint, "fstool").map_err(fstool::Error::Io)?;
+    adapter.mount(mountpoint).map_err(fstool::Error::Io)?;
     Ok(())
 }
 

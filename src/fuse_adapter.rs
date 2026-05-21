@@ -1,128 +1,195 @@
-//! FUSE adapter — exposes an opened ext{2,3,4} image as a userspace
+//! FUSE adapter — exposes any opened [`Filesystem`] image as a userspace
 //! filesystem on a host mountpoint.
 //!
 //! Linux mounts via libfuse, macOS via macFUSE; both reached through
 //! the [`fuser`] crate. Gated by the `fuse` Cargo feature so the
 //! default build doesn't need a C-side FUSE library installed.
 //!
+//! ## Backend-agnostic
+//!
+//! The adapter takes a [`Box<dyn Filesystem>`](crate::fs::Filesystem) —
+//! ext{2,3,4}, FAT32, SquashFS, ISO 9660, GRF, anything that implements
+//! the trait. Write capability follows from
+//! [`Filesystem::mutation_capability`] — backends that report
+//! [`Streaming`](crate::fs::MutationCapability::Streaming) or
+//! [`Immutable`](crate::fs::MutationCapability::Immutable) refuse every
+//! mutation callback with `EROFS`.
+//!
 //! ## Inode mapping
 //!
-//! FUSE's `FUSE_ROOT_ID` is `1`; ext's root inode is `2`. We translate
-//! at the kernel ↔ ext boundary: FUSE sees the root as ino 1, every
-//! other inode is passed through unchanged.
+//! FUSE's `FUSE_ROOT_ID` is `1`, and the kernel addresses every
+//! subsequent object by an opaque inode number we hand back from
+//! `lookup`. Because not every backend has a stable inode space (FAT's
+//! cluster ids aren't kept, tar has none at all), the adapter maintains
+//! its own `ino ↔ path` map: root is `1`, every other path gets a
+//! monotonically increasing id on first `lookup`. We don't recycle ids
+//! — even after `unlink`, the same id stays out of circulation for the
+//! lifetime of the mount.
 //!
 //! ## Concurrency
 //!
 //! [`fuser::mount2`] runs the filesystem on the calling thread; all
-//! callbacks come in serially. That suits our current single-threaded
-//! `Ext` handle — when Phase E adds real concurrency we'll switch to
+//! callbacks come in serially. That suits our single-threaded
+//! filesystem handles — when concurrency is added we'll switch to
 //! `spawn_mount2` and share state via `Arc<Mutex<…>>`.
 //!
 //! ## Flush model
 //!
-//! Writes stage changes in `Ext`'s in-memory metadata + dirty-block
-//! tracking; the disk only sees them after [`Ext::flush`]. We flush
-//! on every `fsync`, `fsyncdir`, and `flush` callback, plus on
-//! `destroy` (unmount). Between those, the FUSE kernel-side page
-//! cache may serve subsequent reads from RAM anyway.
+//! Writes go through the backend's own buffering (ext stages in
+//! in-memory metadata, for example); the disk only sees them after
+//! [`Filesystem::flush`]. We flush on every `fsync`, `fsyncdir`, and
+//! `flush` callback, plus on `destroy` (unmount). Between those, the
+//! FUSE kernel-side page cache may serve subsequent reads from RAM
+//! anyway.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FUSE_ROOT_ID, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    FUSE_ROOT_ID, FileAttr, FileType, Filesystem as FuseFilesystem, KernelConfig, MountOption,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
 use crate::block::BlockDevice;
-use crate::fs::ext::constants;
-use crate::fs::ext::{Ext, rw};
-use crate::fs::{DeviceKind, FileMeta};
+use crate::fs::{
+    DeviceKind, EntryKind, FileAttrs, FileMeta, Filesystem, MutationCapability, OpenFlags, SetAttrs,
+};
 
 const TTL: Duration = Duration::from_secs(1);
 
-/// A FUSE-mountable view of an ext{2,3,4} image.
+/// A FUSE-mountable view of any [`Filesystem`]. Wraps a `Box<dyn
+/// Filesystem>` and its backing device, plus an `ino ↔ path` table
+/// keyed by FUSE inode number.
+///
+/// `mount2` (single-threaded) doesn't require `Send` on the handle,
+/// so neither do we — that keeps `Squashfs` (which holds non-`Sync`
+/// `RefCell` state internally) mountable as-is.
 pub struct FstoolFs {
-    ext: Ext,
+    fs: Box<dyn Filesystem>,
     dev: Box<dyn BlockDevice>,
+    fs_name: &'static str,
+    /// FUSE ino → absolute path. `1` is always `/`.
+    ino_to_path: HashMap<u64, PathBuf>,
+    /// Reverse map for cheap re-lookups.
+    path_to_ino: HashMap<PathBuf, u64>,
+    /// Next ino to hand out. Starts at 2 (1 is reserved for root).
+    next_ino: u64,
+    /// Whether the underlying FS reports `Mutable` or
+    /// `WholeFileOnly`. Captured at construction so per-callback
+    /// dispatch is one bool check.
+    writable: bool,
+    /// True only for `Mutable` — i.e. partial in-place byte writes
+    /// are allowed (otherwise `write` is `EROFS`).
+    partial_writable: bool,
 }
 
 impl FstoolFs {
-    /// Wrap an already-opened [`Ext`] and its backing device. Caller
-    /// is responsible for any required journal replay before
-    /// constructing (replay is a no-op on a clean image, so passing
-    /// the freshly-opened handle through is fine).
-    pub fn new(ext: Ext, dev: Box<dyn BlockDevice>) -> Self {
-        Self { ext, dev }
+    /// Wrap an already-opened filesystem and its backing device.
+    ///
+    /// `fs_name` is the string the kernel surfaces as the FS type in
+    /// `mount(8)` output — pass the short backend name (`"ext"`,
+    /// `"fat32"`, `"squashfs"`, etc.).
+    pub fn new(fs: Box<dyn Filesystem>, dev: Box<dyn BlockDevice>, fs_name: &'static str) -> Self {
+        let cap = fs.mutation_capability();
+        let writable = cap.supports_add_remove();
+        let partial_writable = cap.supports_partial_writes();
+        let mut ino_to_path = HashMap::new();
+        let mut path_to_ino = HashMap::new();
+        ino_to_path.insert(FUSE_ROOT_ID, PathBuf::from("/"));
+        path_to_ino.insert(PathBuf::from("/"), FUSE_ROOT_ID);
+        Self {
+            fs,
+            dev,
+            fs_name,
+            ino_to_path,
+            path_to_ino,
+            next_ino: 2,
+            writable,
+            partial_writable,
+        }
     }
 
     /// Mount under `mountpoint` and pump events on this thread until
     /// `umount` on the mountpoint or a fatal callback returns. Blocks
     /// indefinitely; spawn a thread if you want async-ish behaviour.
-    pub fn mount(self, mountpoint: &Path, fs_name: &str) -> std::io::Result<()> {
-        let opts = vec![
-            MountOption::FSName(fs_name.to_string()),
+    pub fn mount(self, mountpoint: &Path) -> std::io::Result<()> {
+        let mut opts = vec![
+            MountOption::FSName(self.fs_name.to_string()),
             MountOption::AutoUnmount,
             MountOption::AllowOther,
         ];
+        if !self.writable {
+            opts.push(MountOption::RO);
+        }
         fuser::mount2(self, mountpoint, &opts)
     }
 
-    fn ext_ino(&self, fuse_ino: u64) -> u32 {
-        if fuse_ino == FUSE_ROOT_ID {
-            constants::INO_ROOT_DIR
-        } else {
-            fuse_ino as u32
+    /// Look up the path for a FUSE inode. Returns `None` for unknown
+    /// inos — the adapter only mints inos on successful `lookup`, so
+    /// the kernel handing back one we've never seen is a protocol
+    /// error.
+    fn path_for(&self, ino: u64) -> Option<PathBuf> {
+        self.ino_to_path.get(&ino).cloned()
+    }
+
+    /// Mint or recall the inode number for a path. Two `lookup`s of
+    /// the same path return the same id — that's a requirement of
+    /// the FUSE protocol (the kernel uses the id as a stable handle).
+    fn ino_for(&mut self, path: &Path) -> u64 {
+        if let Some(&id) = self.path_to_ino.get(path) {
+            return id;
+        }
+        let id = self.next_ino;
+        self.next_ino += 1;
+        self.ino_to_path.insert(id, path.to_path_buf());
+        self.path_to_ino.insert(path.to_path_buf(), id);
+        id
+    }
+
+    /// Drop the path↔ino mapping for `path`. Called after unlink /
+    /// rmdir so subsequent `lookup`s of the same name get a fresh
+    /// inode. The id itself stays out of circulation for the lifetime
+    /// of the mount (FUSE doesn't permit recycling).
+    fn forget_path(&mut self, path: &Path) {
+        if let Some(id) = self.path_to_ino.remove(path) {
+            self.ino_to_path.remove(&id);
         }
     }
 
-    fn fuse_ino(&self, ext_ino: u32) -> u64 {
-        if ext_ino == constants::INO_ROOT_DIR {
-            FUSE_ROOT_ID
-        } else {
-            ext_ino as u64
-        }
-    }
-
-    fn attr_for(&mut self, ino: u32) -> Option<FileAttr> {
-        let inode = self.ext.read_inode(self.dev.as_mut(), ino).ok()?;
-        let kind = match inode.mode & constants::S_IFMT {
-            constants::S_IFREG => FileType::RegularFile,
-            constants::S_IFDIR => FileType::Directory,
-            constants::S_IFLNK => FileType::Symlink,
-            constants::S_IFBLK => FileType::BlockDevice,
-            constants::S_IFCHR => FileType::CharDevice,
-            constants::S_IFIFO => FileType::NamedPipe,
-            constants::S_IFSOCK => FileType::Socket,
-            _ => return None,
-        };
-        // Device numbers live in i_block[0] when the inode is a
-        // char/block device (encoded by `add_device_to`).
-        let rdev = if matches!(kind, FileType::CharDevice | FileType::BlockDevice) {
-            inode.block[0]
-        } else {
-            0
-        };
-        Some(FileAttr {
-            ino: self.fuse_ino(ino),
-            size: inode.size as u64,
-            blocks: inode.blocks_512 as u64,
-            atime: ts(inode.atime),
-            mtime: ts(inode.mtime),
-            ctime: ts(inode.ctime),
-            crtime: ts(inode.mtime),
+    /// Build a `FileAttr` from a backend [`FileAttrs`] plus the FUSE
+    /// inode we want to surface.
+    fn make_attr(&self, fuse_ino: u64, a: &FileAttrs) -> FileAttr {
+        let kind = entry_kind_to_file_type(a.kind);
+        let blksize = self.fs_block_size_hint().unwrap_or(4096);
+        FileAttr {
+            ino: fuse_ino,
+            size: a.size,
+            blocks: a.blocks,
+            atime: ts(a.atime),
+            mtime: ts(a.mtime),
+            ctime: ts(a.ctime),
+            crtime: ts(a.mtime),
             kind,
-            perm: inode.mode & 0o7777,
-            nlink: inode.links_count as u32,
-            uid: inode.uid as u32,
-            gid: inode.gid as u32,
-            rdev,
-            blksize: self.ext.layout.block_size,
+            perm: a.mode & 0o7777,
+            nlink: a.nlink,
+            uid: a.uid,
+            gid: a.gid,
+            rdev: a.rdev,
+            blksize,
             flags: 0,
-        })
+        }
+    }
+
+    /// Best-effort block-size hint for `blksize` on the inode. We
+    /// don't want to spam the dev with a `statfs` call on every
+    /// `getattr`, so we cache nothing — backends can be cheap or
+    /// not. For the time being we just return 4 KiB.
+    fn fs_block_size_hint(&self) -> Option<u32> {
+        Some(4096)
     }
 
     fn now_secs() -> u32 {
@@ -130,6 +197,20 @@ impl FstoolFs {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0)
+    }
+
+    /// Join `parent_path / name` into an absolute path. Names from
+    /// FUSE arrive as `OsStr`; we decode them as UTF-8-lossy since
+    /// the underlying filesystem trait is path-typed.
+    fn child_path(parent: &Path, name: &OsStr) -> PathBuf {
+        let name_str = name.to_string_lossy();
+        if parent == Path::new("/") {
+            PathBuf::from(format!("/{name_str}"))
+        } else {
+            let mut p = parent.to_path_buf();
+            p.push(name_str.as_ref());
+            p
+        }
     }
 }
 
@@ -150,51 +231,69 @@ fn time_or_now_secs(t: TimeOrNow) -> u32 {
     }
 }
 
-fn ext_err_to_errno(e: &crate::Error) -> i32 {
+fn fs_err_to_errno(e: &crate::Error) -> i32 {
     match e {
-        crate::Error::InvalidArgument(_) => libc::EINVAL,
+        crate::Error::InvalidArgument(_) => libc::ENOENT,
         crate::Error::Unsupported(_) => libc::ENOSYS,
+        crate::Error::Immutable { .. } => libc::EROFS,
         crate::Error::Io(_) => libc::EIO,
         _ => libc::EIO,
     }
 }
 
-impl Filesystem for FstoolFs {
+fn entry_kind_to_file_type(k: EntryKind) -> FileType {
+    match k {
+        EntryKind::Regular => FileType::RegularFile,
+        EntryKind::Dir => FileType::Directory,
+        EntryKind::Symlink => FileType::Symlink,
+        EntryKind::Block => FileType::BlockDevice,
+        EntryKind::Char => FileType::CharDevice,
+        EntryKind::Fifo => FileType::NamedPipe,
+        EntryKind::Socket => FileType::Socket,
+        EntryKind::Unknown => FileType::RegularFile,
+    }
+}
+
+impl FuseFilesystem for FstoolFs {
     fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), libc::c_int> {
         Ok(())
     }
 
     fn destroy(&mut self) {
-        // Best-effort flush on unmount. We can't surface errors from
-        // destroy — fuser swallows them — so just log via stderr.
-        if let Err(e) = self.ext.flush(self.dev.as_mut()) {
-            eprintln!("fstool fuse: flush on unmount failed: {e}");
+        if self.writable {
+            if let Err(e) = self.fs.flush(self.dev.as_mut()) {
+                eprintln!("fstool fuse: flush on unmount failed: {e}");
+            }
         }
         let _ = self.dev.sync();
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let parent = self.ext_ino(parent);
-        let name_bytes = name.as_encoded_bytes();
-        let entries = match self.ext.list_inode(self.dev.as_mut(), parent) {
-            Ok(v) => v,
-            Err(_) => return reply.error(libc::ENOENT),
-        };
-        let entry = match entries.iter().find(|e| e.name.as_bytes() == name_bytes) {
-            Some(e) => e,
+        let parent_path = match self.path_for(parent) {
+            Some(p) => p,
             None => return reply.error(libc::ENOENT),
         };
-        match self.attr_for(entry.inode) {
-            Some(attr) => reply.entry(&TTL, &attr, 0),
-            None => reply.error(libc::EIO),
-        }
+        let child = Self::child_path(&parent_path, name);
+        let attrs = match self.fs.getattr(self.dev.as_mut(), &child) {
+            Ok(a) => a,
+            Err(_) => return reply.error(libc::ENOENT),
+        };
+        let ino = self.ino_for(&child);
+        let attr = self.make_attr(ino, &attrs);
+        reply.entry(&TTL, &attr, 0);
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let ino = self.ext_ino(ino);
-        match self.attr_for(ino) {
-            Some(attr) => reply.attr(&TTL, &attr),
-            None => reply.error(libc::ENOENT),
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        match self.fs.getattr(self.dev.as_mut(), &path) {
+            Ok(attrs) => {
+                let attr = self.make_attr(ino, &attrs);
+                reply.attr(&TTL, &attr);
+            }
+            Err(_) => reply.error(libc::ENOENT),
         }
     }
 
@@ -217,51 +316,61 @@ impl Filesystem for FstoolFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let ino = self.ext_ino(ino);
-        if let Some(m) = mode {
-            if let Err(e) = self.ext.chmod(self.dev.as_mut(), ino, m as u16) {
-                return reply.error(ext_err_to_errno(&e));
-            }
+        if !self.writable {
+            return reply.error(libc::EROFS);
         }
-        if uid.is_some() || gid.is_some() {
-            let cur = match self.ext.read_inode(self.dev.as_mut(), ino) {
-                Ok(i) => i,
-                Err(e) => return reply.error(ext_err_to_errno(&e)),
-            };
-            let new_uid = uid.unwrap_or(cur.uid as u32);
-            let new_gid = gid.unwrap_or(cur.gid as u32);
-            if let Err(e) = self.ext.chown(self.dev.as_mut(), ino, new_uid, new_gid) {
-                return reply.error(ext_err_to_errno(&e));
-            }
-        }
-        if atime.is_some() || mtime.is_some() || ctime.is_some() {
-            let a = atime.map(time_or_now_secs);
-            let m = mtime.map(time_or_now_secs);
-            let c = ctime.map(|t| {
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let attrs = SetAttrs {
+            mode: mode.map(|m| (m & 0o7777) as u16),
+            uid,
+            gid,
+            atime: atime.map(time_or_now_secs),
+            mtime: mtime.map(time_or_now_secs),
+            ctime: ctime.map(|t| {
                 t.duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs() as u32)
                     .unwrap_or(0)
-            });
-            if let Err(e) = self.ext.set_times(self.dev.as_mut(), ino, a, m, c) {
-                return reply.error(ext_err_to_errno(&e));
+            }),
+        };
+        // set_attrs ignores Unsupported for the *whole* set when the
+        // backend can't change any of these. Surface that as ENOSYS
+        // only when the caller actually asked for something.
+        let asked_attrs = attrs.mode.is_some()
+            || attrs.uid.is_some()
+            || attrs.gid.is_some()
+            || attrs.atime.is_some()
+            || attrs.mtime.is_some()
+            || attrs.ctime.is_some();
+        if asked_attrs {
+            if let Err(e) = self.fs.set_attrs(self.dev.as_mut(), &path, attrs) {
+                return reply.error(fs_err_to_errno(&e));
             }
         }
         if let Some(sz) = size {
-            if let Err(e) = self.ext.truncate(self.dev.as_mut(), ino, sz) {
-                return reply.error(ext_err_to_errno(&e));
+            if let Err(e) = self.fs.truncate(self.dev.as_mut(), &path, sz) {
+                return reply.error(fs_err_to_errno(&e));
             }
         }
-        match self.attr_for(ino) {
-            Some(attr) => reply.attr(&TTL, &attr),
-            None => reply.error(libc::EIO),
+        match self.fs.getattr(self.dev.as_mut(), &path) {
+            Ok(a) => {
+                let attr = self.make_attr(ino, &a);
+                reply.attr(&TTL, &attr);
+            }
+            Err(_) => reply.error(libc::EIO),
         }
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        let ino = self.ext_ino(ino);
-        match self.ext.read_symlink_target(self.dev.as_mut(), ino) {
-            Ok(target) => reply.data(target.as_bytes()),
-            Err(e) => reply.error(ext_err_to_errno(&e)),
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        match self.fs.read_symlink(self.dev.as_mut(), &path) {
+            Ok(target) => reply.data(target.as_os_str().as_encoded_bytes()),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
@@ -275,7 +384,14 @@ impl Filesystem for FstoolFs {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        let parent = self.ext_ino(parent);
+        if !self.writable {
+            return reply.error(libc::EROFS);
+        }
+        let parent_path = match self.path_for(parent) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let child = Self::child_path(&parent_path, name);
         let mode_type = mode & 0o170000;
         let meta = FileMeta {
             mode: (mode & 0o7777) as u16,
@@ -285,58 +401,50 @@ impl Filesystem for FstoolFs {
             atime: Self::now_secs(),
             ctime: Self::now_secs(),
         };
-        let res = match mode_type as u16 {
-            constants::S_IFREG => {
-                use std::io::Cursor;
-                let mut empty = Cursor::new(Vec::<u8>::new());
-                self.ext.add_file_to_streaming(
-                    self.dev.as_mut(),
-                    parent,
-                    name.as_encoded_bytes(),
-                    &mut empty,
-                    0,
-                    meta,
-                )
-            }
-            constants::S_IFCHR => {
+        // S_IFREG and the special-file modes go through different
+        // create_* methods in the trait.
+        let res = match mode_type {
+            0o100000 /* S_IFREG */ => self.fs.create_file(
+                self.dev.as_mut(),
+                &child,
+                crate::fs::FileSource::Zero(0),
+                meta,
+            ),
+            0o020000 /* S_IFCHR */ => {
                 let major = (rdev >> 8) & 0xfff;
                 let minor = (rdev & 0xff) | ((rdev >> 12) & 0xfff00);
-                self.ext.add_device_to(
+                self.fs.create_device(
                     self.dev.as_mut(),
-                    parent,
-                    name.as_encoded_bytes(),
+                    &child,
                     DeviceKind::Char,
                     major,
                     minor,
                     meta,
                 )
             }
-            constants::S_IFBLK => {
+            0o060000 /* S_IFBLK */ => {
                 let major = (rdev >> 8) & 0xfff;
                 let minor = (rdev & 0xff) | ((rdev >> 12) & 0xfff00);
-                self.ext.add_device_to(
+                self.fs.create_device(
                     self.dev.as_mut(),
-                    parent,
-                    name.as_encoded_bytes(),
+                    &child,
                     DeviceKind::Block,
                     major,
                     minor,
                     meta,
                 )
             }
-            constants::S_IFIFO => self.ext.add_device_to(
+            0o010000 /* S_IFIFO */ => self.fs.create_device(
                 self.dev.as_mut(),
-                parent,
-                name.as_encoded_bytes(),
+                &child,
                 DeviceKind::Fifo,
                 0,
                 0,
                 meta,
             ),
-            constants::S_IFSOCK => self.ext.add_device_to(
+            0o140000 /* S_IFSOCK */ => self.fs.create_device(
                 self.dev.as_mut(),
-                parent,
-                name.as_encoded_bytes(),
+                &child,
                 DeviceKind::Socket,
                 0,
                 0,
@@ -345,11 +453,8 @@ impl Filesystem for FstoolFs {
             _ => return reply.error(libc::ENOSYS),
         };
         match res {
-            Ok(new_ino) => match self.attr_for(new_ino) {
-                Some(attr) => reply.entry(&TTL, &attr, 0),
-                None => reply.error(libc::EIO),
-            },
-            Err(e) => reply.error(ext_err_to_errno(&e)),
+            Ok(()) => self.reply_with_new_entry(&child, reply),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
@@ -362,7 +467,14 @@ impl Filesystem for FstoolFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let parent = self.ext_ino(parent);
+        if !self.writable {
+            return reply.error(libc::EROFS);
+        }
+        let parent_path = match self.path_for(parent) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let child = Self::child_path(&parent_path, name);
         let meta = FileMeta {
             mode: (mode & 0o7777) as u16,
             uid: req.uid(),
@@ -371,35 +483,32 @@ impl Filesystem for FstoolFs {
             atime: Self::now_secs(),
             ctime: Self::now_secs(),
         };
-        match self
-            .ext
-            .add_dir_to(self.dev.as_mut(), parent, name.as_encoded_bytes(), meta)
-        {
-            Ok(new_ino) => match self.attr_for(new_ino) {
-                Some(attr) => reply.entry(&TTL, &attr, 0),
-                None => reply.error(libc::EIO),
-            },
-            Err(e) => reply.error(ext_err_to_errno(&e)),
+        match self.fs.create_dir(self.dev.as_mut(), &child, meta) {
+            Ok(()) => self.reply_with_new_entry(&child, reply),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let parent = self.ext_ino(parent);
-        // The current remove_path takes an absolute path. Resolve a
-        // synthetic path from parent + name; we don't have ino → path
-        // reverse mapping yet so the underlying API does the work.
-        let path = match self.path_of(parent, name.as_encoded_bytes()) {
-            Ok(p) => p,
-            Err(e) => return reply.error(ext_err_to_errno(&e)),
+        if !self.writable {
+            return reply.error(libc::EROFS);
+        }
+        let parent_path = match self.path_for(parent) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
         };
-        match self.ext.remove_path(self.dev.as_mut(), &path) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(ext_err_to_errno(&e)),
+        let child = Self::child_path(&parent_path, name);
+        match self.fs.remove(self.dev.as_mut(), &child) {
+            Ok(()) => {
+                self.forget_path(&child);
+                reply.ok();
+            }
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        // unlink + rmdir share remove_path's empty-dir check.
+        // unlink + rmdir share the trait-level `remove(path)`.
         self.unlink(_req, parent, name, reply)
     }
 
@@ -411,8 +520,14 @@ impl Filesystem for FstoolFs {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        let parent = self.ext_ino(parent);
-        let target_bytes = target.as_os_str().as_encoded_bytes();
+        if !self.writable {
+            return reply.error(libc::EROFS);
+        }
+        let parent_path = match self.path_for(parent) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let child = Self::child_path(&parent_path, link_name);
         let meta = FileMeta {
             mode: 0o777,
             uid: req.uid(),
@@ -421,18 +536,12 @@ impl Filesystem for FstoolFs {
             atime: Self::now_secs(),
             ctime: Self::now_secs(),
         };
-        match self.ext.add_symlink_to(
-            self.dev.as_mut(),
-            parent,
-            link_name.as_encoded_bytes(),
-            target_bytes,
-            meta,
-        ) {
-            Ok(new_ino) => match self.attr_for(new_ino) {
-                Some(attr) => reply.entry(&TTL, &attr, 0),
-                None => reply.error(libc::EIO),
-            },
-            Err(e) => reply.error(ext_err_to_errno(&e)),
+        match self
+            .fs
+            .create_symlink(self.dev.as_mut(), &child, target, meta)
+        {
+            Ok(()) => self.reply_with_new_entry(&child, reply),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
@@ -446,17 +555,29 @@ impl Filesystem for FstoolFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let parent = self.ext_ino(parent);
-        let newparent = self.ext_ino(newparent);
-        match self.ext.rename(
-            self.dev.as_mut(),
-            parent,
-            name.as_encoded_bytes(),
-            newparent,
-            newname.as_encoded_bytes(),
-        ) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(ext_err_to_errno(&e)),
+        if !self.writable {
+            return reply.error(libc::EROFS);
+        }
+        let parent_path = match self.path_for(parent) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let newparent_path = match self.path_for(newparent) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let old = Self::child_path(&parent_path, name);
+        let new = Self::child_path(&newparent_path, newname);
+        match self.fs.rename(self.dev.as_mut(), &old, &new) {
+            Ok(()) => {
+                // Keep the same FUSE inode pointing at the new path.
+                if let Some(id) = self.path_to_ino.remove(&old) {
+                    self.ino_to_path.insert(id, new.clone());
+                    self.path_to_ino.insert(new, id);
+                }
+                reply.ok();
+            }
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
@@ -468,25 +589,25 @@ impl Filesystem for FstoolFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let ino = self.ext_ino(ino);
-        let newparent = self.ext_ino(newparent);
-        match self.ext.add_link_to(
-            self.dev.as_mut(),
-            newparent,
-            newname.as_encoded_bytes(),
-            ino,
-        ) {
-            Ok(()) => match self.attr_for(ino) {
-                Some(attr) => reply.entry(&TTL, &attr, 0),
-                None => reply.error(libc::EIO),
-            },
-            Err(e) => reply.error(ext_err_to_errno(&e)),
+        if !self.writable {
+            return reply.error(libc::EROFS);
+        }
+        let target = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let newparent_path = match self.path_for(newparent) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let new = Self::child_path(&newparent_path, newname);
+        match self.fs.hardlink(self.dev.as_mut(), &target, &new) {
+            Ok(()) => self.reply_with_new_entry(&new, reply),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
     fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        // No per-open state beyond the inode itself; fh = 0 is a
-        // valid signal that there's nothing to look up later.
         reply.opened(0, 0);
     }
 
@@ -501,16 +622,19 @@ impl Filesystem for FstoolFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let ino = self.ext_ino(ino);
-        let mut reader = match self.ext.open_file_reader(self.dev.as_mut(), ino) {
-            Ok(r) => r,
-            Err(e) => return reply.error(ext_err_to_errno(&e)),
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
         };
-        if reader.seek(SeekFrom::Start(offset as u64)).is_err() {
+        let mut handle = match self.fs.open_file_ro(self.dev.as_mut(), &path) {
+            Ok(h) => h,
+            Err(e) => return reply.error(fs_err_to_errno(&e)),
+        };
+        if handle.seek(SeekFrom::Start(offset as u64)).is_err() {
             return reply.error(libc::EIO);
         }
         let mut buf = vec![0u8; size as usize];
-        let n = match reader.read(&mut buf) {
+        let n = match handle.read(&mut buf) {
             Ok(n) => n,
             Err(_) => return reply.error(libc::EIO),
         };
@@ -531,19 +655,25 @@ impl Filesystem for FstoolFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let ino = self.ext_ino(ino);
-        // open_file_rw_ext_by_inode borrows ext+dev mutably; the
-        // handle's Drop refreshes blocks_512 on the inode.
-        let res = (|| -> std::io::Result<usize> {
-            let mut h = rw::open_file_rw_ext_by_inode(&mut self.ext, self.dev.as_mut(), ino)
-                .map_err(|e| std::io::Error::other(format!("{e}")))?;
-            h.seek(SeekFrom::Start(offset as u64))?;
-            h.write_all(data)?;
+        if !self.partial_writable {
+            return reply.error(libc::EROFS);
+        }
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let res = (|| -> crate::Result<usize> {
+            let mut h =
+                self.fs
+                    .open_file_rw(self.dev.as_mut(), &path, OpenFlags::default(), None)?;
+            h.seek(SeekFrom::Start(offset as u64))
+                .map_err(crate::Error::Io)?;
+            h.write_all(data).map_err(crate::Error::Io)?;
             Ok(data.len())
         })();
         match res {
             Ok(n) => reply.written(n as u32),
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
@@ -555,9 +685,12 @@ impl Filesystem for FstoolFs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        match self.ext.flush(self.dev.as_mut()) {
+        if !self.writable {
+            return reply.ok();
+        }
+        match self.fs.flush(self.dev.as_mut()) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(ext_err_to_errno(&e)),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
@@ -569,9 +702,12 @@ impl Filesystem for FstoolFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.ext.flush(self.dev.as_mut()) {
+        if !self.writable {
+            return reply.ok();
+        }
+        match self.fs.flush(self.dev.as_mut()) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(ext_err_to_errno(&e)),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
@@ -600,38 +736,38 @@ impl Filesystem for FstoolFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let ino = self.ext_ino(ino);
-        let entries = match self.ext.list_inode(self.dev.as_mut(), ino) {
-            Ok(v) => v,
-            Err(e) => return reply.error(ext_err_to_errno(&e)),
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
         };
-        // Synthesize "." and "..". list_inode skips them; FUSE
-        // expects them at offsets 0 and 1 conventionally, but the
-        // kernel doesn't actually mind if we just emit children.
-        // We do include them so userspace tools that compare with
-        // POSIX behaviour don't trip.
-        let parent_ino = self.parent_of(ino).unwrap_or(ino);
-        let mut all: Vec<(u32, FileType, String)> = Vec::with_capacity(entries.len() + 2);
+        let entries = match self.fs.list(self.dev.as_mut(), &path) {
+            Ok(v) => v,
+            Err(e) => return reply.error(fs_err_to_errno(&e)),
+        };
+        // Synthesize "." and ".." — most backends' `list` skips them.
+        let parent_path = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| path.clone());
+        let parent_ino = if path == Path::new("/") {
+            FUSE_ROOT_ID
+        } else {
+            self.ino_for(&parent_path)
+        };
+        let mut all: Vec<(u64, FileType, String)> = Vec::with_capacity(entries.len() + 2);
         all.push((ino, FileType::Directory, ".".to_string()));
         all.push((parent_ino, FileType::Directory, "..".to_string()));
-        for e in &entries {
+        for e in entries {
             if e.name == "." || e.name == ".." {
                 continue;
             }
-            let kind = match e.kind {
-                crate::fs::EntryKind::Regular => FileType::RegularFile,
-                crate::fs::EntryKind::Dir => FileType::Directory,
-                crate::fs::EntryKind::Symlink => FileType::Symlink,
-                crate::fs::EntryKind::Block => FileType::BlockDevice,
-                crate::fs::EntryKind::Char => FileType::CharDevice,
-                crate::fs::EntryKind::Fifo => FileType::NamedPipe,
-                crate::fs::EntryKind::Socket => FileType::Socket,
-                _ => FileType::RegularFile,
-            };
-            all.push((e.inode, kind, e.name.clone()));
+            let child = Self::child_path(&path, OsStr::new(&e.name));
+            let child_ino = self.ino_for(&child);
+            let kind = entry_kind_to_file_type(e.kind);
+            all.push((child_ino, kind, e.name));
         }
         for (i, (child, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(self.fuse_ino(child), (i + 1) as i64, kind, name) {
+            if reply.add(child, (i + 1) as i64, kind, name) {
                 break;
             }
         }
@@ -650,17 +786,19 @@ impl Filesystem for FstoolFs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
-        let sb = &self.ext.sb;
-        reply.statfs(
-            sb.blocks_count as u64,
-            sb.free_blocks_count as u64,
-            sb.free_blocks_count as u64,
-            sb.inodes_count as u64,
-            sb.free_inodes_count as u64,
-            self.ext.layout.block_size,
-            255,
-            self.ext.layout.block_size,
-        );
+        match self.fs.statfs(self.dev.as_mut()) {
+            Ok(s) => reply.statfs(
+                s.blocks,
+                s.blocks_free,
+                s.blocks_avail,
+                s.inodes,
+                s.inodes_free,
+                s.block_size,
+                s.name_max,
+                s.block_size,
+            ),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
+        }
     }
 
     fn create(
@@ -673,9 +811,14 @@ impl Filesystem for FstoolFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        // FUSE `create` is mknod (regular file) + open. We make the
-        // file then return fh = 0 (same as `open`).
-        let parent = self.ext_ino(parent);
+        if !self.writable {
+            return reply.error(libc::EROFS);
+        }
+        let parent_path = match self.path_for(parent) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let child = Self::child_path(&parent_path, name);
         let meta = FileMeta {
             mode: (mode & 0o7777 & !(umask & 0o7777)) as u16,
             uid: req.uid(),
@@ -684,27 +827,26 @@ impl Filesystem for FstoolFs {
             atime: Self::now_secs(),
             ctime: Self::now_secs(),
         };
-        use std::io::Cursor;
-        let mut empty = Cursor::new(Vec::<u8>::new());
-        match self.ext.add_file_to_streaming(
+        let res = self.fs.create_file(
             self.dev.as_mut(),
-            parent,
-            name.as_encoded_bytes(),
-            &mut empty,
-            0,
+            &child,
+            crate::fs::FileSource::Zero(0),
             meta,
-        ) {
-            Ok(new_ino) => match self.attr_for(new_ino) {
-                Some(attr) => reply.created(&TTL, &attr, 0, 0, 0),
-                None => reply.error(libc::EIO),
+        );
+        match res {
+            Ok(()) => match self.fs.getattr(self.dev.as_mut(), &child) {
+                Ok(attrs) => {
+                    let id = self.ino_for(&child);
+                    let attr = self.make_attr(id, &attrs);
+                    reply.created(&TTL, &attr, 0, 0, 0);
+                }
+                Err(_) => reply.error(libc::EIO),
             },
-            Err(e) => reply.error(ext_err_to_errno(&e)),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
         }
     }
 
     fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
-        // No permission enforcement; the kernel does its own UID/GID
-        // checks against the attrs we already returned via getattr.
         reply.ok();
     }
 
@@ -716,16 +858,16 @@ impl Filesystem for FstoolFs {
         size: u32,
         reply: ReplyXattr,
     ) {
-        let ino = self.ext_ino(ino);
-        let xattrs = match self.ext.read_xattrs(self.dev.as_mut(), ino) {
-            Ok(x) => x,
-            Err(e) => return reply.error(ext_err_to_errno(&e)),
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
         };
-        let want = name.as_encoded_bytes();
-        let value = xattrs
-            .iter()
-            .find(|x| x.name.as_bytes() == want)
-            .map(|x| x.value.clone());
+        let xattrs = match self.fs.list_xattrs(self.dev.as_mut(), &path) {
+            Ok(x) => x,
+            Err(e) => return reply.error(fs_err_to_errno(&e)),
+        };
+        let want = name.to_string_lossy();
+        let value = xattrs.into_iter().find(|x| x.name == want).map(|x| x.value);
         match value {
             Some(v) => {
                 if size == 0 {
@@ -741,10 +883,13 @@ impl Filesystem for FstoolFs {
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
-        let ino = self.ext_ino(ino);
-        let xattrs = match self.ext.read_xattrs(self.dev.as_mut(), ino) {
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let xattrs = match self.fs.list_xattrs(self.dev.as_mut(), &path) {
             Ok(x) => x,
-            Err(e) => return reply.error(ext_err_to_errno(&e)),
+            Err(e) => return reply.error(fs_err_to_errno(&e)),
         };
         let mut payload = Vec::new();
         for x in &xattrs {
@@ -759,49 +904,70 @@ impl Filesystem for FstoolFs {
             reply.data(&payload);
         }
     }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if !self.writable {
+            return reply.error(libc::EROFS);
+        }
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let n = name.to_string_lossy();
+        match self
+            .fs
+            .set_xattr(self.dev.as_mut(), &path, n.as_ref(), value)
+        {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
+        }
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        if !self.writable {
+            return reply.error(libc::EROFS);
+        }
+        let path = match self.path_for(ino) {
+            Some(p) => p,
+            None => return reply.error(libc::ENOENT),
+        };
+        let n = name.to_string_lossy();
+        match self.fs.remove_xattr(self.dev.as_mut(), &path, n.as_ref()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(fs_err_to_errno(&e)),
+        }
+    }
 }
 
 impl FstoolFs {
-    /// Build a virtual absolute path "/.../name" for an entry under
-    /// `parent_ino`. Walks up the inode tree by following each dir's
-    /// `..` entry. Used by unlink/rmdir to bridge to the path-based
-    /// `remove_path` API.
-    fn path_of(&mut self, parent_ino: u32, name: &[u8]) -> crate::Result<String> {
-        let mut comps: Vec<String> = vec![String::from_utf8_lossy(name).into_owned()];
-        let mut cur = parent_ino;
-        let root = constants::INO_ROOT_DIR;
-        while cur != root {
-            let entries = self.ext.list_inode(self.dev.as_mut(), cur)?;
-            let parent = entries
-                .iter()
-                .find(|e| e.name == "..")
-                .map(|e| e.inode)
-                .unwrap_or(root);
-            let parent_entries = self.ext.list_inode(self.dev.as_mut(), parent)?;
-            let my_name = parent_entries
-                .iter()
-                .find(|e| e.inode == cur)
-                .map(|e| e.name.clone())
-                .ok_or_else(|| {
-                    crate::Error::InvalidArgument(format!(
-                        "ext: inode {cur} not found in parent {parent}"
-                    ))
-                })?;
-            comps.push(my_name);
-            cur = parent;
-            if cur == root {
-                break;
+    /// Shared tail for create_file/mkdir/symlink/mknod replies: look
+    /// up the new entry's attrs and surface them through the kernel
+    /// `entry` reply.
+    fn reply_with_new_entry(&mut self, path: &Path, reply: ReplyEntry) {
+        match self.fs.getattr(self.dev.as_mut(), path) {
+            Ok(attrs) => {
+                let id = self.ino_for(path);
+                let attr = self.make_attr(id, &attrs);
+                reply.entry(&TTL, &attr, 0);
             }
+            Err(_) => reply.error(libc::EIO),
         }
-        comps.reverse();
-        let mut s = String::from("/");
-        s.push_str(&comps.join("/"));
-        Ok(s)
     }
+}
 
-    /// Resolve a directory inode's `..` to find its parent inode.
-    fn parent_of(&mut self, dir_ino: u32) -> Option<u32> {
-        let entries = self.ext.list_inode(self.dev.as_mut(), dir_ino).ok()?;
-        entries.iter().find(|e| e.name == "..").map(|e| e.inode)
-    }
+/// Make sure `MutationCapability` is referenced even when only the
+/// `EROFS` paths are exercised, so unused-import warnings don't fire
+/// in --no-default-features-without-fuse builds. No-op at runtime.
+#[allow(dead_code)]
+fn _mutation_cap_touch(m: MutationCapability) -> bool {
+    m.supports_add_remove()
 }

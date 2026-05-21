@@ -411,10 +411,72 @@ fn ext2_via_filesystem_trait() {
     let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"conf"));
 
-    let mut reader = ext.read_file(&mut dev, Path::new("/etc/conf")).unwrap();
-    let mut body = Vec::new();
-    reader.read_to_end(&mut body).unwrap();
-    assert_eq!(body, b"trait-impl content\n");
+    {
+        let mut reader = ext.read_file(&mut dev, Path::new("/etc/conf")).unwrap();
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"trait-impl content\n");
+    }
+
+    // New path-typed FUSE-shaped methods on the trait. Each one
+    // forwards to the existing ext-internal API; verify each surfaces
+    // the right values for the file we just wrote.
+    let attrs = ext.getattr(&mut dev, Path::new("/etc/conf")).unwrap();
+    assert_eq!(attrs.kind, fstool::fs::EntryKind::Regular);
+    assert_eq!(attrs.size, b"trait-impl content\n".len() as u64);
+    assert_eq!(attrs.mode, 0o644);
+    assert!(attrs.inode >= 2);
+
+    let set = fstool::fs::SetAttrs {
+        mode: Some(0o600),
+        uid: Some(42),
+        gid: Some(7),
+        mtime: Some(1234567890),
+        ..Default::default()
+    };
+    ext.set_attrs(&mut dev, Path::new("/etc/conf"), set)
+        .unwrap();
+    let attrs = ext.getattr(&mut dev, Path::new("/etc/conf")).unwrap();
+    assert_eq!(attrs.mode, 0o600);
+    assert_eq!(attrs.uid, 42);
+    assert_eq!(attrs.gid, 7);
+    assert_eq!(attrs.mtime, 1234567890);
+
+    // `Ext` has an inherent `truncate(ino, sz)` and `rename(parent_ino,
+    // name, …)`; the trait-shaped variants take paths. Qualify
+    // explicitly to pick the path-based ones.
+    <Ext as Filesystem>::truncate(&mut ext, &mut dev, Path::new("/etc/conf"), 8).unwrap();
+    let attrs = ext.getattr(&mut dev, Path::new("/etc/conf")).unwrap();
+    assert_eq!(attrs.size, 8);
+
+    <Ext as Filesystem>::rename(
+        &mut ext,
+        &mut dev,
+        Path::new("/etc/conf"),
+        Path::new("/etc/renamed"),
+    )
+    .unwrap();
+    let entries = ext.list(&mut dev, Path::new("/etc")).unwrap();
+    let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"renamed"));
+    assert!(!names.contains(&"conf"));
+
+    // hardlink should put a second name pointing at the same inode
+    // (so nlink goes 1 → 2). Confirm the inode-number bit too.
+    let pre = ext.getattr(&mut dev, Path::new("/etc/renamed")).unwrap();
+    ext.hardlink(&mut dev, Path::new("/etc/renamed"), Path::new("/etc/alias"))
+        .unwrap();
+    let post = ext.getattr(&mut dev, Path::new("/etc/renamed")).unwrap();
+    let alias = ext.getattr(&mut dev, Path::new("/etc/alias")).unwrap();
+    assert_eq!(alias.inode, pre.inode);
+    assert_eq!(post.nlink, pre.nlink + 1);
+
+    // statfs reports the superblock counters. Block count must match
+    // the format options exactly.
+    let stat = ext.statfs(&mut dev).unwrap();
+    assert_eq!(stat.block_size, opts.block_size);
+    assert_eq!(stat.blocks, opts.blocks_count as u64);
+    assert_eq!(stat.name_max, 255);
 }
 
 /// ext2 sparse files: holes are represented as zero block pointers in the

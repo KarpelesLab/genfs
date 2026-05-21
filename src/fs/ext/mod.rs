@@ -3808,6 +3808,150 @@ impl crate::fs::Filesystem for Ext {
         let target = self.read_symlink_target(dev, ino)?;
         Ok(std::path::PathBuf::from(target))
     }
+
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        let ino = self.path_to_inode(dev, s)?;
+        let inode = self.read_inode(dev, ino)?;
+        let kind = kind_from_mode(inode.mode);
+        // Device numbers live in i_block[0] when the inode is a
+        // char/block device (encoded by `add_device_to`).
+        let rdev = if matches!(
+            kind,
+            crate::fs::EntryKind::Char | crate::fs::EntryKind::Block
+        ) {
+            inode.block[0]
+        } else {
+            0
+        };
+        Ok(crate::fs::FileAttrs {
+            kind,
+            mode: inode.mode & 0o7777,
+            uid: inode.uid as u32,
+            gid: inode.gid as u32,
+            size: inode.size as u64,
+            blocks: inode.blocks_512 as u64,
+            nlink: inode.links_count as u32,
+            atime: inode.atime,
+            mtime: inode.mtime,
+            ctime: inode.ctime,
+            rdev,
+            inode: ino,
+        })
+    }
+
+    fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        let ino = self.path_to_inode(dev, s)?;
+        if let Some(m) = attrs.mode {
+            self.chmod(dev, ino, m)?;
+        }
+        if attrs.uid.is_some() || attrs.gid.is_some() {
+            let cur = self.read_inode(dev, ino)?;
+            let new_uid = attrs.uid.unwrap_or(cur.uid as u32);
+            let new_gid = attrs.gid.unwrap_or(cur.gid as u32);
+            self.chown(dev, ino, new_uid, new_gid)?;
+        }
+        if attrs.atime.is_some() || attrs.mtime.is_some() || attrs.ctime.is_some() {
+            self.set_times(dev, ino, attrs.atime, attrs.mtime, attrs.ctime)?;
+        }
+        Ok(())
+    }
+
+    fn truncate(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        new_size: u64,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        let ino = self.path_to_inode(dev, s)?;
+        Self::truncate(self, dev, ino, new_size)
+    }
+
+    fn rename(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        old_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) -> Result<()> {
+        let (op, on) = split_path(old_path)?;
+        let (np, nn) = split_path(new_path)?;
+        let op_s = op
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 old parent".into()))?;
+        let np_s = np
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 new parent".into()))?;
+        let op_ino = self.path_to_inode(dev, op_s)?;
+        let np_ino = self.path_to_inode(dev, np_s)?;
+        Self::rename(self, dev, op_ino, on.as_bytes(), np_ino, nn.as_bytes())
+    }
+
+    fn hardlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        target_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) -> Result<()> {
+        let target_s = target_path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 target path".into()))?;
+        let target_ino = self.path_to_inode(dev, target_s)?;
+        let (np, nn) = split_path(new_path)?;
+        let np_s = np
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 new parent".into()))?;
+        let np_ino = self.path_to_inode(dev, np_s)?;
+        self.add_link_to(dev, np_ino, nn.as_bytes(), target_ino)
+    }
+
+    fn list_xattrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::XattrPair>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        let ino = self.path_to_inode(dev, s)?;
+        let xattrs = self.read_xattrs(dev, ino)?;
+        Ok(xattrs
+            .into_iter()
+            .map(|x| crate::fs::XattrPair {
+                name: x.name,
+                value: x.value,
+            })
+            .collect())
+    }
+
+    fn statfs(&mut self, _dev: &mut dyn BlockDevice) -> Result<crate::fs::StatFs> {
+        let sb = &self.sb;
+        Ok(crate::fs::StatFs {
+            block_size: self.layout.block_size,
+            blocks: sb.blocks_count as u64,
+            blocks_free: sb.free_blocks_count as u64,
+            blocks_avail: sb.free_blocks_count as u64,
+            inodes: sb.inodes_count as u64,
+            inodes_free: sb.free_inodes_count as u64,
+            name_max: 255,
+        })
+    }
 }
 
 /// Scan a leaf-extent list for the run containing logical block `n` and

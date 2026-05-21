@@ -232,6 +232,117 @@ pub struct DirEntry {
     pub size: u64,
 }
 
+/// Full attributes for a single path, returned by [`Filesystem::getattr`].
+///
+/// Mirrors what FUSE's `getattr`/`lookup` callbacks need to populate
+/// `FileAttr`. The default impl on [`Filesystem`] synthesises this from
+/// [`Filesystem::list`] of the parent — that delivers `kind`, `size`,
+/// and an inode number, with the rest defaulted (mode `0o644`/`0o755`,
+/// uid/gid 0, all times 0). Backends that carry per-file metadata
+/// (ext, ntfs, hfs+, …) should override `getattr` to surface the real
+/// values.
+#[derive(Debug, Clone, Copy)]
+pub struct FileAttrs {
+    pub kind: EntryKind,
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    /// Block count in 512-byte units (POSIX `st_blocks`).
+    pub blocks: u64,
+    pub nlink: u32,
+    pub atime: u32,
+    pub mtime: u32,
+    pub ctime: u32,
+    /// Device number for char/block special files; `0` otherwise.
+    pub rdev: u32,
+    /// Inode number this path resolves to. `0` when the backend has
+    /// no per-path identity (the FUSE adapter assigns its own ids in
+    /// that case).
+    pub inode: u32,
+}
+
+impl FileAttrs {
+    /// Permissive defaults for backends that can't surface real values
+    /// — used by the trait-level fallback `getattr`. `mode` is set by
+    /// the caller based on `kind` (0o755 for dirs, 0o644 for files).
+    fn defaults_for(kind: EntryKind, size: u64, inode: u32) -> Self {
+        let mode = match kind {
+            EntryKind::Dir => 0o755,
+            EntryKind::Symlink => 0o777,
+            _ => 0o644,
+        };
+        let nlink = match kind {
+            EntryKind::Dir => 2,
+            _ => 1,
+        };
+        Self {
+            kind,
+            mode,
+            uid: 0,
+            gid: 0,
+            size,
+            blocks: size.div_ceil(512),
+            nlink,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            rdev: 0,
+            inode,
+        }
+    }
+}
+
+/// Mutation request for [`Filesystem::set_attrs`]. Every field is
+/// optional — `None` means "leave as-is." Mirrors the shape of FUSE's
+/// `setattr` so the adapter can pass a single packed struct in.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SetAttrs {
+    pub mode: Option<u16>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub atime: Option<u32>,
+    pub mtime: Option<u32>,
+    pub ctime: Option<u32>,
+}
+
+/// Filesystem-level capacity stats returned by [`Filesystem::statfs`].
+/// All `u64` so backends with huge counts don't overflow. `name_max`
+/// is the longest filename the FS will accept.
+#[derive(Debug, Clone, Copy)]
+pub struct StatFs {
+    pub block_size: u32,
+    pub blocks: u64,
+    pub blocks_free: u64,
+    pub blocks_avail: u64,
+    pub inodes: u64,
+    pub inodes_free: u64,
+    pub name_max: u32,
+}
+
+impl Default for StatFs {
+    fn default() -> Self {
+        // 4 KiB block, no quota, generous name budget — the same
+        // numbers the kernel hands out for tmpfs in a fresh mount.
+        Self {
+            block_size: 4096,
+            blocks: 0,
+            blocks_free: 0,
+            blocks_avail: 0,
+            inodes: 0,
+            inodes_free: 0,
+            name_max: 255,
+        }
+    }
+}
+
+/// A single extended attribute, returned by [`Filesystem::list_xattrs`].
+#[derive(Debug, Clone)]
+pub struct XattrPair {
+    pub name: String,
+    pub value: Vec<u8>,
+}
+
 /// How — and whether — a filesystem can be mutated after `flush()`.
 /// Returned by [`Filesystem::mutation_capability`].
 ///
@@ -452,6 +563,153 @@ pub trait Filesystem {
         ))
     }
 
+    /// Full attributes for `path`. Used by the FUSE adapter to populate
+    /// `getattr` and `lookup` replies; also handy for any consumer that
+    /// wants a complete stat-like result without juggling
+    /// [`Self::list`] + the file handle.
+    ///
+    /// Default: best-effort. We `list` the parent and find the entry
+    /// — that gives `kind`, `size`, and `inode`. The rest (mode, uid,
+    /// gid, times) are defaulted by `FileAttrs::defaults_for` (mode
+    /// `0o755` for dirs, `0o644` for files, `0o777` for symlinks; all
+    /// times 0). Backends with per-file metadata (ext, hfs+, ntfs,
+    /// xfs, …) should override.
+    fn getattr(
+        &mut self,
+        dev: &mut dyn crate::block::BlockDevice,
+        path: &Path,
+    ) -> crate::Result<FileAttrs> {
+        if path == Path::new("/") || path.as_os_str().is_empty() {
+            return Ok(FileAttrs::defaults_for(EntryKind::Dir, 0, 1));
+        }
+        let parent = path.parent().unwrap_or(Path::new("/"));
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| crate::Error::InvalidArgument("getattr: bad path".into()))?;
+        let entries = self.list(dev, parent)?;
+        let entry = entries
+            .into_iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| crate::Error::InvalidArgument(format!("getattr: {name} not found")))?;
+        Ok(FileAttrs::defaults_for(entry.kind, entry.size, entry.inode))
+    }
+
+    /// Update attributes on `path`. Fields set to `None` in `attrs`
+    /// are left unchanged. Backends that can't change a given field
+    /// silently ignore it (FAT, for example, has no uid/gid concept).
+    ///
+    /// Default: returns `Unsupported`. Read-only and metadata-poor
+    /// backends keep this default; mutable backends override.
+    fn set_attrs(
+        &mut self,
+        _dev: &mut dyn crate::block::BlockDevice,
+        _path: &Path,
+        _attrs: SetAttrs,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Unsupported(
+            "this filesystem does not implement set_attrs".into(),
+        ))
+    }
+
+    /// Resize `path` to `new_size` bytes. Equivalent to
+    /// [`FileHandle::set_len`] reached through a path. Growing fills
+    /// with zeros; shrinking discards trailing bytes and frees blocks.
+    ///
+    /// Default: returns `Unsupported`. Mutable backends override.
+    fn truncate(
+        &mut self,
+        _dev: &mut dyn crate::block::BlockDevice,
+        _path: &Path,
+        _new_size: u64,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Unsupported(
+            "this filesystem does not implement truncate".into(),
+        ))
+    }
+
+    /// Rename `old_path` to `new_path`. Cross-directory moves and
+    /// directory renames are both in scope — the operation must
+    /// preserve the target inode (so hardlinks survive).
+    ///
+    /// Default: returns `Unsupported`. Mutable backends override.
+    fn rename(
+        &mut self,
+        _dev: &mut dyn crate::block::BlockDevice,
+        _old_path: &Path,
+        _new_path: &Path,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Unsupported(
+            "this filesystem does not implement rename".into(),
+        ))
+    }
+
+    /// Add a new directory entry at `new_path` that points at the
+    /// existing inode at `target_path` — a POSIX hard link.
+    ///
+    /// Default: returns `Unsupported`. Only ext implements this today.
+    fn hardlink(
+        &mut self,
+        _dev: &mut dyn crate::block::BlockDevice,
+        _target_path: &Path,
+        _new_path: &Path,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Unsupported(
+            "this filesystem does not implement hardlink".into(),
+        ))
+    }
+
+    /// List the extended attributes attached to `path`, with both
+    /// names and values. The FUSE adapter splits this into
+    /// `listxattr` / `getxattr` itself; we surface both at once so
+    /// backends don't need two parallel walkers.
+    ///
+    /// Default: empty vec. Backends with xattr storage (ext, ntfs,
+    /// hfs+) override.
+    fn list_xattrs(
+        &mut self,
+        _dev: &mut dyn crate::block::BlockDevice,
+        _path: &Path,
+    ) -> crate::Result<Vec<XattrPair>> {
+        Ok(Vec::new())
+    }
+
+    /// Write or replace the xattr `name` on `path`. Returns
+    /// `Unsupported` when the backend can't store xattrs.
+    fn set_xattr(
+        &mut self,
+        _dev: &mut dyn crate::block::BlockDevice,
+        _path: &Path,
+        _name: &str,
+        _value: &[u8],
+    ) -> crate::Result<()> {
+        Err(crate::Error::Unsupported(
+            "this filesystem does not implement set_xattr".into(),
+        ))
+    }
+
+    /// Remove the xattr `name` from `path`. Returns `Unsupported`
+    /// when the backend can't store xattrs.
+    fn remove_xattr(
+        &mut self,
+        _dev: &mut dyn crate::block::BlockDevice,
+        _path: &Path,
+        _name: &str,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Unsupported(
+            "this filesystem does not implement remove_xattr".into(),
+        ))
+    }
+
+    /// Filesystem-level capacity stats. The FUSE adapter calls this
+    /// to answer `statfs`; the CLI's `info` command could too.
+    ///
+    /// Default: [`StatFs::default`] — 4 KiB block size, zero counts,
+    /// `name_max = 255`. Backends with real superblock data override.
+    fn statfs(&mut self, _dev: &mut dyn crate::block::BlockDevice) -> crate::Result<StatFs> {
+        Ok(StatFs::default())
+    }
+
     /// Recursive sum of all regular-file sizes in the filesystem.
     /// Uses the `size` field on [`DirEntry`] returned by [`Self::list`]
     /// — filesystems that don't surface size from a listing return 0
@@ -556,5 +814,110 @@ mod tests {
         std::io::Write::write_all(f.as_file_mut(), b"hello world").unwrap();
         let src = FileSource::HostPath(f.path().to_path_buf());
         assert_eq!(src.len().unwrap(), 11);
+    }
+
+    #[test]
+    fn file_attrs_defaults_set_kind_appropriate_mode() {
+        // Directories default to 0o755 + nlink 2; regular files to
+        // 0o644 + nlink 1; symlinks to 0o777. These are the values
+        // the FUSE adapter surfaces for backends that don't override
+        // `getattr`, so they need to look like a sensible mount.
+        let d = FileAttrs::defaults_for(EntryKind::Dir, 0, 42);
+        assert_eq!(d.mode, 0o755);
+        assert_eq!(d.nlink, 2);
+        assert_eq!(d.inode, 42);
+
+        let f = FileAttrs::defaults_for(EntryKind::Regular, 1024, 7);
+        assert_eq!(f.mode, 0o644);
+        assert_eq!(f.nlink, 1);
+        assert_eq!(f.size, 1024);
+        // 1024 bytes = 2 × 512-byte blocks.
+        assert_eq!(f.blocks, 2);
+
+        let s = FileAttrs::defaults_for(EntryKind::Symlink, 16, 9);
+        assert_eq!(s.mode, 0o777);
+    }
+
+    #[test]
+    fn default_getattr_walks_parent_listing() {
+        // Trait-level fallback: a backend that only implements the
+        // five required methods still gets a working `getattr` via
+        // `list` of the parent. We assert that here against a tiny
+        // hand-rolled `Filesystem` to lock in the contract for any
+        // backend that doesn't override.
+        use crate::block::BlockDevice;
+        struct Tiny {
+            entries: Vec<DirEntry>,
+        }
+        impl Filesystem for Tiny {
+            fn create_file(
+                &mut self,
+                _: &mut dyn BlockDevice,
+                _: &Path,
+                _: FileSource,
+                _: FileMeta,
+            ) -> crate::Result<()> {
+                unimplemented!()
+            }
+            fn create_dir(
+                &mut self,
+                _: &mut dyn BlockDevice,
+                _: &Path,
+                _: FileMeta,
+            ) -> crate::Result<()> {
+                unimplemented!()
+            }
+            fn create_symlink(
+                &mut self,
+                _: &mut dyn BlockDevice,
+                _: &Path,
+                _: &Path,
+                _: FileMeta,
+            ) -> crate::Result<()> {
+                unimplemented!()
+            }
+            fn create_device(
+                &mut self,
+                _: &mut dyn BlockDevice,
+                _: &Path,
+                _: DeviceKind,
+                _: u32,
+                _: u32,
+                _: FileMeta,
+            ) -> crate::Result<()> {
+                unimplemented!()
+            }
+            fn remove(&mut self, _: &mut dyn BlockDevice, _: &Path) -> crate::Result<()> {
+                unimplemented!()
+            }
+            fn list(&mut self, _: &mut dyn BlockDevice, _: &Path) -> crate::Result<Vec<DirEntry>> {
+                Ok(self.entries.clone())
+            }
+            fn read_file<'a>(
+                &'a mut self,
+                _: &'a mut dyn BlockDevice,
+                _: &Path,
+            ) -> crate::Result<Box<dyn Read + 'a>> {
+                unimplemented!()
+            }
+            fn flush(&mut self, _: &mut dyn BlockDevice) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+        let mut t = Tiny {
+            entries: vec![DirEntry {
+                name: "hello.txt".into(),
+                inode: 17,
+                kind: EntryKind::Regular,
+                size: 11,
+            }],
+        };
+        // Need *some* BlockDevice; MemoryBackend works.
+        let mut dev = crate::block::MemoryBackend::new(4096);
+        let attrs = t.getattr(&mut dev, Path::new("/hello.txt")).unwrap();
+        assert_eq!(attrs.kind, EntryKind::Regular);
+        assert_eq!(attrs.size, 11);
+        assert_eq!(attrs.inode, 17);
+        assert_eq!(attrs.mode, 0o644);
     }
 }

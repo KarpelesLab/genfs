@@ -35,7 +35,9 @@ jobs:
             hfsprogs \
             ntfs-3g \
             f2fs-tools \
-            squashfs-tools
+            squashfs-tools \
+            libfuse3-dev \
+            pkg-config
           # Sanity-check that everything we cross-validate against is on PATH.
           which sgdisk
           which fdisk

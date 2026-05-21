@@ -2405,24 +2405,302 @@ impl Ext {
             }
         }
 
-        // Free the target's data + indirection blocks, then its inode.
-        self.free_inode_blocks(dev, &target)?;
-        self.free_inode(target_ino);
-        // Stage a zeroed inode so flush writes a clean (links=0) slot.
-        self.inodes.retain(|(i, _)| *i != target_ino);
-        self.inodes.push((target_ino, Inode::default()));
-
-        // Unlink from the parent directory.
+        // Unlink the dirent from the parent first; this is the
+        // operation that's visible to other observers. Inode-side
+        // cleanup follows.
         self.unlink_dir_entry(dev, parent_ino, name.as_bytes())?;
 
         if is_dir {
-            // The removed dir's ".." was a link to the parent.
+            // Removing a directory always frees its inode (POSIX dirs
+            // can't be hardlinked outside ./.. so links_count is
+            // always exactly 2 here). The parent's links_count drops
+            // by 1 because the gone dir's ".." was a link back.
+            self.free_inode_blocks(dev, &target)?;
+            self.free_inode(target_ino);
+            self.inodes.retain(|(i, _)| *i != target_ino);
+            self.inodes.push((target_ino, Inode::default()));
             self.patch_inode(dev, parent_ino, |i| {
                 i.links_count = i.links_count.saturating_sub(1);
             })?;
             self.groups[0].desc.used_dirs_count =
                 self.groups[0].desc.used_dirs_count.saturating_sub(1);
+            return Ok(());
         }
+
+        // Non-dir: hardlink-aware. Decrement links_count; only free
+        // the inode and its data blocks when the last link is gone.
+        if target.links_count > 1 {
+            self.patch_inode(dev, target_ino, |i| {
+                i.links_count = i.links_count.saturating_sub(1);
+            })?;
+        } else {
+            self.free_inode_blocks(dev, &target)?;
+            self.free_inode(target_ino);
+            self.inodes.retain(|(i, _)| *i != target_ino);
+            self.inodes.push((target_ino, Inode::default()));
+        }
+        Ok(())
+    }
+
+    /// Change the permission bits (low 12 bits of `i_mode`) of an
+    /// existing inode. Preserves the file-type bits (`S_IFMT`).
+    /// POSIX `chmod`.
+    pub fn chmod(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u32,
+        mode_perms: u16,
+    ) -> Result<()> {
+        let new_perms = mode_perms & 0o7777;
+        self.patch_inode(dev, ino, |i| {
+            i.mode = (i.mode & constants::S_IFMT) | new_perms;
+        })
+    }
+
+    /// Change the ownership (uid/gid) of an existing inode. POSIX
+    /// `chown`. Values are truncated to 16 bits — the high halves
+    /// would live in `osd2.l_i_uid_high` / `osd2.l_i_gid_high` but
+    /// the v1 inode encoder doesn't surface them yet.
+    pub fn chown(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<()> {
+        self.patch_inode(dev, ino, |i| {
+            i.uid = (uid & 0xffff) as u16;
+            i.gid = (gid & 0xffff) as u16;
+        })
+    }
+
+    /// Stamp atime / mtime / ctime on an existing inode. POSIX
+    /// `utimensat`. Each argument is a UNIX timestamp in seconds;
+    /// passing `None` leaves that field unchanged. We don't yet
+    /// store the nanosecond extension (`i_atime_extra` etc.).
+    pub fn set_times(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u32,
+        atime: Option<u32>,
+        mtime: Option<u32>,
+        ctime: Option<u32>,
+    ) -> Result<()> {
+        self.patch_inode(dev, ino, |i| {
+            if let Some(a) = atime {
+                i.atime = a;
+            }
+            if let Some(m) = mtime {
+                i.mtime = m;
+            }
+            if let Some(c) = ctime {
+                i.ctime = c;
+            }
+        })
+    }
+
+    /// Truncate a regular file to `new_size` bytes. Grow: leaves a
+    /// hole — no blocks are allocated until the file is actually
+    /// written. Shrink: frees any data block past the new end and
+    /// shrinks the inode's block list / extent tree to match.
+    /// Only operates on regular files; returns `InvalidArgument` for
+    /// dirs, symlinks, devices.
+    pub fn truncate(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u32,
+        new_size: u64,
+    ) -> Result<()> {
+        if new_size > u32::MAX as u64 {
+            return Err(crate::Error::Unsupported(
+                "ext: file > 4 GiB requires LARGE_FILE handling (deferred)".into(),
+            ));
+        }
+        let new_size = new_size as u32;
+        self.ensure_inode_staged(dev, ino)?;
+        let inode = self
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == ino)
+            .map(|(_, i)| *i)
+            .unwrap();
+        let mode_type = inode.mode & constants::S_IFMT;
+        if mode_type != constants::S_IFREG {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: truncate target inode {ino} is not a regular file (mode={:#o})",
+                inode.mode
+            )));
+        }
+        let bs = self.layout.block_size;
+        let old_blocks = (inode.size as u64).div_ceil(bs as u64) as u32;
+        let new_blocks = (new_size as u64).div_ceil(bs as u64) as u32;
+        // Shrink path: free everything past the new end.
+        if new_blocks < old_blocks {
+            for n in new_blocks..old_blocks {
+                let phys = self.file_block(dev, &inode, n)?;
+                if phys != 0 {
+                    self.free_block(phys);
+                }
+            }
+            // The simplest reliable way to rebuild the block-pointer
+            // structure is to gather the surviving block list and
+            // re-pack it. For ext4 extent trees this stays inline
+            // (≤ 4 leaves typical for small files); for ext2/3 it
+            // re-establishes a fresh indirect chain.
+            let surviving: Vec<u32> = (0..new_blocks)
+                .map(|n| self.file_block(dev, &inode, n).unwrap_or(0))
+                .collect();
+            // Clear the old block pointers so fill_block_pointers
+            // starts from a known state. Preserve EXTENTS_FL — we'll
+            // re-stamp it inside fill_block_pointers_extent.
+            self.patch_inode(dev, ino, |i| {
+                i.block = [0u32; constants::N_BLOCKS];
+                i.flags &= !constants::EXT4_EXTENTS_FL;
+            })?;
+            let mut staged = self
+                .inodes
+                .iter()
+                .find(|(i, _)| *i == ino)
+                .map(|(_, i)| *i)
+                .unwrap();
+            let allocated_meta = if matches!(self.kind, FsKind::Ext4) {
+                self.fill_block_pointers_extent(&mut staged, &surviving)?
+            } else {
+                self.fill_block_pointers_indirect(&mut staged, &surviving)?
+            };
+            let sectors_per_block = bs / 512;
+            let real_blocks: u32 = surviving.iter().filter(|&&b| b != 0).count() as u32;
+            self.patch_inode(dev, ino, |i| {
+                i.block = staged.block;
+                i.flags = staged.flags;
+                i.size = new_size;
+                i.blocks_512 = (real_blocks + allocated_meta) * sectors_per_block;
+            })?;
+        } else {
+            // Grow path (or no-op): leave block list alone, just bump
+            // size. Subsequent writes will allocate as needed.
+            self.patch_inode(dev, ino, |i| {
+                i.size = new_size;
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Rename a single entry: remove `old_name` from `old_parent_ino`
+    /// and re-add it under `new_name` in `new_parent_ino`, preserving
+    /// the target inode (so all hardlinks survive). Cross-directory
+    /// moves correctly update the parent's `links_count` when the
+    /// target is a directory (its `..` link transfers).
+    ///
+    /// `new_name` must not already exist in `new_parent_ino`. Posix
+    /// `rename` overwrites; we leave that to the caller (probe + remove
+    /// + rename) until we're ready to make atomic-overwrite work end
+    /// to end.
+    pub fn rename(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        old_parent_ino: u32,
+        old_name: &[u8],
+        new_parent_ino: u32,
+        new_name: &[u8],
+    ) -> Result<()> {
+        // Look up the source.
+        let entries = self.list_inode(dev, old_parent_ino)?;
+        let target = entries
+            .iter()
+            .find(|e| e.name.as_bytes() == old_name)
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "ext: rename source {:?} not found in dir {old_parent_ino}",
+                    String::from_utf8_lossy(old_name)
+                ))
+            })?;
+        let target_ino = target.inode;
+        let target_inode = self.read_inode(dev, target_ino)?;
+        let is_dir = target_inode.mode & constants::S_IFMT == constants::S_IFDIR;
+
+        // Ensure new_name doesn't already exist in new_parent_ino.
+        let dest_entries = self.list_inode(dev, new_parent_ino)?;
+        if dest_entries.iter().any(|e| e.name.as_bytes() == new_name) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ext: rename target {:?} already exists in dir {new_parent_ino}",
+                String::from_utf8_lossy(new_name)
+            )));
+        }
+
+        let file_type = match target_inode.mode & constants::S_IFMT {
+            constants::S_IFREG => constants::DENT_REG,
+            constants::S_IFDIR => constants::DENT_DIR,
+            constants::S_IFLNK => constants::DENT_LNK,
+            constants::S_IFCHR => constants::DENT_CHR,
+            constants::S_IFBLK => constants::DENT_BLK,
+            constants::S_IFIFO => constants::DENT_FIFO,
+            constants::S_IFSOCK => constants::DENT_SOCK,
+            _ => 0,
+        };
+
+        // Add the new dirent first so a partial-success crash leaves
+        // the file findable under SOME name (matches kernel rename
+        // semantics — better to have a duplicate than to lose the
+        // file). Then drop the old dirent.
+        self.add_entry_to_dir_block_for(
+            dev,
+            new_parent_ino,
+            new_name,
+            target_ino,
+            file_type,
+        )?;
+        self.unlink_dir_entry(dev, old_parent_ino, old_name)?;
+
+        // Cross-directory move of a directory: the target's `..` now
+        // points at a different parent. Update old/new parents'
+        // links_count and rewrite the moved dir's `..` dirent.
+        if is_dir && old_parent_ino != new_parent_ino {
+            self.patch_inode(dev, old_parent_ino, |i| {
+                i.links_count = i.links_count.saturating_sub(1);
+            })?;
+            self.patch_inode(dev, new_parent_ino, |i| {
+                i.links_count = i.links_count.saturating_add(1);
+            })?;
+            self.repoint_dotdot(dev, target_ino, new_parent_ino)?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the `..` dirent of `dir_ino` to point at `new_parent`.
+    /// Called by `rename` on a cross-directory move of a directory.
+    fn repoint_dotdot(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_ino: u32,
+        new_parent: u32,
+    ) -> Result<()> {
+        self.ensure_inode_staged(dev, dir_ino)?;
+        let inode_copy = self
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == dir_ino)
+            .map(|(_, i)| *i)
+            .unwrap();
+        let blk = self.file_block(dev, &inode_copy, 0)?;
+        if blk == 0 {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: dir inode {dir_ino} has no first data block"
+            )));
+        }
+        self.ensure_block_staged(dev, blk)?;
+        if !self.dir_blocks.iter().any(|(b, _)| *b == blk) {
+            self.dir_blocks.push((blk, dir_ino));
+        }
+        let block = self
+            .data_blocks
+            .iter_mut()
+            .find(|(b, _)| *b == blk)
+            .map(|(_, bytes)| bytes)
+            .unwrap();
+        // "." at offset 0 (rec_len 12). ".." at offset 12: inode in
+        // the first 4 bytes.
+        block[12..16].copy_from_slice(&new_parent.to_le_bytes());
         Ok(())
     }
 

@@ -1274,3 +1274,134 @@ fn ext4_indexed_directory_two_level_passes_e2fsck() {
         "debugfs didn't see /big as depth-1:\n{out}"
     );
 }
+
+/// Exercise the post-build mutation API end-to-end: chmod, chown,
+/// set_times, truncate (shrink + grow), rename (within-dir + cross-dir),
+/// and hardlink-aware unlink. The image must stay e2fsck-clean after
+/// every operation.
+#[test]
+fn ext4_mutation_api_round_trips_through_e2fsck() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    use fstool::block::BlockDevice as _;
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 8192,
+        inodes_count: 128,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    // Two regular files, hardlinked.
+    let mut payload = NamedTempFile::new().unwrap();
+    payload.as_file_mut().write_all(b"original\n").unwrap();
+    let ino = ext
+        .add_file_to(
+            &mut dev,
+            2,
+            b"primary",
+            FileSource::HostPath(payload.path().to_path_buf()),
+            FileMeta::with_mode(0o600),
+        )
+        .unwrap();
+    ext.add_link_to(&mut dev, 2, b"alias", ino).unwrap();
+
+    // A subdir we'll rename across.
+    let sub = ext
+        .add_dir_to(&mut dev, 2, b"sub_a", FileMeta::with_mode(0o755))
+        .unwrap();
+    // Put a file inside so the dir isn't empty.
+    let mut nested = NamedTempFile::new().unwrap();
+    nested.as_file_mut().write_all(b"nested\n").unwrap();
+    ext.add_file_to(
+        &mut dev,
+        sub,
+        b"nested.txt",
+        FileSource::HostPath(nested.path().to_path_buf()),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+
+    // chmod / chown / set_times on `primary`.
+    ext.chmod(&mut dev, ino, 0o640).unwrap();
+    ext.chown(&mut dev, ino, 1000, 1000).unwrap();
+    ext.set_times(&mut dev, ino, Some(123456), Some(654321), Some(111111))
+        .unwrap();
+
+    // Verify the changes are visible via read_inode.
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(inode.mode & 0o7777, 0o640);
+    assert_eq!(inode.uid as u32, 1000);
+    assert_eq!(inode.gid as u32, 1000);
+    assert_eq!(inode.atime, 123456);
+    assert_eq!(inode.mtime, 654321);
+    assert_eq!(inode.ctime, 111111);
+
+    // Truncate (grow): the file's logical size grows but no new blocks
+    // are allocated until something writes into the hole.
+    ext.truncate(&mut dev, ino, 32 * 1024).unwrap();
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(inode.size, 32 * 1024);
+
+    // Truncate (shrink): back down to the original 9-byte content.
+    ext.truncate(&mut dev, ino, 9).unwrap();
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(inode.size, 9);
+
+    // Rename within the same dir.
+    ext.rename(&mut dev, 2, b"alias", 2, b"alias_renamed")
+        .unwrap();
+    let root_entries = ext.list_inode(&mut dev, 2).unwrap();
+    assert!(root_entries.iter().any(|e| e.name == "alias_renamed"));
+    assert!(!root_entries.iter().any(|e| e.name == "alias"));
+
+    // Rename cross-dir: move primary into sub_a.
+    ext.rename(&mut dev, 2, b"primary", sub, b"primary").unwrap();
+    let root_entries = ext.list_inode(&mut dev, 2).unwrap();
+    assert!(!root_entries.iter().any(|e| e.name == "primary"));
+    let sub_entries = ext.list_inode(&mut dev, sub).unwrap();
+    assert!(sub_entries.iter().any(|e| e.name == "primary"));
+
+    // Hardlink-aware unlink: alias_renamed still points at the same
+    // inode as primary (links_count = 2). Removing alias_renamed must
+    // decrement links_count to 1, NOT free the inode.
+    let before = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(before.links_count, 2);
+    ext.remove_path(&mut dev, "/alias_renamed").unwrap();
+    let after = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(after.links_count, 1);
+    assert_ne!(after.mode, 0, "primary inode must still be allocated");
+
+    // Cross-dir rename of a directory: move sub_a → sub_b. The dir's
+    // `..` is rewired to the new parent (here still root, so the
+    // dirent stays = 2; we just verify the rename succeeded and the
+    // image stays clean).
+    ext.rename(&mut dev, 2, b"sub_a", 2, b"sub_b").unwrap();
+    let root_entries = ext.list_inode(&mut dev, 2).unwrap();
+    assert!(root_entries.iter().any(|e| e.name == "sub_b"));
+    assert!(!root_entries.iter().any(|e| e.name == "sub_a"));
+
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected the post-mutation image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}

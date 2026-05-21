@@ -188,11 +188,7 @@ impl OptionMap {
     /// Remove and copy a UTF-8 string for `key` into a fixed-size
     /// volume-label byte array, padding with the given byte. Returns
     /// `Err` if the string is too long to fit in `N` bytes.
-    pub fn take_label<const N: usize>(
-        &mut self,
-        key: &str,
-        pad: u8,
-    ) -> Result<Option<[u8; N]>> {
+    pub fn take_label<const N: usize>(&mut self, key: &str, pad: u8) -> Result<Option<[u8; N]>> {
         let Some(v) = self.map.remove(key) else {
             return Ok(None);
         };
@@ -282,8 +278,7 @@ mod tests {
 
     #[test]
     fn cli_supports_hex_and_bool_synonyms() {
-        let mut m =
-            OptionMap::from_cli("volume_id=0xCAFEBABE,journaled=yes,trim=off").unwrap();
+        let mut m = OptionMap::from_cli("volume_id=0xCAFEBABE,journaled=yes,trim=off").unwrap();
         assert_eq!(m.take_u32("volume_id").unwrap(), Some(0xCAFE_BABE));
         assert_eq!(m.take_bool("journaled").unwrap(), Some(true));
         assert_eq!(m.take_bool("trim").unwrap(), Some(false));

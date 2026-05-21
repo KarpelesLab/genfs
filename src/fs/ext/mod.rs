@@ -189,10 +189,7 @@ impl FormatOpts {
     /// surface a UUID knob yet).
     ///
     /// [`OptionMap`]: crate::format_opts::OptionMap
-    pub fn apply_options(
-        &mut self,
-        map: &mut crate::format_opts::OptionMap,
-    ) -> crate::Result<()> {
+    pub fn apply_options(&mut self, map: &mut crate::format_opts::OptionMap) -> crate::Result<()> {
         if let Some(v) = map.take_u32("block_size")? {
             self.block_size = v;
         }
@@ -1145,7 +1142,11 @@ impl Ext {
         if extended {
             // Re-encode the last leaf in place.
             let new_image = extent::encode_leaf_block(&leaf_runs, bs, csum_tail)?;
-            if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| *b == last_leaf_phys) {
+            if let Some(slot) = self
+                .data_blocks
+                .iter_mut()
+                .find(|(b, _)| *b == last_leaf_phys)
+            {
                 slot.1 = new_image;
             }
             return Ok(allocated_meta);
@@ -1158,7 +1159,11 @@ impl Ext {
                 physical: new_phys as u64,
             });
             let new_image = extent::encode_leaf_block(&leaf_runs, bs, csum_tail)?;
-            if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| *b == last_leaf_phys) {
+            if let Some(slot) = self
+                .data_blocks
+                .iter_mut()
+                .find(|(b, _)| *b == last_leaf_phys)
+            {
                 slot.1 = new_image;
             }
             return Ok(allocated_meta);
@@ -1496,9 +1501,7 @@ impl Ext {
                 bytes[n - 4..].copy_from_slice(&c.to_le_bytes());
                 continue;
             }
-            if let Some((_, owner_ino)) =
-                self.extent_leaf_blocks.iter().find(|(b, _)| b == blk)
-            {
+            if let Some((_, owner_ino)) = self.extent_leaf_blocks.iter().find(|(b, _)| b == blk) {
                 let generation = self
                     .inodes
                     .iter()
@@ -1985,7 +1988,13 @@ impl Ext {
         for _ in 0..n_blocks {
             blocks.push(self.alloc_data_block()?);
         }
-        let mut inode = Inode::directory(bs * n_blocks, meta.mode & 0o7777, meta.uid, meta.gid, meta.mtime);
+        let mut inode = Inode::directory(
+            bs * n_blocks,
+            meta.mode & 0o7777,
+            meta.uid,
+            meta.gid,
+            meta.mtime,
+        );
         // ext4: extent tree (depth-0 for any contiguous run that fits in
         // 4 leaves, depth-1 otherwise via the streaming-grow promote
         // path — but with sequential alloc we should always stay
@@ -2158,8 +2167,7 @@ impl Ext {
                 csum_tail,
             );
             self.data_blocks.push((blocks[0], dx_root_buf));
-            self.dx_root_blocks
-                .push((blocks[0], ino, n_leaves as u16));
+            self.dx_root_blocks.push((blocks[0], ino, n_leaves as u16));
         } else {
             // Two-level: dx_root entries map to dx_nodes; dx_node
             // entries map to leaves. We chunk leaves into groups of
@@ -2216,8 +2224,7 @@ impl Ext {
                 csum_tail,
             );
             self.data_blocks.push((blocks[0], dx_root_buf));
-            self.dx_root_blocks
-                .push((blocks[0], ino, n_nodes as u16));
+            self.dx_root_blocks.push((blocks[0], ino, n_nodes as u16));
         }
 
         // Leaves start empty; the router fills them as entries arrive.
@@ -2505,12 +2512,7 @@ impl Ext {
     /// Change the permission bits (low 12 bits of `i_mode`) of an
     /// existing inode. Preserves the file-type bits (`S_IFMT`).
     /// POSIX `chmod`.
-    pub fn chmod(
-        &mut self,
-        dev: &mut dyn BlockDevice,
-        ino: u32,
-        mode_perms: u16,
-    ) -> Result<()> {
+    pub fn chmod(&mut self, dev: &mut dyn BlockDevice, ino: u32, mode_perms: u16) -> Result<()> {
         let new_perms = mode_perms & 0o7777;
         self.patch_inode(dev, ino, |i| {
             i.mode = (i.mode & constants::S_IFMT) | new_perms;
@@ -2521,13 +2523,7 @@ impl Ext {
     /// `chown`. Values are truncated to 16 bits — the high halves
     /// would live in `osd2.l_i_uid_high` / `osd2.l_i_gid_high` but
     /// the v1 inode encoder doesn't surface them yet.
-    pub fn chown(
-        &mut self,
-        dev: &mut dyn BlockDevice,
-        ino: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Result<()> {
+    pub fn chown(&mut self, dev: &mut dyn BlockDevice, ino: u32, uid: u32, gid: u32) -> Result<()> {
         self.patch_inode(dev, ino, |i| {
             i.uid = (uid & 0xffff) as u16;
             i.gid = (gid & 0xffff) as u16;
@@ -2565,12 +2561,7 @@ impl Ext {
     /// shrinks the inode's block list / extent tree to match.
     /// Only operates on regular files; returns `InvalidArgument` for
     /// dirs, symlinks, devices.
-    pub fn truncate(
-        &mut self,
-        dev: &mut dyn BlockDevice,
-        ino: u32,
-        new_size: u64,
-    ) -> Result<()> {
+    pub fn truncate(&mut self, dev: &mut dyn BlockDevice, ino: u32, new_size: u64) -> Result<()> {
         if new_size > u32::MAX as u64 {
             return Err(crate::Error::Unsupported(
                 "ext: file > 4 GiB requires LARGE_FILE handling (deferred)".into(),
@@ -2703,13 +2694,7 @@ impl Ext {
         // the file findable under SOME name (matches kernel rename
         // semantics — better to have a duplicate than to lose the
         // file). Then drop the old dirent.
-        self.add_entry_to_dir_block_for(
-            dev,
-            new_parent_ino,
-            new_name,
-            target_ino,
-            file_type,
-        )?;
+        self.add_entry_to_dir_block_for(dev, new_parent_ino, new_name, target_ino, file_type)?;
         self.unlink_dir_entry(dev, old_parent_ino, old_name)?;
 
         // Cross-directory move of a directory: the target's `..` now
@@ -3887,10 +3872,7 @@ fn try_append_dir_entry(
     // blocks whose first entry is a real one, but flags "placeholder stub
     // followed by real entries" as a corrupted block.
     if let Some(first) = dir::decode_entry(block, with_filetype) {
-        if first.inode == 0
-            && first.name.is_empty()
-            && first.rec_len >= usable
-            && needed <= usable
+        if first.inode == 0 && first.name.is_empty() && first.rec_len >= usable && needed <= usable
         {
             // Wipe the usable region (the csum tail past `usable` is
             // untouched), then encode the single new entry to span it.
@@ -3898,7 +3880,14 @@ fn try_append_dir_entry(
                 *b = 0;
             }
             let mut tail = Vec::with_capacity(usable);
-            dir::encode_entry(&mut tail, inode, name, usable as u16, file_type, with_filetype);
+            dir::encode_entry(
+                &mut tail,
+                inode,
+                name,
+                usable as u16,
+                file_type,
+                with_filetype,
+            );
             debug_assert_eq!(tail.len(), usable);
             block[..usable].copy_from_slice(&tail);
             return Ok(true);
@@ -3956,8 +3945,7 @@ fn popcount_bits(bm: &[u8], start: u32, end: u32) -> u32 {
 /// ≤ target wins. The countlimit slot's `block` field is the
 /// catch-all for hashes preceding any real boundary.
 fn dx_lookup_logical(buf: &[u8], header_len: usize, target: u32) -> u32 {
-    let cl_hash =
-        u32::from_le_bytes(buf[header_len..header_len + 4].try_into().unwrap());
+    let cl_hash = u32::from_le_bytes(buf[header_len..header_len + 4].try_into().unwrap());
     let count = (cl_hash >> 16) as usize;
     let mut chosen_slot = 0usize;
     for slot in 1..count {

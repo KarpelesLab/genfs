@@ -827,12 +827,7 @@ impl Apfs {
     /// [`rw::commit_with_mutator`] uses for every other in-place
     /// mutation. The on-disk byte affected lives at offset 80..82
     /// of `j_inode_val_t`.
-    pub fn chmod(
-        &mut self,
-        dev: &mut dyn BlockDevice,
-        path: &str,
-        mode_perms: u16,
-    ) -> Result<()> {
+    pub fn chmod(&mut self, dev: &mut dyn BlockDevice, path: &str, mode_perms: u16) -> Result<()> {
         let target_oid = self.resolve_path_to_oid(dev, path)?;
         let new_perms = mode_perms & 0o7777;
         rw::commit_with_mutator(self, dev, |records| {
@@ -1648,10 +1643,7 @@ impl ApfsFormatOpts {
     /// Apply a generic option-bag (CLI `-O key=val` / TOML
     /// `[filesystem.options]`) on top of these opts. Unknown keys are
     /// left in the map for the caller to flag.
-    pub fn apply_options(
-        &mut self,
-        map: &mut crate::format_opts::OptionMap,
-    ) -> crate::Result<()> {
+    pub fn apply_options(&mut self, map: &mut crate::format_opts::OptionMap) -> crate::Result<()> {
         if let Some(sz) = map.take_size("block_size")? {
             self.block_size = sz as u32;
         }
@@ -1820,11 +1812,8 @@ impl<'a> std::io::Read for ApfsFileReader<'a> {
 /// patcher mutates in place — typically to flip mode bits, owner,
 /// group, or timestamps. Used by [`Apfs::chmod`], [`Apfs::chown`],
 /// [`Apfs::set_times`], and the dirent/hardlink mutators.
-pub(crate) fn patch_inode_record<F>(
-    records: &mut [(Vec<u8>, Vec<u8>)],
-    target_oid: u64,
-    patcher: F,
-) where
+pub(crate) fn patch_inode_record<F>(records: &mut [(Vec<u8>, Vec<u8>)], target_oid: u64, patcher: F)
+where
     F: FnOnce(&mut Vec<u8>),
 {
     for (k, v) in records.iter_mut() {

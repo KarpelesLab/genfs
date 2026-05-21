@@ -63,10 +63,7 @@ impl FatFormatOpts {
     ///   the device size by the caller, not by the user.
     /// - `volume_id` (u32, decimal or `0x…`)
     /// - `volume_label` (string, ≤ 11 ASCII bytes, space-padded)
-    pub fn apply_options(
-        &mut self,
-        map: &mut crate::format_opts::OptionMap,
-    ) -> crate::Result<()> {
+    pub fn apply_options(&mut self, map: &mut crate::format_opts::OptionMap) -> crate::Result<()> {
         if let Some(v) = map.take_u32("total_sectors")? {
             self.total_sectors = v;
         }

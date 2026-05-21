@@ -91,10 +91,7 @@ impl FormatOpts {
     /// Apply a generic option-bag (CLI `-O key=val` / TOML
     /// `[filesystem.options]`) on top of these opts. Unknown keys are
     /// left in the map for the caller to flag.
-    pub fn apply_options(
-        &mut self,
-        map: &mut crate::format_opts::OptionMap,
-    ) -> crate::Result<()> {
+    pub fn apply_options(&mut self, map: &mut crate::format_opts::OptionMap) -> crate::Result<()> {
         if let Some(s) = map.take_str("volume_label") {
             self.volume_label = s;
         }

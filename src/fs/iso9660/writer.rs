@@ -75,10 +75,7 @@ impl FormatOpts {
     /// left in the map for the caller to flag. El Torito boot config is
     /// not yet plumbable through the bag — set it directly on
     /// `FormatOpts`.
-    pub fn apply_options(
-        &mut self,
-        map: &mut crate::format_opts::OptionMap,
-    ) -> crate::Result<()> {
+    pub fn apply_options(&mut self, map: &mut crate::format_opts::OptionMap) -> crate::Result<()> {
         if let Some(s) = map.take_str("volume_id") {
             self.volume_id = s;
         }

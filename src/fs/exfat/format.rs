@@ -71,10 +71,7 @@ impl FormatOpts {
     /// - `volume_serial_number` (u32, decimal or `0x…`)
     /// - `volume_label` (string, up to 11 UTF-16 code units; longer is
     ///   silently truncated by the formatter)
-    pub fn apply_options(
-        &mut self,
-        map: &mut crate::format_opts::OptionMap,
-    ) -> crate::Result<()> {
+    pub fn apply_options(&mut self, map: &mut crate::format_opts::OptionMap) -> crate::Result<()> {
         if let Some(v) = map.take_u8("bytes_per_sector_shift")? {
             self.bytes_per_sector_shift = v;
         }

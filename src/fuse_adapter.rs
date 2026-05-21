@@ -160,11 +160,7 @@ fn ext_err_to_errno(e: &crate::Error) -> i32 {
 }
 
 impl Filesystem for FstoolFs {
-    fn init(
-        &mut self,
-        _req: &Request<'_>,
-        _config: &mut KernelConfig,
-    ) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), libc::c_int> {
         Ok(())
     }
 
@@ -806,9 +802,6 @@ impl FstoolFs {
     /// Resolve a directory inode's `..` to find its parent inode.
     fn parent_of(&mut self, dir_ino: u32) -> Option<u32> {
         let entries = self.ext.list_inode(self.dev.as_mut(), dir_ino).ok()?;
-        entries
-            .iter()
-            .find(|e| e.name == "..")
-            .map(|e| e.inode)
+        entries.iter().find(|e| e.name == "..").map(|e| e.inode)
     }
 }

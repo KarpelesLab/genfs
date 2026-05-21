@@ -761,16 +761,8 @@ fn ext4_repack_preserves_hardlinks() {
         b"shared bytes for the hardlink test\n",
     )
     .unwrap();
-    std::fs::hard_link(
-        srcdir.path().join("primary"),
-        srcdir.path().join("alias_a"),
-    )
-    .unwrap();
-    std::fs::hard_link(
-        srcdir.path().join("primary"),
-        srcdir.path().join("alias_b"),
-    )
-    .unwrap();
+    std::fs::hard_link(srcdir.path().join("primary"), srcdir.path().join("alias_a")).unwrap();
+    std::fs::hard_link(srcdir.path().join("primary"), srcdir.path().join("alias_b")).unwrap();
 
     let src = NamedTempFile::new().unwrap();
     let mk = Command::new("mke2fs")
@@ -1120,7 +1112,8 @@ fn ext4_repack_replays_pending_journal() {
     {
         let mut dev = FileBackend::open(src_tmp.path()).unwrap();
         let mut buf = vec![0u8; bs as usize];
-        dev.read_at(marker_phys as u64 * bs as u64, &mut buf).unwrap();
+        dev.read_at(marker_phys as u64 * bs as u64, &mut buf)
+            .unwrap();
         assert_eq!(&buf[..4], b"OLD\n");
     }
 
@@ -1153,7 +1146,8 @@ fn ext4_repack_replays_pending_journal() {
         .read_to_end(&mut got)
         .unwrap();
     assert_eq!(
-        got, b"NEW\n",
+        got,
+        b"NEW\n",
         "expected replay to apply NEW, got {:?}",
         String::from_utf8_lossy(&got)
     );
@@ -1208,13 +1202,7 @@ fn ext4_indexed_directory_two_level_passes_e2fsck() {
     let names: Vec<String> = (0..6500).map(|i| format!("entry_{i:05}")).collect();
     let name_bytes: Vec<&[u8]> = names.iter().map(|s| s.as_bytes()).collect();
     let bigdir = ext
-        .add_dir_indexed(
-            &mut dev,
-            2,
-            b"big",
-            FileMeta::with_mode(0o755),
-            &name_bytes,
-        )
+        .add_dir_indexed(&mut dev, 2, b"big", FileMeta::with_mode(0o755), &name_bytes)
         .unwrap();
     for name in &name_bytes {
         let mut src = NamedTempFile::new().unwrap();
@@ -1364,7 +1352,8 @@ fn ext4_mutation_api_round_trips_through_e2fsck() {
     assert!(!root_entries.iter().any(|e| e.name == "alias"));
 
     // Rename cross-dir: move primary into sub_a.
-    ext.rename(&mut dev, 2, b"primary", sub, b"primary").unwrap();
+    ext.rename(&mut dev, 2, b"primary", sub, b"primary")
+        .unwrap();
     let root_entries = ext.list_inode(&mut dev, 2).unwrap();
     assert!(!root_entries.iter().any(|e| e.name == "primary"));
     let sub_entries = ext.list_inode(&mut dev, sub).unwrap();
@@ -1496,7 +1485,10 @@ fn ext4_inline_data_stores_small_files_in_inode() {
         0,
         "non-inline file must NOT carry EXT4_INLINE_DATA_FL"
     );
-    assert!(big_inode.blocks_512 > 0, "non-inline file must allocate data blocks");
+    assert!(
+        big_inode.blocks_512 > 0,
+        "non-inline file must allocate data blocks"
+    );
 
     drop(dev);
 

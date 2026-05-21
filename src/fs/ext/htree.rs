@@ -271,14 +271,20 @@ fn round_f(a: u32, b: u32, c: u32, d: u32, x: u32, s: u32) -> u32 {
 fn round_g(a: u32, b: u32, c: u32, d: u32, x: u32, s: u32) -> u32 {
     let g = (b & c) | (b & d) | (c & d);
     const K2: u32 = 0x5a827999;
-    a.wrapping_add(g).wrapping_add(x).wrapping_add(K2).rotate_left(s)
+    a.wrapping_add(g)
+        .wrapping_add(x)
+        .wrapping_add(K2)
+        .rotate_left(s)
 }
 
 #[inline]
 fn round_h(a: u32, b: u32, c: u32, d: u32, x: u32, s: u32) -> u32 {
     let h = b ^ c ^ d;
     const K3: u32 = 0x6ed9eba1;
-    a.wrapping_add(h).wrapping_add(x).wrapping_add(K3).rotate_left(s)
+    a.wrapping_add(h)
+        .wrapping_add(x)
+        .wrapping_add(K3)
+        .rotate_left(s)
 }
 
 // ─── dx_root encoding ───────────────────────────────────────────────
@@ -383,11 +389,7 @@ pub fn make_dx_root_block(
 /// leaf at this node. `entries[1..]` are real `{hash, block}` rows
 /// sorted by ascending hash. Same convention as
 /// [`make_dx_root_block`].
-pub fn make_dx_node_block(
-    block_size: u32,
-    entries: &[DxEntry],
-    csum_tail: bool,
-) -> Vec<u8> {
+pub fn make_dx_node_block(block_size: u32, entries: &[DxEntry], csum_tail: bool) -> Vec<u8> {
     assert!(
         !entries.is_empty(),
         "dx_node must have at least the countlimit slot"
@@ -480,7 +482,16 @@ mod tests {
             hash: pack_countlimit(508, 1),
             block: 1,
         }];
-        let buf = make_dx_root_block(12, 2, 4096, DX_HASH_HALF_MD4_UNSIGNED, 0, &entries, true, false);
+        let buf = make_dx_root_block(
+            12,
+            2,
+            4096,
+            DX_HASH_HALF_MD4_UNSIGNED,
+            0,
+            &entries,
+            true,
+            false,
+        );
         // "." at offset 0
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 12);
         assert_eq!(u16::from_le_bytes(buf[4..6].try_into().unwrap()), 12);

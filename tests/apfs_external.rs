@@ -669,8 +669,14 @@ fn apfs_rename_unlink_link_round_trips() {
             .into_iter()
             .map(|e| e.name)
             .collect();
-        assert!(names.contains(&"renamed.txt".to_string()), "rename failed: {names:?}");
-        assert!(!names.contains(&"src.txt".to_string()), "old name lingers: {names:?}");
+        assert!(
+            names.contains(&"renamed.txt".to_string()),
+            "rename failed: {names:?}"
+        );
+        assert!(
+            !names.contains(&"src.txt".to_string()),
+            "old name lingers: {names:?}"
+        );
     }
 
     // link: add an alias under /alias.txt
@@ -690,7 +696,10 @@ fn apfs_rename_unlink_link_round_trips() {
             .map(|e| e.name)
             .collect();
         assert!(names.contains(&"renamed.txt".to_string()));
-        assert!(names.contains(&"alias.txt".to_string()), "link missing: {names:?}");
+        assert!(
+            names.contains(&"alias.txt".to_string()),
+            "link missing: {names:?}"
+        );
     }
 
     // unlink first link — second link survives, inode stays put

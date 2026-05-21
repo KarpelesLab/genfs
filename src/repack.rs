@@ -1236,8 +1236,8 @@ fn copy_ext_dir_at(
                     .iter()
                     .filter(|c| c.name != "." && c.name != "..")
                     .collect();
-                let use_htree = matches!(dst.kind, crate::fs::ext::FsKind::Ext4)
-                    && real_children.len() >= 250;
+                let use_htree =
+                    matches!(dst.kind, crate::fs::ext::FsKind::Ext4) && real_children.len() >= 250;
                 let child_ino = if use_htree {
                     let names: Vec<&[u8]> =
                         real_children.iter().map(|c| c.name.as_bytes()).collect();
@@ -1253,7 +1253,14 @@ fn copy_ext_dir_at(
                     dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?
                 };
                 copy_ext_dir_at(
-                    src_dev, src, e.inode, dst_dev, dst, child_ino, &entry_path, link_map,
+                    src_dev,
+                    src,
+                    e.inode,
+                    dst_dev,
+                    dst,
+                    child_ino,
+                    &entry_path,
+                    link_map,
                 )?;
                 child_ino
             }

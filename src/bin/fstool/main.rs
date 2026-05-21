@@ -1546,8 +1546,8 @@ fn copy_ext_dir_at(
                     .iter()
                     .filter(|c| c.name != "." && c.name != "..")
                     .collect();
-                let use_htree = matches!(dst.kind, fstool::fs::ext::FsKind::Ext4)
-                    && real_children.len() >= 250;
+                let use_htree =
+                    matches!(dst.kind, fstool::fs::ext::FsKind::Ext4) && real_children.len() >= 250;
                 let child_ino = if use_htree {
                     let names: Vec<&[u8]> =
                         real_children.iter().map(|c| c.name.as_bytes()).collect();
@@ -1557,15 +1557,20 @@ fn copy_ext_dir_at(
                     for c in &real_children {
                         bytes += ext_dir::min_rec_len(c.name.len());
                     }
-                    let usable = ext_dir::usable_dir_len(
-                        dst.layout.block_size,
-                        dst.has_metadata_csum_pub(),
-                    );
+                    let usable =
+                        ext_dir::usable_dir_len(dst.layout.block_size, dst.has_metadata_csum_pub());
                     let child_blocks = bytes.div_ceil(usable).max(1) as u32;
                     dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?
                 };
                 copy_ext_dir_at(
-                    src_dev, src, e.inode, dst_dev, dst, child_ino, &entry_path, link_map,
+                    src_dev,
+                    src,
+                    e.inode,
+                    dst_dev,
+                    dst,
+                    child_ino,
+                    &entry_path,
+                    link_map,
                 )?;
                 child_ino
             }
@@ -2627,9 +2632,7 @@ fn create_ext(
     // Block size is a `create_ext`-shaped knob: BuildPlan needs it
     // before it can run, so we peel it off the bag here instead of
     // letting the generic per-FS `apply_options` consume it.
-    let block_size = bag
-        .take_u32("block_size")?
-        .unwrap_or(1024);
+    let block_size = bag.take_u32("block_size")?.unwrap_or(1024);
 
     let mut plan = BuildPlan::new(block_size, kind);
     if let Some(src) = source {
@@ -2708,7 +2711,9 @@ fn create_fat32(
     // Defaults match the old `fat-build` behaviour: 11-byte ASCII
     // label, 0 volume id. Keep the upper-casing + non-printable
     // scrubbing so legacy CLI usage stays bit-identical.
-    let label_str = bag.take_str("volume_label").unwrap_or_else(|| "NO NAME".into());
+    let label_str = bag
+        .take_str("volume_label")
+        .unwrap_or_else(|| "NO NAME".into());
     let label_bytes = fat32_label_bytes(&label_str);
     let volume_id = bag.take_u32("volume_id")?.unwrap_or(0);
     bag.check_empty("fat32")?;
@@ -2720,7 +2725,8 @@ fn create_fat32(
         let s = size_arg.ok_or_else(|| {
             fstool::Error::InvalidArgument(
                 "create: --size is required for fat32 when OUTPUT is a regular file \
-                 (FAT32 needs ≥ ~33 MiB)".into(),
+                 (FAT32 needs ≥ ~33 MiB)"
+                    .into(),
             )
         })?;
         fstool::spec::parse_size(s)?

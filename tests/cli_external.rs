@@ -559,7 +559,9 @@ fn cli_fat32_add_and_rm() {
 
     let img = NamedTempFile::new().unwrap();
     let out = Command::new(FSTOOL)
-        .args(["create", "-t", "fat32", "--size", "64MiB", "--label", "CLIRM"])
+        .args([
+            "create", "-t", "fat32", "--size", "64MiB", "--label", "CLIRM",
+        ])
         .arg(srcdir.path())
         .arg("-o")
         .arg(img.path())
@@ -650,7 +652,9 @@ fn cli_fat32_build_ls_cat_info_roundtrip() {
 
     let img = NamedTempFile::new().unwrap();
     let out = Command::new(FSTOOL)
-        .args(["create", "-t", "fat32", "--size", "64MiB", "--label", "CLIFAT"])
+        .args([
+            "create", "-t", "fat32", "--size", "64MiB", "--label", "CLIFAT",
+        ])
         .arg(srcdir.path())
         .arg("-o")
         .arg(img.path())

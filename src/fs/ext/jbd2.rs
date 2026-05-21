@@ -411,8 +411,7 @@ pub(crate) fn replay_journal(ext: &super::Ext, dev: &mut dyn BlockDevice) -> Res
         let cmagic = u32::from_be_bytes(commit_buf[0..4].try_into().unwrap());
         let ctype = u32::from_be_bytes(commit_buf[4..8].try_into().unwrap());
         let ctid = u32::from_be_bytes(commit_buf[8..12].try_into().unwrap());
-        let commit_seen =
-            cmagic == JBD2_MAGIC && ctype == JBD2_COMMIT_BLOCK && ctid == tid;
+        let commit_seen = cmagic == JBD2_MAGIC && ctype == JBD2_COMMIT_BLOCK && ctid == tid;
         idx = ring_next(idx, &jsb);
 
         if !commit_seen {
@@ -538,14 +537,7 @@ pub(crate) fn write_transaction(
         };
         let is_last_desc = chunk_end == blocks.len();
 
-        let desc = encode_descriptor_block(
-            bs,
-            tid,
-            chunk,
-            &jsb.uuid,
-            is_first_desc,
-            is_last_desc,
-        );
+        let desc = encode_descriptor_block(bs, tid, chunk, &jsb.uuid, is_first_desc, is_last_desc);
         write_journal_block(ext, dev, journal_inode, idx, &desc)?;
         idx = ring_next(idx, jsb);
 

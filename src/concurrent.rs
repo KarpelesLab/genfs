@@ -116,7 +116,6 @@ impl SharedExt {
 mod tests {
     use super::*;
     use crate::block::MemoryBackend;
-    use crate::fs::FileSource;
     use crate::fs::ext::{FormatOpts, FsKind};
     use std::sync::Arc;
     use std::thread;

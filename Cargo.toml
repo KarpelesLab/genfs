@@ -46,6 +46,11 @@ dmg-encrypted = [
     "dep:sha1",
     "dep:pbkdf2",
 ]
+# FUSE adapter: enables the `fstool mount` subcommand which exposes an
+# ext{2,3,4} image as a userspace filesystem via libfuse (Linux) or
+# macFUSE (macOS). Off by default so the core build doesn't need a C
+# FUSE library on the host; opt in with `--features fuse`.
+fuse = ["dep:fuser"]
 
 [dependencies]
 thiserror = "2"
@@ -89,6 +94,14 @@ des = { version = "0.8", optional = true }
 hmac = { version = "0.12", optional = true }
 sha1 = { version = "0.10", optional = true }
 pbkdf2 = { version = "0.12", optional = true, default-features = false, features = ["hmac"] }
+
+# FUSE adapter — Linux uses libfuse, macOS uses macFUSE. Off by default
+# (see the `fuse` feature). `fuser` is the maintained successor to
+# `fuse-rs` and tracks the libfuse 3.x ABI. We enable the default
+# `libfuse` feature so the build links against the system FUSE
+# library; running `cargo build --features fuse` therefore requires
+# libfuse-dev (Linux) or macFUSE (macOS) installed on the host.
+fuser = { version = "0.16", optional = true, features = ["libfuse"] }
 
 # Needed on Unix for the BLKGETSIZE64 / DKIOCGETBLOCKCOUNT ioctls used to
 # query the size of a block device, plus the O_EXCL open flag that refuses

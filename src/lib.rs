@@ -16,6 +16,8 @@ pub mod compression;
 pub mod error;
 pub mod format_opts;
 pub mod fs;
+#[cfg(feature = "fuse")]
+pub mod fuse_adapter;
 pub mod inspect;
 pub mod merge;
 pub mod part;

@@ -1219,6 +1219,49 @@ pub(crate) fn open_file_rw_ext<'a>(
     Ok(Box::new(handle))
 }
 
+/// Open an already-resolved inode for read/write without traversing
+/// the path namespace. Used by the FUSE adapter (which receives inode
+/// numbers from the kernel) and by other consumers that already know
+/// the inode. Same journal-replay + extent-depth gating as
+/// [`open_file_rw_ext`].
+pub fn open_file_rw_ext_by_inode<'a>(
+    ext: &'a mut Ext,
+    dev: &'a mut dyn BlockDevice,
+    ino: u32,
+) -> Result<Ext2FileHandle<'a>> {
+    let fi = ext.sb.feature_incompat;
+    if fi & constants::feature::INCOMPAT_JOURNAL_DEV != 0 {
+        return Err(crate::Error::Unsupported(
+            "ext: image is an external journal device — partial writes not applicable".into(),
+        ));
+    }
+    if ext.sb.feature_compat & constants::feature::COMPAT_HAS_JOURNAL != 0 {
+        let replayed = jbd2::replay_journal(ext, dev)?;
+        if replayed {
+            ext.reload_groups_from_disk(dev)?;
+        }
+    }
+    let inode = ext.read_inode(dev, ino)?;
+    if inode.mode & S_IFMT != S_IFREG {
+        return Err(crate::Error::InvalidArgument(format!(
+            "ext: inode {ino} is not a regular file (mode={:#o})",
+            inode.mode
+        )));
+    }
+    if inode.flags & EXT4_EXTENTS_FL != 0 {
+        let bytes = extent::iblock_to_bytes(&inode.block);
+        let header = extent::decode_header(&bytes[..12])?;
+        if header.depth > 1 {
+            return Err(crate::Error::Unsupported(format!(
+                "ext4: extent tree depth {} not supported for in-place rw",
+                header.depth
+            )));
+        }
+    }
+    let len = inode.size as u64;
+    Ext2FileHandle::new(ext, dev, ino, len)
+}
+
 #[inline]
 fn read_u32_le(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())

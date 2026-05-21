@@ -223,6 +223,20 @@ enum Command {
         #[arg(long, value_name = "SIZE", default_value = "64KiB")]
         cluster_size: String,
     },
+    /// Mount an ext{2,3,4} image at a host mountpoint via FUSE.
+    /// Only available when fstool is built with `--features fuse`.
+    /// The mount stays attached until `umount` on the mountpoint
+    /// (or the process exits — `AutoUnmount` is on by default).
+    #[cfg(feature = "fuse")]
+    Mount {
+        /// Image to mount. Plain file or `path:N` partition selector.
+        #[arg(value_name = "IMAGE")]
+        image: String,
+        /// Host directory to mount the image under. Must already exist
+        /// and be empty (or close to it — your kernel decides).
+        #[arg(value_name = "MOUNTPOINT")]
+        mountpoint: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -301,7 +315,38 @@ fn run(cli: Cli) -> fstool::Result<()> {
             fstool::repack::leave();
             res
         }
+        #[cfg(feature = "fuse")]
+        Command::Mount { image, mountpoint } => mount_cmd(&image, &mountpoint),
     }
+}
+
+#[cfg(feature = "fuse")]
+fn mount_cmd(image: &str, mountpoint: &std::path::Path) -> fstool::Result<()> {
+    // FUSE adapter wants ownership of both `Ext` and a `Box<dyn
+    // BlockDevice>`. Partition selectors (`image:N`) and qcow2 sources
+    // go through `inspect::with_target_device` which doesn't give us
+    // ownership; for v1 we accept plain raw images only.
+    if image.contains(':') {
+        return Err(fstool::Error::Unsupported(
+            "fstool mount: partitioned-image selectors (`path:N`) and qcow2 sources \
+             are not wired through the FUSE adapter yet — open a raw .img directly"
+                .into(),
+        ));
+    }
+    let path = std::path::Path::new(image);
+    let mut dev: Box<dyn fstool::block::BlockDevice> =
+        Box::new(fstool::block::FileBackend::open(path)?);
+    let mut ext = fstool::fs::ext::Ext::open(dev.as_mut())?;
+    // Replay any pending journal so the mounted view matches what the
+    // kernel would see on first mount of an unclean shutdown.
+    let _ = ext.replay_pending_journal(dev.as_mut())?;
+    let fs = fstool::fuse_adapter::FstoolFs::new(ext, dev);
+    eprintln!(
+        "fstool: mounted {image} at {} (umount to detach)",
+        mountpoint.display()
+    );
+    fs.mount(mountpoint, "fstool").map_err(fstool::Error::Io)?;
+    Ok(())
 }
 
 fn convert_cmd(

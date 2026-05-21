@@ -125,6 +125,13 @@ pub struct FormatOpts {
     /// groups are recorded in `s_backup_bgs[2]`; the writer picks
     /// `[1, last_group]` automatically. Off by default.
     pub sparse_super2: bool,
+    /// When true, advertise `INCOMPAT_INLINE_DATA` and store small
+    /// regular files (≤ 60 bytes) directly in the inode's `i_block`
+    /// array instead of allocating a data block. Saves one block per
+    /// small file. Off by default — flipping it changes the on-disk
+    /// shape of the FS so kernel/e2fsck installations older than ~3.8
+    /// would refuse to mount the result.
+    pub inline_data: bool,
 }
 
 impl Default for FormatOpts {
@@ -145,6 +152,7 @@ impl Default for FormatOpts {
             log_groups_per_flex: 0,
             use_64bit: false,
             sparse_super2: false,
+            inline_data: false,
         }
     }
 }
@@ -496,6 +504,9 @@ impl Ext {
             ext.sb.feature_compat |= constants::feature::COMPAT_SPARSE_SUPER2;
             ext.sb.backup_bgs = backup_bgs;
         }
+        if opts.inline_data {
+            ext.sb.feature_incompat |= constants::feature::INCOMPAT_INLINE_DATA;
+        }
 
         // Reserve inodes 1..first_ino-1 (1..=10 for dynamic rev).
         let first_ino = ext.sb.first_ino;
@@ -530,6 +541,14 @@ impl Ext {
     /// Whether the `metadata_csum` feature is active on this filesystem.
     pub(crate) fn has_metadata_csum(&self) -> bool {
         self.sb.feature_ro_compat & constants::feature::RO_COMPAT_METADATA_CSUM != 0
+    }
+
+    /// Whether the `inline_data` feature is active. When true, small
+    /// regular files (≤ 60 bytes) get stored in `i_block` directly
+    /// instead of allocating a data block; readers honour the
+    /// `EXT4_INLINE_DATA_FL` flag on the inode to decode them.
+    pub(crate) fn has_inline_data(&self) -> bool {
+        self.sb.feature_incompat & constants::feature::INCOMPAT_INLINE_DATA != 0
     }
 
     /// If the filesystem carries a JBD2 journal with committed-but-not-
@@ -1816,6 +1835,47 @@ impl Ext {
                 "ext: file > 4 GiB requires LARGE_FILE (deferred to ext4)".into(),
             ));
         }
+
+        // Inline-data fast path: files that fit in the inode's
+        // i_block array don't need a data block at all. Reduces
+        // small-file overhead from "1 inode + 1 data block" to "1
+        // inode" — a 10-byte file goes from 4 KiB on disk to ~128.
+        //
+        // The on-disk contract: when `EXT4_INLINE_DATA_FL` is set
+        // every such inode MUST carry a `system.data` xattr too (the
+        // kernel uses its presence as the "this inode is inline-data"
+        // probe; e2fsck enforces it). The xattr's value holds any
+        // overflow beyond i_block's 60 bytes — for files ≤ 60 bytes
+        // we stamp an empty value to satisfy the invariant.
+        const INLINE_CAP: u64 = 60;
+        if self.has_inline_data() && len <= INLINE_CAP {
+            let mut payload = [0u8; INLINE_CAP as usize];
+            reader.read_exact(&mut payload[..len as usize])?;
+            let ino = self.alloc_inode()?;
+            let mut inode = Inode::regular(
+                len as u32,
+                meta.mode & 0o7777,
+                meta.uid,
+                meta.gid,
+                meta.mtime,
+            );
+            inode.flags |= constants::EXT4_INLINE_DATA_FL;
+            inode.blocks_512 = 0;
+            // Pack the data into i_block (60 bytes = 15 × 4-byte slots).
+            for (i, slot) in inode.block.iter_mut().enumerate() {
+                let off = i * 4;
+                *slot = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+            }
+            self.inodes.push((ino, inode));
+            self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_REG)?;
+            // Stamp the marker xattr. Value is empty for files that
+            // fit entirely in i_block; for > 60 bytes (deferred — see
+            // the cap above) it would hold bytes 60..end.
+            let marker = xattr::Xattr::new("system.data", Vec::<u8>::new());
+            self.set_xattrs(dev, ino, &[marker])?;
+            return Ok(ino);
+        }
+
         let n_data_blocks = len.div_ceil(bs as u64) as u32;
 
         let ino = self.alloc_inode()?;
@@ -3502,6 +3562,16 @@ impl<'a> Read for FileReader<'a> {
         let total = self.inode.size as u64;
         if self.pos >= total {
             return Ok(0);
+        }
+        // Inline-data fast path: the file's body lives inside i_block
+        // (the 60-byte block-pointer array). No data block to walk.
+        if self.inode.flags & constants::EXT4_INLINE_DATA_FL != 0 {
+            let inline_bytes = extent::iblock_to_bytes(&self.inode.block);
+            let remaining_in_file = (total - self.pos) as usize;
+            let n = out.len().min(remaining_in_file);
+            out[..n].copy_from_slice(&inline_bytes[self.pos as usize..self.pos as usize + n]);
+            self.pos += n as u64;
+            return Ok(n);
         }
         let bs = self.ext.layout.block_size as u64;
         let block_idx = (self.pos / bs) as u32;

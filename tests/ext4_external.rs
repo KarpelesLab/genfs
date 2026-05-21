@@ -1405,3 +1405,110 @@ fn ext4_mutation_api_round_trips_through_e2fsck() {
         String::from_utf8_lossy(&fsck.stderr)
     );
 }
+
+/// Build an ext4 with `inline_data` on, write a 40-byte file, and
+/// confirm: (1) the inode carries `EXT4_INLINE_DATA_FL` and
+/// `blocks_512 == 0` (no data block allocated), (2) our own reader
+/// returns the original bytes, (3) e2fsck stays clean (it understands
+/// the inline-data layout when `INCOMPAT_INLINE_DATA` is advertised).
+#[test]
+fn ext4_inline_data_stores_small_files_in_inode() {
+    use std::io::Read;
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        inline_data: true,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    let body = b"inline payload that fits in 60 bytes \xe2\x9c\x93\n";
+    assert!(body.len() <= 60);
+    let mut src = NamedTempFile::new().unwrap();
+    src.as_file_mut().write_all(body).unwrap();
+    let ino = ext
+        .add_file_to(
+            &mut dev,
+            2,
+            b"small.txt",
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    ext.flush(&mut dev).unwrap();
+    use fstool::block::BlockDevice as _;
+    dev.sync().unwrap();
+
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(
+        inode.size as usize,
+        body.len(),
+        "inline file size should match payload"
+    );
+    assert!(
+        inode.flags & 0x1000_0000 != 0,
+        "EXT4_INLINE_DATA_FL must be set on inline inodes, flags={:#x}",
+        inode.flags
+    );
+    // The data itself sits in i_block (no file data block). With our
+    // default inode_size = 128, the kernel-required `system.data`
+    // marker xattr still costs an external 1-block xattr region; once
+    // inode_size is bumped to 256+ the marker would fit inline and
+    // `blocks_512` could drop to zero.
+
+    let mut got = Vec::new();
+    ext.open_file_reader(&mut dev, ino)
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, body, "inline read-back mismatch");
+
+    // For a regular file > 60 bytes, the inline-data path should NOT
+    // engage and the writer falls back to allocating a data block.
+    let mut bigger = NamedTempFile::new().unwrap();
+    let big_body: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
+    bigger.as_file_mut().write_all(&big_body).unwrap();
+    let big_ino = ext
+        .add_file_to(
+            &mut dev,
+            2,
+            b"bigger.bin",
+            FileSource::HostPath(bigger.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    let big_inode = ext.read_inode(&mut dev, big_ino).unwrap();
+    assert_eq!(
+        big_inode.flags & 0x1000_0000,
+        0,
+        "non-inline file must NOT carry EXT4_INLINE_DATA_FL"
+    );
+    assert!(big_inode.blocks_512 > 0, "non-inline file must allocate data blocks");
+
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected the inline_data image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}

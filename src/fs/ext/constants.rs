@@ -107,6 +107,7 @@ pub mod feature {
     pub const INCOMPAT_EXTENTS: u32 = 0x0040;
     pub const INCOMPAT_64BIT: u32 = 0x0080;
     pub const INCOMPAT_FLEX_BG: u32 = 0x0200;
+    pub const INCOMPAT_INLINE_DATA: u32 = 0x8000;
 
     // ro_compat
     pub const RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
@@ -127,6 +128,14 @@ pub const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 /// data block is an HTree root (dx_root) and whose subsequent blocks
 /// are hash-bucketed leaf blocks.
 pub const EXT4_INDEX_FL: u32 = 0x0000_1000;
+
+/// Inode flag `EXT4_INLINE_DATA_FL` — set on regular-file inodes
+/// whose data is stored entirely inside the inode (in `i_block` and,
+/// for inodes larger than 128 bytes, in the trailing
+/// `system.data` xattr) rather than in separately-allocated data
+/// blocks. `i_size` reflects the true logical size; `blocks_512`
+/// stays at 0 because no data blocks were allocated.
+pub const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
 
 /// Number of direct block pointers in an inode (`i_block[0..12]`).
 pub const N_DIRECT: usize = 12;

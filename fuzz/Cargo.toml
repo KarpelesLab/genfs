@@ -1,0 +1,28 @@
+[package]
+name = "fstool-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.fstool]
+path = ".."
+
+[[bin]]
+name = "ext_open"
+path = "fuzz_targets/ext_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ext_list_corrupt_dir"
+path = "fuzz_targets/ext_list_corrupt_dir.rs"
+test = false
+doc = false
+bench = false

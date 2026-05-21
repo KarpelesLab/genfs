@@ -27,12 +27,14 @@ use std::io::{Read, Seek, Write};
 
 use crate::Result;
 
+pub mod crash_inject;
 pub mod dmg;
 pub mod file;
 pub mod memory;
 pub mod qcow2;
 pub mod sliced;
 
+pub use crash_inject::{CrashInject, FailAfter};
 pub use dmg::DmgBackend;
 pub use file::FileBackend;
 pub use memory::MemoryBackend;

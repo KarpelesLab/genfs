@@ -1223,7 +1223,7 @@ pub(crate) fn open_file_rw_ext<'a>(
 /// the path namespace. Used by the FUSE adapter (which receives inode
 /// numbers from the kernel) and by other consumers that already know
 /// the inode. Same journal-replay + extent-depth gating as
-/// [`open_file_rw_ext`].
+/// `open_file_rw_ext`.
 pub fn open_file_rw_ext_by_inode<'a>(
     ext: &'a mut Ext,
     dev: &'a mut dyn BlockDevice,

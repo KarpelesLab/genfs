@@ -824,7 +824,7 @@ impl Apfs {
     /// inode at `path`. Preserves the file-type bits.
     ///
     /// Writes a fresh APFS checkpoint — same COW pathway
-    /// [`rw::commit_with_mutator`] uses for every other in-place
+    /// `rw::commit_with_mutator` uses for every other in-place
     /// mutation. The on-disk byte affected lives at offset 80..82
     /// of `j_inode_val_t`.
     pub fn chmod(&mut self, dev: &mut dyn BlockDevice, path: &str, mode_perms: u16) -> Result<()> {

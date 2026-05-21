@@ -9,9 +9,10 @@
 //! special **dx_root** block whose payload layers a hash-index table
 //! over what otherwise look like two ordinary dirent records (`.` and
 //! `..`). Bytes 0..12 hold `.`, 12..24 hold `..`, 24..32 hold a tiny
-//! [`DxRootInfo`] header, and 32.. is an array of [`DxEntry`] slots
+//! `dx_root_info` header, and 32.. is an array of [`DxEntry`] slots
 //! `{hash, block}`. Slot 0 is overloaded as `{limit, count, leaf_block}`
-//! ([`DxCountLimit`]); slots 1..count carry real `{hash, block}` pairs.
+//! (the `dx_countlimit` view); slots 1..count carry real `{hash, block}`
+//! pairs.
 //!
 //! Lookups walk the dx_entry table by binary search on `hash`, then dive
 //! into the leaf block whose range covers that hash. The leaf block is

@@ -577,7 +577,7 @@ impl Ext {
         Ok(replayed)
     }
 
-    /// Public accessor for [`Self::has_metadata_csum`], exposed for the
+    /// Public accessor for `Self::has_metadata_csum`, exposed for the
     /// repack layer (which needs to mirror destination metadata_csum
     /// state when pre-sizing directories).
     pub fn has_metadata_csum_pub(&self) -> bool {

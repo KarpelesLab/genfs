@@ -10,10 +10,10 @@
 //!
 //! Two failure modes:
 //!
-//! - [`FailAfter::Writes(n)`] — succeed on the first `n` write
+//! - [`FailAfter::Writes`]`(n)` — succeed on the first `n` write
 //!   syscalls, then return `EIO` on every subsequent write. Stable
 //!   across re-runs of the same test (deterministic).
-//! - [`FailAfter::Bytes(n)`] — succeed until the cumulative byte
+//! - [`FailAfter::Bytes`]`(n)` — succeed until the cumulative byte
 //!   count written reaches `n`, then short-circuit. Maps to the
 //!   "torn write" pattern where a buffered write reaches disk
 //!   partially.

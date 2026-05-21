@@ -190,9 +190,9 @@ fn str2hashbuf_unsigned(msg: &[u8], out: &mut [u32; 8], num: usize) {
     if len > num * 4 {
         len = num * 4;
     }
-    for i in 0..len {
+    for (i, &b) in msg.iter().take(len).enumerate() {
         // Kernel: val = ((int) ucp[i]) + (val << 8)
-        val = (msg[i] as u32).wrapping_add(val.wrapping_shl(8));
+        val = (b as u32).wrapping_add(val.wrapping_shl(8));
         if i % 4 == 3 {
             out[written] = val;
             written += 1;
@@ -302,6 +302,7 @@ fn round_h(a: u32, b: u32, c: u32, d: u32, x: u32, s: u32) -> u32 {
 /// When `csum_tail` is set, the final 8 bytes are reserved for the
 /// dx_tail (zero-stamped here; the actual CRC32C is computed at flush
 /// time by [`compute_dx_csum`]).
+#[allow(clippy::too_many_arguments)] // mirrors the e2fsprogs layout struct
 pub fn make_dx_root_block(
     self_inode: u32,
     parent_inode: u32,

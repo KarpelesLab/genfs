@@ -1067,7 +1067,7 @@ impl Ext {
             leaf_phys.push(self.alloc_data_block()?);
         }
         let (i_block_bytes, leaf_images) = extent::pack_depth1(&runs, bs, csum_tail, &leaf_phys)?;
-        for (phys, image) in leaf_phys.iter().zip(leaf_images.into_iter()) {
+        for (phys, image) in leaf_phys.iter().zip(leaf_images) {
             // Stage in data_blocks; track for CRC stamping at flush.
             if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| b == phys) {
                 slot.1 = image;
@@ -1209,7 +1209,7 @@ impl Ext {
         new_phys: u32,
     ) -> Result<u32> {
         let bs = self.layout.block_size;
-        let ptrs_per_block = (bs / 4) as u32;
+        let ptrs_per_block = bs / 4;
         let n_direct = constants::N_DIRECT as u32;
         if new_logical < n_direct {
             self.patch_inode(dev, inode_no, |i| {
@@ -2644,9 +2644,9 @@ impl Ext {
     /// target is a directory (its `..` link transfers).
     ///
     /// `new_name` must not already exist in `new_parent_ino`. Posix
-    /// `rename` overwrites; we leave that to the caller (probe + remove
-    /// + rename) until we're ready to make atomic-overwrite work end
-    /// to end.
+    /// `rename` overwrites; we leave that to the caller
+    /// (probe-then-remove-then-rename) until we're ready to make
+    /// atomic-overwrite work end to end.
     pub fn rename(
         &mut self,
         dev: &mut dyn BlockDevice,

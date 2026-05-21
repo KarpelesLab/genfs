@@ -1034,16 +1034,16 @@ fn ext4_repack_replays_pending_journal() {
     // ── Locate the journal's physical blocks 0..3 on disk.
     let journal_ino = src_ext.sb.journal_inum;
     let journal_inode = src_ext.read_inode(&mut src_dev, journal_ino).unwrap();
-    let mut jb_phys = |logical: u32| {
-        src_ext
-            .file_block(&mut src_dev, &journal_inode, logical)
-            .unwrap()
+    // Borrow `src_dev` through a scoped closure so the &mut goes away
+    // before we re-borrow `src_dev` to read the journal SB below.
+    let (jsb_phys, desc_phys, data_phys, commit_phys) = {
+        let mut jb_phys = |logical: u32| {
+            src_ext
+                .file_block(&mut src_dev, &journal_inode, logical)
+                .unwrap()
+        };
+        (jb_phys(0), jb_phys(1), jb_phys(2), jb_phys(3))
     };
-    let jsb_phys = jb_phys(0);
-    let desc_phys = jb_phys(1);
-    let data_phys = jb_phys(2);
-    let commit_phys = jb_phys(3);
-    drop(jb_phys);
 
     // ── Read the journal SB to learn its sequence number / UUID.
     let bs = opts.block_size;

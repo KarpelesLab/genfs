@@ -115,7 +115,7 @@ impl FstoolFs {
             ctime: ts(inode.ctime),
             crtime: ts(inode.mtime),
             kind,
-            perm: (inode.mode & 0o7777) as u16,
+            perm: inode.mode & 0o7777,
             nlink: inode.links_count as u32,
             uid: inode.uid as u32,
             gid: inode.gid as u32,

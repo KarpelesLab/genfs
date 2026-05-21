@@ -1473,6 +1473,7 @@ fn copy_ext_dir(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // recursive walker — splitting would just shuffle state
 fn copy_ext_dir_at(
     src_dev: &mut dyn fstool::block::BlockDevice,
     src: &fstool::fs::ext::Ext,
@@ -2806,6 +2807,7 @@ fn create_exfat(
 /// Format + populate any FS that implements [`FilesystemFactory`].
 /// `apply` is the per-FS `FormatOpts::apply_options` closure (avoids
 /// adding the method to the trait surface).
+#[allow(clippy::too_many_arguments)] // generic dispatcher — each arg is a distinct knob
 fn create_via_factory<F>(
     label: &str,
     source: Option<&fstool::repack::Source>,

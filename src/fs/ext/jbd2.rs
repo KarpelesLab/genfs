@@ -508,9 +508,10 @@ pub(crate) fn write_transaction(
     // block + one trailing commit. First chunk holds up to `first_cap`
     // tags (it carries the UUID payload), subsequent chunks up to
     // `next_cap` each.
-    let n_descs = if blocks.is_empty() {
-        1
-    } else if blocks.len() <= first_cap {
+    let n_descs = if blocks.len() <= first_cap {
+        // Covers both the empty case (0 data blocks → 1 descriptor
+        // carrying just the UUID + commit) and the "fits in the
+        // first chunk" case.
         1
     } else {
         1 + (blocks.len() - first_cap).div_ceil(next_cap)

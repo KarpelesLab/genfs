@@ -93,7 +93,7 @@ impl Progress {
                 self.files, self.last_path
             );
             let _ = err.flush();
-        } else if self.verbose && self.files.is_multiple_of(500) {
+        } else if self.verbose && self.files % 500 == 0 {
             eprintln!("repack: {} files | {}", self.files, self.last_path);
         }
     }
@@ -1160,6 +1160,7 @@ fn predict_dir_blocks(
 /// its destination inode number; every subsequent encounter (a hard
 /// link) goes through `add_link_to` and reuses the same dst inode
 /// instead of duplicating the file body.
+#[allow(clippy::too_many_arguments)] // recursive walker — splitting would just shuffle state
 fn copy_ext_dir_at(
     src_dev: &mut dyn crate::block::BlockDevice,
     src: &crate::fs::ext::Ext,

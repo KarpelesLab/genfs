@@ -757,7 +757,7 @@ fn ext2_large_directory_uses_indirect_block() {
     // the 12-direct-block threshold (forcing a single-indirect block).
     let inode = ext.read_inode(&mut dev, bigdir).unwrap();
     assert!(
-        inode.size as u32 >= opts.block_size * 12,
+        inode.size >= opts.block_size * 12,
         "expected dir > 12 blocks, got size={} (block={})",
         inode.size,
         opts.block_size

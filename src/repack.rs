@@ -243,7 +243,13 @@ fn copy_image_into_ext(
     dst: &mut Ext,
 ) -> Result<()> {
     crate::inspect::with_target_device(target, |src_dev| {
-        let src_fs = crate::inspect::AnyFs::open(src_dev)?;
+        let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
+        // For ext sources with a pending journal (INCOMPAT_RECOVER /
+        // s_start != 0), replay before reading so the destination
+        // reflects the post-recovery state.
+        if let crate::inspect::AnyFs::Ext(ext) = &mut src_fs {
+            let _ = ext.replay_pending_journal(src_dev)?;
+        }
         copy_into_ext(src_dev, &src_fs, dst_dev, dst)
     })
 }

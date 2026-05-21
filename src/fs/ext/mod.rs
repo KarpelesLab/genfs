@@ -526,6 +526,35 @@ impl Ext {
         self.sb.feature_ro_compat & constants::feature::RO_COMPAT_METADATA_CSUM != 0
     }
 
+    /// If the filesystem carries a JBD2 journal with committed-but-not-
+    /// checkpointed transactions, replay them onto the device. Mirrors
+    /// what the Linux kernel does on first mount of an unclean ext{3,4}
+    /// filesystem: walk the journal log starting at `s_start`, apply
+    /// each transaction's data blocks to their target FS locations,
+    /// then mark the journal clean (`s_start = 0`).
+    ///
+    /// No-op when the journal is clean, absent, or the FS isn't a
+    /// journalled flavour.
+    ///
+    /// Returns `true` if any work was replayed. After a successful
+    /// replay the in-memory bitmaps and group descriptors are
+    /// re-read from disk (replay rewrote them) and `INCOMPAT_RECOVER`
+    /// is cleared from the in-memory superblock — recovery has been
+    /// completed, even if we haven't yet flushed that back to the
+    /// on-disk SB (callers writing back to the source should issue a
+    /// fresh flush; read-only consumers won't notice the difference).
+    pub fn replay_pending_journal(&mut self, dev: &mut dyn BlockDevice) -> Result<bool> {
+        if self.sb.feature_compat & constants::feature::COMPAT_HAS_JOURNAL == 0 {
+            return Ok(false);
+        }
+        let replayed = jbd2::replay_journal(self, dev)?;
+        if replayed {
+            self.reload_groups_from_disk(dev)?;
+            self.sb.feature_incompat &= !constants::feature::INCOMPAT_RECOVER;
+        }
+        Ok(replayed)
+    }
+
     /// Public accessor for [`Self::has_metadata_csum`], exposed for the
     /// repack layer (which needs to mirror destination metadata_csum
     /// state when pre-sizing directories).

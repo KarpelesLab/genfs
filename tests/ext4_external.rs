@@ -990,3 +990,182 @@ fn ext4_repack_preserves_sparse_files() {
         String::from_utf8_lossy(&fsck.stderr)
     );
 }
+
+/// Build a clean ext4 image with a file marker.txt containing "OLD",
+/// then surgically inject a JBD2 transaction into the journal that
+/// overwrites marker.txt's data block with "NEW", set `s_start` so
+/// the journal looks dirty, and confirm `fstool repack` applies the
+/// pending transaction (destination's marker.txt reads "NEW") instead
+/// of taking the stale on-disk state.
+#[test]
+fn ext4_repack_replays_pending_journal() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    use fstool::block::BlockDevice as _;
+    use fstool::fs::ext::jbd2;
+
+    // ── Build the source clean.
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let src_tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut src_dev = FileBackend::create(src_tmp.path(), size).unwrap();
+    let mut src_ext = Ext::format_with(&mut src_dev, &opts).unwrap();
+
+    let mut srcfile = NamedTempFile::new().unwrap();
+    srcfile.as_file_mut().write_all(b"OLD\n").unwrap();
+    let marker_ino = src_ext
+        .add_file_to(
+            &mut src_dev,
+            2,
+            b"marker.txt",
+            FileSource::HostPath(srcfile.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    src_ext.flush(&mut src_dev).unwrap();
+    src_dev.sync().unwrap();
+
+    // ── Capture the marker.txt data-block address.
+    let marker_inode = src_ext.read_inode(&mut src_dev, marker_ino).unwrap();
+    let marker_phys = src_ext.file_block(&mut src_dev, &marker_inode, 0).unwrap();
+    assert_ne!(marker_phys, 0, "marker.txt must have a data block");
+
+    // ── Locate the journal's physical blocks 0..3 on disk.
+    let journal_ino = src_ext.sb.journal_inum;
+    let journal_inode = src_ext.read_inode(&mut src_dev, journal_ino).unwrap();
+    let mut jb_phys = |logical: u32| {
+        src_ext
+            .file_block(&mut src_dev, &journal_inode, logical)
+            .unwrap()
+    };
+    let jsb_phys = jb_phys(0);
+    let desc_phys = jb_phys(1);
+    let data_phys = jb_phys(2);
+    let commit_phys = jb_phys(3);
+    drop(jb_phys);
+
+    // ── Read the journal SB to learn its sequence number / UUID.
+    let bs = opts.block_size;
+    let mut jsb_buf = vec![0u8; bs as usize];
+    src_dev
+        .read_at(jsb_phys as u64 * bs as u64, &mut jsb_buf)
+        .unwrap();
+    let jsb = jbd2::JournalSuperblock::decode(&jsb_buf).unwrap();
+    let tid = jsb.sequence;
+
+    // ── Build the descriptor block (journal logical block 1).
+    let payload = {
+        let mut b = vec![0u8; bs as usize];
+        b[..4].copy_from_slice(b"NEW\n");
+        b
+    };
+    let descriptor = jbd2::encode_descriptor_block(
+        bs,
+        tid,
+        &[jbd2::JournalBlock {
+            fs_block: marker_phys,
+            bytes: payload.clone(),
+        }],
+        &jsb.uuid,
+    );
+    let commit = jbd2::encode_commit_block(bs, tid, 0, 0);
+
+    // ── Write the three log blocks.
+    src_dev
+        .write_at(desc_phys as u64 * bs as u64, &descriptor)
+        .unwrap();
+    src_dev
+        .write_at(data_phys as u64 * bs as u64, &payload)
+        .unwrap();
+    src_dev
+        .write_at(commit_phys as u64 * bs as u64, &commit)
+        .unwrap();
+
+    // ── Mark the journal as dirty: s_start = 1 (logical-in-journal).
+    jbd2::set_start(&mut jsb_buf, 1);
+    src_dev
+        .write_at(jsb_phys as u64 * bs as u64, &jsb_buf)
+        .unwrap();
+
+    // ── Flip INCOMPAT_RECOVER on the FS superblock so the image
+    //    advertises that recovery is needed (matches what a real
+    //    unclean shutdown leaves behind). Re-stamp the CRC32C `s_checksum`
+    //    at offset 1020 since we changed bytes earlier in the SB.
+    let mut sb_buf = vec![0u8; 1024];
+    src_dev.read_at(1024, &mut sb_buf).unwrap();
+    let fi_off = 96usize; // s_feature_incompat
+    let mut fi = u32::from_le_bytes(sb_buf[fi_off..fi_off + 4].try_into().unwrap());
+    fi |= 0x0004; // INCOMPAT_RECOVER
+    sb_buf[fi_off..fi_off + 4].copy_from_slice(&fi.to_le_bytes());
+    let new_csum = fstool::fs::ext::csum::superblock(&sb_buf);
+    sb_buf[1020..1024].copy_from_slice(&new_csum.to_le_bytes());
+    src_dev.write_at(1024, &sb_buf).unwrap();
+    src_dev.sync().unwrap();
+    drop(src_dev);
+    drop(src_ext);
+
+    // ── Sanity-check the pre-replay state: on-disk marker_phys still
+    //    has the OLD content (replay hasn't run yet).
+    {
+        let mut dev = FileBackend::open(src_tmp.path()).unwrap();
+        let mut buf = vec![0u8; bs as usize];
+        dev.read_at(marker_phys as u64 * bs as u64, &mut buf).unwrap();
+        assert_eq!(&buf[..4], b"OLD\n");
+    }
+
+    // ── Repack via the CLI; the source-open path now triggers
+    //    replay_pending_journal before walking the source.
+    let dst = NamedTempFile::new().unwrap();
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_fstool"));
+    let out = Command::new(&bin)
+        .args(["repack", "--shrink"])
+        .arg(src_tmp.path())
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fstool repack failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // ── Destination's marker.txt must reflect the replayed value.
+    use std::io::Read;
+    let mut dst_dev = FileBackend::open(dst.path()).unwrap();
+    let dst_ext = Ext::open(&mut dst_dev).unwrap();
+    let ino = dst_ext.path_to_inode(&mut dst_dev, "/marker.txt").unwrap();
+    let mut got = Vec::new();
+    dst_ext
+        .open_file_reader(&mut dst_dev, ino)
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(
+        got, b"NEW\n",
+        "expected replay to apply NEW, got {:?}",
+        String::from_utf8_lossy(&got)
+    );
+    drop(dst_dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected post-replay repack:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}

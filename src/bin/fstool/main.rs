@@ -410,6 +410,13 @@ fn repack_cmd(
     // without ever touching the host filesystem.
     fstool::inspect::with_target_device(&src_target, |src_dev| {
         let mut src_fs = fstool::inspect::AnyFs::open(src_dev)?;
+        // For ext sources with INCOMPAT_RECOVER / s_start != 0,
+        // replay the journal onto the source so we read the
+        // post-recovery state (anything still pending in the log
+        // would otherwise be lost from the repack output).
+        if let fstool::inspect::AnyFs::Ext(ext) = &mut src_fs {
+            let _ = ext.replay_pending_journal(src_dev)?;
+        }
         let source_kind = src_fs.kind_string();
         let src_total = src_dev.total_size();
 

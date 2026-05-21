@@ -532,6 +532,15 @@ fn repack_cmd(
             "ext2" | "ext3" | "ext4" => {
                 let plan = build_ext_plan(src_dev, &mut src_fs, block_size, &lower)?;
                 let mut opts = plan.to_format_opts();
+                // Preserve sparse-file extent: the source reader emits
+                // zero bytes wherever the source has a hole, and the
+                // destination writer turns all-zero blocks into holes
+                // when sparse is on. End result: holes round-trip
+                // through repack instead of being inflated to dense
+                // zero blocks. Semantically transparent for non-sparse
+                // files (their blocks aren't all-zero so nothing
+                // changes).
+                opts.sparse = true;
                 // Grow to fill the destination if the user requested an
                 // explicit size larger than the auto-min.
                 let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
@@ -936,7 +945,13 @@ fn repack_from_tar_stream_into_fs(
                     TarKind::CharDev | TarKind::BlockDev | TarKind::Fifo => plan.add_device(),
                 }
             }
-            let opts = plan.to_format_opts();
+            let mut opts = plan.to_format_opts();
+            // Same sparse-preserve rationale as the FS-to-ext repack
+            // path: tar archives can carry long zero runs (sparse-form
+            // entries unpacked dense, or just zero-filled files). The
+            // writer's all-zero-block check turns them back into
+            // holes on the destination.
+            opts.sparse = true;
             let mut dst_ext = fstool::fs::ext::Ext::format_with(dst_dev.as_mut(), &opts)?;
             replay_tar_index_into_ext(src, algo, &index, dst_dev.as_mut(), &mut dst_ext)?;
             dst_ext.flush(dst_dev.as_mut())?;

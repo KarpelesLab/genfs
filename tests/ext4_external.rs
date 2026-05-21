@@ -880,3 +880,113 @@ fn ext4_repack_preserves_hardlinks() {
         String::from_utf8_lossy(&fsck.stderr)
     );
 }
+
+/// Build a source ext4 image whose biggest file is sparse (4 KiB of
+/// real data, then a 240 KiB hole, then another 4 KiB of real data),
+/// run `fstool repack --shrink`, and confirm the destination keeps
+/// the hole instead of inflating the file to its full dense size.
+#[test]
+fn ext4_repack_preserves_sparse_files() {
+    use std::io::Read;
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    // Source: build directly via fstool with sparse=true so the source
+    // file's blocks_512 is small even though its logical size is 248 KiB.
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 16 * 1024,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        sparse: true,
+        ..FormatOpts::default()
+    };
+    let src_tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut src_dev = FileBackend::create(src_tmp.path(), size).unwrap();
+    let mut src_ext = Ext::format_with(&mut src_dev, &opts).unwrap();
+
+    let mut body = vec![b'A'; 4096];
+    body.extend(std::iter::repeat_n(0u8, 240 * 1024));
+    body.extend(std::iter::repeat_n(b'B', 4096));
+    let payload = NamedTempFile::new().unwrap();
+    std::fs::write(payload.path(), &body).unwrap();
+    src_ext
+        .add_file_to(
+            &mut src_dev,
+            2,
+            b"sparse.bin",
+            FileSource::HostPath(payload.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    src_ext.flush(&mut src_dev).unwrap();
+    src_dev.sync().unwrap();
+    drop(src_dev);
+
+    // Confirm source's sparse.bin really has a small blocks_512.
+    {
+        let mut dev = FileBackend::open(src_tmp.path()).unwrap();
+        let ext = Ext::open(&mut dev).unwrap();
+        let ino = ext.path_to_inode(&mut dev, "/sparse.bin").unwrap();
+        let inode = ext.read_inode(&mut dev, ino).unwrap();
+        assert!(
+            inode.blocks_512 < 64,
+            "source sparse.bin used {} sectors, expected far fewer than dense ({})",
+            inode.blocks_512,
+            body.len() / 512
+        );
+    }
+
+    // Repack via the CLI; the repack path now sets sparse=true on the
+    // destination Ext.
+    let dst = NamedTempFile::new().unwrap();
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_fstool"));
+    let out = Command::new(&bin)
+        .args(["repack", "--shrink"])
+        .arg(src_tmp.path())
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fstool repack failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Destination's sparse.bin must still be sparse: blocks_512 small,
+    // file content byte-exact.
+    let mut dst_dev = FileBackend::open(dst.path()).unwrap();
+    let dst_ext = Ext::open(&mut dst_dev).unwrap();
+    let ino = dst_ext.path_to_inode(&mut dst_dev, "/sparse.bin").unwrap();
+    let inode = dst_ext.read_inode(&mut dst_dev, ino).unwrap();
+    assert!(
+        inode.blocks_512 < 64,
+        "destination sparse.bin used {} sectors after repack, expected sparse layout",
+        inode.blocks_512
+    );
+    let mut got = Vec::new();
+    dst_ext
+        .open_file_reader(&mut dst_dev, ino)
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, body, "sparse.bin content mismatch after repack");
+    drop(dst_dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected sparse-preserving repack:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}

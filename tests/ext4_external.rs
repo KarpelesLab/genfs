@@ -395,3 +395,226 @@ fn ext4_sparse_super_skips_non_backup_groups() {
         "group 3 SHOULD have a backup superblock (3 is a power of 3):\n{body}"
     );
 }
+
+/// Add enough entries to a single directory that it spans multiple data
+/// blocks. Exercises the writer's directory-growth path (per-block linear
+/// fill, allocate-and-extend-extent on overflow). The output must pass
+/// `e2fsck -fn` and `debugfs ls /bigdir` must list every entry.
+#[test]
+fn ext4_large_directory_spans_multiple_blocks() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    // 4 KiB blocks → ~120 short entries per dir block. 500 names guarantees
+    // we cross the single-block cap, but stays well under the depth-0 extent
+    // cap (4 contiguous-or-coalescing extents).
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 8192,
+        inodes_count: 1024,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    // Subdirectory to hold the burst.
+    let bigdir = ext
+        .add_dir_to(&mut dev, 2, b"bigdir", FileMeta::with_mode(0o755))
+        .unwrap();
+
+    // 500 zero-byte files with short, distinct names.
+    let n = 500u32;
+    for i in 0..n {
+        let name = format!("f{i:04}");
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(b"").unwrap();
+        ext.add_file_to(
+            &mut dev,
+            bigdir,
+            name.as_bytes(),
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Confirm the inode's recorded size grew past one block.
+    let bigdir_inode = ext.read_inode(&mut dev, bigdir).unwrap();
+    assert!(
+        bigdir_inode.size > opts.block_size,
+        "expected multi-block dir, got size={} (one block is {})",
+        bigdir_inode.size,
+        opts.block_size
+    );
+
+    // Our own reader must see all 500 names.
+    let entries = ext.list_inode(&mut dev, bigdir).unwrap();
+    let names: std::collections::HashSet<_> = entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    assert_eq!(
+        names.len() as u32,
+        n,
+        "fstool ls miscounted: got {} expected {n}",
+        names.len()
+    );
+
+    drop(dev);
+
+    // e2fsck must stay clean.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed on multi-block dir image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    // debugfs must agree on the entry count.
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg("ls -l /bigdir")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let count = listing
+        .lines()
+        .filter(|l| {
+            // Real entry rows start with "<inode>". Skip blank, ".", "..".
+            let first = l.split_whitespace().next().unwrap_or("");
+            first.parse::<u32>().is_ok()
+                && !l.contains(" . ")
+                && !l.ends_with(" .")
+                && !l.contains(" .. ")
+                && !l.ends_with(" ..")
+        })
+        .count();
+    assert_eq!(
+        count as u32, n,
+        "debugfs counted {count} entries, expected {n}:\n{listing}"
+    );
+}
+
+/// Force the extent tree past its depth-0 cap (4 inline leaves) by
+/// interleaving directory growth with multi-block file writes. Each file
+/// pushes the allocator forward several blocks, so each successive dir
+/// block lands non-adjacent to the previous one → no coalescing → many
+/// extents. The writer must promote depth-0 → depth-1, write a leaf
+/// block with its `ext4_extent_tail` CRC32C, and pass e2fsck on the
+/// metadata_csum-enabled output.
+#[test]
+fn ext4_fragmented_directory_promotes_to_depth1_extent_tree() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 32 * 1024,
+        inodes_count: 4096,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    let bigdir = ext
+        .add_dir_to(&mut dev, 2, b"frag", FileMeta::with_mode(0o755))
+        .unwrap();
+
+    // Make every file 16 KiB → 4 dir-block-sized regions are allocated
+    // between each dir grow, fragmenting the dir's own block layout
+    // enough to need more than 4 extents.
+    let mut payload = Vec::with_capacity(16 * 1024);
+    for i in 0..(16 * 1024) {
+        payload.push((i & 0xff) as u8);
+    }
+    // ~250 entries fill one 4 KiB block; 2000 needs ~8 dir blocks, which
+    // can't fit in 4 inline extents once each block is fragmented.
+    let n = 2000u32;
+    for i in 0..n {
+        let name = format!("frag{i:04}");
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(&payload).unwrap();
+        ext.add_file_to(
+            &mut dev,
+            bigdir,
+            name.as_bytes(),
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Our reader must enumerate every entry — exercises both depth-0 and
+    // depth-1 readback.
+    let entries = ext.list_inode(&mut dev, bigdir).unwrap();
+    let names: std::collections::HashSet<_> = entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    assert_eq!(names.len() as u32, n, "fstool ls miscounted");
+
+    // Confirm the inode's extent tree is now depth-1 (otherwise the test
+    // wouldn't have exercised the new path). Decode the header directly.
+    let frag = ext.read_inode(&mut dev, bigdir).unwrap();
+    let bytes = {
+        let mut out = [0u8; 60];
+        for (i, slot) in frag.block.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&slot.to_le_bytes());
+        }
+        out
+    };
+    let magic = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
+    assert_eq!(magic, 0xF30A, "extent header magic missing");
+    let depth = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+    assert_eq!(
+        depth, 1,
+        "expected /frag to use depth-1 extent tree (got depth={depth})"
+    );
+
+    drop(dev);
+
+    // e2fsck stays clean — depth-1 leaves carry the `ext4_extent_tail`
+    // CRC, which is what would fail here if the stamp path is wrong.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed on fragmented dir image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}

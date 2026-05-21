@@ -277,6 +277,10 @@ pub struct Ext {
     /// owning directory inode. Used at flush time to stamp the per-block
     /// CRC32C checksum tail when `metadata_csum` is active.
     dir_blocks: Vec<(u32, u32)>,
+    /// Extent-tree leaf blocks staged in `data_blocks`, tagged with their
+    /// owning inode. Used at flush time to stamp the 4-byte
+    /// `ext4_extent_tail` CRC32C when `metadata_csum` is active.
+    extent_leaf_blocks: Vec<(u32, u32)>,
     /// True until the first flush after a `format_with` lands. The
     /// initial flush is a "blast everything fresh" write that doesn't
     /// ride a journal transaction (there's nothing yet to be consistent
@@ -415,6 +419,7 @@ impl Ext {
             inodes: Vec::new(),
             data_blocks: Vec::new(),
             dir_blocks: Vec::new(),
+            extent_leaf_blocks: Vec::new(),
             // During format the journal SB is staged in `data_blocks`
             // and the file system as a whole is being assembled fresh;
             // the initial flush is a "blast everything" write rather
@@ -503,8 +508,15 @@ impl Ext {
     }
 
     /// Whether the `metadata_csum` feature is active on this filesystem.
-    fn has_metadata_csum(&self) -> bool {
+    pub(crate) fn has_metadata_csum(&self) -> bool {
         self.sb.feature_ro_compat & constants::feature::RO_COMPAT_METADATA_CSUM != 0
+    }
+
+    /// Public accessor for [`Self::has_metadata_csum`], exposed for the
+    /// repack layer (which needs to mirror destination metadata_csum
+    /// state when pre-sizing directories).
+    pub fn has_metadata_csum_pub(&self) -> bool {
+        self.has_metadata_csum()
     }
 
     /// Whether directory entries carry a `file_type` byte (`INCOMPAT_FILETYPE`).
@@ -718,8 +730,11 @@ impl Ext {
     }
 
     /// Append a dir entry into the data block(s) of the directory whose
-    /// inode is `dir_inode`. v1: only ever touches the directory's first
-    /// data block; full-block error if it doesn't fit.
+    /// inode is `dir_inode`. Walks the existing data blocks (last-to-first,
+    /// since appends cluster at the tail) and writes into the first one
+    /// with room; if every block is full, allocates a new data block,
+    /// extends the inode's block-pointer storage, and writes into the
+    /// fresh block.
     fn add_entry_to_dir_block_for(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -729,35 +744,423 @@ impl Ext {
         file_type: u8,
     ) -> Result<()> {
         self.ensure_inode_staged(dev, dir_inode)?;
-        // Resolve the dir's first data block via file_block (handles both
-        // direct-pointer ext2 dirs and extent-encoded ext4 dirs uniformly).
+        let bs = self.layout.block_size;
+        let usable = dir::usable_dir_len(bs, self.has_metadata_csum());
+        let with_filetype = self.has_filetype();
+
+        // Snapshot the staged inode so we can call file_block/etc without
+        // re-borrowing self.inodes mid-loop.
         let inode_copy = self
             .inodes
             .iter()
             .find(|(i, _)| *i == dir_inode)
             .map(|(_, i)| *i)
             .unwrap();
-        let dir_block_num = self.file_block(dev, &inode_copy, 0)?;
-        if dir_block_num == 0 {
-            return Err(crate::Error::InvalidImage(format!(
-                "ext: dir inode {dir_inode} has no first data block"
+        let n_blocks = inode_copy.size.div_ceil(bs);
+
+        // Try existing blocks last-to-first: the tail block is the only
+        // candidate with room under a build-only workload; falling back
+        // to earlier blocks covers the cold path where deletions opened
+        // slack.
+        for logical in (0..n_blocks).rev() {
+            let blk = self.file_block(dev, &inode_copy, logical)?;
+            if blk == 0 {
+                // Sparse gap inside a directory — skip.
+                continue;
+            }
+            self.ensure_block_staged(dev, blk)?;
+            if !self.dir_blocks.iter().any(|(b, _)| *b == blk) {
+                self.dir_blocks.push((blk, dir_inode));
+            }
+            let block = self
+                .data_blocks
+                .iter_mut()
+                .find(|(b, _)| *b == blk)
+                .map(|(_, bytes)| bytes)
+                .unwrap();
+            if try_append_dir_entry(block, name, child_ino, file_type, with_filetype, usable)? {
+                return Ok(());
+            }
+        }
+
+        // Every existing block is full (or there are none): grow the dir
+        // by one block and write the entry into it.
+        self.grow_dir_block_and_append(dev, dir_inode, name, child_ino, file_type)
+    }
+
+    /// Allocate one new data block for directory `dir_inode`, append it to
+    /// the inode's block-pointer storage (extents for ext4, direct +
+    /// single-indirect for ext2/3), initialise it as an empty dir block,
+    /// and write the new entry into it.
+    fn grow_dir_block_and_append(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_inode: u32,
+        name: &[u8],
+        child_ino: u32,
+        file_type: u8,
+    ) -> Result<()> {
+        let bs = self.layout.block_size;
+        let csum_tail = self.has_metadata_csum();
+        let with_filetype = self.has_filetype();
+        let usable = dir::usable_dir_len(bs, csum_tail);
+
+        let new_blk = self.alloc_data_block()?;
+
+        // Compute the next logical block index from the current inode size.
+        let inode_copy = self
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == dir_inode)
+            .map(|(_, i)| *i)
+            .unwrap();
+        let new_logical = inode_copy.size.div_ceil(bs);
+
+        // Wire the new block into the inode's block-pointer storage.
+        let meta_blocks_added =
+            self.append_data_block_to_inode(dev, dir_inode, new_logical, new_blk)?;
+
+        // Grow i_size by one block and account for the new data block plus
+        // any indirection metadata that the append required.
+        let sectors_per_block = bs / 512;
+        self.patch_inode(dev, dir_inode, |i| {
+            i.size += bs;
+            i.blocks_512 += sectors_per_block * (1 + meta_blocks_added);
+        })?;
+
+        // Initialise the new dir block in memory (one empty placeholder
+        // entry spanning the usable region; csum tail stamped at flush).
+        let mut new_buf = dir::make_empty_dir_block(bs, csum_tail);
+        // Write the actual entry into the placeholder.
+        if !try_append_dir_entry(
+            &mut new_buf,
+            name,
+            child_ino,
+            file_type,
+            with_filetype,
+            usable,
+        )? {
+            return Err(crate::Error::Unsupported(format!(
+                "ext: dir entry for {:?} doesn't fit in a fresh {bs}-byte block",
+                String::from_utf8_lossy(name)
             )));
         }
-        self.ensure_block_staged(dev, dir_block_num)?;
-        // This block is a directory block; tag it so flush stamps its
-        // checksum tail (no-op if already recorded).
-        if !self.dir_blocks.iter().any(|(b, _)| *b == dir_block_num) {
-            self.dir_blocks.push((dir_block_num, dir_inode));
+        self.data_blocks.push((new_blk, new_buf));
+        self.dir_blocks.push((new_blk, dir_inode));
+        Ok(())
+    }
+
+    /// Append a single new data block to the block-pointer storage of
+    /// inode `inode_no`. Dispatches on the extent-tree flag: extents for
+    /// ext4 inodes, classic direct + single-indirect for ext2/3 inodes.
+    ///
+    /// Returns the number of newly allocated *metadata* blocks (indirect
+    /// blocks for ext2/3, extent-tree leaves for ext4) so the caller can
+    /// fold them into `blocks_512`. The data block itself is allocated by
+    /// the caller and is not counted here.
+    fn append_data_block_to_inode(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        inode_no: u32,
+        new_logical: u32,
+        new_phys: u32,
+    ) -> Result<u32> {
+        let uses_extents = self
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == inode_no)
+            .map(|(_, i)| i.flags & constants::EXT4_EXTENTS_FL != 0)
+            .unwrap();
+        if uses_extents {
+            self.append_extent_inline(dev, inode_no, new_logical, new_phys)
+        } else {
+            self.append_indirect_block(dev, inode_no, new_logical, new_phys)
         }
-        let usable = dir::usable_dir_len(self.layout.block_size, self.has_metadata_csum());
-        let with_filetype = self.has_filetype();
-        let block = self
+    }
+
+    /// Append `new_phys` (at logical block `new_logical`) to an
+    /// inline-extent-tree inode. Tries to extend the last extent first
+    /// (zero allocation, best for the typical contiguous case); otherwise
+    /// adds a new extent. Promotes a depth-0 tree to depth-1 when more
+    /// than 4 leaf extents would be needed, and appends into an existing
+    /// depth-1 tree's last leaf.
+    ///
+    /// Returns the number of newly allocated metadata blocks (extent
+    /// leaves) so the caller can fold them into `blocks_512`.
+    fn append_extent_inline(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        inode_no: u32,
+        new_logical: u32,
+        new_phys: u32,
+    ) -> Result<u32> {
+        let inode_copy = self
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == inode_no)
+            .map(|(_, i)| *i)
+            .unwrap();
+        let iblock = extent::iblock_to_bytes(&inode_copy.block);
+        let header = extent::decode_header(&iblock[..12])?;
+        match header.depth {
+            0 => self.append_extent_depth0(dev, inode_no, &iblock, new_logical, new_phys),
+            1 => self.append_extent_depth1(dev, inode_no, new_logical, new_phys),
+            d => Err(crate::Error::Unsupported(format!(
+                "ext4: extent tree depth {d} growth not supported (writer caps at depth-1)"
+            ))),
+        }
+    }
+
+    /// Depth-0 append: try last-extent extension, fall back to adding a
+    /// new extent. If that would exceed the 4-extent inline cap, promote
+    /// the tree to depth-1.
+    fn append_extent_depth0(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        inode_no: u32,
+        iblock: &[u8; 60],
+        new_logical: u32,
+        new_phys: u32,
+    ) -> Result<u32> {
+        let (_, mut runs) = extent::decode_depth0_iblock(iblock)?;
+        let extended = if let Some(last) = runs.last_mut() {
+            last.physical + last.len as u64 == new_phys as u64
+                && (last.logical + last.len as u32) == new_logical
+                && last.len < extent::MAX_LEN_PER_EXTENT
+                && {
+                    last.len += 1;
+                    true
+                }
+        } else {
+            false
+        };
+        if !extended {
+            runs.push(extent::ExtentRun {
+                logical: new_logical,
+                len: 1,
+                physical: new_phys as u64,
+            });
+        }
+        if runs.len() <= extent::MAX_EXTENTS_IN_INODE {
+            let packed = extent::pack_into_iblock(&runs)?;
+            self.patch_inode(dev, inode_no, |i| {
+                i.block = extent::bytes_to_iblock(&packed);
+            })?;
+            return Ok(0);
+        }
+        // Promote depth-0 → depth-1. With locality-favouring sequential
+        // allocation, runs.len() usually stays small; we still need this
+        // path when files are interleaved with directory growth.
+        self.promote_extent_tree_to_depth1(dev, inode_no, runs)
+    }
+
+    /// Rebuild the inode's extent tree as a depth-1 layout: one idx node
+    /// inline in `i_block`, plus N leaf blocks (each capped to `per_leaf`
+    /// extents). Allocates the leaf blocks fresh, stages them in
+    /// `data_blocks`, and tracks them for CRC stamping when
+    /// `metadata_csum` is on.
+    fn promote_extent_tree_to_depth1(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        inode_no: u32,
+        runs: Vec<extent::ExtentRun>,
+    ) -> Result<u32> {
+        let bs = self.layout.block_size;
+        let csum_tail = self.has_metadata_csum();
+        let per_leaf = extent::entries_per_leaf_block_capped(bs, csum_tail);
+        let need_leaves = runs.len().div_ceil(per_leaf);
+        if need_leaves > extent::MAX_INDICES_IN_INODE {
+            return Err(crate::Error::Unsupported(format!(
+                "ext4: depth-1 tree needs {need_leaves} leaf blocks, max {} inline (depth>1 not supported)",
+                extent::MAX_INDICES_IN_INODE
+            )));
+        }
+        let mut leaf_phys = Vec::with_capacity(need_leaves);
+        for _ in 0..need_leaves {
+            leaf_phys.push(self.alloc_data_block()?);
+        }
+        let (i_block_bytes, leaf_images) = extent::pack_depth1(&runs, bs, csum_tail, &leaf_phys)?;
+        for (phys, image) in leaf_phys.iter().zip(leaf_images.into_iter()) {
+            // Stage in data_blocks; track for CRC stamping at flush.
+            if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| b == phys) {
+                slot.1 = image;
+            } else {
+                self.data_blocks.push((*phys, image));
+            }
+            self.track_extent_leaf_block(*phys, inode_no);
+        }
+        self.patch_inode(dev, inode_no, |i| {
+            i.block = extent::bytes_to_iblock(&i_block_bytes);
+        })?;
+        Ok(need_leaves as u32)
+    }
+
+    /// Depth-1 append: walk the idx array, load the last leaf block,
+    /// extend its last extent or add a new one; if that leaf is full,
+    /// allocate another leaf and add an idx entry pointing at it (capped
+    /// at 4 inline idx entries — beyond that we'd need depth-2).
+    fn append_extent_depth1(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        inode_no: u32,
+        new_logical: u32,
+        new_phys: u32,
+    ) -> Result<u32> {
+        let bs = self.layout.block_size;
+        let csum_tail = self.has_metadata_csum();
+        let per_leaf = extent::entries_per_leaf_block_capped(bs, csum_tail);
+
+        let inode_copy = self
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == inode_no)
+            .map(|(_, i)| *i)
+            .unwrap();
+        let iblock = extent::iblock_to_bytes(&inode_copy.block);
+        let (_, mut indices) = extent::decode_idx_iblock(&iblock)?;
+        if indices.is_empty() {
+            return Err(crate::Error::InvalidImage(
+                "ext4: depth-1 extent tree with zero idx entries".into(),
+            ));
+        }
+        // Append to the LAST leaf block (the only candidate with room
+        // under the streaming-build workload).
+        let last_idx = indices.last().copied().unwrap();
+        let last_leaf_phys = last_idx.leaf as u32;
+        self.ensure_block_staged(dev, last_leaf_phys)?;
+        self.track_extent_leaf_block(last_leaf_phys, inode_no);
+
+        let leaf_bytes = self
+            .data_blocks
+            .iter()
+            .find(|(b, _)| *b == last_leaf_phys)
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap();
+        let (leaf_header, mut leaf_runs) = extent::decode_leaf_block(&leaf_bytes[..bs as usize])?;
+        let _ = leaf_header;
+
+        // Try extending the last extent on the last leaf.
+        let extended = if let Some(last) = leaf_runs.last_mut() {
+            last.physical + last.len as u64 == new_phys as u64
+                && (last.logical + last.len as u32) == new_logical
+                && last.len < extent::MAX_LEN_PER_EXTENT
+                && {
+                    last.len += 1;
+                    true
+                }
+        } else {
+            false
+        };
+        let mut allocated_meta = 0u32;
+        if extended {
+            // Re-encode the last leaf in place.
+            let new_image = extent::encode_leaf_block(&leaf_runs, bs, csum_tail)?;
+            if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| *b == last_leaf_phys) {
+                slot.1 = new_image;
+            }
+            return Ok(allocated_meta);
+        }
+        // Try adding a new extent into the last leaf.
+        if leaf_runs.len() < per_leaf {
+            leaf_runs.push(extent::ExtentRun {
+                logical: new_logical,
+                len: 1,
+                physical: new_phys as u64,
+            });
+            let new_image = extent::encode_leaf_block(&leaf_runs, bs, csum_tail)?;
+            if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| *b == last_leaf_phys) {
+                slot.1 = new_image;
+            }
+            return Ok(allocated_meta);
+        }
+        // Last leaf is full. Allocate a new leaf with the single new
+        // extent, and add an idx entry pointing at it.
+        if indices.len() >= extent::MAX_INDICES_IN_INODE {
+            return Err(crate::Error::Unsupported(format!(
+                "ext4: depth-1 tree has {} idx slots filled with full leaves; depth-2 not supported",
+                indices.len()
+            )));
+        }
+        let new_leaf_phys = self.alloc_data_block()?;
+        allocated_meta += 1;
+        let new_run = extent::ExtentRun {
+            logical: new_logical,
+            len: 1,
+            physical: new_phys as u64,
+        };
+        let new_leaf_image = extent::encode_leaf_block(&[new_run], bs, csum_tail)?;
+        self.data_blocks.push((new_leaf_phys, new_leaf_image));
+        self.track_extent_leaf_block(new_leaf_phys, inode_no);
+        indices.push(extent::ExtentIdx {
+            block: new_logical,
+            leaf: new_leaf_phys as u64,
+        });
+        let packed = extent::pack_idx_into_iblock(&indices)?;
+        self.patch_inode(dev, inode_no, |i| {
+            i.block = extent::bytes_to_iblock(&packed);
+        })?;
+        Ok(allocated_meta)
+    }
+
+    /// Append `new_phys` (at logical block `new_logical`) to an ext2/3
+    /// inode using direct + single-indirect block pointers. Allocates an
+    /// indirect block on demand (returning 1 in that case so the caller
+    /// folds it into `blocks_512`).
+    fn append_indirect_block(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        inode_no: u32,
+        new_logical: u32,
+        new_phys: u32,
+    ) -> Result<u32> {
+        let bs = self.layout.block_size;
+        let ptrs_per_block = (bs / 4) as u32;
+        let n_direct = constants::N_DIRECT as u32;
+        if new_logical < n_direct {
+            self.patch_inode(dev, inode_no, |i| {
+                i.block[new_logical as usize] = new_phys;
+            })?;
+            return Ok(0);
+        }
+        let single_off = new_logical - n_direct;
+        if single_off >= ptrs_per_block {
+            return Err(crate::Error::Unsupported(format!(
+                "ext: directory grew past single-indirect capacity at logical block {new_logical}"
+            )));
+        }
+        // Locate (or allocate) the single-indirect block.
+        let inode_copy = self
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == inode_no)
+            .map(|(_, i)| *i)
+            .unwrap();
+        let (ind_blk, meta_added) = match inode_copy.block[constants::IDX_INDIRECT] {
+            0 => {
+                let blk = self.alloc_data_block()?;
+                self.patch_inode(dev, inode_no, |i| {
+                    i.block[constants::IDX_INDIRECT] = blk;
+                })?;
+                // Initialise the indirect block to all zeros (the holes
+                // pattern); the slot we're about to write is the only
+                // non-zero entry initially.
+                self.data_blocks.push((blk, vec![0u8; bs as usize]));
+                (blk, 1u32)
+            }
+            existing => {
+                self.ensure_block_staged(dev, existing)?;
+                (existing, 0u32)
+            }
+        };
+        let ind_buf = self
             .data_blocks
             .iter_mut()
-            .find(|(b, _)| *b == dir_block_num)
+            .find(|(b, _)| *b == ind_blk)
             .map(|(_, bytes)| bytes)
             .unwrap();
-        append_dir_entry(block, name, child_ino, file_type, with_filetype, usable)
+        let off = single_off as usize * 4;
+        ind_buf[off..off + 4].copy_from_slice(&new_phys.to_le_bytes());
+        Ok(meta_added)
     }
 
     /// Mutate an inode in place. If the inode isn't already in the staged
@@ -918,13 +1321,16 @@ impl Ext {
         // assume their inode stays staged across `sync` calls.
         self.data_blocks.clear();
         self.dir_blocks.clear();
+        self.extent_leaf_blocks.clear();
         Ok(())
     }
 
-    /// Stamp every staged directory data block's CRC32C tail in place.
-    /// No-op when `metadata_csum` is off. Called by [`flush_metadata`]
-    /// before the journal commit so the journaled image matches what
-    /// the checkpoint phase writes to the directory's home block.
+    /// Stamp every staged metadata block's CRC32C tail in place: dir
+    /// blocks (12-byte trailing dirent + CRC) and extent-tree leaf blocks
+    /// (4-byte `ext4_extent_tail` at the very end). No-op when
+    /// `metadata_csum` is off. Called by [`flush_metadata`] before the
+    /// journal commit so the journaled image matches what the checkpoint
+    /// phase writes to each block's home location.
     fn stamp_dir_block_checksums(&mut self) {
         if !self.has_metadata_csum() {
             return;
@@ -941,8 +1347,37 @@ impl Ext {
                 let n = bytes.len();
                 let c = csum::dir_block(seed, *dir_ino, generation, &bytes[..n - 12]);
                 bytes[n - 4..].copy_from_slice(&c.to_le_bytes());
+                continue;
+            }
+            if let Some((_, owner_ino)) =
+                self.extent_leaf_blocks.iter().find(|(b, _)| b == blk)
+            {
+                let generation = self
+                    .inodes
+                    .iter()
+                    .find(|(i, _)| i == owner_ino)
+                    .map(|(_, i)| i.generation)
+                    .unwrap_or(0);
+                let n = bytes.len();
+                let c = csum::extent_tail(seed, *owner_ino, generation, &bytes[..n - 4]);
+                bytes[n - 4..].copy_from_slice(&c.to_le_bytes());
             }
         }
+    }
+
+    /// Register `blk` as an extent-tree leaf block owned by `inode_no`.
+    /// At flush time the per-block `ext4_extent_tail` CRC32C is stamped
+    /// against this inode's number + generation. Idempotent.
+    pub(crate) fn track_extent_leaf_block(&mut self, blk: u32, inode_no: u32) {
+        if !self.extent_leaf_blocks.iter().any(|(b, _)| *b == blk) {
+            self.extent_leaf_blocks.push((blk, inode_no));
+        }
+    }
+
+    /// Reverse of [`track_extent_leaf_block`]: drop the record so a freed
+    /// leaf block is no longer stamped on flush.
+    pub(crate) fn untrack_extent_leaf_block(&mut self, blk: u32) {
+        self.extent_leaf_blocks.retain(|(b, _)| *b != blk);
     }
 
     /// Build the block-aligned metadata image set (block_no, full-block
@@ -1323,6 +1758,67 @@ impl Ext {
             dir::make_initial_dir_block(ino, parent_ino, bs, with_filetype, csum_tail);
         self.data_blocks.push((blk, block_bytes));
         self.dir_blocks.push((blk, ino));
+        self.inodes.push((ino, inode));
+        self.groups[0].desc.used_dirs_count += 1;
+
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
+        self.patch_inode(dev, parent_ino, |i| i.links_count += 1)?;
+        Ok(ino)
+    }
+
+    /// Like [`Self::add_dir_to`] but pre-allocates `n_blocks` data blocks
+    /// for the new directory's body, wired into the inode in one shot.
+    /// Use this when the caller knows the destination directory's child
+    /// count up front (e.g. repack walking a source directory): a
+    /// contiguous run from the sequential allocator coalesces into a
+    /// single extent, side-stepping the per-grow extent-tree mutations
+    /// and keeping the dir at depth-0 even with many entries.
+    ///
+    /// `n_blocks` must be at least 1. If the caller under-estimates,
+    /// the streaming `add_entry_to_dir_block_for` growth path takes over
+    /// naturally — this is a hint, not a hard limit.
+    pub fn add_dir_to_with_blocks(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_ino: u32,
+        name: &[u8],
+        meta: FileMeta,
+        n_blocks: u32,
+    ) -> Result<u32> {
+        let n_blocks = n_blocks.max(1);
+        let bs = self.layout.block_size;
+        let csum_tail = self.has_metadata_csum();
+        let with_filetype = self.has_filetype();
+        let ino = self.alloc_inode()?;
+        // Allocate the dir's blocks back-to-back. With the sequential
+        // bitmap allocator this is a contiguous run within a group, so
+        // `coalesce` produces a single extent.
+        let mut blocks = Vec::with_capacity(n_blocks as usize);
+        for _ in 0..n_blocks {
+            blocks.push(self.alloc_data_block()?);
+        }
+        let mut inode = Inode::directory(bs * n_blocks, meta.mode & 0o7777, meta.uid, meta.gid, meta.mtime);
+        // ext4: extent tree (depth-0 for any contiguous run that fits in
+        // 4 leaves, depth-1 otherwise via the streaming-grow promote
+        // path — but with sequential alloc we should always stay
+        // depth-0). ext2/3: direct + indirect chain.
+        let allocated_meta = if matches!(self.kind, FsKind::Ext4) {
+            self.fill_block_pointers_extent(&mut inode, &blocks)?
+        } else {
+            self.fill_block_pointers_indirect(&mut inode, &blocks)?
+        };
+        inode.blocks_512 = (n_blocks + allocated_meta) * (bs / 512);
+
+        // First block: "." / ".."; all trailing blocks: empty placeholder
+        // so the linear-scan reader sees well-formed dir blocks.
+        let head = dir::make_initial_dir_block(ino, parent_ino, bs, with_filetype, csum_tail);
+        self.data_blocks.push((blocks[0], head));
+        self.dir_blocks.push((blocks[0], ino));
+        for &blk in &blocks[1..] {
+            self.data_blocks
+                .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
+            self.dir_blocks.push((blk, ino));
+        }
         self.inodes.push((ino, inode));
         self.groups[0].desc.used_dirs_count += 1;
 
@@ -1862,6 +2358,7 @@ impl Ext {
             inodes: Vec::new(),
             data_blocks: Vec::new(),
             dir_blocks: Vec::new(),
+            extent_leaf_blocks: Vec::new(),
             // Opened (vs. just-formatted) images go through the journal
             // path on flush. `open()` itself runs JBD2 replay before
             // returning, so by the time we land here the on-disk journal
@@ -2559,18 +3056,51 @@ fn kind_from_mode(mode: u16) -> crate::fs::EntryKind {
 
 /// Append a dir entry to a directory block by shrinking the existing last
 /// entry to its natural minimum and writing the new entry into the freed
-/// tail. `usable` is the byte length available for real entries — the whole
+/// tail.
+///
+/// `usable` is the byte length available for real entries — the whole
 /// block, or `block_size - 12` when `metadata_csum` reserves a checksum
-/// tail. The last real entry's `rec_len` runs up to `usable`.
-fn append_dir_entry(
+/// tail. The last real entry's `rec_len` always runs up to `usable`.
+///
+/// Returns `Ok(true)` when the entry fits and is written, `Ok(false)`
+/// when the block has insufficient trailing slack (caller should grow the
+/// directory by one block and retry), and `Err` only on a corrupt block.
+fn try_append_dir_entry(
     block: &mut [u8],
     name: &[u8],
     inode: u32,
     file_type: u8,
     with_filetype: bool,
     usable: usize,
-) -> Result<()> {
+) -> Result<bool> {
     let needed = dir::min_rec_len(name.len());
+
+    // Fresh-block fast path: when the sole entry is the empty placeholder
+    // produced by `make_empty_dir_block` (inode=0, name_len=0, rec_len
+    // spanning the usable region), overwrite it entirely with the new
+    // entry rather than leaving an 8-byte zero stub at offset 0. e2fsck
+    // accepts blocks that are *entirely* empty (single placeholder) and
+    // blocks whose first entry is a real one, but flags "placeholder stub
+    // followed by real entries" as a corrupted block.
+    if let Some(first) = dir::decode_entry(block, with_filetype) {
+        if first.inode == 0
+            && first.name.is_empty()
+            && first.rec_len >= usable
+            && needed <= usable
+        {
+            // Wipe the usable region (the csum tail past `usable` is
+            // untouched), then encode the single new entry to span it.
+            for b in block[..usable].iter_mut() {
+                *b = 0;
+            }
+            let mut tail = Vec::with_capacity(usable);
+            dir::encode_entry(&mut tail, inode, name, usable as u16, file_type, with_filetype);
+            debug_assert_eq!(tail.len(), usable);
+            block[..usable].copy_from_slice(&tail);
+            return Ok(true);
+        }
+    }
+
     let mut off = 0usize;
     let last_off: usize;
     loop {
@@ -2590,9 +3120,7 @@ fn append_dir_entry(
     let new_entry_off = last_off + last_min;
     let new_entry_space = last_real_end - new_entry_off;
     if new_entry_space < needed {
-        return Err(crate::Error::Unsupported(
-            "ext: dir block full — multi-block directories not yet implemented".into(),
-        ));
+        return Ok(false);
     }
     // Shrink the last entry's rec_len.
     block[last_off + 4..last_off + 6].copy_from_slice(&(last_min as u16).to_le_bytes());
@@ -2608,7 +3136,7 @@ fn append_dir_entry(
     );
     debug_assert_eq!(tail.len(), new_entry_space);
     block[new_entry_off..new_entry_off + new_entry_space].copy_from_slice(&tail);
-    Ok(())
+    Ok(true)
 }
 
 fn popcount_bits(bm: &[u8], start: u32, end: u32) -> u32 {

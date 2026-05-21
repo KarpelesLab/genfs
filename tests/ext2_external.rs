@@ -701,3 +701,114 @@ fn empty_ext2_dumpe2fs_clean() {
     assert!(stdout.contains("Inode count:              16"));
     assert!(stdout.contains("Filesystem state:         clean"));
 }
+
+/// ext2 cousin of `ext4_large_directory_spans_multiple_blocks`. Exercises
+/// the direct/single-indirect growth path: 1 KiB blocks → ~40 entries per
+/// block, so 300 entries cross both the direct-only threshold (12 blocks)
+/// and force a single-indirect block to be allocated for the dir.
+#[test]
+fn ext2_large_directory_uses_indirect_block() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        block_size: 1024,
+        blocks_count: 16 * 1024,
+        inodes_count: 4096,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    use fstool::block::BlockDevice;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    let bigdir = ext
+        .add_dir_to(&mut dev, 2, b"bigdir", FileMeta::with_mode(0o755))
+        .unwrap();
+
+    // ~62 entries fit per 1 KiB block (24 bytes for "."+".." in block 0,
+    // 16 bytes for each "fNNNN" entry). 900 entries cross the 12-direct
+    // threshold and force a single-indirect block.
+    let n = 900u32;
+    for i in 0..n {
+        let name = format!("f{i:04}");
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(b"").unwrap();
+        ext.add_file_to(
+            &mut dev,
+            bigdir,
+            name.as_bytes(),
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // The inode must have crossed the single-block threshold and ideally
+    // the 12-direct-block threshold (forcing a single-indirect block).
+    let inode = ext.read_inode(&mut dev, bigdir).unwrap();
+    assert!(
+        inode.size as u32 >= opts.block_size * 12,
+        "expected dir > 12 blocks, got size={} (block={})",
+        inode.size,
+        opts.block_size
+    );
+    // Single-indirect slot must be populated.
+    assert!(
+        inode.block[12] != 0,
+        "expected single-indirect block allocated, got 0 (block[]={:?})",
+        inode.block
+    );
+
+    // Our reader must see all 300 names.
+    let entries = ext.list_inode(&mut dev, bigdir).unwrap();
+    let names: std::collections::HashSet<_> = entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    assert_eq!(names.len() as u32, n, "fstool ls miscounted");
+
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg("ls -l /bigdir")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let count = listing
+        .lines()
+        .filter(|l| {
+            let first = l.split_whitespace().next().unwrap_or("");
+            first.parse::<u32>().is_ok()
+                && !l.contains(" . ")
+                && !l.ends_with(" .")
+                && !l.contains(" .. ")
+                && !l.ends_with(" ..")
+        })
+        .count();
+    assert_eq!(count as u32, n, "debugfs counted {count}, expected {n}");
+}

@@ -285,7 +285,11 @@ fn run(cli: Cli) -> fstool::Result<()> {
             let dst_str = paths.pop().expect("clap enforces num_args >= 2");
             let dst = PathBuf::from(dst_str);
             let srcs = paths;
-            repack_cmd(
+            // Install a progress sink for the duration of the repack;
+            // it emits a refreshing status line in TTY mode and stays
+            // quiet for pipes/logs.
+            fstool::repack::enter(fstool::repack::Progress::auto());
+            let res = repack_cmd(
                 &srcs,
                 &dst,
                 size.as_deref(),
@@ -293,7 +297,9 @@ fn run(cli: Cli) -> fstool::Result<()> {
                 fs_type.as_deref(),
                 block_size,
                 &cluster_size,
-            )
+            );
+            fstool::repack::leave();
+            res
         }
     }
 }
@@ -1387,6 +1393,19 @@ fn copy_ext_dir(
     dst: &mut fstool::fs::ext::Ext,
     dst_ino: u32,
 ) -> fstool::Result<()> {
+    copy_ext_dir_at(src_dev, src, src_ino, dst_dev, dst, dst_ino, "")
+}
+
+fn copy_ext_dir_at(
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    src: &fstool::fs::ext::Ext,
+    src_ino: u32,
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    dst: &mut fstool::fs::ext::Ext,
+    dst_ino: u32,
+    parent_path: &str,
+) -> fstool::Result<()> {
+    use fstool::fs::ext::dir as ext_dir;
     use fstool::fs::ext::inode::decode_devnum;
     use fstool::fs::{DeviceKind, FileMeta};
 
@@ -1409,6 +1428,11 @@ fn copy_ext_dir(
         // Read source xattrs once per entry; preserve them across the
         // create + (optional) recursion.
         let xattrs = src.read_xattrs(src_dev, e.inode)?;
+        let mut entry_path = String::with_capacity(parent_path.len() + 1 + e.name.len());
+        entry_path.push_str(parent_path);
+        entry_path.push('/');
+        entry_path.push_str(&e.name);
+        fstool::repack::note(&entry_path);
         let new_ino = match mode_type {
             t if t == fstool::fs::ext::constants::S_IFREG => {
                 let mut reader = src.open_file_reader(src_dev, e.inode)?;
@@ -1422,8 +1446,26 @@ fn copy_ext_dir(
                 )?
             }
             t if t == fstool::fs::ext::constants::S_IFDIR => {
-                let child_ino = dst.add_dir_to(dst_dev, dst_ino, name, meta)?;
-                copy_ext_dir(src_dev, src, e.inode, dst_dev, dst, child_ino)?;
+                // Pre-size from the source child list so the dst dir's
+                // blocks land in one contiguous run (one extent).
+                let child_blocks = {
+                    let entries = src.list_inode(src_dev, e.inode).unwrap_or_default();
+                    let mut bytes: usize = 24;
+                    for c in &entries {
+                        if c.name == "." || c.name == ".." {
+                            continue;
+                        }
+                        bytes += ext_dir::min_rec_len(c.name.len());
+                    }
+                    let usable = ext_dir::usable_dir_len(
+                        dst.layout.block_size,
+                        dst.has_metadata_csum_pub(),
+                    );
+                    bytes.div_ceil(usable).max(1) as u32
+                };
+                let child_ino =
+                    dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?;
+                copy_ext_dir_at(src_dev, src, e.inode, dst_dev, dst, child_ino, &entry_path)?;
                 child_ino
             }
             t if t == fstool::fs::ext::constants::S_IFLNK => {

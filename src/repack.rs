@@ -26,11 +26,130 @@
 //! [`spec`](crate::spec) layer when a TOML `source = "..."` value
 //! points at a tar / image instead of a directory.
 
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::Result;
 use crate::compression::Algo;
 use crate::fs::ext::{Ext, FsKind};
+
+/// Progress reporter for a running repack. The CLI installs one with
+/// [`enter`] before driving the copy path and tears it down with
+/// [`leave`] afterward; the inner copy code calls [`note`] for each
+/// entry it processes.
+///
+/// Output style adapts to the destination:
+/// - TTY → refreshing single line (`\r` + ANSI clear-to-end-of-line),
+///   throttled to one update per 200 ms.
+/// - Otherwise → silent unless explicitly verbose, in which case a
+///   fresh line lands every 500 entries.
+pub struct Progress {
+    files: u64,
+    last_emit: Instant,
+    last_path: String,
+    is_tty: bool,
+    verbose: bool,
+    started: Instant,
+}
+
+impl Progress {
+    /// Construct with style auto-detected from stderr.
+    pub fn auto() -> Self {
+        let now = Instant::now();
+        Self {
+            files: 0,
+            // Treat the first note as immediately due.
+            last_emit: now - Duration::from_secs(1),
+            last_path: String::new(),
+            is_tty: std::io::stderr().is_terminal(),
+            verbose: false,
+            started: now,
+        }
+    }
+
+    /// Force on (line-per-tick), useful when stderr is captured to a
+    /// log and the user still wants periodic progress.
+    pub fn verbose() -> Self {
+        let mut p = Self::auto();
+        p.verbose = true;
+        p
+    }
+
+    fn note_inner(&mut self, path: &str) {
+        self.files += 1;
+        self.last_path.clear();
+        self.last_path.push_str(path);
+        let now = Instant::now();
+        if now.duration_since(self.last_emit) < Duration::from_millis(200) {
+            return;
+        }
+        self.last_emit = now;
+        if self.is_tty {
+            let mut err = std::io::stderr().lock();
+            let _ = write!(
+                err,
+                "\r\x1b[Krepack: {} files | {}",
+                self.files, self.last_path
+            );
+            let _ = err.flush();
+        } else if self.verbose && self.files.is_multiple_of(500) {
+            eprintln!("repack: {} files | {}", self.files, self.last_path);
+        }
+    }
+
+    fn finish_inner(&self) {
+        let elapsed = self.started.elapsed();
+        if self.is_tty {
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(
+                err,
+                "\r\x1b[Krepack: {} files in {:.1}s",
+                self.files,
+                elapsed.as_secs_f32()
+            );
+        } else if self.verbose || self.files > 0 {
+            eprintln!(
+                "repack: {} files in {:.1}s",
+                self.files,
+                elapsed.as_secs_f32()
+            );
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_PROGRESS: std::cell::RefCell<Option<Progress>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install `p` as the active progress sink for this thread. Inner copy
+/// code calls [`note`] without knowing whether progress is wired up;
+/// the sink is per-thread so different concurrent repacks don't trample
+/// each other.
+pub fn enter(p: Progress) {
+    ACTIVE_PROGRESS.with(|cell| *cell.borrow_mut() = Some(p));
+}
+
+/// Tear down the active progress sink, emitting its final summary.
+/// No-op if `enter` wasn't called.
+pub fn leave() {
+    ACTIVE_PROGRESS.with(|cell| {
+        if let Some(p) = cell.borrow().as_ref() {
+            p.finish_inner();
+        }
+        *cell.borrow_mut() = None;
+    });
+}
+
+/// Record one processed entry at `path`. No-op when no sink is active.
+pub fn note(path: &str) {
+    ACTIVE_PROGRESS.with(|cell| {
+        if let Some(p) = cell.borrow_mut().as_mut() {
+            p.note_inner(path);
+        }
+    });
+}
 
 /// Where to draw a filesystem's contents from when building or
 /// populating it. See module docs.
@@ -979,6 +1098,53 @@ pub(crate) fn copy_ext_dir(
     dst: &mut crate::fs::ext::Ext,
     dst_ino: u32,
 ) -> crate::Result<()> {
+    copy_ext_dir_at(src_dev, src, src_ino, dst_dev, dst, dst_ino, "")
+}
+
+/// Walk the source directory at `src_ino` once and estimate how many
+/// destination data blocks its body will need. Sums each child's
+/// minimum dir-entry size (`min_rec_len(name_len)`), plus the 24 bytes
+/// for "." / "..", and divides by the usable-bytes-per-block for the
+/// destination's block size + metadata_csum mode. Errors during the
+/// walk fall back to 1 block — the streaming-grow path will pick up
+/// the slack.
+fn predict_dir_blocks(
+    src_dev: &mut dyn crate::block::BlockDevice,
+    src: &crate::fs::ext::Ext,
+    src_ino: u32,
+    dst_block_size: u32,
+    dst_csum_tail: bool,
+) -> u32 {
+    use crate::fs::ext::dir;
+    let entries = match src.list_inode(src_dev, src_ino) {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
+    // 24 bytes for the canonical "." (rec_len 12) + ".." (rec_len 12)
+    // at the head of the first block.
+    let mut bytes: usize = 24;
+    for e in &entries {
+        if e.name == "." || e.name == ".." {
+            continue;
+        }
+        bytes += dir::min_rec_len(e.name.len());
+    }
+    let usable = dir::usable_dir_len(dst_block_size, dst_csum_tail);
+    bytes.div_ceil(usable).max(1) as u32
+}
+
+/// Inner helper that threads the running path string for progress
+/// reporting. `parent_path` is the slash-joined source path of `src_ino`
+/// (empty for the source root); each child appends its own name.
+fn copy_ext_dir_at(
+    src_dev: &mut dyn crate::block::BlockDevice,
+    src: &crate::fs::ext::Ext,
+    src_ino: u32,
+    dst_dev: &mut dyn crate::block::BlockDevice,
+    dst: &mut crate::fs::ext::Ext,
+    dst_ino: u32,
+    parent_path: &str,
+) -> crate::Result<()> {
     use crate::fs::ext::inode::decode_devnum;
     use crate::fs::{DeviceKind, FileMeta};
 
@@ -1001,6 +1167,11 @@ pub(crate) fn copy_ext_dir(
         // Read source xattrs once per entry; preserve them across the
         // create + (optional) recursion.
         let xattrs = src.read_xattrs(src_dev, e.inode)?;
+        let mut entry_path = String::with_capacity(parent_path.len() + 1 + e.name.len());
+        entry_path.push_str(parent_path);
+        entry_path.push('/');
+        entry_path.push_str(&e.name);
+        note(&entry_path);
         let new_ino = match mode_type {
             t if t == crate::fs::ext::constants::S_IFREG => {
                 let mut reader = src.open_file_reader(src_dev, e.inode)?;
@@ -1014,8 +1185,15 @@ pub(crate) fn copy_ext_dir(
                 )?
             }
             t if t == crate::fs::ext::constants::S_IFDIR => {
-                let child_ino = dst.add_dir_to(dst_dev, dst_ino, name, meta)?;
-                copy_ext_dir(src_dev, src, e.inode, dst_dev, dst, child_ino)?;
+                // Pre-size the destination directory from the known
+                // source child count + total name length. With the
+                // sequential block allocator this lays the dir's blocks
+                // out as one contiguous extent — staying depth-0 and
+                // skipping per-entry extent-tree mutations.
+                let child_blocks = predict_dir_blocks(src_dev, src, e.inode, dst.layout.block_size, dst.has_metadata_csum_pub());
+                let child_ino =
+                    dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?;
+                copy_ext_dir_at(src_dev, src, e.inode, dst_dev, dst, child_ino, &entry_path)?;
                 child_ino
             }
             t if t == crate::fs::ext::constants::S_IFLNK => {

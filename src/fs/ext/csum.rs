@@ -94,6 +94,16 @@ pub fn dir_block(seed: u32, dir_inode: u32, dir_generation: u32, block_before_ta
     raw_update(c, block_before_tail)
 }
 
+/// Extent-tree leaf/index block checksum (`ext4_extent_tail`). Chained:
+/// seed → owning inode number → inode generation → the block bytes
+/// *before* the trailing 4-byte `et_checksum`. Pass
+/// `&block[..block_size - 4]`.
+pub fn extent_tail(seed: u32, inode_num: u32, generation: u32, block_before_tail: &[u8]) -> u32 {
+    let c = raw_update(seed, &inode_num.to_le_bytes());
+    let c = raw_update(c, &generation.to_le_bytes());
+    raw_update(c, block_before_tail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

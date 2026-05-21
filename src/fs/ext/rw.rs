@@ -256,7 +256,8 @@ impl<'a> Ext2FileHandle<'a> {
         old_state: &ExtentTreeState,
     ) -> Result<()> {
         let bs = self.ext.layout.block_size;
-        let per_leaf = extent::entries_per_leaf_block(bs);
+        let csum_tail = self.ext.has_metadata_csum();
+        let per_leaf = extent::entries_per_leaf_block_capped(bs, csum_tail);
         if runs.len() <= MAX_EXTENTS_IN_INODE {
             // Free any old leaf blocks before stamping a depth-0 tree.
             for &b in &old_state.leaf_blocks {
@@ -290,11 +291,14 @@ impl<'a> Ext2FileHandle<'a> {
 
         // Allocate new leaf blocks, build the idx array, and write each
         // leaf block's contents.
+        let ino = self.ino;
         let mut indices = Vec::with_capacity(needed_leaves);
         for chunk in runs.chunks(per_leaf) {
             let leaf_blk = self.ext.alloc_data_block()?;
-            let leaf_bytes = extent::encode_leaf_block(chunk, bs)?;
+            let leaf_bytes = extent::encode_leaf_block(chunk, bs, csum_tail)?;
             self.write_indirect_block(leaf_blk, &leaf_bytes)?;
+            // Track for metadata_csum tail stamping at flush time.
+            self.ext.track_extent_leaf_block(leaf_blk, ino);
             indices.push(ExtentIdx {
                 block: chunk[0].logical,
                 leaf: leaf_blk as u64,
@@ -309,10 +313,13 @@ impl<'a> Ext2FileHandle<'a> {
 
     /// Free a leaf block (depth-1 internal node). Also evicts the staged
     /// copy from `ext.data_blocks` so a future read of that block number
-    /// hits the (now-unowned) on-disk content instead of the stale leaf.
+    /// hits the (now-unowned) on-disk content instead of the stale leaf,
+    /// and drops the metadata_csum tracking record so no stale CRC is
+    /// stamped at flush.
     fn free_leaf_block(&mut self, blk: u32) {
         self.ext.free_block(blk);
         self.ext.data_blocks.retain(|(b, _)| *b != blk);
+        self.ext.untrack_extent_leaf_block(blk);
     }
 
     /// Sum the lengths of every leaf extent in the tree, then add the

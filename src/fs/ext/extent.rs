@@ -64,12 +64,21 @@ pub struct ExtentIdx {
 }
 
 /// Number of extent records (leaf or idx) that fit in a single
-/// `block_size`-byte tree block, after subtracting the 12-byte header and
-/// the optional 4-byte CRC tail. We don't emit a CRC tail (no
-/// `metadata_csum`-with-extent-tree path yet), so we use the full
-/// `(bs - 12) / 12` capacity.
+/// `block_size`-byte tree block. Used by the reader as an upper bound on
+/// `eh_entries`, so it must reflect the WITHOUT-csum capacity (a
+/// `metadata_csum`-on writer emits a smaller `eh_max`, which fits
+/// inside this bound).
 pub fn entries_per_leaf_block(block_size: u32) -> usize {
     ((block_size as usize) - 12) / 12
+}
+
+/// Same as [`entries_per_leaf_block`] but reserves the trailing 4-byte
+/// `ext4_extent_tail` (the CRC32C) when `csum_tail` is set. The writer
+/// emits this value as `eh_max` on each leaf block.
+pub fn entries_per_leaf_block_capped(block_size: u32, csum_tail: bool) -> usize {
+    let header = 12usize;
+    let tail = if csum_tail { 4 } else { 0 };
+    ((block_size as usize) - header - tail) / 12
 }
 
 /// Encode the 12-byte extent header.
@@ -206,11 +215,18 @@ pub fn pack_idx_into_iblock(indices: &[ExtentIdx]) -> crate::Result<[u8; 60]> {
 
 /// Encode a full leaf block (header + leaf extents) into a `bs`-byte
 /// buffer. Used when writing a leaf block to disk in a depth-1 tree.
-pub fn encode_leaf_block(runs: &[ExtentRun], block_size: u32) -> crate::Result<Vec<u8>> {
-    let max = entries_per_leaf_block(block_size);
+/// When `csum_tail` is set, the trailing 4 bytes are reserved for the
+/// `ext4_extent_tail` CRC32C (stamped at flush time, not here) and
+/// `eh_max` is capped to fit.
+pub fn encode_leaf_block(
+    runs: &[ExtentRun],
+    block_size: u32,
+    csum_tail: bool,
+) -> crate::Result<Vec<u8>> {
+    let max = entries_per_leaf_block_capped(block_size, csum_tail);
     if runs.len() > max {
         return Err(crate::Error::Unsupported(format!(
-            "ext4: leaf block would need {} entries, max {} per {}-byte block (depth > 1 not implemented)",
+            "ext4: leaf block would need {} entries, max {} per {}-byte block (csum_tail={csum_tail})",
             runs.len(),
             max,
             block_size,
@@ -224,6 +240,51 @@ pub fn encode_leaf_block(runs: &[ExtentRun], block_size: u32) -> crate::Result<V
         out[off..off + 12].copy_from_slice(&encode_leaf(*r));
     }
     Ok(out)
+}
+
+/// Pack `runs` into a depth-1 extent tree: an idx-node header + index
+/// entries in the 60-byte `i_block` view, plus one or more leaf-block
+/// images. The caller supplies `leaf_phys_blocks` — one physical block
+/// number per leaf — typically allocated immediately before this call.
+///
+/// Returns `(i_block_bytes, leaf_images)`. `leaf_images[i]` is the byte
+/// payload that should be staged at `leaf_phys_blocks[i]`.
+///
+/// Errors if `runs` would need more leaf blocks than `MAX_INDICES_IN_INODE`
+/// (4) — depth > 1 is intentionally not supported here; with 4 leaves of
+/// `entries_per_leaf_block_capped(bs, csum) * 32768` blocks each, depth-1
+/// already covers more than any realistic single-file address space.
+pub fn pack_depth1(
+    runs: &[ExtentRun],
+    block_size: u32,
+    csum_tail: bool,
+    leaf_phys_blocks: &[u32],
+) -> crate::Result<([u8; 60], Vec<Vec<u8>>)> {
+    let per_leaf = entries_per_leaf_block_capped(block_size, csum_tail);
+    let need_leaves = runs.len().div_ceil(per_leaf);
+    if need_leaves > MAX_INDICES_IN_INODE {
+        return Err(crate::Error::Unsupported(format!(
+            "ext4: depth-1 tree needs {need_leaves} leaf blocks, max {} (depth>1 not supported)",
+            MAX_INDICES_IN_INODE
+        )));
+    }
+    if leaf_phys_blocks.len() != need_leaves {
+        return Err(crate::Error::InvalidArgument(format!(
+            "pack_depth1: caller supplied {} leaf blocks, need {need_leaves}",
+            leaf_phys_blocks.len()
+        )));
+    }
+    let mut indices = Vec::with_capacity(need_leaves);
+    let mut leaf_images = Vec::with_capacity(need_leaves);
+    for (chunk_idx, chunk) in runs.chunks(per_leaf).enumerate() {
+        indices.push(ExtentIdx {
+            block: chunk[0].logical,
+            leaf: leaf_phys_blocks[chunk_idx] as u64,
+        });
+        leaf_images.push(encode_leaf_block(chunk, block_size, csum_tail)?);
+    }
+    let i_block = pack_idx_into_iblock(&indices)?;
+    Ok((i_block, leaf_images))
 }
 
 /// Decode a leaf block's runs. The header must claim depth == 0; any

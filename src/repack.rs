@@ -1186,13 +1186,33 @@ fn copy_ext_dir_at(
             }
             t if t == crate::fs::ext::constants::S_IFDIR => {
                 // Pre-size the destination directory from the known
-                // source child count + total name length. With the
-                // sequential block allocator this lays the dir's blocks
-                // out as one contiguous extent — staying depth-0 and
-                // skipping per-entry extent-tree mutations.
-                let child_blocks = predict_dir_blocks(src_dev, src, e.inode, dst.layout.block_size, dst.has_metadata_csum_pub());
-                let child_ino =
-                    dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?;
+                // source child list. For ext4 destinations with enough
+                // children to benefit from a hash index, emit an HTree
+                // (DIR_INDEX) directory — matches mke2fs output and
+                // gives O(log n) kernel-side lookups. For smaller dirs
+                // and for ext2/3 destinations, fall back to a contig
+                // unindexed dir (one extent, depth-0).
+                let child_entries = src.list_inode(src_dev, e.inode).unwrap_or_default();
+                let real_children: Vec<&crate::fs::DirEntry> = child_entries
+                    .iter()
+                    .filter(|c| c.name != "." && c.name != "..")
+                    .collect();
+                let use_htree = matches!(dst.kind, crate::fs::ext::FsKind::Ext4)
+                    && real_children.len() >= 250;
+                let child_ino = if use_htree {
+                    let names: Vec<&[u8]> =
+                        real_children.iter().map(|c| c.name.as_bytes()).collect();
+                    dst.add_dir_indexed(dst_dev, dst_ino, name, meta, &names)?
+                } else {
+                    let child_blocks = predict_dir_blocks(
+                        src_dev,
+                        src,
+                        e.inode,
+                        dst.layout.block_size,
+                        dst.has_metadata_csum_pub(),
+                    );
+                    dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?
+                };
                 copy_ext_dir_at(src_dev, src, e.inode, dst_dev, dst, child_ino, &entry_path)?;
                 child_ino
             }

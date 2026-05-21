@@ -123,6 +123,11 @@ pub mod feature {
 /// holds an ext4 extent tree rather than direct/indirect block pointers.
 pub const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 
+/// Inode flag `EXT4_INDEX_FL` — set on directory inodes whose first
+/// data block is an HTree root (dx_root) and whose subsequent blocks
+/// are hash-bucketed leaf blocks.
+pub const EXT4_INDEX_FL: u32 = 0x0000_1000;
+
 /// Number of direct block pointers in an inode (`i_block[0..12]`).
 pub const N_DIRECT: usize = 12;
 /// Index of the single-indirect block in `i_block`.

@@ -25,6 +25,7 @@ pub mod csum;
 pub mod dir;
 pub mod extent;
 pub mod group;
+pub mod htree;
 pub mod inode;
 pub mod jbd2;
 pub mod layout;
@@ -281,6 +282,13 @@ pub struct Ext {
     /// owning inode. Used at flush time to stamp the 4-byte
     /// `ext4_extent_tail` CRC32C when `metadata_csum` is active.
     extent_leaf_blocks: Vec<(u32, u32)>,
+    /// HTree dx_root blocks staged in `data_blocks`. Tuple is
+    /// (block, owning_inode, dx_entry_count). The CRC at flush time
+    /// covers only the in-use prefix (count_offset + count * 8 bytes)
+    /// plus a 4-byte dt_reserved + a 4-byte dt_checksum placeholder —
+    /// distinct from both the dir-block tail csum and the extent_tail
+    /// csum.
+    dx_root_blocks: Vec<(u32, u32, u16)>,
     /// True until the first flush after a `format_with` lands. The
     /// initial flush is a "blast everything fresh" write that doesn't
     /// ride a journal transaction (there's nothing yet to be consistent
@@ -420,6 +428,7 @@ impl Ext {
             data_blocks: Vec::new(),
             dir_blocks: Vec::new(),
             extent_leaf_blocks: Vec::new(),
+            dx_root_blocks: Vec::new(),
             // During format the journal SB is staged in `data_blocks`
             // and the file system as a whole is being assembled fresh;
             // the initial flush is a "blast everything" write rather
@@ -441,6 +450,11 @@ impl Ext {
             ext.sb.feature_incompat |= constants::feature::INCOMPAT_FILETYPE;
             // Match mke2fs: a fresh ext4 carries CRC32C metadata checksums.
             ext.sb.feature_ro_compat |= constants::feature::RO_COMPAT_METADATA_CSUM;
+            // Advertise DIR_INDEX (HTree) capability. Setting the bit
+            // doesn't oblige every dir to be indexed — un-indexed dirs
+            // are still valid; we set EXT4_INDEX_FL per-inode on the
+            // ones we actually emit as HTree.
+            ext.sb.feature_compat |= constants::feature::COMPAT_DIR_INDEX;
         }
         if opts.sparse_super {
             ext.sb.feature_ro_compat |= constants::feature::RO_COMPAT_SPARSE_SUPER;
@@ -748,14 +762,36 @@ impl Ext {
         let usable = dir::usable_dir_len(bs, self.has_metadata_csum());
         let with_filetype = self.has_filetype();
 
-        // Snapshot the staged inode so we can call file_block/etc without
-        // re-borrowing self.inodes mid-loop.
+        // HTree-indexed dir? Route by hash to the right leaf instead
+        // of scanning linearly. The leaf is always non-block-0 (block 0
+        // is the dx_root and never holds real entries).
         let inode_copy = self
             .inodes
             .iter()
             .find(|(i, _)| *i == dir_inode)
             .map(|(_, i)| *i)
             .unwrap();
+        if inode_copy.flags & constants::EXT4_INDEX_FL != 0 {
+            let logical_leaf = self.dx_route_logical_leaf(dev, dir_inode, name)?;
+            let phys = self.file_block(dev, &inode_copy, logical_leaf)?;
+            self.ensure_block_staged(dev, phys)?;
+            if !self.dir_blocks.iter().any(|(b, _)| *b == phys) {
+                self.dir_blocks.push((phys, dir_inode));
+            }
+            let block = self
+                .data_blocks
+                .iter_mut()
+                .find(|(b, _)| *b == phys)
+                .map(|(_, bytes)| bytes)
+                .unwrap();
+            if !try_append_dir_entry(block, name, child_ino, file_type, with_filetype, usable)? {
+                return Err(crate::Error::Unsupported(format!(
+                    "ext: HTree leaf {phys} for dir {dir_inode} is full — bucket-split not implemented"
+                )));
+            }
+            return Ok(());
+        }
+
         let n_blocks = inode_copy.size.div_ceil(bs);
 
         // Try existing blocks last-to-first: the tail block is the only
@@ -1322,12 +1358,14 @@ impl Ext {
         self.data_blocks.clear();
         self.dir_blocks.clear();
         self.extent_leaf_blocks.clear();
+        self.dx_root_blocks.clear();
         Ok(())
     }
 
-    /// Stamp every staged metadata block's CRC32C tail in place: dir
-    /// blocks (12-byte trailing dirent + CRC) and extent-tree leaf blocks
-    /// (4-byte `ext4_extent_tail` at the very end). No-op when
+    /// Stamp every staged metadata block's CRC32C tail in place: regular
+    /// dir blocks (12-byte trailing dirent + CRC), extent-tree leaf
+    /// blocks (4-byte `ext4_extent_tail`), and HTree dx_root blocks
+    /// (8-byte `dx_tail` covering only the in-use prefix). No-op when
     /// `metadata_csum` is off. Called by [`flush_metadata`] before the
     /// journal commit so the journaled image matches what the checkpoint
     /// phase writes to each block's home location.
@@ -1337,6 +1375,34 @@ impl Ext {
         }
         let seed = self.csum_seed();
         for (blk, bytes) in &mut self.data_blocks {
+            // dx_root: distinct csum layout (dt_tail at the very end,
+            // covers only `count_offset + count * 8` bytes from the
+            // start). Check this BEFORE the generic dir_blocks lookup
+            // because dx_root blocks aren't tagged in dir_blocks.
+            if let Some((_, owner_ino, count)) = self
+                .dx_root_blocks
+                .iter()
+                .find(|(b, _, _)| b == blk)
+                .copied()
+            {
+                let generation = self
+                    .inodes
+                    .iter()
+                    .find(|(i, _)| *i == owner_ino)
+                    .map(|(_, i)| i.generation)
+                    .unwrap_or(0);
+                let c = htree::compute_dx_csum(
+                    csum::raw_update,
+                    seed,
+                    owner_ino,
+                    generation,
+                    bytes,
+                    htree::DX_ROOT_HEADER_LEN,
+                    count as usize,
+                );
+                htree::stamp_dx_csum(bytes, c);
+                continue;
+            }
             if let Some((_, dir_ino)) = self.dir_blocks.iter().find(|(b, _)| b == blk) {
                 let generation = self
                     .inodes
@@ -1825,6 +1891,212 @@ impl Ext {
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
         self.patch_inode(dev, parent_ino, |i| i.links_count += 1)?;
         Ok(ino)
+    }
+
+    /// Like [`Self::add_dir_to_with_blocks`] but builds an HTree-indexed
+    /// directory: block 0 becomes a `dx_root` pointing at K leaf
+    /// blocks, the new inode carries `EXT4_INDEX_FL`, and later
+    /// `add_entry_to_dir_block_for` calls hash each name and route to
+    /// the matching leaf (preserving lookup-by-hash order).
+    ///
+    /// `expected_names` is the full list of names the caller will add
+    /// under this directory — needed up front so we can hash each one
+    /// and partition them into leaves. Names that don't end up being
+    /// added still cost an unused tail-slack byte or two in their
+    /// leaf, but the writer doesn't care; conversely, names added that
+    /// weren't predicted still fit because every entry is hash-routed
+    /// to a leaf with available room.
+    ///
+    /// Ext2/Ext3 don't support HTree; calling this on a non-ext4
+    /// instance returns `Unsupported`.
+    pub fn add_dir_indexed(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_ino: u32,
+        name: &[u8],
+        meta: FileMeta,
+        expected_names: &[&[u8]],
+    ) -> Result<u32> {
+        if !matches!(self.kind, FsKind::Ext4) {
+            return Err(crate::Error::Unsupported(
+                "ext: HTree (DIR_INDEX) requires ext4".into(),
+            ));
+        }
+        let bs = self.layout.block_size;
+        let csum_tail = self.has_metadata_csum();
+        let with_filetype = self.has_filetype();
+        let usable = dir::usable_dir_len(bs, csum_tail);
+
+        // Hash every expected name, including `.`/`..` is unnecessary
+        // because those live in the dx_root's fake-dirent prefix.
+        let mut hashes: Vec<(u32, usize)> = expected_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (htree::half_md4_hash(n).0, i))
+            .collect();
+        hashes.sort_by_key(|(h, _)| *h);
+
+        // Bucket entries into leaves of `usable` byte capacity each.
+        // Each entry costs `min_rec_len(name.len())` bytes plus a
+        // small reserved slack for future appends (we keep ~15% spare
+        // so post-creation adds don't immediately overflow a leaf).
+        // Leaf 0 covers hashes 0..first_real_hash; subsequent leaves
+        // partition by hash range.
+        let mut leaves: Vec<Vec<usize>> = vec![Vec::new()]; // indices into expected_names, per leaf
+        let mut current_bytes: usize = 0;
+        let cap = usable.saturating_sub(usable / 8); // 87.5% target
+        for &(_, idx) in &hashes {
+            let need = dir::min_rec_len(expected_names[idx].len());
+            if current_bytes + need > cap && !leaves.last().unwrap().is_empty() {
+                leaves.push(Vec::new());
+                current_bytes = 0;
+            }
+            leaves.last_mut().unwrap().push(idx);
+            current_bytes += need;
+        }
+        let n_leaves = leaves.len();
+        let total_blocks = 1 + n_leaves; // 1 dx_root + N leaves
+
+        // Sanity-check against the dx_root's slot capacity.
+        let limit = htree::dx_root_limit(bs, csum_tail);
+        if n_leaves > limit {
+            return Err(crate::Error::Unsupported(format!(
+                "ext: HTree dir {:?} would need {n_leaves} leaves, dx_root limit is {limit} \
+                 (multi-level dx_node not implemented)",
+                String::from_utf8_lossy(name)
+            )));
+        }
+
+        let ino = self.alloc_inode()?;
+        let mut blocks = Vec::with_capacity(total_blocks);
+        for _ in 0..total_blocks {
+            blocks.push(self.alloc_data_block()?);
+        }
+        let mut inode = Inode::directory(
+            bs * total_blocks as u32,
+            meta.mode & 0o7777,
+            meta.uid,
+            meta.gid,
+            meta.mtime,
+        );
+        let allocated_meta = self.fill_block_pointers_extent(&mut inode, &blocks)?;
+        inode.blocks_512 = (total_blocks as u32 + allocated_meta) * (bs / 512);
+        inode.flags |= constants::EXT4_INDEX_FL;
+
+        // Build the dx_entry table: slot 0 is the countlimit (with
+        // leaf-0 pointer in its block field), slots 1..n point at
+        // leaves 1..n-1.
+        let count = n_leaves as u16; // entries occupied (incl. countlimit slot)
+        let mut entries: Vec<htree::DxEntry> = Vec::with_capacity(n_leaves);
+        // countlimit slot
+        entries.push(htree::DxEntry {
+            hash: htree::pack_countlimit(limit as u16, count),
+            block: 1, // logical block #1 = first leaf
+        });
+        // Real slots — one per additional leaf, hash = first-name hash in that leaf
+        for (logical_idx, leaf_entries) in leaves.iter().enumerate().skip(1) {
+            let first_name_idx = leaf_entries[0];
+            let first_hash = expected_names[first_name_idx];
+            let h = htree::half_md4_hash(first_hash).0;
+            entries.push(htree::DxEntry {
+                hash: h,
+                block: (logical_idx + 1) as u32, // +1 because dx_root is logical block 0
+            });
+        }
+
+        // Wait — re-examine: `block` is logical, not physical, in
+        // dx_entries. logical block 0 = dx_root, logical block 1 =
+        // first leaf, logical block N = N-th leaf. Adjust.
+        // (The loop above already uses `logical_idx + 1` so leaf at
+        // position 1 in `leaves` → logical block 2. Hmm, that skips
+        // leaf 0 which is the countlimit's `block: 1`. Let me re-walk:
+        //   entries[0] = countlimit, block field = 1 (logical leaf 0)
+        //   entries[1] = first real slot, block = 2 (logical leaf 1)
+        //   entries[k] = block = k+1
+        // That matches what `logical_idx + 1` does for skip(1), since
+        // `enumerate()` yields (1, leaf1) → block=2. Good.
+
+        let dx_root_buf = htree::make_dx_root_block(
+            ino,
+            parent_ino,
+            bs,
+            // Declare the signed variant. For ASCII names (bytes <
+            // 0x80) the unsigned-byte path we run produces identical
+            // hashes to the signed-byte path, so the index round-trips
+            // correctly. Old e2fsprogs builds reject the _UNSIGNED
+            // version code (4) even when valid, so 1 is the safer
+            // declaration unless the FS actually contains non-ASCII
+            // filenames. (Multi-byte UTF-8 starts at 0xC2; if those
+            // ever appear we'll switch to a true signed-byte hash.)
+            htree::DX_HASH_HALF_MD4,
+            &entries,
+            with_filetype,
+            csum_tail,
+        );
+        self.data_blocks.push((blocks[0], dx_root_buf));
+        self.dx_root_blocks.push((blocks[0], ino, count));
+
+        // Each leaf starts as an empty dir block. The router will
+        // append entries to the right leaf as add_*_to runs.
+        for &blk in &blocks[1..] {
+            self.data_blocks
+                .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
+            self.dir_blocks.push((blk, ino));
+        }
+
+        self.inodes.push((ino, inode));
+        self.groups[0].desc.used_dirs_count += 1;
+
+        self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
+        self.patch_inode(dev, parent_ino, |i| i.links_count += 1)?;
+        Ok(ino)
+    }
+
+    /// Resolve a name to the logical block index of its HTree leaf.
+    /// Reads the dx_root from staged storage (or disk via
+    /// `ensure_block_staged`) and binary-searches the dx_entry table.
+    fn dx_route_logical_leaf(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_inode: u32,
+        name: &[u8],
+    ) -> Result<u32> {
+        // Resolve dx_root: it's logical block 0 of the dir.
+        let inode_copy = self
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == dir_inode)
+            .map(|(_, i)| *i)
+            .unwrap();
+        let dx_root_blk = self.file_block(dev, &inode_copy, 0)?;
+        self.ensure_block_staged(dev, dx_root_blk)?;
+        let buf = self
+            .data_blocks
+            .iter()
+            .find(|(b, _)| *b == dx_root_blk)
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap();
+        // dx_entry table starts at offset 32; first slot is countlimit.
+        let cl_hash = u32::from_le_bytes(buf[32..36].try_into().unwrap());
+        let count = (cl_hash >> 16) as usize;
+        // Compute hash of the name we're routing.
+        let (hash, _minor) = htree::half_md4_hash(name);
+        // Binary-search slots 1..count for the rightmost slot whose
+        // hash ≤ target. Fall through to slot 0 (the leftmost leaf
+        // covering hash=0..first_real_hash) when none match.
+        let mut chosen_slot = 0usize;
+        for slot in 1..count {
+            let off = 32 + slot * 8;
+            let slot_hash = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            if slot_hash <= hash {
+                chosen_slot = slot;
+            } else {
+                break;
+            }
+        }
+        let block_off = 32 + chosen_slot * 8 + 4;
+        let logical_leaf = u32::from_le_bytes(buf[block_off..block_off + 4].try_into().unwrap());
+        Ok(logical_leaf)
     }
 
     /// Create a symbolic link. Targets ≤ 60 bytes are stored inline in
@@ -2359,6 +2631,7 @@ impl Ext {
             data_blocks: Vec::new(),
             dir_blocks: Vec::new(),
             extent_leaf_blocks: Vec::new(),
+            dx_root_blocks: Vec::new(),
             // Opened (vs. just-formatted) images go through the journal
             // path on flush. `open()` itself runs JBD2 replay before
             // returning, so by the time we land here the on-disk journal

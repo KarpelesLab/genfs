@@ -1446,25 +1446,33 @@ fn copy_ext_dir_at(
                 )?
             }
             t if t == fstool::fs::ext::constants::S_IFDIR => {
-                // Pre-size from the source child list so the dst dir's
-                // blocks land in one contiguous run (one extent).
-                let child_blocks = {
-                    let entries = src.list_inode(src_dev, e.inode).unwrap_or_default();
+                // For ext4 destinations with enough children, emit an
+                // HTree (DIR_INDEX) directory; otherwise pre-size the
+                // dir with one contiguous extent and use a plain
+                // unindexed layout.
+                let child_entries = src.list_inode(src_dev, e.inode).unwrap_or_default();
+                let real_children: Vec<&fstool::fs::DirEntry> = child_entries
+                    .iter()
+                    .filter(|c| c.name != "." && c.name != "..")
+                    .collect();
+                let use_htree = matches!(dst.kind, fstool::fs::ext::FsKind::Ext4)
+                    && real_children.len() >= 250;
+                let child_ino = if use_htree {
+                    let names: Vec<&[u8]> =
+                        real_children.iter().map(|c| c.name.as_bytes()).collect();
+                    dst.add_dir_indexed(dst_dev, dst_ino, name, meta, &names)?
+                } else {
                     let mut bytes: usize = 24;
-                    for c in &entries {
-                        if c.name == "." || c.name == ".." {
-                            continue;
-                        }
+                    for c in &real_children {
                         bytes += ext_dir::min_rec_len(c.name.len());
                     }
                     let usable = ext_dir::usable_dir_len(
                         dst.layout.block_size,
                         dst.has_metadata_csum_pub(),
                     );
-                    bytes.div_ceil(usable).max(1) as u32
+                    let child_blocks = bytes.div_ceil(usable).max(1) as u32;
+                    dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?
                 };
-                let child_ino =
-                    dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?;
                 copy_ext_dir_at(src_dev, src, e.inode, dst_dev, dst, child_ino, &entry_path)?;
                 child_ino
             }

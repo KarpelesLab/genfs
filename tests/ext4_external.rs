@@ -618,3 +618,116 @@ fn ext4_fragmented_directory_promotes_to_depth1_extent_tree() {
         String::from_utf8_lossy(&fsck.stderr)
     );
 }
+
+/// Build an HTree-indexed directory (`EXT4_INDEX_FL`) and confirm
+/// e2fsck accepts it, debugfs sees it as indexed, and our reader
+/// enumerates every entry via the legacy linear-scan path that
+/// dx_root's fake `.` / `..` façade is meant to support.
+#[test]
+fn ext4_indexed_directory_passes_e2fsck() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+    use fstool::fs::ext::FormatOpts;
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 16 * 1024,
+        inodes_count: 2048,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    // 500 entries → ~3 leaves with our 87.5% target fill ratio.
+    let names: Vec<String> = (0..500).map(|i| format!("entry_{i:04}")).collect();
+    let name_bytes: Vec<&[u8]> = names.iter().map(|s| s.as_bytes()).collect();
+    let bigdir = ext
+        .add_dir_indexed(
+            &mut dev,
+            2,
+            b"indexed",
+            FileMeta::with_mode(0o755),
+            &name_bytes,
+        )
+        .unwrap();
+
+    // Now add the actual files. The router in add_entry_to_dir_block_for
+    // hashes each name and lands it in the right leaf.
+    for name in &name_bytes {
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(b"x\n").unwrap();
+        ext.add_file_to(
+            &mut dev,
+            bigdir,
+            name,
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Inode must carry EXT4_INDEX_FL (0x1000).
+    let inode = ext.read_inode(&mut dev, bigdir).unwrap();
+    assert!(
+        inode.flags & 0x1000 != 0,
+        "expected EXT4_INDEX_FL on /indexed inode, got flags={:#x}",
+        inode.flags
+    );
+
+    // Our reader's linear scan must enumerate every name via the
+    // `.`/`..` façade at the head of dx_root, even though it doesn't
+    // understand the dx_entry table.
+    let entries = ext.list_inode(&mut dev, bigdir).unwrap();
+    let got: std::collections::HashSet<String> = entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    assert_eq!(
+        got.len(),
+        names.len(),
+        "fstool ls miscounted on indexed dir"
+    );
+
+    drop(dev);
+
+    // e2fsck must accept the indexed dir. If half-MD4 doesn't match
+    // the kernel's, or dx_root is malformed, this is where we find out.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected indexed dir:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    // debugfs sees the directory as indexed (the htree_dump command
+    // succeeds only on EXT4_INDEX_FL inodes).
+    let dump = Command::new("debugfs")
+        .arg("-R")
+        .arg("htree_dump /indexed")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&dump.stdout);
+    assert!(
+        out.contains("Number of entries") || out.contains("Hash Version") || out.contains("htree:"),
+        "debugfs htree_dump didn't recognise /indexed:\n{out}"
+    );
+}

@@ -219,6 +219,90 @@ impl<'a> FileHandle for ApfsFileHandle<'a> {
     }
 }
 
+/// Commit a checkpoint after running `mutator` against the dumped
+/// fs-tree record list. Use this for any change that lives entirely
+/// in B-tree records (inode attributes, directory entries, xattrs,
+/// hardlink bookkeeping, …) — anything that doesn't need fresh file
+/// extents allocated.
+///
+/// On return, `fs.state` is refreshed to a fresh write state that
+/// reflects the newly-written checkpoint.
+pub(crate) fn commit_with_mutator<F>(
+    fs: &mut Apfs,
+    dev: &mut dyn BlockDevice,
+    mutator: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<()>,
+{
+    let (
+        block_size,
+        total_blocks,
+        volume_name,
+        container_uuid,
+        volume_uuid,
+        cur_xid,
+        next_xp_desc_slot,
+        bump_high_water,
+        next_oid,
+        num_files,
+        num_directories,
+        num_symlinks,
+    ) = match &fs.state {
+        ApfsState::Write(w) => (
+            fs.block_size,
+            w.total_blocks,
+            w.volume_name.clone(),
+            w.container_uuid,
+            w.volume_uuid,
+            w.cur_xid,
+            w.next_xp_desc_slot,
+            w.bump_high_water,
+            w.next_oid,
+            w.num_files,
+            w.num_directories,
+            w.num_symlinks,
+        ),
+        _ => {
+            return Err(crate::Error::Unsupported(
+                "apfs: commit called outside write state".into(),
+            ));
+        }
+    };
+
+    let mut records = dump_all_records(fs, dev)?;
+    mutator(&mut records)?;
+
+    let new_xid = cur_xid + 1;
+    {
+        let mut w = write::ApfsWriter::new_checkpoint(
+            dev,
+            total_blocks,
+            block_size,
+            &volume_name,
+            container_uuid,
+            volume_uuid,
+            new_xid,
+            next_xp_desc_slot,
+            bump_high_water,
+            next_oid,
+            num_files,
+            num_directories,
+            num_symlinks,
+        )?;
+        for (k, v) in records {
+            w.push_raw_record(k, v);
+        }
+        w.finish()?;
+    }
+
+    let refreshed = Apfs::open_writable(dev)?;
+    debug_assert!(matches!(refreshed.state, ApfsState::Write(_)));
+    fs.state = refreshed.state;
+    fs.volume_name = refreshed.volume_name;
+    Ok(())
+}
+
 /// Commit a checkpoint that replaces the file at `target_oid` with the
 /// given `new_bytes`. All other inodes / directories / xattrs are
 /// preserved exactly.

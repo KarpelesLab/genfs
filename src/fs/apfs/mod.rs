@@ -90,7 +90,7 @@ use crate::block::BlockDevice;
 use fstree::{DrecKeyLayout, FsKeyTarget, FsTreeCtx, RangeScan};
 use jrec::{
     APFS_TYPE_DIR_REC, APFS_TYPE_FILE_EXTENT, APFS_TYPE_INODE, APFS_TYPE_XATTR, DT_DIR, DT_LNK,
-    DT_REG, DrecKey, DrecVal, FileExtentVal, InodeVal,
+    DT_REG, DrecKey, DrecVal, FileExtentVal, InodeVal, OBJ_ID_MASK, OBJ_TYPE_SHIFT,
 };
 use obj::{OBJECT_TYPE_MASK, ObjPhys};
 use omap::{OmapPhys, lookup as omap_lookup};
@@ -820,6 +820,90 @@ impl Apfs {
         })
     }
 
+    /// Change the permission bits (low 12 bits of `mode`) of the
+    /// inode at `path`. Preserves the file-type bits.
+    ///
+    /// Writes a fresh APFS checkpoint — same COW pathway
+    /// [`rw::commit_with_mutator`] uses for every other in-place
+    /// mutation. The on-disk byte affected lives at offset 80..82
+    /// of `j_inode_val_t`.
+    pub fn chmod(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        mode_perms: u16,
+    ) -> Result<()> {
+        let target_oid = self.resolve_path_to_oid(dev, path)?;
+        let new_perms = mode_perms & 0o7777;
+        rw::commit_with_mutator(self, dev, |records| {
+            patch_inode_record(records, target_oid, |val| {
+                if val.len() < jrec::J_INODE_VAL_FIXED_SIZE {
+                    return;
+                }
+                let cur_mode = u16::from_le_bytes(val[80..82].try_into().unwrap());
+                let new_mode = (cur_mode & 0xF000) | new_perms;
+                val[80..82].copy_from_slice(&new_mode.to_le_bytes());
+            });
+            Ok(())
+        })
+    }
+
+    /// Change ownership (owner/group) of the inode at `path`. POSIX
+    /// `chown`. `j_inode_val_t` carries owner at offset 72..76 and
+    /// group at 76..80.
+    pub fn chown(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        owner: u32,
+        group: u32,
+    ) -> Result<()> {
+        let target_oid = self.resolve_path_to_oid(dev, path)?;
+        rw::commit_with_mutator(self, dev, |records| {
+            patch_inode_record(records, target_oid, |val| {
+                if val.len() < jrec::J_INODE_VAL_FIXED_SIZE {
+                    return;
+                }
+                val[72..76].copy_from_slice(&owner.to_le_bytes());
+                val[76..80].copy_from_slice(&group.to_le_bytes());
+            });
+            Ok(())
+        })
+    }
+
+    /// Stamp the modification / access / change timestamps on the
+    /// inode at `path`. Each argument is a UNIX timestamp in
+    /// nanoseconds (APFS native precision); `None` leaves the field
+    /// unchanged. Layout: `mod_time` at 24..32, `change_time` at
+    /// 32..40, `access_time` at 40..48 — all u64 little-endian.
+    pub fn set_times(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        mtime_ns: Option<u64>,
+        ctime_ns: Option<u64>,
+        atime_ns: Option<u64>,
+    ) -> Result<()> {
+        let target_oid = self.resolve_path_to_oid(dev, path)?;
+        rw::commit_with_mutator(self, dev, |records| {
+            patch_inode_record(records, target_oid, |val| {
+                if val.len() < jrec::J_INODE_VAL_FIXED_SIZE {
+                    return;
+                }
+                if let Some(m) = mtime_ns {
+                    val[24..32].copy_from_slice(&m.to_le_bytes());
+                }
+                if let Some(c) = ctime_ns {
+                    val[32..40].copy_from_slice(&c.to_le_bytes());
+                }
+                if let Some(a) = atime_ns {
+                    val[40..48].copy_from_slice(&a.to_le_bytes());
+                }
+            });
+            Ok(())
+        })
+    }
+
     /// Total container capacity in bytes (`nx_block_count * nx_block_size`).
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
@@ -1512,6 +1596,32 @@ impl<'a> std::io::Read for ApfsFileReader<'a> {
         }
         self.cursor += want as u64;
         Ok(want)
+    }
+}
+
+/// Walk the dumped fs-tree record list, find the `INODE` record for
+/// `target_oid`, and run `patcher` against its value bytes. The
+/// patcher mutates in place — typically to flip mode bits, owner,
+/// group, or timestamps. Used by [`Apfs::chmod`], [`Apfs::chown`],
+/// [`Apfs::set_times`], and the dirent/hardlink mutators.
+pub(crate) fn patch_inode_record<F>(
+    records: &mut [(Vec<u8>, Vec<u8>)],
+    target_oid: u64,
+    patcher: F,
+) where
+    F: FnOnce(&mut Vec<u8>),
+{
+    for (k, v) in records.iter_mut() {
+        if k.len() < 8 {
+            continue;
+        }
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        let oid = hdr & OBJ_ID_MASK;
+        let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
+        if oid == target_oid && kind == APFS_TYPE_INODE {
+            patcher(v);
+            return;
+        }
     }
 }
 

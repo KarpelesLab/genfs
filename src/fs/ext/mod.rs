@@ -4811,6 +4811,73 @@ mod tests {
         assert_eq!(got, b"hello world");
     }
 
+    /// FUSE-style write: each kernel WRITE issues a fresh
+    /// `open_file_rw`, seeks to the kernel-supplied offset, writes
+    /// the chunk, drops the handle. A single user-space
+    /// `write_all(1952 bytes)` can fragment into multiple
+    /// chunks — verify that the file ends up with the full 1952
+    /// bytes across re-opens.
+    #[test]
+    fn open_file_rw_multi_open_write_extends_ext2() {
+        let (mut ext, mut dev) = ext2_with_file(b"_unused.bin", b"x");
+        // Create empty file via add_file_to_streaming (mirrors
+        // adapter::create's FileSource::Zero(0) path).
+        ext.add_file_to_streaming(
+            &mut dev,
+            constants::INO_ROOT_DIR,
+            b"chunked.bin",
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+            0,
+            FileMeta::with_mode(0o644),
+        )
+        .expect("create empty");
+
+        // Two separate open_file_rw cycles writing 1024 + 928 bytes.
+        let chunk_a = vec![b'A'; 1024];
+        let chunk_b = vec![b'B'; 928];
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/chunked.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open 1");
+            h.seek(SeekFrom::Start(0)).unwrap();
+            h.write_all(&chunk_a).unwrap();
+            // No sync — drop the handle while the inode update is
+            // only staged, like the FUSE adapter does between
+            // FUSE_WRITE calls.
+        }
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/chunked.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open 2");
+            h.seek(SeekFrom::Start(1024)).unwrap();
+            h.write_all(&chunk_b).unwrap();
+        }
+
+        // Read through the SAME Ext instance (no reopen) — this
+        // is the path adapter::read takes after adapter::write.
+        let mut expected = Vec::with_capacity(1952);
+        expected.extend_from_slice(&chunk_a);
+        expected.extend_from_slice(&chunk_b);
+        let got = read_full_via_handle(&mut ext, &mut dev, "/chunked.bin");
+        assert_eq!(
+            got.len(),
+            1952,
+            "size after two open_file_rw cycles should be 1952, got {}",
+            got.len()
+        );
+        assert_eq!(got, expected, "content mismatch after two-stage write");
+    }
+
     #[test]
     fn open_file_rw_truncate_ext2() {
         let payload = vec![b'k'; 4096];

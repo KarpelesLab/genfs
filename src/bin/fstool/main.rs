@@ -338,10 +338,10 @@ fn mount_cmd(image: &str, mountpoint: &std::path::Path) -> fstool::Result<()> {
         ));
     }
     let path = std::path::Path::new(image);
-    let mut dev: Box<dyn fstool::block::BlockDevice> =
+    let mut dev: Box<dyn fstool::block::BlockDevice + Send> =
         Box::new(fstool::block::FileBackend::open(path)?);
     let kind = fstool::inspect::detect_fs(dev.as_mut())?;
-    let (fs, fs_name): (Box<dyn Filesystem>, &'static str) = match kind {
+    let (fs, fs_name): (Box<dyn Filesystem + Send>, &'static str) = match kind {
         FsKind::Ext => {
             let mut ext = fstool::fs::ext::Ext::open(dev.as_mut())?;
             // Replay any pending journal so the mounted view matches
@@ -402,7 +402,11 @@ fn mount_cmd(image: &str, mountpoint: &std::path::Path) -> fstool::Result<()> {
     } else {
         " (read-only)"
     };
-    let adapter = fstool::fuse_adapter::FstoolFs::new(fs, dev, fs_name);
+    // The CLI opts into `allow_other` so multi-user access works
+    // when the operator has enabled `user_allow_other` in
+    // `/etc/fuse.conf`; the integration tests leave it off so they
+    // pass on stock setups.
+    let adapter = fstool::fuse_adapter::FstoolFs::new(fs, dev, fs_name).allow_other(true);
     eprintln!(
         "fstool: mounted {image} as {fs_name}{ro_suffix} at {} (umount to detach)",
         mountpoint.display()

@@ -49,9 +49,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FUSE_ROOT_ID, FileAttr, FileType, Filesystem as FuseFilesystem, KernelConfig, MountOption,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    BackgroundSession, FUSE_ROOT_ID, FileAttr, FileType, Filesystem as FuseFilesystem,
+    KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
 use crate::block::BlockDevice;
@@ -65,12 +65,15 @@ const TTL: Duration = Duration::from_secs(1);
 /// Filesystem>` and its backing device, plus an `ino ↔ path` table
 /// keyed by FUSE inode number.
 ///
-/// `mount2` (single-threaded) doesn't require `Send` on the handle,
-/// so neither do we — that keeps `Squashfs` (which holds non-`Sync`
-/// `RefCell` state internally) mountable as-is.
+/// Both inner boxes are `Send` so the adapter can be moved onto a
+/// background thread by `fuser::spawn_mount2` (used by the integration
+/// tests; the CLI uses the blocking `mount`). Every backend in-tree
+/// satisfies that bound — none of them hold `Rc`, and the
+/// `RefCell` cells inside `Squashfs` are `Send` because their
+/// contents are.
 pub struct FstoolFs {
-    fs: Box<dyn Filesystem>,
-    dev: Box<dyn BlockDevice>,
+    fs: Box<dyn Filesystem + Send>,
+    dev: Box<dyn BlockDevice + Send>,
     fs_name: &'static str,
     /// FUSE ino → absolute path. `1` is always `/`.
     ino_to_path: HashMap<u64, PathBuf>,
@@ -85,6 +88,11 @@ pub struct FstoolFs {
     /// True only for `Mutable` — i.e. partial in-place byte writes
     /// are allowed (otherwise `write` is `EROFS`).
     partial_writable: bool,
+    /// Opt-in for the `allow_other` mount option, which lets users
+    /// other than the mounter see the mount. Requires the system to
+    /// have `user_allow_other` in `/etc/fuse.conf`; we leave it off
+    /// by default so the integration tests work on stock setups.
+    allow_other: bool,
 }
 
 impl FstoolFs {
@@ -93,7 +101,11 @@ impl FstoolFs {
     /// `fs_name` is the string the kernel surfaces as the FS type in
     /// `mount(8)` output — pass the short backend name (`"ext"`,
     /// `"fat32"`, `"squashfs"`, etc.).
-    pub fn new(fs: Box<dyn Filesystem>, dev: Box<dyn BlockDevice>, fs_name: &'static str) -> Self {
+    pub fn new(
+        fs: Box<dyn Filesystem + Send>,
+        dev: Box<dyn BlockDevice + Send>,
+        fs_name: &'static str,
+    ) -> Self {
         let cap = fs.mutation_capability();
         let writable = cap.supports_add_remove();
         let partial_writable = cap.supports_partial_writes();
@@ -110,22 +122,57 @@ impl FstoolFs {
             next_ino: 2,
             writable,
             partial_writable,
+            allow_other: false,
         }
+    }
+
+    /// Turn on the `allow_other` mount option so users other than the
+    /// mounter can see the mount. Requires the system to have
+    /// `user_allow_other` set in `/etc/fuse.conf`; on hosts without
+    /// that, `mount` returns `EPERM`. The CLI's `fstool mount` opts
+    /// in via this method; tests leave it off.
+    pub fn allow_other(mut self, yes: bool) -> Self {
+        self.allow_other = yes;
+        self
+    }
+
+    /// Assemble the [`MountOption`] vector this adapter wants to
+    /// pass to fuser. Shared between [`Self::mount`] and
+    /// [`Self::spawn_mount`].
+    fn mount_options(&self) -> Vec<MountOption> {
+        let mut opts = vec![MountOption::FSName(self.fs_name.to_string())];
+        // `AutoUnmount` makes fusermount tear the mount down if the
+        // mounting process dies — convenient for the CLI but
+        // *requires* `AllowOther` (or `AllowRoot`) per fuser's
+        // contract, which in turn requires `user_allow_other` in
+        // `/etc/fuse.conf`. We only enable the pair when the
+        // operator opted in via `.allow_other(true)`; the test path
+        // relies on `BackgroundSession::Drop` for unmount instead.
+        if self.allow_other {
+            opts.push(MountOption::AllowOther);
+            opts.push(MountOption::AutoUnmount);
+        }
+        if !self.writable {
+            opts.push(MountOption::RO);
+        }
+        opts
     }
 
     /// Mount under `mountpoint` and pump events on this thread until
     /// `umount` on the mountpoint or a fatal callback returns. Blocks
-    /// indefinitely; spawn a thread if you want async-ish behaviour.
+    /// indefinitely; use [`Self::spawn_mount`] for async-ish behaviour.
     pub fn mount(self, mountpoint: &Path) -> std::io::Result<()> {
-        let mut opts = vec![
-            MountOption::FSName(self.fs_name.to_string()),
-            MountOption::AutoUnmount,
-            MountOption::AllowOther,
-        ];
-        if !self.writable {
-            opts.push(MountOption::RO);
-        }
+        let opts = self.mount_options();
         fuser::mount2(self, mountpoint, &opts)
+    }
+
+    /// Mount on a background thread and return the session handle.
+    /// Drop the returned [`BackgroundSession`] (or call its
+    /// `.join()`) to unmount cleanly. The mount survives only as
+    /// long as the session does.
+    pub fn spawn_mount(self, mountpoint: &Path) -> std::io::Result<BackgroundSession> {
+        let opts = self.mount_options();
+        fuser::spawn_mount2(self, mountpoint, &opts)
     }
 
     /// Look up the path for a FUSE inode. Returns `None` for unknown

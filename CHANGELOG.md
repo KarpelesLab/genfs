@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/KarpelesLab/fstool/compare/v0.4.0...v0.4.1) - 2026-05-22
+
+### Added
+
+- *(fuse)* backend-agnostic adapter — mount any Filesystem via FUSE
+- *(apfs)* rename, unlink (hardlink-aware), and link()
+- *(apfs)* chmod / chown / set_times mutation API
+- shared-access wrapper for cross-thread Ext usage (Phase E)
+- fuzz harness + crash-injection block device (Phase D)
+- *(ext)* inline_data — store small files in the inode
+- FUSE adapter — mount ext{2,3,4} images as a userspace filesystem
+- *(ext)* post-build mutation API (chmod, chown, set_times, truncate, rename)
+- *(ext)* multi-descriptor JBD2 transactions + fix dx_node header
+- *(ext)* two-level HTree (dx_node intermediates)
+- *(repack)* replay pending JBD2 journal on the source before reading
+- *(repack)* preserve sparse files in ext repack
+- *(ext)* preserve hard links across repack
+- *(ext)* HTree (DIR_INDEX) write-side support for ext4
+- *(ext)* multi-block directories, depth-1 extents, repack progress
+
+### Fixed
+
+- *(clippy)* clean up 11 lints exposed by --all-features build
+- *(concurrent)* drop unused `FileSource` import from test module
+- *(repack)* wire progress sink through tar-output paths
+
+### Other
+
+- *(fuse)* kernel round-trip test via spawn_mount
+- fix 7 broken intra-doc links exposed by --all-features doc build
+- install libfuse3-dev + pkg-config on Linux for clippy --all-features
+- cargo fmt across recent landings
+
 ## [0.4.0](https://github.com/KarpelesLab/fstool/compare/v0.3.1...v0.4.0) - 2026-05-21
 
 ### Added

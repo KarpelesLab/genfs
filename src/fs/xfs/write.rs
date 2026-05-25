@@ -1762,6 +1762,17 @@ impl Xfs {
             agf[56..60].copy_from_slice(&longest.to_be_bytes());
             agf[60..64].copy_from_slice(&0u32.to_be_bytes());
             agf[64..80].copy_from_slice(&uuid);
+            // rmap_blocks (80..84) stays 0 — no RMAPBT.
+            // REFLINK fields, matching `format::build_agf`:
+            //   84..88  refcount_blocks = 1
+            //   88..92  refcount_root   = REFCNTBT_AGBLOCK (7)
+            //   92..96  refcount_level  = 1
+            // Phase 3b stage 1 leaves the REFCNTBT empty; the block at
+            // AG-block 7 is laid down by `format::format()` and not
+            // touched by the writer until `clone_range` (stage 2).
+            agf[84..88].copy_from_slice(&1u32.to_be_bytes());
+            agf[88..92].copy_from_slice(&super::format::REFCNTBT_AGBLOCK.to_be_bytes());
+            agf[92..96].copy_from_slice(&1u32.to_be_bytes());
             super::format::stamp_v5_agf_crc(&mut agf);
             dev.write_at(ag_byte + sect, &agf)?;
 

@@ -461,3 +461,93 @@ fn open_file_rw_round_trip_passes_xfs_repair() {
 // cover the same surface this integration test would have: a real
 // `list_path("/")` walk against a BTREE-format directory, plus the
 // typed `Unsupported` error citing the single-level depth limit.
+
+/// REFLINK feature + per-AG REFCNTBT root is laid down correctly on a
+/// freshly-formatted image. The on-disk contract is exercised by
+/// dumping AGF + the REFCNTBT block with `xfs_db` and matching the
+/// values mkfs.xfs (with `-m reflink=1`) writes: `refcountroot` set,
+/// `refcount_level = 1`, `refcount_blocks = 1`, REFCNTBT magic
+/// "R3FC", level 0 (leaf), numrecs 0 (empty).
+///
+/// Skipped when `xfs_db` isn't installed.
+#[test]
+fn writer_image_opts_in_reflink() {
+    let Some(_) = which("xfs_db") else {
+        eprintln!("skipping: xfs_db not installed");
+        return;
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size: u64 = 512 * 1024 * 1024;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let opts = FormatOpts {
+        uuid: [0x42u8; 16],
+        ..Default::default()
+    };
+    {
+        let mut x = xfs::format(&mut dev, &opts).unwrap();
+        x.begin_writes(opts.uuid);
+        x.flush_writes(&mut dev).unwrap();
+    }
+    dev.sync().unwrap();
+    drop(dev);
+
+    // 1) AGF refcount fields.
+    let out = Command::new("xfs_db")
+        .args(["-r", "-c", "agf 0", "-c", "p"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let agf = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        agf.contains("refcntroot = 7"),
+        "AGF refcntroot not 7:\n{agf}"
+    );
+    assert!(
+        agf.contains("refcntlevel = 1"),
+        "AGF refcntlevel not 1:\n{agf}"
+    );
+    assert!(
+        agf.contains("refcntblocks = 1"),
+        "AGF refcntblocks not 1:\n{agf}"
+    );
+
+    // 2) REFCNTBT block magic + empty leaf.
+    let out = Command::new("xfs_db")
+        .args(["-r", "-c", "agf 0", "-c", "addr refcntroot", "-c", "p"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let bt = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        bt.contains("magic = 0x52334643"),
+        "REFCNTBT magic not R3FC:\n{bt}"
+    );
+    assert!(bt.contains("level = 0"), "REFCNTBT level not 0:\n{bt}");
+    assert!(
+        bt.contains("numrecs = 0"),
+        "REFCNTBT not empty (expected numrecs=0):\n{bt}"
+    );
+    assert!(
+        bt.contains("(correct)"),
+        "REFCNTBT CRC not (correct):\n{bt}"
+    );
+
+    // 3) Superblock features_ro_compat includes REFLINK (0x4).
+    let out = Command::new("xfs_db")
+        .args(["-r", "-c", "sb 0", "-c", "p features_ro_compat"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    // xfs_db prints the raw hex: e.g. `features_ro_compat = 0x4`.
+    // Bit 0x4 is `XFS_SB_FEAT_RO_COMPAT_REFLINK`.
+    let hex = s
+        .lines()
+        .find_map(|l| l.split_once('=').map(|(_, v)| v.trim()))
+        .unwrap_or("");
+    let val = u32::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0);
+    assert!(
+        val & 0x4 != 0,
+        "SB features_ro_compat missing REFLINK bit (got {val:#x}):\n{s}"
+    );
+}

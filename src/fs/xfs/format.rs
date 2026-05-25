@@ -95,6 +95,13 @@ pub const XFS_ABTB_CRC_MAGIC: u32 = 0x4142_3342;
 pub const XFS_ABTC_CRC_MAGIC: u32 = 0x4142_3343;
 /// INOBT v5 — "IAB3".
 pub const XFS_IBT_CRC_MAGIC: u32 = 0x4941_4233;
+/// REFCNTBT v5 — "R3FC". Per-AG refcount B+tree (reflink feature).
+pub const XFS_REFC_CRC_MAGIC: u32 = 0x5233_4643;
+
+/// `sb_features_ro_compat` bit for REFLINK (per-AG refcount B+tree).
+/// Set on every v5 image fstool writes — readers / kernels without the
+/// bit can still mount the image read-only.
+pub const XFS_SB_FEAT_RO_COMPAT_REFLINK: u32 = 0x4;
 
 /// AGF version number (always 1 on disk).
 pub const XFS_AGF_VERSION: u32 = 1;
@@ -136,9 +143,15 @@ pub const XFS_INODESIZE: u16 = 512;
 pub const XFS_INOPBLOCK: u16 = (XFS_BLOCKSIZE / XFS_INODESIZE as u32) as u16;
 
 /// Reserved per-AG metadata blocks. SB/AGF/AGI/AGFL live in sectors
-/// 0..3 of AG-block 0; BNO/CNT/INOBT live at AG-blocks 4/5/6. Block 7
-/// is unused (AGFL reservation slack).
-pub const AG0_METADATA_BLOCKS: u32 = 7;
+/// 0..3 of AG-block 0; BNO/CNT/INOBT live at AG-blocks 4/5/6;
+/// REFCNTBT (reflink) lives at AG-block 7.
+pub const AG0_METADATA_BLOCKS: u32 = 8;
+
+/// AG-relative block where the per-AG REFCNTBT root lives. Stamped
+/// empty (`numrecs = 0`) on a freshly-formatted volume; the
+/// `clone_range` writer (Phase 3b) inserts records as files are
+/// reflinked.
+pub const REFCNTBT_AGBLOCK: u32 = 7;
 
 /// AG-relative block where the root-inode chunk lives. 64 inodes × 512 B
 /// = 32 KiB = 8 FS blocks at 4 KiB. Aligned to a multiple of 8 because
@@ -295,6 +308,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Xfs> {
             free_blocks,
             /*bno_root*/ 4,
             /*cnt_root*/ 5,
+            /*refc_root*/ REFCNTBT_AGBLOCK,
         );
         stamp_v5_agf_crc(&mut agf_buf);
         dev.write_at(ag_byte + (XFS_SECTSIZE as u64), &agf_buf)?;
@@ -371,6 +385,18 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Xfs> {
         );
         stamp_v5_btree_block_crc(&mut inobt_buf);
         dev.write_at(ag_byte + 6 * blocksize, &inobt_buf)?;
+
+        // -- REFCNTBT root at AG-block 7 -------------------------------
+        // Empty refcount-btree (no shared extents yet). The reflink
+        // writer (clone_range) adds records as files are cloned.
+        let mut refc_buf = build_refcountbt_root_leaf(
+            &opts.uuid,
+            /*owner_ag*/ ag,
+            agblocks,
+            /*blkno*/ REFCNTBT_AGBLOCK,
+        );
+        stamp_v5_btree_block_crc(&mut refc_buf);
+        dev.write_at(ag_byte + (REFCNTBT_AGBLOCK as u64) * blocksize, &refc_buf)?;
     }
 
     // -- Inode chunk: 8 contiguous blocks holding 64 v3 inodes (AG 0) ---
@@ -621,8 +647,10 @@ fn build_v5_superblock(
     buf[200..204].copy_from_slice(&0x0000_018au32.to_be_bytes());
     buf[204..208].copy_from_slice(&0x0000_018au32.to_be_bytes()); // bad_features2
     // sb_features_compat (208..212) zero
-    // sb_features_ro_compat (212..216) - we set 0 (no FINOBT etc.).
-    buf[212..216].copy_from_slice(&0u32.to_be_bytes());
+    // sb_features_ro_compat (212..216) - REFLINK (per-AG refcount-btree
+    // for FICLONE / FICLONERANGE). RO_COMPAT means kernels that don't
+    // understand it can still mount the image read-only.
+    buf[212..216].copy_from_slice(&XFS_SB_FEAT_RO_COMPAT_REFLINK.to_be_bytes());
     // sb_features_incompat (216..220) - FTYPE = 0x1.
     buf[216..220].copy_from_slice(&0x0000_0001u32.to_be_bytes());
     // sb_features_log_incompat (220..224) zero
@@ -643,6 +671,7 @@ fn build_agf(
     free_blocks: u32,
     bno_root: u32,
     cnt_root: u32,
+    refc_root: u32,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; XFS_SECTSIZE as usize];
     buf[0..4].copy_from_slice(&XFS_AGF_MAGIC.to_be_bytes());
@@ -667,7 +696,14 @@ fn build_agf(
     // v5 block starts at 64: uuid(16) rmap_blocks(4) refcount_blocks(4)
     // refcount_root(4) refcount_level(4) spare64(14*8) | lsn(8) crc(4) spare2(4)
     buf[64..80].copy_from_slice(uuid);
-    // spare/refc etc all zero
+    // rmap_blocks at 80..84 — stays 0 (no RMAPBT).
+    buf[80..84].copy_from_slice(&0u32.to_be_bytes());
+    // refcount_blocks at 84..88 — one block holds the empty REFCNTBT root.
+    buf[84..88].copy_from_slice(&1u32.to_be_bytes());
+    // refcount_root at 88..92 — AG-relative block of the REFCNTBT leaf.
+    buf[88..92].copy_from_slice(&refc_root.to_be_bytes());
+    // refcount_level at 92..96 — single leaf, no internal levels.
+    buf[92..96].copy_from_slice(&1u32.to_be_bytes());
     // CRC at offset 224 in the AGF (v5 layout: see XFS spec).
     buf
 }
@@ -783,6 +819,36 @@ fn build_alloc_btree_root_leaf(
     let rec_off = XFS_BTREE_SBLOCK_V5_SIZE;
     buf[rec_off..rec_off + 4].copy_from_slice(&free_startblock.to_be_bytes());
     buf[rec_off + 4..rec_off + 8].copy_from_slice(&free_blockcount.to_be_bytes());
+    buf
+}
+
+/// Build a freshly-formatted (empty) v5 REFCNTBT root leaf block. The
+/// refcount B+tree records `(start_block, block_count, refcount)`
+/// triples for every shared-extent range in the AG; an empty leaf has
+/// `numrecs = 0` and is what `xfs_repair -n` expects on an image with
+/// no clones yet.
+///
+/// `clone_range` (Phase 3b stage 2) appends `xfs_refcount_rec` (12-byte)
+/// records here as files are reflinked.
+fn build_refcountbt_root_leaf(
+    uuid: &[u8; 16],
+    owner_ag: u32,
+    agblocks: u32,
+    blkno_ag: u32,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; XFS_BLOCKSIZE as usize];
+    buf[0..4].copy_from_slice(&XFS_REFC_CRC_MAGIC.to_be_bytes());
+    buf[4..6].copy_from_slice(&0u16.to_be_bytes()); // level (leaf)
+    buf[6..8].copy_from_slice(&0u16.to_be_bytes()); // numrecs — empty
+    buf[8..12].copy_from_slice(&u32::MAX.to_be_bytes()); // leftsib
+    buf[12..16].copy_from_slice(&u32::MAX.to_be_bytes()); // rightsib
+    let basic_blkno =
+        ((owner_ag as u64) * (agblocks as u64) + blkno_ag as u64) * (XFS_BLOCKSIZE as u64 / 512);
+    buf[16..24].copy_from_slice(&basic_blkno.to_be_bytes());
+    // lsn at 24..32 zero
+    buf[32..48].copy_from_slice(uuid);
+    buf[48..52].copy_from_slice(&owner_ag.to_be_bytes());
+    // crc at 52..56 left zero (stamped later)
     buf
 }
 

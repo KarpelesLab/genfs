@@ -1607,3 +1607,118 @@ fn ext4_crash_during_flush_recovers_cleanly() {
         );
     }
 }
+
+/// Regression for the one-shot build path (used by `repack`): a file
+/// whose data blocks are scattered across the free-space map needs more
+/// than the 4-extent inline budget, so `fill_block_pointers_extent`
+/// must promote to a depth-1 extent tree. Before the fix it errored
+/// with "max 4 per depth-0 tree (multi-level trees not yet
+/// implemented)" — the exact failure a fragmented tar.gz → ext4 repack
+/// hit.
+///
+/// Recipe to force fragmentation deterministically: fill a band of the
+/// free map with single-block files, free every other one (the
+/// allocator's first-free scan then hands those scattered blocks back),
+/// and write one multi-block file into the holes. e2fsck must accept
+/// the result and the bytes must round-trip in logical order.
+#[test]
+fn ext4_fragmented_file_one_shot_promotes_to_depth1() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 16 * 1024,
+        inodes_count: 1024,
+        journal_blocks: 1024,
+        // Non-sparse so every block is really allocated — otherwise an
+        // all-zero block would become a hole and not fragment.
+        sparse: false,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    let bs = 4096usize;
+
+    // 1) Lay down 64 single-block files contiguously.
+    let filler = vec![0x11u8; bs];
+    let mut spacer = NamedTempFile::new().unwrap();
+    spacer.as_file_mut().write_all(&filler).unwrap();
+    for i in 0..64u32 {
+        let name = format!("sp{i:03}");
+        ext.add_file_to(
+            &mut dev,
+            2,
+            name.as_bytes(),
+            FileSource::HostPath(spacer.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    // 2) Free every other one → ~32 scattered single-block holes.
+    for i in (0..64u32).step_by(2) {
+        ext.remove_path(&mut dev, &format!("/sp{i:03}")).unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+
+    // 3) Write one 24-block file. Each logical block gets a distinct
+    //    non-zero byte so a mis-ordered extent would corrupt readback.
+    let mut payload = Vec::with_capacity(24 * bs);
+    for b in 0..24u8 {
+        payload.extend(std::iter::repeat_n(b.wrapping_add(1), bs));
+    }
+    let mut bigf = NamedTempFile::new().unwrap();
+    bigf.as_file_mut().write_all(&payload).unwrap();
+    ext.add_file_to(
+        &mut dev,
+        2,
+        b"big.bin",
+        FileSource::HostPath(bigf.path().to_path_buf()),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // 4) The extent tree for big.bin must be depth-1 (otherwise the new
+    //    one-shot promotion path wasn't exercised). Decode the header.
+    let ino = ext.path_to_inode(&mut dev, "/big.bin").unwrap();
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    let mut iblock = [0u8; 60];
+    for (i, slot) in inode.block.iter().enumerate() {
+        iblock[i * 4..i * 4 + 4].copy_from_slice(&slot.to_le_bytes());
+    }
+    let depth = u16::from_le_bytes(iblock[6..8].try_into().unwrap());
+    assert_eq!(
+        depth, 1,
+        "big.bin extent tree should be depth-1 after fragmentation, got depth {depth}"
+    );
+
+    // 5) Content round-trips in logical order through fstool's reader.
+    {
+        use std::io::Read;
+        let mut r = ext.open_file_reader(&mut dev, ino).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload, "big.bin bytes corrupted / mis-ordered");
+    }
+    drop(dev);
+
+    // 6) e2fsck -fn clean.
+    let out = Command::new("e2fsck")
+        .args(["-fn"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck not clean on depth-1 fragmented file:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

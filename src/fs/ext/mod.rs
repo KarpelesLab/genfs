@@ -601,26 +601,75 @@ impl Ext {
     /// tree (depth 0, up to 4 leaves, no extra metadata blocks); ext2/3 use
     /// the classic direct + single-indirect + double-indirect scheme.
     /// Returns the number of metadata (indirection) blocks allocated.
-    fn fill_block_pointers(&mut self, inode: &mut Inode, data: &[u32]) -> Result<u32> {
+    fn fill_block_pointers(&mut self, ino: u32, inode: &mut Inode, data: &[u32]) -> Result<u32> {
         if matches!(self.kind, FsKind::Ext4) {
-            return self.fill_block_pointers_extent(inode, data);
+            return self.fill_block_pointers_extent(ino, inode, data);
         }
         self.fill_block_pointers_indirect(inode, data)
     }
 
-    /// Ext4 path: pack `data` into an extent tree stored directly in
-    /// `i_block` and set `EXT4_EXTENTS_FL` on the inode. Allocates no extra
-    /// metadata blocks for depth-0 trees (the cap is 4 extents per inode).
-    fn fill_block_pointers_extent(&mut self, inode: &mut Inode, data: &[u32]) -> Result<u32> {
+    /// Ext4 path: pack `data` into an extent tree stored in `i_block`
+    /// and set `EXT4_EXTENTS_FL`. A run list that fits the 4-extent
+    /// inline budget stays depth-0 (no metadata blocks). Beyond that we
+    /// promote to depth-1: an inline idx node pointing at up to
+    /// `MAX_INDICES_IN_INODE` freshly-allocated leaf blocks, each
+    /// holding up to `per_leaf` extents. This mirrors the streaming
+    /// `append_extent_depth0` → `promote_extent_tree_to_depth1` path so
+    /// the one-shot build (used by `repack`) handles fragmented files
+    /// too. Returns the count of metadata (leaf) blocks allocated.
+    ///
+    /// `ino` is needed so depth-1 leaf blocks can be tracked for
+    /// `ext4_extent_tail` CRC stamping at flush when `metadata_csum`
+    /// is on. Depth ≥ 2 (more than `MAX_INDICES_IN_INODE * per_leaf`
+    /// extents) still returns `Unsupported`.
+    fn fill_block_pointers_extent(
+        &mut self,
+        ino: u32,
+        inode: &mut Inode,
+        data: &[u32],
+    ) -> Result<u32> {
         let runs = extent::coalesce(data);
-        let packed = extent::pack_into_iblock(&runs)?;
-        // Decode the 60 packed bytes back into the 15 u32 slots of i_block.
-        for (i, slot) in inode.block.iter_mut().enumerate() {
-            let off = i * 4;
-            *slot = u32::from_le_bytes(packed[off..off + 4].try_into().unwrap());
-        }
         inode.flags |= constants::EXT4_EXTENTS_FL;
-        Ok(0)
+
+        if runs.len() <= extent::MAX_EXTENTS_IN_INODE {
+            let packed = extent::pack_into_iblock(&runs)?;
+            inode.block = extent::bytes_to_iblock(&packed);
+            return Ok(0);
+        }
+
+        // Depth-1 promotion. Partition the flat run list across leaf
+        // blocks below an inline idx node.
+        let bs = self.layout.block_size;
+        let csum_tail = self.has_metadata_csum();
+        let per_leaf = extent::entries_per_leaf_block_capped(bs, csum_tail);
+        let need_leaves = runs.len().div_ceil(per_leaf);
+        if need_leaves > extent::MAX_INDICES_IN_INODE {
+            return Err(crate::Error::Unsupported(format!(
+                "ext4: file requires {} leaf blocks ({} idx slots × {} entries = {} max); \
+                 depth ≥ 2 not implemented",
+                need_leaves,
+                extent::MAX_INDICES_IN_INODE,
+                per_leaf,
+                extent::MAX_INDICES_IN_INODE * per_leaf,
+            )));
+        }
+        let mut leaf_phys = Vec::with_capacity(need_leaves);
+        for _ in 0..need_leaves {
+            leaf_phys.push(self.alloc_data_block()?);
+        }
+        let (i_block_bytes, leaf_images) = extent::pack_depth1(&runs, bs, csum_tail, &leaf_phys)?;
+        for (phys, image) in leaf_phys.iter().zip(leaf_images) {
+            // Stage the leaf-block image; track it so the metadata_csum
+            // tail is stamped with this inode's seed at flush time.
+            if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| b == phys) {
+                slot.1 = image;
+            } else {
+                self.data_blocks.push((*phys, image));
+            }
+            self.track_extent_leaf_block(*phys, ino);
+        }
+        inode.block = extent::bytes_to_iblock(&i_block_bytes);
+        Ok(need_leaves as u32)
     }
 
     /// Ext2 / Ext3 path: direct + single + double indirection. v1 cap.
@@ -710,7 +759,7 @@ impl Ext {
             data.push(self.alloc_data_block()?);
         }
         let mut inode = Inode::regular(blocks * bs, 0o600, 0, 0, mtime);
-        let meta_blocks = self.fill_block_pointers(&mut inode, &data)?;
+        let meta_blocks = self.fill_block_pointers(ino, &mut inode, &data)?;
         inode.blocks_512 = (blocks + meta_blocks) * (bs / 512);
 
         // Build the JBD2 v2 journal superblock for block 0 of the journal.
@@ -759,7 +808,7 @@ impl Ext {
         }
 
         let mut inode = Inode::directory(16384, 0o700, 0, 0, mtime);
-        let meta_blocks = self.fill_block_pointers(&mut inode, &data_blocks)?;
+        let meta_blocks = self.fill_block_pointers(ino, &mut inode, &data_blocks)?;
         inode.blocks_512 = (target_data_blocks + meta_blocks) * (bs / 512);
 
         // First data block: "." / "..". All blocks of lost+found are
@@ -1914,7 +1963,7 @@ impl Ext {
         }
         debug_assert_eq!(remaining, 0);
 
-        let allocated_meta_blocks = self.fill_block_pointers(&mut inode, &data_blocks)?;
+        let allocated_meta_blocks = self.fill_block_pointers(ino, &mut inode, &data_blocks)?;
         inode.blocks_512 = (allocated_data + allocated_meta_blocks) * (bs / 512);
 
         self.inodes.push((ino, inode));
@@ -1938,7 +1987,7 @@ impl Ext {
         // For ext4, encode the single data block as an inline extent tree;
         // for ext2/3, store the block number directly in i_block[0].
         if matches!(self.kind, FsKind::Ext4) {
-            self.fill_block_pointers_extent(&mut inode, &[blk])?;
+            self.fill_block_pointers_extent(ino, &mut inode, &[blk])?;
         } else {
             inode.block[0] = blk;
         }
@@ -2000,7 +2049,7 @@ impl Ext {
         // path — but with sequential alloc we should always stay
         // depth-0). ext2/3: direct + indirect chain.
         let allocated_meta = if matches!(self.kind, FsKind::Ext4) {
-            self.fill_block_pointers_extent(&mut inode, &blocks)?
+            self.fill_block_pointers_extent(ino, &mut inode, &blocks)?
         } else {
             self.fill_block_pointers_indirect(&mut inode, &blocks)?
         };
@@ -2130,7 +2179,7 @@ impl Ext {
             meta.gid,
             meta.mtime,
         );
-        let allocated_meta = self.fill_block_pointers_extent(&mut inode, &blocks)?;
+        let allocated_meta = self.fill_block_pointers_extent(ino, &mut inode, &blocks)?;
         inode.blocks_512 = (total_blocks as u32 + allocated_meta) * (bs / 512);
         inode.flags |= constants::EXT4_INDEX_FL;
 
@@ -2615,7 +2664,7 @@ impl Ext {
                 .map(|(_, i)| *i)
                 .unwrap();
             let allocated_meta = if matches!(self.kind, FsKind::Ext4) {
-                self.fill_block_pointers_extent(&mut staged, &surviving)?
+                self.fill_block_pointers_extent(ino, &mut staged, &surviving)?
             } else {
                 self.fill_block_pointers_indirect(&mut staged, &surviving)?
             };

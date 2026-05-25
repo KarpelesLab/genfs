@@ -1662,6 +1662,105 @@ impl crate::fs::Filesystem for Ntfs {
         Ok(Box::new(r))
     }
 
+    /// NTFS has no POSIX ownership/mode; we surface what maps cleanly:
+    /// the four timestamps (NT-FILETIME → Unix) and a mode synthesised
+    /// from the DOS attribute bits (directory + read-only). uid/gid stay
+    /// 0. The kind/size come from the directory index (authoritative, and
+    /// the size is what the repack walker streams). Native NTFS metadata
+    /// (DOS attrs, ADS, security, …) round-trips via [`Self::list_xattrs`].
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ntfs: non-UTF-8 path".into()))?;
+        let norm = s.trim_end_matches('/');
+        if norm.is_empty() {
+            return Ok(crate::fs::FileAttrs {
+                kind: crate::fs::EntryKind::Dir,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                blocks: 0,
+                nlink: 2,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
+                rdev: 0,
+                inode: MFT_RECORD_ROOT as u32,
+            });
+        }
+        // kind / size / inode from the parent's index — the same source
+        // the trait default uses, and the only authoritative file size.
+        let (parent, name) = norm.rsplit_once('/').unwrap_or(("", norm));
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let de = self
+            .list_path(dev, parent)?
+            .into_iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| crate::Error::InvalidArgument(format!("ntfs: no entry at {s:?}")))?;
+
+        // mode + times from $STANDARD_INFORMATION (surfaced as xattrs).
+        let xa = self.read_xattrs(dev, s).unwrap_or_default();
+        let dos = xa
+            .get(xattr_keys::DOS_ATTRS)
+            .filter(|v| v.len() >= 4)
+            .map(|v| u32::from_le_bytes(v[0..4].try_into().unwrap()))
+            .unwrap_or(0);
+        let read_only = dos & 0x1 != 0; // FILE_ATTRIBUTE_READONLY
+        let mode = match de.kind {
+            crate::fs::EntryKind::Dir => 0o755,
+            _ if read_only => 0o444,
+            _ => 0o644,
+        };
+        // TIMES_RAW = [creation, modified, mft_changed, accessed] FILETIMEs.
+        let filetime_to_unix = |ft: u64| (ft / 10_000_000).saturating_sub(11_644_473_600) as u32;
+        let pick = |off: usize| -> u32 {
+            xa.get(xattr_keys::TIMES_RAW)
+                .filter(|v| v.len() >= off + 8)
+                .map(|v| filetime_to_unix(u64::from_le_bytes(v[off..off + 8].try_into().unwrap())))
+                .unwrap_or(0)
+        };
+        Ok(crate::fs::FileAttrs {
+            kind: de.kind,
+            mode,
+            uid: 0,
+            gid: 0,
+            size: de.size,
+            blocks: de.size.div_ceil(512),
+            nlink: 1,
+            atime: pick(24),
+            mtime: pick(8),
+            ctime: pick(16),
+            rdev: 0,
+            inode: de.inode,
+        })
+    }
+
+    /// Surface NTFS's native metadata (DOS attributes, object id, reparse
+    /// data, alternate data streams, security descriptor, short name, raw
+    /// timestamps) as `user.ntfs.*` / `system.ntfs_security` xattrs so it
+    /// round-trips through repack.
+    fn list_xattrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::XattrPair>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ntfs: non-UTF-8 path".into()))?;
+        let mut pairs: Vec<crate::fs::XattrPair> = self
+            .read_xattrs(dev, s)?
+            .into_iter()
+            .map(|(name, value)| crate::fs::XattrPair { name, value })
+            .collect();
+        pairs.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(pairs)
+    }
+
     fn open_file_ro<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,

@@ -236,6 +236,64 @@ fn iso_rock_ridge_source_preserves_mode_into_tar() {
     );
 }
 
+/// NTFS source fidelity: NTFS has no POSIX ownership, so `getattr`
+/// surfaces real timestamps (NT-FILETIME → Unix) + a mode synthesised
+/// from the DOS attributes (a read-only file → `r--r--r--`), and
+/// `list_xattrs` carries the native metadata (`user.ntfs.dos_attrs`).
+/// Content + size must survive (the walker streams `getattr` size).
+#[test]
+#[cfg(unix)]
+fn ntfs_source_surfaces_times_mode_and_xattrs() {
+    if !which("tar") {
+        eprintln!("skipping: tar not installed");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let f = src.join("n.txt");
+    std::fs::write(&f, b"payload\n").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let img = work.path().join("fs.img");
+    assert!(
+        run(&[
+            "create",
+            "-t",
+            "ntfs",
+            src.to_str().unwrap(),
+            "-o",
+            img.to_str().unwrap()
+        ])
+        .0
+    );
+    let tar = work.path().join("out.tar");
+    assert!(run(&["repack", img.to_str().unwrap(), tar.to_str().unwrap()]).0);
+
+    // Content + size survive.
+    let body = Command::new("tar")
+        .arg("xOf")
+        .arg(&tar)
+        .arg("n.txt")
+        .output()
+        .unwrap();
+    assert_eq!(body.stdout, b"payload\n", "ntfs body wrong");
+
+    // Synthesised read-only mode + a real (non-1970) timestamp.
+    let listing = Command::new("tar").arg("tvf").arg(&tar).output().unwrap();
+    let s = String::from_utf8_lossy(&listing.stdout);
+    let line = s.lines().find(|l| l.contains("n.txt")).unwrap_or("");
+    assert!(
+        line.contains("r--r--r--"),
+        "ntfs read-only mode not synthesised:\n{line}"
+    );
+    assert!(
+        !line.contains("1970"),
+        "ntfs timestamp not surfaced (still epoch):\n{line}"
+    );
+}
+
 /// HFS+ source fidelity: a `0640` file repacked to tar keeps its mode +
 /// uid/gid (HFS+ `getattr` reads `HFSPlusBSDInfo`).
 #[test]

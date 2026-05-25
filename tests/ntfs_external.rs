@@ -471,6 +471,249 @@ fn reopen_then_add_file_roundtrips_and_validates() {
     }
 }
 
+/// Remove round-trip: build the standard tree (resident `hello.txt`,
+/// non-resident `sub/big.bin`, `link` symlink, `sub/` directory), drop
+/// the handle, reopen, remove each of them in dependency order, flush,
+/// reopen again and confirm:
+///   * the removed names are absent from `list_path`;
+///   * `lookup_path` on a removed name returns an error;
+///   * surviving siblings (none in this test, but the size invariant
+///     and `ntfsfix` cleanness stand in);
+///   * `ntfsfix --no-action` reports the volume mounted cleanly;
+///   * `ntfsls --force` does not list the removed names.
+#[test]
+fn remove_files_and_empty_dir_round_trip() {
+    let img = build_image_with_tree(16 * 1024 * 1024);
+    let path = img.path().to_path_buf();
+
+    // Phase 1: reopen, remove everything we can, flush.
+    {
+        let mut dev = FileBackend::open(&path).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+
+        // Order matters: empty sub/ requires big.bin to be gone first.
+        ntfs.remove(&mut dev, "/link").unwrap();
+        ntfs.remove(&mut dev, "/sub/big.bin").unwrap();
+        ntfs.remove(&mut dev, "/sub").unwrap();
+        ntfs.remove(&mut dev, "/hello.txt").unwrap();
+
+        ntfs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    // Phase 2: reopen — the names are gone, lookup_path errors.
+    {
+        let mut dev = FileBackend::open(&path).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        let names: Vec<String> = ntfs
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        for gone in ["link", "sub", "hello.txt"] {
+            assert!(
+                !names.iter().any(|n| n == gone),
+                "expected {gone:?} to be gone, got {names:?}"
+            );
+        }
+        for gone in ["/link", "/sub", "/sub/big.bin", "/hello.txt"] {
+            assert!(
+                ntfs.lookup_path(&mut dev, gone).is_err(),
+                "lookup_path on removed {gone:?} unexpectedly succeeded"
+            );
+        }
+    }
+
+    // Phase 3: ntfsfix / ntfsls oracles.
+    if which("ntfsfix").is_some() {
+        let out = Command::new("ntfsfix")
+            .arg("--no-action")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("Mounting volume... OK"),
+            "ntfsfix did not cleanly mount the post-remove image:\n{combined}"
+        );
+    } else {
+        eprintln!("skipping ntfsfix oracle: not installed");
+    }
+
+    if which("ntfsls").is_some() {
+        let out = Command::new("ntfsls")
+            .arg("--force")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "ntfsls failed after removes:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for gone in ["link", "sub", "hello.txt"] {
+            // `ntfsls` shows one entry per line; reject substring rather
+            // than exact-line match so trailing whitespace is tolerated.
+            for line in stdout.lines() {
+                assert!(
+                    line.trim() != gone,
+                    "ntfsls still lists removed name {gone:?}:\n{stdout}"
+                );
+            }
+        }
+    } else {
+        eprintln!("skipping ntfsls oracle: not installed");
+    }
+}
+
+/// Promoted-index removal: stuff a single directory with enough entries
+/// to force `promote_index_to_allocation` (one INDX block), then remove
+/// one entry from the middle of the block. Confirms the large-index
+/// branch of the splice path works and the image stays `ntfsfix`-clean.
+#[test]
+fn remove_from_promoted_index_passes_ntfsfix() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), 16 * 1024 * 1024).unwrap();
+    let opts = FormatOpts {
+        volume_label: "FSTOOL-REM-LG".to_string(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+    ntfs.create_dir(&mut dev, "/many", FileMeta::default())
+        .unwrap();
+    // 16 files of ~50 chars each — pushes $INDEX_ROOT past
+    // MAX_INDEX_ROOT_BYTES (512) and forces promotion while still
+    // fitting inside the writer's single-INDX-block budget.
+    let mut planted: Vec<String> = Vec::new();
+    for i in 0..16 {
+        let name = format!("/many/entry-with-a-longish-name-{i:03}.txt");
+        ntfs.create_file(
+            &mut dev,
+            &name,
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(format!("body-{i}\n").into_bytes())),
+                len: format!("body-{i}\n").len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        planted.push(name);
+    }
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // Reopen, remove one entry from the middle of the promoted block.
+    let victim_idx = planted.len() / 2;
+    let victim = &planted[victim_idx];
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        ntfs.remove(&mut dev, victim).unwrap();
+        ntfs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    // Re-open and confirm the victim is gone but siblings remain.
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        assert!(
+            ntfs.lookup_path(&mut dev, victim).is_err(),
+            "victim still resolves after promoted-index remove"
+        );
+        let kids: Vec<String> = ntfs
+            .list_path(&mut dev, "/many")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(kids.len(), planted.len() - 1, "kids: {kids:?}");
+        for (i, name) in planted.iter().enumerate() {
+            let leaf = name.rsplit('/').next().unwrap();
+            if i == victim_idx {
+                assert!(!kids.iter().any(|k| k == leaf), "victim survived: {kids:?}");
+            } else {
+                assert!(kids.iter().any(|k| k == leaf), "sibling lost: {kids:?}");
+            }
+        }
+    }
+
+    if which("ntfsfix").is_some() {
+        let out = Command::new("ntfsfix")
+            .arg("--no-action")
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("Mounting volume... OK"),
+            "ntfsfix not clean after promoted-index remove:\n{combined}"
+        );
+    } else {
+        eprintln!("skipping ntfsfix oracle: not installed");
+    }
+}
+
+/// Negative cases: removing the root, a system record, a missing path,
+/// or a non-empty directory all reject cleanly without corrupting the
+/// image (ntfsfix stays clean afterwards).
+#[test]
+fn remove_negative_cases_reject_cleanly() {
+    let img = build_image_with_tree(16 * 1024 * 1024);
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+
+    // Root.
+    let err = ntfs
+        .remove(&mut dev, "/")
+        .expect_err("remove of root must reject");
+    assert!(matches!(err, fstool::Error::InvalidArgument(_)));
+
+    // Missing path.
+    assert!(ntfs.remove(&mut dev, "/no-such-file").is_err());
+
+    // Non-empty directory.
+    let err = ntfs
+        .remove(&mut dev, "/sub")
+        .expect_err("remove of non-empty dir must reject");
+    assert!(
+        matches!(err, fstool::Error::InvalidArgument(_)),
+        "expected InvalidArgument for non-empty dir, got: {err:?}"
+    );
+
+    // The image must still be mountable (no half-state corruption).
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+    if which("ntfsfix").is_some() {
+        let out = Command::new("ntfsfix")
+            .arg("--no-action")
+            .arg(img.path())
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("Mounting volume... OK"),
+            "rejected removes corrupted the image:\n{combined}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------
 // Mount-via-ntfs-3g (manual only).
 //

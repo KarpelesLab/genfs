@@ -560,6 +560,310 @@ impl super::Ntfs {
         ))
     }
 
+    /// Remove the file / empty directory / symlink at `path`. The inverse
+    /// of `create_file` / `create_dir` / `create_symlink`:
+    ///
+    /// 1. splice every parent `$I30` entry pointing at the target out of
+    ///    `$INDEX_ROOT` (or, for promoted dirs, out of the single
+    ///    `$INDEX_ALLOCATION` INDX block — no de-promotion);
+    /// 2. free every non-resident attribute's clusters in `$Bitmap`
+    ///    (unnamed `$DATA`, named ADS, `$INDEX_ALLOCATION`,
+    ///    non-resident `$BITMAP`);
+    /// 3. clear the MFT record's `FLAG_IN_USE`, bump its sequence
+    ///    number, and clear the corresponding bit in the MFT bitmap.
+    ///
+    /// `flush` (caller-driven) restamps `$Bitmap` and the MFT bitmap.
+    ///
+    /// Refuses with `Unsupported` for:
+    /// * the root or any system record (rec < `FIRST_USER_RECORD`),
+    /// * records that have spilled into `$ATTRIBUTE_LIST` (writer
+    ///   never produces those, so this only fires on third-party images),
+    /// * non-empty directories,
+    /// * `$DATA` carrying the encrypted / compressed / sparse flags
+    ///   (the writer never produces them and freeing their runs by
+    ///   physical extent count would be unsafe).
+    pub fn remove(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        self.ensure_writer(dev)?;
+        let norm = normalize_path(path);
+        if norm == "/" {
+            return Err(crate::Error::InvalidArgument(
+                "ntfs: refusing to remove the root directory".into(),
+            ));
+        }
+        let target_rec = self.lookup_path(dev, &norm)?;
+        if target_rec < FIRST_USER_RECORD {
+            return Err(crate::Error::InvalidArgument(format!(
+                "ntfs: refusing to remove system record {target_rec}"
+            )));
+        }
+        let (parent_path, _base_name) = split_parent(&norm)?;
+        let parent_rec = self.resolve_dir(dev, &parent_path)?;
+
+        // Load the target's MFT record(s). $ATTRIBUTE_LIST spill is
+        // rejected (matches the writer's create-side simplification).
+        let records = self.load_record_set(dev, target_rec)?;
+        if records.len() > 1 {
+            return Err(crate::Error::Unsupported(
+                "ntfs: remove of records with $ATTRIBUTE_LIST spill is not supported".into(),
+            ));
+        }
+        let target_rec_bytes = records[0].1.clone();
+        let target_hdr = mft::RecordHeader::parse(&target_rec_bytes)?;
+        if !target_hdr.is_in_use() {
+            return Err(crate::Error::InvalidImage(format!(
+                "ntfs: record {target_rec} is not in use"
+            )));
+        }
+
+        // Empty-directory check. read_directory dedups DOS/Win32 entries
+        // and only surfaces the system `$`-prefixed entries at the root —
+        // which is rejected above — so for a user-created dir an empty
+        // index means an empty directory.
+        if target_hdr.is_directory() {
+            let kids = self.read_directory(dev, target_rec)?;
+            if !kids.is_empty() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "ntfs: cannot remove non-empty directory ({} entries)",
+                    kids.len()
+                )));
+            }
+        }
+
+        // Read the link count from the record header (offset 0x12, u16).
+        // If > 1 this is a hard-linked file: unlink only from the given
+        // parent, decrement, do NOT free clusters or the MFT record.
+        let link_count = u16::from_le_bytes(target_rec_bytes[0x12..0x14].try_into().unwrap());
+        let is_hardlink = link_count > 1;
+
+        // Reject encrypted / compressed / sparse $DATA so we don't
+        // mis-free clusters of a layout the writer can't produce.
+        for attr_res in super::attribute::AttributeIter::new(
+            &target_rec_bytes,
+            target_hdr.first_attribute_offset as usize,
+        ) {
+            let attr = attr_res?;
+            if attr.type_code == super::attribute::TYPE_DATA
+                && (attr.flags
+                    & (super::attribute::ATTR_FLAG_COMPRESSED
+                        | super::attribute::ATTR_FLAG_ENCRYPTED
+                        | super::attribute::ATTR_FLAG_SPARSE))
+                    != 0
+            {
+                return Err(crate::Error::Unsupported(
+                    "ntfs: remove of compressed / encrypted / sparse $DATA is not supported".into(),
+                ));
+            }
+        }
+
+        // 1) Splice every parent index entry pointing at target_rec.
+        self.remove_entries_from_parent(dev, parent_rec, target_rec)?;
+
+        if is_hardlink {
+            // Hard-link unlink: decrement link count + write back.
+            let mut rec_buf = target_rec_bytes.clone();
+            let new_lc = link_count - 1;
+            rec_buf[0x12..0x14].copy_from_slice(&new_lc.to_le_bytes());
+            let off = self
+                .writer
+                .as_ref()
+                .expect("writer present")
+                .mft_offset(target_rec)?;
+            let sector_size = self
+                .writer
+                .as_ref()
+                .expect("writer present")
+                .layout
+                .bytes_per_sector as usize;
+            mft::install_fixup(&mut rec_buf, sector_size, 1);
+            dev.write_at(off, &rec_buf)?;
+        } else {
+            // 2) Free clusters from every non-resident stream.
+            self.free_runlist_clusters(&target_rec_bytes)?;
+            // 3) Free the MFT record.
+            self.mark_record_free(dev, target_rec, target_rec_bytes)?;
+        }
+
+        // Drop dir_cache entry for the removed path (and the parent's
+        // entry stays, of course). The path normalisation we computed
+        // above is already in canonical form.
+        if let Some(w) = self.writer.as_mut() {
+            w.dir_cache.remove(&norm);
+        }
+
+        Ok(())
+    }
+
+    /// Splice every index entry whose `file_ref`'s low 48 bits equal
+    /// `target_rec` out of the parent directory's `$I30`. Dispatches
+    /// between the resident `$INDEX_ROOT` (small) and the single-block
+    /// `$INDEX_ALLOCATION` (promoted) cases — never de-promotes.
+    fn remove_entries_from_parent(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_rec: u64,
+        target_rec: u64,
+    ) -> Result<()> {
+        let (rec_size, sector_size) = {
+            let w = self.writer.as_ref().expect("writer present");
+            (
+                w.layout.mft_record_size as usize,
+                w.layout.bytes_per_sector as usize,
+            )
+        };
+        let off = self
+            .writer
+            .as_ref()
+            .expect("writer present")
+            .mft_offset(parent_rec)?;
+        let mut rec = vec![0u8; rec_size];
+        dev.read_at(off, &mut rec)?;
+        mft::apply_fixup(&mut rec, sector_size)?;
+
+        let current =
+            extract_resident_attr_value(&rec, TYPE_INDEX_ROOT, "$I30").ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: parent directory missing $INDEX_ROOT".into())
+            })?;
+        // LARGE_INDEX flag lives at value offset 28 (index-header byte 12).
+        let is_large_index = current.len() >= 29 && current[28] & 0x01 != 0;
+        if is_large_index {
+            // Promoted: real entries live in the single INDX block.
+            self.remove_entry_from_allocation_block(dev, parent_rec, target_rec)
+        } else {
+            // Small: rebuild $INDEX_ROOT with matching entries dropped.
+            let new_value = format::remove_entry_from_index_root(&current, target_rec)?;
+            rewrite_resident_attr(&mut rec, rec_size, TYPE_INDEX_ROOT, "$I30", &new_value)?;
+            mft::install_fixup(&mut rec, sector_size, 1);
+            dev.write_at(off, &rec)?;
+            Ok(())
+        }
+    }
+
+    /// Inverse of `insert_into_allocation_block`: read the single INDX
+    /// block, drop entries whose `file_ref` low-48 == `target_rec`,
+    /// rebuild via `build_indx_block`, write back.
+    fn remove_entry_from_allocation_block(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_rec: u64,
+        target_rec: u64,
+    ) -> Result<()> {
+        let writer = self.writer.as_mut().expect("writer present");
+        let rec_size = writer.layout.mft_record_size as usize;
+        let sector_size = writer.layout.bytes_per_sector as usize;
+        let cluster_size = writer.cluster_size;
+        let block_size = writer.layout.index_record_size as usize;
+
+        let off = writer.mft_offset(dir_rec)?;
+        let mut rec = vec![0u8; rec_size];
+        dev.read_at(off, &mut rec)?;
+        mft::apply_fixup(&mut rec, sector_size)?;
+
+        let alloc_runs = extract_non_resident_runs(&rec, TYPE_INDEX_ALLOCATION, "$I30")
+            .ok_or_else(|| {
+                crate::Error::InvalidImage(
+                    "ntfs: promoted directory missing $INDEX_ALLOCATION".into(),
+                )
+            })?;
+        let (alloc_lcn, _alloc_clusters) = alloc_runs[0];
+
+        let block_off = alloc_lcn * cluster_size;
+        let mut block = vec![0u8; block_size];
+        dev.read_at(block_off, &mut block)?;
+        mft::apply_fixup(&mut block, sector_size)?;
+
+        let first_entry_off = u32::from_le_bytes(block[0x18..0x1C].try_into().unwrap()) as usize;
+        let bytes_in_use = u32::from_le_bytes(block[0x1C..0x20].try_into().unwrap()) as usize;
+        let entries_start = 0x18 + first_entry_off;
+        let entries_end = 0x18 + bytes_in_use;
+        const FILE_REF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+        let mut kept_entries: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = entries_start;
+        while cursor + 16 <= entries_end {
+            let entry_len =
+                u16::from_le_bytes(block[cursor + 8..cursor + 10].try_into().unwrap()) as usize;
+            if entry_len < 16 || cursor + entry_len > entries_end {
+                break;
+            }
+            let flags = u32::from_le_bytes(block[cursor + 12..cursor + 16].try_into().unwrap());
+            let is_last = flags & 0x02 != 0;
+            if is_last {
+                break;
+            }
+            let file_ref =
+                u64::from_le_bytes(block[cursor..cursor + 8].try_into().unwrap()) & FILE_REF_MASK;
+            if file_ref != target_rec {
+                kept_entries.push(block[cursor..cursor + entry_len].to_vec());
+            }
+            cursor += entry_len;
+        }
+
+        let mut new_block = build_indx_block(block_size, sector_size, 0, &kept_entries)?;
+        mft::install_fixup(&mut new_block, sector_size, 1);
+        dev.write_at(block_off, &new_block)?;
+        let _ = rec_size; // silence unused (mirrors insert path)
+        Ok(())
+    }
+
+    /// Free every cluster owned by the target record's non-resident
+    /// attributes (unnamed `$DATA`, named ADS, `$INDEX_ALLOCATION`,
+    /// non-resident `$BITMAP`). Sets the writer dirty so flush restamps
+    /// `$Bitmap`.
+    fn free_runlist_clusters(&mut self, rec_bytes: &[u8]) -> Result<()> {
+        let writer = self.writer.as_mut().expect("writer present");
+        for (_tc, _name, runs) in for_each_non_resident_attr(rec_bytes) {
+            for (lcn, length) in runs {
+                for c in lcn..lcn.saturating_add(length) {
+                    writer.layout.bitmap.clear(c);
+                }
+            }
+        }
+        writer.dirty = true;
+        Ok(())
+    }
+
+    /// Mark `target_rec` free: clear `FLAG_IN_USE` in the header, bump
+    /// the sequence number (NTFS convention so stale file references
+    /// can be detected), reinstall fixup, write the record back, clear
+    /// the bit in `mft_bitmap`, and lower `next_user_record` so the
+    /// slot is reused on the next allocation. Sets `dirty`.
+    fn mark_record_free(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        target_rec: u64,
+        mut rec_bytes: Vec<u8>,
+    ) -> Result<()> {
+        let writer = self.writer.as_mut().expect("writer present");
+        let sector_size = writer.layout.bytes_per_sector as usize;
+        let off = writer.mft_offset(target_rec)?;
+
+        // Header: flags at 0x16 (u16), seq at 0x10 (u16).
+        let mut flags = u16::from_le_bytes(rec_bytes[0x16..0x18].try_into().unwrap());
+        flags &= !mft::RecordHeader::FLAG_IN_USE;
+        rec_bytes[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
+        let seq = u16::from_le_bytes(rec_bytes[0x10..0x12].try_into().unwrap());
+        let mut new_seq = seq.wrapping_add(1);
+        if new_seq == 0 {
+            new_seq = 1;
+        }
+        rec_bytes[0x10..0x12].copy_from_slice(&new_seq.to_le_bytes());
+
+        mft::install_fixup(&mut rec_bytes, sector_size, 1);
+        dev.write_at(off, &rec_bytes)?;
+
+        // Clear the MFT bitmap bit + lower the allocation hint.
+        let i = (target_rec / 8) as usize;
+        let m = 1u8 << ((target_rec % 8) as u8);
+        if i < writer.mft_bitmap.len() {
+            writer.mft_bitmap[i] &= !m;
+        }
+        if target_rec < writer.next_user_record {
+            writer.next_user_record = target_rec;
+        }
+        writer.dirty = true;
+        Ok(())
+    }
+
     /// Reconstruct a [`WriterState`] from an already-formatted on-disk
     /// volume so a *reopened* image (`Ntfs::open`, `writer: None`) can be
     /// mutated — e.g. an NTFS filesystem living inside a qcow2 used as a
@@ -1097,6 +1401,75 @@ fn extract_non_resident_runs(rec: &[u8], type_code: u32, name: &str) -> Option<V
         cursor += len;
     }
     None
+}
+
+/// `(type_code, attribute_name, runs)` — one entry per non-resident
+/// attribute returned by [`for_each_non_resident_attr`].
+type NonResidentAttrInfo = (u32, String, Vec<(u64, u64)>);
+
+/// Sibling of [`extract_non_resident_runs`] that enumerates *every*
+/// non-resident attribute in `rec` and returns its `(type_code, name,
+/// runs)` tuples. The runs include only allocated extents (`lcn !=
+/// None`), matching `extract_non_resident_runs`'s convention.
+///
+/// Used by `free_runlist_clusters` on the remove path: a single MFT
+/// record can carry the unnamed `$DATA`, named `$DATA` ADS streams, a
+/// directory's `$INDEX_ALLOCATION`, and a non-resident `$BITMAP` — all
+/// must be freed when the file is removed.
+fn for_each_non_resident_attr(rec: &[u8]) -> Vec<NonResidentAttrInfo> {
+    let mut out: Vec<NonResidentAttrInfo> = Vec::new();
+    let Ok(hdr) = mft::RecordHeader::parse(rec) else {
+        return out;
+    };
+    let bytes_in_use = hdr.bytes_in_use as usize;
+    let first = hdr.first_attribute_offset as usize;
+    let mut cursor = first;
+    while cursor + 4 <= bytes_in_use {
+        let Ok(tc_b) = rec[cursor..cursor + 4].try_into() else {
+            break;
+        };
+        let tc = u32::from_le_bytes(tc_b);
+        if tc == 0xFFFF_FFFF {
+            break;
+        }
+        let Ok(len_b) = rec[cursor + 4..cursor + 8].try_into() else {
+            break;
+        };
+        let len = u32::from_le_bytes(len_b) as usize;
+        if len == 0 || cursor + len > bytes_in_use {
+            break;
+        }
+        let non_resident = rec[cursor + 8] != 0;
+        let name_len = rec[cursor + 9] as usize;
+        let name_off =
+            u16::from_le_bytes(rec[cursor + 10..cursor + 12].try_into().unwrap_or([0; 2])) as usize;
+        let attr_name = if name_len == 0 {
+            String::new()
+        } else {
+            super::attribute::decode_utf16le(
+                &rec[cursor + name_off..cursor + name_off + name_len * 2],
+            )
+        };
+        if non_resident {
+            let runs_off = u16::from_le_bytes(
+                rec[cursor + 0x20..cursor + 0x22]
+                    .try_into()
+                    .unwrap_or([0; 2]),
+            ) as usize;
+            let runs_bytes = &rec[cursor + runs_off..cursor + len];
+            if let Ok(extents) = super::run_list::decode(runs_bytes) {
+                let runs: Vec<(u64, u64)> = extents
+                    .into_iter()
+                    .filter_map(|e| e.lcn.map(|lcn| (lcn, e.length)))
+                    .collect();
+                if !runs.is_empty() {
+                    out.push((tc, attr_name, runs));
+                }
+            }
+        }
+        cursor += len;
+    }
+    out
 }
 
 /// Walk an MFT record looking for a resident attribute of `(type_code, name)`.

@@ -1643,10 +1643,11 @@ impl crate::fs::Filesystem for Ntfs {
         self.create_device(dev, s, kind, major, minor, meta)
     }
 
-    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "ntfs: remove is not yet implemented".into(),
-        ))
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ntfs: non-UTF-8 path".into()))?;
+        self.remove(dev, s)
     }
 
     fn list(

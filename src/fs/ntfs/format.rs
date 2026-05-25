@@ -1731,6 +1731,77 @@ pub fn insert_into_index_root(
     Ok(out)
 }
 
+/// Pure inverse of [`insert_into_index_root`]: splice every `$I30`
+/// entry whose `file_ref`'s low 48 bits equal `target_rec` out of the
+/// `$INDEX_ROOT` value, rebuilding the index header so `bytes_in_use`
+/// / `bytes_allocated` shrink to match. Returns the new value bytes.
+///
+/// Matches by record number rather than by collation key — the
+/// writer's flat `$INDEX_ROOT` never has duplicate names referring to
+/// different records, and the same file's Win32 + DOS dual entries
+/// both share `file_ref` (just with different `$FILE_NAME` keys), so
+/// the record-number filter removes them in a single pass.
+pub fn remove_entry_from_index_root(root_value: &[u8], target_rec: u64) -> Result<Vec<u8>> {
+    if root_value.len() < 32 {
+        return Err(crate::Error::InvalidImage(
+            "ntfs: $INDEX_ROOT too small to mutate".into(),
+        ));
+    }
+    let header_meta = &root_value[..16];
+    let bytes_in_use = u32::from_le_bytes(root_value[20..24].try_into().unwrap()) as usize;
+    let flags = root_value[28];
+    let entries_start = 32;
+    let entries_end = 16 + bytes_in_use;
+
+    const FILE_REF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+    let mut cursor = entries_start;
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut terminator: Vec<u8> = Vec::new();
+    while cursor + 16 <= entries_end {
+        let entry_len =
+            u16::from_le_bytes(root_value[cursor + 8..cursor + 10].try_into().unwrap()) as usize;
+        if entry_len < 16 || cursor + entry_len > entries_end {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: malformed $INDEX_ROOT entry length".into(),
+            ));
+        }
+        let e_flags = u32::from_le_bytes(root_value[cursor + 12..cursor + 16].try_into().unwrap());
+        let is_last = e_flags & 0x02 != 0;
+        let slice = root_value[cursor..cursor + entry_len].to_vec();
+        if is_last {
+            terminator = slice;
+            break;
+        }
+        let file_ref =
+            u64::from_le_bytes(root_value[cursor..cursor + 8].try_into().unwrap()) & FILE_REF_MASK;
+        if file_ref != target_rec {
+            entries.push(slice);
+        }
+        cursor += entry_len;
+    }
+    if terminator.is_empty() {
+        return Err(crate::Error::InvalidImage(
+            "ntfs: $INDEX_ROOT missing terminator".into(),
+        ));
+    }
+
+    let entries_total: usize = entries.iter().map(|e| e.len()).sum::<usize>() + terminator.len();
+    let new_bytes_in_use = 16 + entries_total;
+    let new_total = 16 + new_bytes_in_use;
+    let mut out = Vec::with_capacity(new_total);
+    out.extend_from_slice(header_meta);
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&(new_bytes_in_use as u32).to_le_bytes());
+    out.extend_from_slice(&(new_bytes_in_use as u32).to_le_bytes());
+    out.push(flags);
+    out.extend_from_slice(&[0u8; 3]);
+    for e in &entries {
+        out.extend_from_slice(e);
+    }
+    out.extend_from_slice(&terminator);
+    Ok(out)
+}
+
 /// Compute the number of mirror clusters: covers records 0..3 (4 × rec_size).
 pub fn mirror_clusters(rec_size: u32, cluster_size: u32) -> u64 {
     let mirror_bytes = 4 * rec_size as u64;

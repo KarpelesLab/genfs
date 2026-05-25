@@ -36,9 +36,21 @@ pub(super) fn add_file(
 ) -> Result<()> {
     // Load the source bytes into memory. GRF entries are zlib blobs
     // that must be deflated as a single stream, so we can't avoid
-    // buffering — keep this realistic by capping at 4 GiB minus
-    // a margin so the u32 fields don't overflow.
+    // buffering one file — but only one (bounded by the largest file),
+    // never a temp file and never the whole tree.
     let plain = read_source(src)?;
+    add_file_bytes(grf, dev, key, plain)
+}
+
+/// Compress `plain` and append it at the current `data_end`, recording the
+/// entry. Shared by [`add_file`] and the streaming create path so neither
+/// needs a temp file.
+pub(super) fn add_file_bytes(
+    grf: &mut Grf,
+    dev: &mut dyn BlockDevice,
+    key: String,
+    plain: Vec<u8>,
+) -> Result<()> {
     if plain.len() > (u32::MAX as usize - 1024) {
         return Err(crate::Error::Unsupported(
             "grf: file body larger than 4 GiB - 1 KiB".into(),

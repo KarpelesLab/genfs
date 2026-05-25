@@ -326,6 +326,27 @@ impl crate::fs::Filesystem for Grf {
         writer::add_file(self, dev, key, src)
     }
 
+    /// Stream the body straight into the (zlib-compressed) data area — no
+    /// temp file. GRF must hold one file in memory to deflate it as a
+    /// single stream, but never more than the largest file, and never the
+    /// whole tree.
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        _meta: FileMeta,
+    ) -> Result<()> {
+        let key = normalise_path(
+            path.to_str()
+                .ok_or_else(|| crate::Error::InvalidArgument("grf: non-UTF-8 path".into()))?,
+        );
+        let mut plain = Vec::with_capacity(len.min(64 * 1024 * 1024) as usize);
+        std::io::Read::take(body, len).read_to_end(&mut plain)?;
+        writer::add_file_bytes(self, dev, key, plain)
+    }
+
     fn create_dir(
         &mut self,
         _dev: &mut dyn BlockDevice,

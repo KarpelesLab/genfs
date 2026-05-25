@@ -69,13 +69,28 @@ impl Default for EntryMeta {
     }
 }
 
-/// Buffered entry kinds. Regular file payloads are kept as `FileSource`
-/// to preserve the streaming invariant.
+/// Per-file on-disk layout, recorded as each file's data is streamed to
+/// the output device during the data phase. Phase B reads these to build
+/// the file inodes. Carried at module scope because the data phase now
+/// runs incrementally (one file at a time) rather than in a single
+/// `flush` loop.
+struct FileLayout {
+    blocks_start: u64,
+    block_size_words: Vec<u32>,
+    fragment_index: u32,
+    fragment_offset: u32,
+    file_size: u64,
+}
+
+/// Buffered entry kinds. Regular file payloads are streamed to disk the
+/// moment they are added (see [`WriteState::stream_file`]); the on-disk
+/// layout lives in [`WriteState::file_layouts`], so the `File` variant
+/// itself carries no data.
 #[allow(dead_code)]
 enum BuiltKind {
     /// Reserved for future use (e.g. device nodes); not currently emitted.
     Dir,
-    File(FileSource),
+    File,
     Symlink(String),
     /// A second directory entry pointing at an existing inode. The `String`
     /// is the *normalised* path of the source entry. We resolve it at
@@ -112,6 +127,40 @@ pub struct WriteState {
     /// [`compress_threads`] (env / CPU count). Tests use this to compare
     /// serial vs parallel output without racing on a process-global env.
     compress_threads: Option<usize>,
+
+    // ---- Incremental data-phase state ----
+    //
+    // File payloads are written to the output device the moment they are
+    // added rather than buffered (in RAM or a temp file) until `flush`.
+    // The only data-side memory we hold is the current fragment block
+    // (≤ `block_size`) plus whatever the parallel pipeline keeps in
+    // flight (bounded by back-pressure).
+    /// Parallel compression + ordered-write pipeline for data/fragment
+    /// blocks. Created lazily by [`Self::ensure_data_phase`] and consumed
+    /// in [`Self::flush`]. `None` until the first file (or `flush`) runs.
+    data_pipe: Option<BlockPipeline>,
+    /// Running disk offset for the data phase (start of the next section
+    /// once the pipeline drains). Mirrors the old `next_disk_offset`.
+    data_next_offset: u64,
+    /// Current fragment-block accumulator. Tails / sub-block files pack
+    /// here until appending would exceed `block_size`, at which point the
+    /// buffer is submitted as one fragment block.
+    frag_buf: Vec<u8>,
+    /// Fragment-table entries (disk_offset, size_word), back-patched once
+    /// the pipeline drains in `flush`.
+    fragment_entries: Vec<(u64, u32)>,
+    /// Count of fragment blocks submitted so far == the index the *next*
+    /// fragment block will occupy. Matches the serial code's
+    /// `fragment_entries.len()` for files whose tail lands in the current
+    /// (not-yet-flushed) buffer.
+    frag_block_count: u32,
+    /// Per-file on-disk layout, recorded as each file streams.
+    file_layouts: BTreeMap<String, FileLayout>,
+    /// 64 KiB staging buffer reused for copying tails into `frag_buf`.
+    data_scratch: Vec<u8>,
+    /// Whether [`Self::ensure_data_phase`] has run (placeholder superblock
+    /// + LZ4 options written, pipeline created).
+    data_started: bool,
 }
 
 struct EntryDir {
@@ -138,6 +187,14 @@ impl WriteState {
             dirs,
             files: BTreeMap::new(),
             compress_threads: None,
+            data_pipe: None,
+            data_next_offset: 0,
+            frag_buf: Vec::new(),
+            fragment_entries: Vec::new(),
+            frag_block_count: 0,
+            file_layouts: BTreeMap::new(),
+            data_scratch: Vec::new(),
+            data_started: false,
         }
     }
 
@@ -159,6 +216,7 @@ impl WriteState {
 
     pub fn create_file(
         &mut self,
+        dev: &mut dyn BlockDevice,
         path: &str,
         src: FileSource,
         meta: EntryMeta,
@@ -172,14 +230,197 @@ impl WriteState {
         }
         let parent = parent_path(&p);
         self.ensure_parent(parent)?;
+        // Stream the payload to the data area immediately; only bounded
+        // metadata (and the current fragment block) stays in RAM.
+        self.ensure_data_phase(dev)?;
+        let (mut r, total) = src
+            .open()
+            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+        self.stream_file(dev, &p, &mut r, total)?;
         self.files.insert(
             p,
             BuiltEntry {
-                kind: BuiltKind::File(src),
+                kind: BuiltKind::File,
                 meta,
                 xattrs,
             },
         );
+        Ok(())
+    }
+
+    /// Like [`Self::create_file`] but streams the payload directly from a
+    /// borrowed reader — no `FileSource`, no temp file. The data area
+    /// receives exactly `len` bytes from `body`.
+    pub fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        body: &mut dyn Read,
+        len: u64,
+        meta: EntryMeta,
+        xattrs: Vec<Xattr>,
+    ) -> Result<()> {
+        let p = normalise_path(path)?;
+        if p == "/" {
+            return Err(crate::Error::InvalidArgument(
+                "squashfs: cannot create file at /".into(),
+            ));
+        }
+        let parent = parent_path(&p);
+        self.ensure_parent(parent)?;
+        self.ensure_data_phase(dev)?;
+        self.stream_file(dev, &p, body, len)?;
+        self.files.insert(
+            p,
+            BuiltEntry {
+                kind: BuiltKind::File,
+                meta,
+                xattrs,
+            },
+        );
+        Ok(())
+    }
+
+    /// Start the data phase if it has not begun: write the placeholder
+    /// superblock (96 zeros) and, for LZ4, the compressor-options
+    /// metablock, set the running disk offset, and create the parallel
+    /// block pipeline. Idempotent.
+    fn ensure_data_phase(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if self.data_started {
+            return Ok(());
+        }
+        let mut next_disk_offset: u64 = 96; // immediately after superblock
+        // Write a placeholder superblock space (zeros).
+        ensure_size(dev, 96)?;
+        dev.write_at(0, &[0u8; 96])?;
+
+        // LZ4 needs a compressor-options metablock immediately after the
+        // superblock: 8 bytes of payload (`u32 version=1, u32 flags=0`)
+        // wrapped in a 2-byte uncompressed-metablock header. We must
+        // also set the SQUASHFS_COMP_OPT flag in the superblock (done
+        // later, when we encode `sb`).
+        if matches!(self.compression, Compression::Lz4) {
+            // 2-byte header: length=8, high bit set (uncompressed).
+            let header = ((8u16) | 0x8000).to_le_bytes();
+            let body = [
+                1u32.to_le_bytes(),
+                0u32.to_le_bytes(), // flags: 0 = standard LZ4 (no HC)
+            ]
+            .concat();
+            ensure_size(dev, 96 + 2 + body.len() as u64)?;
+            dev.write_at(96, &header)?;
+            dev.write_at(98, &body)?;
+            next_disk_offset = 96 + 2 + body.len() as u64;
+        }
+
+        // Compression runs on a pool of worker threads (one per logical
+        // CPU by default; `FSTOOL_COMPRESS_THREADS` overrides, `1` keeps
+        // the old serial path). The pool compresses blocks in parallel
+        // but the pipeline writes them to `dev` in submission order, so
+        // `data_next_offset`, every file's `block_size_words`, and the
+        // fragment-table indices are byte-identical to the serial build.
+        let threads = self.compress_threads.unwrap_or_else(compress_threads);
+        self.data_pipe = Some(BlockPipeline::new(
+            self.compression,
+            next_disk_offset,
+            threads,
+        ));
+        self.data_next_offset = next_disk_offset;
+        if self.data_scratch.is_empty() {
+            self.data_scratch = vec![0u8; 65_536];
+        }
+        self.data_started = true;
+        Ok(())
+    }
+
+    /// Flush the current fragment buffer (if any) into the pipeline as one
+    /// fragment block and reserve its `fragment_entries` slot.
+    fn submit_frag(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if self.frag_buf.is_empty() {
+            return Ok(());
+        }
+        let buf = std::mem::take(&mut self.frag_buf);
+        let entry_idx = self.frag_block_count;
+        self.fragment_entries.push((0, 0)); // back-patched after the pool drains
+        self.frag_block_count += 1;
+        let pipe = self.data_pipe.as_mut().expect("data phase started");
+        pipe.submit(dev, buf, EmitTarget::Fragment { entry_idx })
+    }
+
+    /// Stream one file's payload to the data area: full blocks via the
+    /// pipeline, the tail (or a sub-block file) packed into the fragment
+    /// buffer. Records the resulting layout under `path`.
+    fn stream_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        reader: &mut dyn Read,
+        total: u64,
+    ) -> Result<()> {
+        let block_size = self.block_size;
+        let mut layout = FileLayout {
+            // `blocks_start` is back-patched from the first data block's
+            // actual write offset; left 0 for fragment-only and empty
+            // files (where it is unused).
+            blocks_start: 0,
+            block_size_words: Vec::new(),
+            fragment_index: 0xFFFF_FFFF,
+            fragment_offset: 0,
+            file_size: total,
+        };
+        if total == 0 {
+            self.file_layouts.insert(path.to_string(), layout);
+            return Ok(());
+        }
+        if total < block_size as u64 {
+            // Whole file goes to a fragment. Flush the current frag buffer
+            // first if appending this tail would push it past `block_size`.
+            if self.frag_buf.len() as u64 + total > block_size as u64 {
+                self.submit_frag(dev)?;
+            }
+            let off = self.frag_buf.len();
+            let mut scratch = std::mem::take(&mut self.data_scratch);
+            let res = copy_to_buf(reader, &mut scratch, total, &mut self.frag_buf);
+            self.data_scratch = scratch;
+            res?;
+            layout.fragment_index = self.frag_block_count;
+            layout.fragment_offset = off as u32;
+            self.file_layouts.insert(path.to_string(), layout);
+            return Ok(());
+        }
+        let mut consumed: u64 = 0;
+        while total - consumed >= block_size as u64 {
+            // Fresh buffer per block — it is moved to a worker thread.
+            let mut block_buf = vec![0u8; block_size as usize];
+            read_exact(reader, &mut block_buf)?;
+            layout.block_size_words.push(0); // back-patched with the size word
+            let block_idx = layout.block_size_words.len() - 1;
+            let pipe = self.data_pipe.as_mut().expect("data phase started");
+            pipe.submit(
+                dev,
+                block_buf,
+                EmitTarget::Data {
+                    file_key: path.to_string(),
+                    block_idx,
+                    first: block_idx == 0,
+                },
+            )?;
+            consumed += block_size as u64;
+        }
+        let tail = (total - consumed) as usize;
+        if tail > 0 {
+            if self.frag_buf.len() + tail > block_size as usize {
+                self.submit_frag(dev)?;
+            }
+            let off = self.frag_buf.len();
+            let mut scratch = std::mem::take(&mut self.data_scratch);
+            let res = copy_to_buf(reader, &mut scratch, tail as u64, &mut self.frag_buf);
+            self.data_scratch = scratch;
+            res?;
+            layout.fragment_index = self.frag_block_count;
+            layout.fragment_offset = off as u32;
+        }
+        self.file_layouts.insert(path.to_string(), layout);
         Ok(())
     }
 
@@ -407,197 +648,33 @@ impl WriteState {
             i
         };
 
-        // ---- 4) Phase A — write file data blocks + pack tails into a single fragment block.
+        // ---- 4) Phase A — finish the incremental data phase. ----
         //
-        // We accumulate per-file metadata: blocks_start, block_size words,
-        // fragment_index, fragment_offset.
-        let mut next_disk_offset: u64 = 96; // immediately after superblock
-        // Write a placeholder superblock space (zeros).
-        ensure_size(dev, 96)?;
-        dev.write_at(0, &[0u8; 96])?;
-
-        // LZ4 needs a compressor-options metablock immediately after the
-        // superblock: 8 bytes of payload (`u32 version=1, u32 flags=0`)
-        // wrapped in a 2-byte uncompressed-metablock header. We must
-        // also set the SQUASHFS_COMP_OPT flag in the superblock (done
-        // later, when we encode `sb`).
-        if matches!(self.compression, Compression::Lz4) {
-            // 2-byte header: length=8, high bit set (uncompressed).
-            let header = ((8u16) | 0x8000).to_le_bytes();
-            let body = [
-                1u32.to_le_bytes(),
-                0u32.to_le_bytes(), // flags: 0 = standard LZ4 (no HC)
-            ]
-            .concat();
-            ensure_size(dev, 96 + 2 + body.len() as u64)?;
-            dev.write_at(96, &header)?;
-            dev.write_at(98, &body)?;
-            next_disk_offset = 96 + 2 + body.len() as u64;
-        }
-
-        struct FileLayout {
-            blocks_start: u64,
-            block_size_words: Vec<u32>,
-            fragment_index: u32,
-            fragment_offset: u32,
-            file_size: u64,
-        }
-        let mut file_layouts: BTreeMap<String, FileLayout> = BTreeMap::new();
-        // Fragment block accumulator. Tails are packed into the *current*
-        // fragment buffer; once it would exceed `block_size`, we emit it as
-        // one fragment-table entry and start a fresh buffer. This produces
-        // multiple fragment-table entries for trees with many small files.
-        let mut frag_buf: Vec<u8> = Vec::new();
-        // Fragment table entries built as we flush each frag buffer.
-        let mut fragment_entries: Vec<(u64, u32)> = Vec::new(); // (disk_offset, size_word)
-
+        // File payloads were streamed to the data area as each file was
+        // added (see `stream_file`); `file_layouts` / `fragment_entries`
+        // already carry every file's metadata except the disk offsets and
+        // size words that the pipeline back-patches once it drains. Here we
+        // flush the trailing fragment block, drain the pool, and back-patch.
+        //
+        // `ensure_data_phase` is idempotent — calling it here covers the
+        // empty-filesystem case (no files were ever added) by writing the
+        // placeholder superblock + LZ4 options and creating the pipeline.
         let block_size = self.block_size;
-        let mut scratch = vec![0u8; 65_536];
-
-        // Compression runs on a pool of worker threads (one per logical
-        // CPU by default; `FSTOOL_COMPRESS_THREADS` overrides, `1` keeps
-        // the old serial path). The pool compresses blocks in parallel
-        // but the pipeline writes them to `dev` in submission order, so
-        // `next_disk_offset`, every file's `block_size_words`, and the
-        // fragment-table indices are byte-identical to the serial build.
-        // `targets[seq]` records where each block's results belong; we
-        // back-patch the layout after the pool drains.
-        let threads = self.compress_threads.unwrap_or_else(compress_threads);
-        let mut pipe = BlockPipeline::new(self.compression, next_disk_offset, threads);
-        // Number of fragment blocks submitted so far == index the *next*
-        // fragment block will occupy. A file whose tail lands in the
-        // current (not-yet-flushed) buffer records this as its
-        // `fragment_index`, matching the serial code's
-        // `fragment_entries.len()`.
-        let mut frag_block_count: u32 = 0;
-
-        // Flush the current fragment buffer (if any) into the pipeline as
-        // one fragment block; reserve its `fragment_entries` slot.
-        fn submit_frag(
-            pipe: &mut BlockPipeline,
-            dev: &mut dyn BlockDevice,
-            frag_buf: &mut Vec<u8>,
-            fragment_entries: &mut Vec<(u64, u32)>,
-            frag_block_count: &mut u32,
-        ) -> Result<()> {
-            if frag_buf.is_empty() {
-                return Ok(());
-            }
-            let buf = std::mem::take(frag_buf);
-            let entry_idx = *frag_block_count;
-            fragment_entries.push((0, 0)); // back-patched after the pool drains
-            *frag_block_count += 1;
-            pipe.submit(dev, buf, EmitTarget::Fragment { entry_idx })
-        }
-
-        // Iterate files in deterministic order.
-        let file_keys: Vec<String> = self.files.keys().cloned().collect();
-        for path in &file_keys {
-            let entry = self.files.get_mut(path).unwrap();
-            // Only the regular-file variant emits data here; leave the
-            // other variants untouched.
-            let is_file = matches!(entry.kind, BuiltKind::File(_));
-            if !is_file {
-                continue;
-            }
-            // Swap the source out so we can consume it; replace with a
-            // zero placeholder that we'll never read again.
-            let placeholder = BuiltKind::File(FileSource::Zero(0));
-            let BuiltKind::File(src) = std::mem::replace(&mut entry.kind, placeholder) else {
-                unreachable!()
-            };
-            // Open the source.
-            let len = src
-                .len()
-                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-            let (mut reader, total) = src
-                .open()
-                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-            let _ = len;
-            let mut layout = FileLayout {
-                // `blocks_start` is back-patched from the first data
-                // block's actual write offset; left 0 for fragment-only
-                // and empty files (where it is unused).
-                blocks_start: 0,
-                block_size_words: Vec::new(),
-                fragment_index: 0xFFFF_FFFF,
-                fragment_offset: 0,
-                file_size: total,
-            };
-            let mut consumed: u64 = 0;
-            if total == 0 {
-                file_layouts.insert(path.clone(), layout);
-                continue;
-            }
-            if total < block_size as u64 {
-                // Whole file goes to a fragment. Flush the current frag
-                // buffer first if appending this tail would push it past
-                // `block_size`.
-                if frag_buf.len() as u64 + total > block_size as u64 {
-                    submit_frag(
-                        &mut pipe,
-                        dev,
-                        &mut frag_buf,
-                        &mut fragment_entries,
-                        &mut frag_block_count,
-                    )?;
-                }
-                let off = frag_buf.len();
-                copy_to_buf(&mut *reader, &mut scratch, total, &mut frag_buf)?;
-                layout.fragment_index = frag_block_count;
-                layout.fragment_offset = off as u32;
-                file_layouts.insert(path.clone(), layout);
-                continue;
-            }
-            while total - consumed >= block_size as u64 {
-                // Fresh buffer per block — it is moved to a worker thread.
-                let mut block_buf = vec![0u8; block_size as usize];
-                read_exact(&mut *reader, &mut block_buf)?;
-                layout.block_size_words.push(0); // back-patched with the size word
-                let block_idx = layout.block_size_words.len() - 1;
-                pipe.submit(
-                    dev,
-                    block_buf,
-                    EmitTarget::Data {
-                        file_key: path.clone(),
-                        block_idx,
-                        first: block_idx == 0,
-                    },
-                )?;
-                consumed += block_size as u64;
-            }
-            let tail = (total - consumed) as usize;
-            if tail > 0 {
-                if frag_buf.len() + tail > block_size as usize {
-                    submit_frag(
-                        &mut pipe,
-                        dev,
-                        &mut frag_buf,
-                        &mut fragment_entries,
-                        &mut frag_block_count,
-                    )?;
-                }
-                let off = frag_buf.len();
-                copy_to_buf(&mut *reader, &mut scratch, tail as u64, &mut frag_buf)?;
-                layout.fragment_index = frag_block_count;
-                layout.fragment_offset = off as u32;
-            }
-            file_layouts.insert(path.clone(), layout);
-        }
+        self.ensure_data_phase(dev)?;
 
         // Emit the final (possibly only) fragment block, if any.
-        submit_frag(
-            &mut pipe,
-            dev,
-            &mut frag_buf,
-            &mut fragment_entries,
-            &mut frag_block_count,
-        )?;
+        self.submit_frag(dev)?;
 
         // Drain the pool (compress + ordered write all remaining blocks),
         // then back-patch each block's size word + disk offset into the
         // file layouts and fragment table.
-        let (targets, results) = pipe.finish(dev, &mut next_disk_offset)?;
+        let mut data_next_offset = self.data_next_offset;
+        let (targets, results) = self
+            .data_pipe
+            .take()
+            .expect("data phase started")
+            .finish(dev, &mut data_next_offset)?;
+        self.data_next_offset = data_next_offset;
         for (seq, target) in targets.iter().enumerate() {
             let (off, size_word) = results[seq];
             match target {
@@ -606,7 +683,8 @@ impl WriteState {
                     block_idx,
                     first,
                 } => {
-                    let layout = file_layouts
+                    let layout = self
+                        .file_layouts
                         .get_mut(file_key)
                         .expect("data block targets an existing file layout");
                     layout.block_size_words[*block_idx] = size_word;
@@ -615,10 +693,18 @@ impl WriteState {
                     }
                 }
                 EmitTarget::Fragment { entry_idx } => {
-                    fragment_entries[*entry_idx as usize] = (off, size_word);
+                    self.fragment_entries[*entry_idx as usize] = (off, size_word);
                 }
             }
         }
+
+        // Hand the streamed state off to the locals Phase B+ expects.
+        let mut next_disk_offset = self.data_next_offset;
+        let file_layouts = std::mem::take(&mut self.file_layouts);
+        let fragment_entries = std::mem::take(&mut self.fragment_entries);
+        // `file_keys` preserves the deterministic iteration order Phase B
+        // relies on.
+        let file_keys: Vec<String> = self.files.keys().cloned().collect();
 
         // ---- 5) Phase B — assign uid/gid + xattr indices, build inode metablocks. ----
         //
@@ -688,7 +774,7 @@ impl WriteState {
             // link_count field is materialised on disk.
             let force_ext = link_count > 1;
             match &entry.kind {
-                BuiltKind::File(_) => {
+                BuiltKind::File => {
                     let layout = &file_layouts[path];
                     if layout.blocks_start > u32::MAX as u64 {
                         return Err(crate::Error::InvalidImage(
@@ -824,13 +910,13 @@ impl WriteState {
             // path's inode position. We resolve that here so the listing
             // emitter further down uses the right (block_rel, offset).
             let (kind, target_path) = match &self.files[p].kind {
-                BuiltKind::File(_) => (INODE_BASIC_FILE, p.clone()),
+                BuiltKind::File => (INODE_BASIC_FILE, p.clone()),
                 BuiltKind::Symlink(_) => (INODE_BASIC_SYMLINK, p.clone()),
                 BuiltKind::Dir => (INODE_BASIC_DIR, p.clone()),
                 BuiltKind::Hardlink(src) => {
                     // Source kind: peek at the source entry.
                     let k = match &self.files[src].kind {
-                        BuiltKind::File(_) => INODE_BASIC_FILE,
+                        BuiltKind::File => INODE_BASIC_FILE,
                         BuiltKind::Symlink(_) => INODE_BASIC_SYMLINK,
                         BuiltKind::Device { kind, .. } => match kind {
                             DeviceKind::Block => INODE_BASIC_BLOCK,
@@ -1694,6 +1780,7 @@ mod tests {
         }
         state
             .create_file(
+                &mut dev,
                 "/big.bin",
                 FileSource::Reader {
                     reader: Box::new(std::io::Cursor::new(payload.clone())),
@@ -1745,6 +1832,7 @@ mod tests {
                 let payload: Vec<u8> = (0..n).map(|j| ((i * 31 + j) % 97) as u8).collect();
                 state
                     .create_file(
+                        &mut dev,
                         &format!("/f{i:02}.bin"),
                         FileSource::Reader {
                             reader: Box::new(std::io::Cursor::new(payload.clone())),
@@ -1795,6 +1883,7 @@ mod tests {
             .unwrap();
         state
             .create_file(
+                &mut dev,
                 "/etc/hello.txt",
                 FileSource::Reader {
                     reader: Box::new(std::io::Cursor::new(b"hello".to_vec())),

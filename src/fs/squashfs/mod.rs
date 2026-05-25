@@ -346,12 +346,12 @@ impl Squashfs {
         s.create_dir(path, meta, xattrs)
     }
 
-    /// Buffer a new regular file. Bytes are streamed from `src` at
-    /// [`flush`](Self::flush) time so large [`FileSource`]s are never
-    /// loaded entirely into memory.
+    /// Buffer a new regular file. Bytes are streamed from `src` to the
+    /// data area immediately, so large [`FileSource`]s are never loaded
+    /// entirely into memory nor spilled to a temp file.
     pub fn create_file(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &str,
         src: FileSource,
         meta: EntryMeta,
@@ -361,7 +361,7 @@ impl Squashfs {
             .write_state
             .as_mut()
             .ok_or_else(|| crate::Error::InvalidArgument("squashfs: not in write mode".into()))?;
-        s.create_file(path, src, meta, xattrs)
+        s.create_file(dev, path, src, meta, xattrs)
     }
 
     /// Buffer a new symbolic link.
@@ -702,6 +702,28 @@ impl crate::fs::Filesystem for Squashfs {
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
         self.create_file(dev, s, src, entry_meta_from(meta), Vec::new())
+    }
+
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        // SquashFS streams payloads to the data area as each file arrives,
+        // so we consume `body` directly — no temp file, no in-RAM spool.
+        // This bypasses the trait default entirely (so `streams_immediately`
+        // is irrelevant here).
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        let st = self
+            .write_state
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: not in write mode".into()))?;
+        st.create_file_streaming(dev, s, body, len, entry_meta_from(meta), Vec::new())
     }
 
     fn create_dir(

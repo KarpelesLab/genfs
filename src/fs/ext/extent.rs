@@ -287,6 +287,126 @@ pub fn pack_depth1(
     Ok((i_block, leaf_images))
 }
 
+/// One tree block (leaf or internal index node) to stage on disk as
+/// part of an extent tree: its physical block number and encoded image.
+/// Every such block needs an `ext4_extent_tail` CRC when metadata_csum
+/// is on, so callers must track them all.
+#[derive(Debug, Clone)]
+pub struct TreeBlock {
+    pub phys: u32,
+    pub image: Vec<u8>,
+}
+
+/// Encode an index node header + index entries into a 60-byte `i_block`
+/// view at tree depth `depth` (≥ 1). Panics in debug if more than
+/// [`MAX_INDICES_IN_INODE`] entries are supplied — the caller guarantees
+/// the top level fits inline.
+fn encode_idx_iblock(indices: &[ExtentIdx], depth: u16) -> [u8; 60] {
+    debug_assert!(indices.len() <= MAX_INDICES_IN_INODE);
+    let mut out = [0u8; 60];
+    let hdr = encode_header(indices.len() as u16, MAX_INDICES_IN_INODE as u16, depth);
+    out[0..12].copy_from_slice(&hdr);
+    for (i, idx) in indices.iter().enumerate() {
+        let off = 12 + i * 12;
+        out[off..off + 12].copy_from_slice(&encode_idx(*idx));
+    }
+    out
+}
+
+/// Encode a full internal index block (header at `depth` + index
+/// entries) into a `block_size`-byte buffer. Mirrors
+/// [`encode_leaf_block`] but for idx records; reserves the
+/// `ext4_extent_tail` when `csum_tail` is set.
+fn encode_idx_block(
+    indices: &[ExtentIdx],
+    block_size: u32,
+    csum_tail: bool,
+    depth: u16,
+) -> crate::Result<Vec<u8>> {
+    let max = entries_per_leaf_block_capped(block_size, csum_tail);
+    if indices.len() > max {
+        return Err(crate::Error::Unsupported(format!(
+            "ext4: index block would need {} entries, max {} per {}-byte block",
+            indices.len(),
+            max,
+            block_size,
+        )));
+    }
+    let mut out = vec![0u8; block_size as usize];
+    let hdr = encode_header(indices.len() as u16, max as u16, depth);
+    out[0..12].copy_from_slice(&hdr);
+    for (i, idx) in indices.iter().enumerate() {
+        let off = 12 + i * 12;
+        out[off..off + 12].copy_from_slice(&encode_idx(*idx));
+    }
+    Ok(out)
+}
+
+/// Pack `runs` into an extent tree of whatever depth is required and
+/// return the inode's 60-byte `i_block` view plus every on-disk tree
+/// block (leaf + internal index nodes) to stage. `alloc` hands out a
+/// fresh physical block number for each tree block.
+///
+/// The tree is built bottom-up: leaves first (depth 0), then index
+/// levels until the top level fits in the ≤ [`MAX_INDICES_IN_INODE`]
+/// `i_block` slots. Depth-0 (≤ 4 extents) returns an inline tree with no
+/// staged blocks. Every staged block carries the `ext4_extent_tail`
+/// reservation when `csum_tail` is set; the caller stamps the CRC.
+pub fn pack_extent_tree(
+    runs: &[ExtentRun],
+    block_size: u32,
+    csum_tail: bool,
+    alloc: &mut dyn FnMut() -> crate::Result<u32>,
+) -> crate::Result<([u8; 60], Vec<TreeBlock>)> {
+    if runs.len() <= MAX_EXTENTS_IN_INODE {
+        return Ok((pack_into_iblock(runs)?, Vec::new()));
+    }
+    let per = entries_per_leaf_block_capped(block_size, csum_tail);
+    if per == 0 {
+        return Err(crate::Error::Unsupported(
+            "ext4: block size too small for an extent tree".into(),
+        ));
+    }
+
+    let mut staged: Vec<TreeBlock> = Vec::new();
+    // Leaf level (depth 0): one block per `per`-sized chunk of runs.
+    let mut children: Vec<ExtentIdx> = Vec::with_capacity(runs.len().div_ceil(per));
+    for chunk in runs.chunks(per) {
+        let phys = alloc()?;
+        staged.push(TreeBlock {
+            phys,
+            image: encode_leaf_block(chunk, block_size, csum_tail)?,
+        });
+        children.push(ExtentIdx {
+            block: chunk[0].logical,
+            leaf: phys as u64,
+        });
+    }
+
+    // Build index levels until the top fits inline in `i_block`.
+    let mut child_depth: u16 = 0;
+    loop {
+        let parent_depth = child_depth + 1;
+        if children.len() <= MAX_INDICES_IN_INODE {
+            return Ok((encode_idx_iblock(&children, parent_depth), staged));
+        }
+        let mut next: Vec<ExtentIdx> = Vec::with_capacity(children.len().div_ceil(per));
+        for chunk in children.chunks(per) {
+            let phys = alloc()?;
+            staged.push(TreeBlock {
+                phys,
+                image: encode_idx_block(chunk, block_size, csum_tail, parent_depth)?,
+            });
+            next.push(ExtentIdx {
+                block: chunk[0].block,
+                leaf: phys as u64,
+            });
+        }
+        children = next;
+        child_depth = parent_depth;
+    }
+}
+
 /// Decode a leaf block's runs. The header must claim depth == 0; any
 /// other value is an internal-node block and the caller should walk the
 /// tree further (not yet implemented for depth > 1).
@@ -485,6 +605,74 @@ mod tests {
             .collect();
         let err = pack_into_iblock(&runs).unwrap_err();
         assert!(matches!(err, crate::Error::Unsupported(_)));
+    }
+
+    /// Force a depth-2 tree (> 4 leaf blocks) and walk it back, checking
+    /// every run is recovered and the inline header claims depth 2.
+    #[test]
+    fn pack_extent_tree_depth2_roundtrip() {
+        let bs = 1024u32;
+        let per = entries_per_leaf_block_capped(bs, false); // 84 at 1 KiB
+        // 400 non-contiguous runs → ceil(400/84) = 5 leaves → > 4 inline
+        // idx slots → depth 2.
+        let runs: Vec<ExtentRun> = (0..400u32)
+            .map(|i| ExtentRun {
+                logical: i * 2, // gaps keep them from coalescing
+                len: 1,
+                physical: 100_000 + i as u64 * 2,
+            })
+            .collect();
+        assert!(runs.len().div_ceil(per) > MAX_INDICES_IN_INODE);
+
+        let mut next = 5_000u32;
+        let mut images: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+        let (iblock, tree) = {
+            let mut alloc = || {
+                let b = next;
+                next += 1;
+                Ok(b)
+            };
+            pack_extent_tree(&runs, bs, false, &mut alloc).unwrap()
+        };
+        for tb in tree {
+            images.insert(tb.phys, tb.image);
+        }
+
+        let hdr = decode_header(&iblock[..12]).unwrap();
+        assert_eq!(hdr.depth, 2, "expected a depth-2 tree, got {}", hdr.depth);
+
+        // Recursively walk the tree, collecting leaf runs.
+        fn walk(
+            phys: u32,
+            bs: u32,
+            images: &std::collections::HashMap<u32, Vec<u8>>,
+            out: &mut Vec<ExtentRun>,
+        ) {
+            let buf = &images[&phys];
+            let h = decode_header(&buf[..12]).unwrap();
+            if h.depth == 0 {
+                let (_, runs) = decode_leaf_block(&buf[..bs as usize]).unwrap();
+                out.extend(runs);
+            } else {
+                for i in 0..h.entries as usize {
+                    let off = 12 + i * 12;
+                    let idx = decode_idx(&buf[off..off + 12]);
+                    walk(idx.leaf as u32, bs, images, out);
+                }
+            }
+        }
+        let (_, top) = decode_idx_iblock(&iblock).unwrap();
+        let mut got = Vec::new();
+        for idx in top {
+            walk(idx.leaf as u32, bs, &images, &mut got);
+        }
+        assert_eq!(got.len(), runs.len());
+        for (a, b) in got.iter().zip(&runs) {
+            assert_eq!(
+                (a.logical, a.len, a.physical),
+                (b.logical, b.len, b.physical)
+            );
+        }
     }
 
     #[test]

@@ -651,39 +651,24 @@ impl Ext {
             return Ok(0);
         }
 
-        // Depth-1 promotion. Partition the flat run list across leaf
-        // blocks below an inline idx node.
+        // Build an extent tree of whatever depth the run count needs
+        // (depth ≥ 2 for heavily fragmented files / large directories).
         let bs = self.layout.block_size;
         let csum_tail = self.has_metadata_csum();
-        let per_leaf = extent::entries_per_leaf_block_capped(bs, csum_tail);
-        let need_leaves = runs.len().div_ceil(per_leaf);
-        if need_leaves > extent::MAX_INDICES_IN_INODE {
-            return Err(crate::Error::Unsupported(format!(
-                "ext4: file requires {} leaf blocks ({} idx slots × {} entries = {} max); \
-                 depth ≥ 2 not implemented",
-                need_leaves,
-                extent::MAX_INDICES_IN_INODE,
-                per_leaf,
-                extent::MAX_INDICES_IN_INODE * per_leaf,
-            )));
-        }
-        let mut leaf_phys = Vec::with_capacity(need_leaves);
-        for _ in 0..need_leaves {
-            leaf_phys.push(self.alloc_data_block()?);
-        }
-        let (i_block_bytes, leaf_images) = extent::pack_depth1(&runs, bs, csum_tail, &leaf_phys)?;
-        for (phys, image) in leaf_phys.iter().zip(leaf_images) {
-            // Stage the leaf-block image; track it so the metadata_csum
-            // tail is stamped with this inode's seed at flush time.
-            if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| b == phys) {
-                slot.1 = image;
-            } else {
-                self.push_data_block(*phys, image);
-            }
-            self.track_extent_leaf_block(*phys, ino);
+        let (i_block_bytes, tree_blocks) = {
+            let mut alloc = || self.alloc_data_block();
+            extent::pack_extent_tree(&runs, bs, csum_tail, &mut alloc)?
+        };
+        let meta = tree_blocks.len();
+        for tb in tree_blocks {
+            // Stage each tree block (leaf + internal index nodes); track
+            // it so the metadata_csum tail is stamped with this inode's
+            // seed at flush time.
+            self.push_data_block(tb.phys, tb.image);
+            self.track_extent_leaf_block(tb.phys, ino);
         }
         inode.block = extent::bytes_to_iblock(&i_block_bytes);
-        Ok(need_leaves as u32)
+        Ok(meta as u32)
     }
 
     /// Ext2 / Ext3 path: direct + single + double indirection. v1 cap.
@@ -1773,6 +1758,30 @@ impl Ext {
                 "ext: journal blocksize {} != FS blocksize {bs}",
                 jsb.blocksize
             )));
+        }
+
+        // A single transaction can never exceed the journal ring. When the
+        // metadata set is larger than the journal can hold — the bulk
+        // build / populate case (e.g. a directory with 100k entries dirties
+        // thousands of inode-table + directory blocks at once) — there is
+        // no way to journal it, and no concurrent mount to stay consistent
+        // with, so write the metadata directly and leave the journal clean.
+        // mke2fs / genext2fs produce exactly this (empty journal) for a
+        // freshly-populated image.
+        let avail = jsb.maxlen.saturating_sub(jsb.first) as usize;
+        let first_cap = jbd2::descriptor_tag_capacity(bs, true);
+        let next_cap = jbd2::descriptor_tag_capacity(bs, false);
+        let n_descs = if images.len() <= first_cap {
+            1
+        } else {
+            1 + (images.len() - first_cap).div_ceil(next_cap)
+        };
+        let need = n_descs + images.len() + 1;
+        if need > avail {
+            for (blk, bytes) in images {
+                dev.write_at(*blk as u64 * bs as u64, bytes)?;
+            }
+            return Ok(());
         }
 
         // Build payload list.
@@ -3357,9 +3366,10 @@ impl Ext {
     }
 
     /// Resolve logical block `n` against an inode that uses an ext4
-    /// extent tree. Supports depth-0 (inline up to 4 leaves) and depth-1
-    /// (up to 4 idx entries in `i_block`, each pointing at one leaf
-    /// block on disk holding the actual extent records).
+    /// extent tree of any depth. Depth-0 reads the inline leaf extents;
+    /// deeper trees descend index level by index level — at each level
+    /// picking the last idx entry whose `ei_block <= n` — until a depth-0
+    /// leaf block is reached, then resolves `n` within its extents.
     #[allow(clippy::needless_pass_by_ref_mut)]
     fn file_block_extent(&self, dev: &mut dyn BlockDevice, ino: &Inode, n: u32) -> Result<u32> {
         let iblock = extent::iblock_to_bytes(&ino.block);
@@ -3368,31 +3378,39 @@ impl Ext {
             let (_, runs) = extent::decode_depth0_iblock(&iblock)?;
             return Ok(resolve_logical_in_runs(&runs, n));
         }
-        if header.depth == 1 {
-            let (_, indices) = extent::decode_idx_iblock(&iblock)?;
-            // The idx array is sorted by ei_block ascending; find the
-            // last idx whose block <= n.
-            let mut chosen: Option<extent::ExtentIdx> = None;
-            for idx in &indices {
+        // Pick the child subtree from the inline (`i_block`) index node.
+        let (_, indices) = extent::decode_idx_iblock(&iblock)?;
+        let Some(mut child) = pick_idx_for_logical(&indices, n) else {
+            return Ok(0);
+        };
+
+        // Descend through any further index levels, then the leaf.
+        let bs = self.layout.block_size as usize;
+        let mut buf = vec![0u8; bs];
+        loop {
+            self.read_block(dev, child, &mut buf)?;
+            let h = extent::decode_header(&buf[..12])?;
+            if h.depth == 0 {
+                let (_, runs) = extent::decode_leaf_block(&buf)?;
+                return Ok(resolve_logical_in_runs(&runs, n));
+            }
+            // Internal index block: parse its idx entries and pick the
+            // subtree covering `n`.
+            let mut chosen: Option<u32> = None;
+            for i in 0..h.entries as usize {
+                let off = 12 + i * 12;
+                let idx = extent::decode_idx(&buf[off..off + 12]);
                 if idx.block <= n {
-                    chosen = Some(*idx);
+                    chosen = Some(idx.leaf as u32);
                 } else {
                     break;
                 }
             }
-            let Some(idx) = chosen else {
-                return Ok(0);
-            };
-            let bs = self.layout.block_size as usize;
-            let mut buf = vec![0u8; bs];
-            self.read_block(dev, idx.leaf as u32, &mut buf)?;
-            let (_, runs) = extent::decode_leaf_block(&buf)?;
-            return Ok(resolve_logical_in_runs(&runs, n));
+            match chosen {
+                Some(c) => child = c,
+                None => return Ok(0),
+            }
         }
-        Err(crate::Error::Unsupported(format!(
-            "ext4: extent tree depth {} not yet supported in reader (depth-0 and depth-1 only)",
-            header.depth
-        )))
     }
 
     /// List the entries of the directory inode `ino`. Returns
@@ -4097,6 +4115,21 @@ impl crate::fs::Filesystem for Ext {
 /// Scan a leaf-extent list for the run containing logical block `n` and
 /// return the corresponding physical block. Returns 0 if `n` falls in a
 /// hole (no extent covers it).
+/// Pick the child physical block for logical block `n` from a sorted
+/// (ascending `ei_block`) index array: the last entry whose `block <= n`.
+/// `None` when `n` precedes the first entry (a hole before any extent).
+fn pick_idx_for_logical(indices: &[extent::ExtentIdx], n: u32) -> Option<u32> {
+    let mut chosen = None;
+    for idx in indices {
+        if idx.block <= n {
+            chosen = Some(idx.leaf as u32);
+        } else {
+            break;
+        }
+    }
+    chosen
+}
+
 fn resolve_logical_in_runs(runs: &[extent::ExtentRun], n: u32) -> u32 {
     for r in runs {
         let len = if r.len > extent::MAX_LEN_PER_EXTENT {

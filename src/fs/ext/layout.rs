@@ -284,6 +284,23 @@ pub fn plan_layout(
     let gdt_bytes = num_groups as u64 * desc_size as u64;
     let gdt_blocks = gdt_bytes.div_ceil(block_size as u64) as u32;
 
+    // Cap the flex unit so the first group of each unit can hold the
+    // packed bitmaps + inode tables of all `flex_size` members. With
+    // small blocks and many inodes the per-group inode table is large, so
+    // a nominal `log_groups_per_flex` of 4 (16 groups) would overflow the
+    // first group; shrink it to the largest power of two that fits.
+    let mut log_groups_per_flex = log_groups_per_flex;
+    if log_groups_per_flex != 0 {
+        // Worst case the unit's first group also carries a SB + GDT backup.
+        let reserve = 1 + gdt_blocks;
+        let per_member = 2 + inode_table_blocks; // block bitmap + inode bitmap + inode table
+        let budget = blocks_per_group.saturating_sub(reserve);
+        let max_members = (budget / per_member.max(1)).max(1);
+        while (1u32 << log_groups_per_flex) > max_members && log_groups_per_flex > 0 {
+            log_groups_per_flex -= 1;
+        }
+    }
+
     let flex_size: u32 = if log_groups_per_flex == 0 {
         1
     } else {

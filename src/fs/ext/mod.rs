@@ -1039,6 +1039,23 @@ impl Ext {
         }
     }
 
+    /// Read a staged metadata block's bytes (staging it from disk first
+    /// if needed). Used by the incremental extent-tree append path.
+    fn staged_block_bytes(&mut self, dev: &mut dyn BlockDevice, phys: u32) -> Result<Vec<u8>> {
+        self.ensure_block_staged(dev, phys)?;
+        let pos = self.data_block_pos(phys).expect("just staged");
+        Ok(self.data_blocks[pos].1.clone())
+    }
+
+    /// Replace (or insert) a staged metadata block's image.
+    fn update_staged_block(&mut self, phys: u32, image: Vec<u8>) {
+        if let Some(pos) = self.data_block_pos(phys) {
+            self.data_blocks[pos].1 = image;
+        } else {
+            self.push_data_block(phys, image);
+        }
+    }
+
     /// Append `new_phys` (at logical block `new_logical`) to an
     /// inline-extent-tree inode. Tries to extend the last extent first
     /// (zero allocation, best for the typical contiguous case); otherwise
@@ -1066,8 +1083,9 @@ impl Ext {
         match header.depth {
             0 => self.append_extent_depth0(dev, inode_no, &iblock, new_logical, new_phys),
             1 => self.append_extent_depth1(dev, inode_no, new_logical, new_phys),
+            2 => self.append_extent_depth2(dev, inode_no, new_logical, new_phys),
             d => Err(crate::Error::Unsupported(format!(
-                "ext4: extent tree depth {d} growth not supported (writer caps at depth-1)"
+                "ext4: extent tree depth {d} growth not supported (writer caps at depth-2)"
             ))),
         }
     }
@@ -1244,27 +1262,155 @@ impl Ext {
         }
         // Last leaf is full. Allocate a new leaf with the single new
         // extent, and add an idx entry pointing at it.
-        if indices.len() >= extent::MAX_INDICES_IN_INODE {
-            return Err(crate::Error::Unsupported(format!(
-                "ext4: depth-1 tree has {} idx slots filled with full leaves; depth-2 not supported",
-                indices.len()
-            )));
-        }
-        let new_leaf_phys = self.alloc_data_block()?;
-        allocated_meta += 1;
         let new_run = extent::ExtentRun {
             logical: new_logical,
             len: 1,
             physical: new_phys as u64,
         };
+        let new_leaf_phys = self.alloc_data_block()?;
+        allocated_meta += 1;
         let new_leaf_image = extent::encode_leaf_block(&[new_run], bs, csum_tail)?;
         self.push_data_block(new_leaf_phys, new_leaf_image);
         self.track_extent_leaf_block(new_leaf_phys, inode_no);
-        indices.push(extent::ExtentIdx {
+
+        if indices.len() < extent::MAX_INDICES_IN_INODE {
+            // Still room for another idx inline: stay depth-1.
+            indices.push(extent::ExtentIdx {
+                block: new_logical,
+                leaf: new_leaf_phys as u64,
+            });
+            let packed = extent::encode_idx_iblock(&indices, 1);
+            self.patch_inode(dev, inode_no, |i| {
+                i.block = extent::bytes_to_iblock(&packed);
+            })?;
+            return Ok(allocated_meta);
+        }
+
+        // Inline idx slots are full → promote to depth-2: the existing
+        // leaves move into one internal index block, joined by the new
+        // leaf, and `i_block` holds a single idx pointing at it.
+        let mut ib_indices = indices;
+        ib_indices.push(extent::ExtentIdx {
             block: new_logical,
             leaf: new_leaf_phys as u64,
         });
-        let packed = extent::pack_idx_into_iblock(&indices)?;
+        let ib_phys = self.alloc_data_block()?;
+        allocated_meta += 1;
+        let ib_image = extent::encode_idx_block(&ib_indices, bs, csum_tail, 1)?;
+        self.push_data_block(ib_phys, ib_image);
+        self.track_extent_leaf_block(ib_phys, inode_no);
+        let top = [extent::ExtentIdx {
+            block: ib_indices[0].block,
+            leaf: ib_phys as u64,
+        }];
+        let packed = extent::encode_idx_iblock(&top, 2);
+        self.patch_inode(dev, inode_no, |i| {
+            i.block = extent::bytes_to_iblock(&packed);
+        })?;
+        Ok(allocated_meta)
+    }
+
+    /// Incrementally append one data block to a depth-2 extent tree.
+    /// Appends into the last index block's last leaf, growing the last
+    /// leaf → a new leaf under the last index block → a new index block
+    /// under `i_block`, in that order. Promotion past depth-2 (a 4th
+    /// index block whose own leaves all fill) is not supported — depth-2
+    /// already addresses tens of thousands of extents.
+    fn append_extent_depth2(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        inode_no: u32,
+        new_logical: u32,
+        new_phys: u32,
+    ) -> Result<u32> {
+        let bs = self.layout.block_size;
+        let csum_tail = self.has_metadata_csum();
+        let per = extent::entries_per_leaf_block_capped(bs, csum_tail);
+        let new_run = extent::ExtentRun {
+            logical: new_logical,
+            len: 1,
+            physical: new_phys as u64,
+        };
+
+        let inode_copy = self.inodes[self.inode_pos(inode_no).unwrap()].1;
+        let iblock = extent::iblock_to_bytes(&inode_copy.block);
+        let (_, mut top) = extent::decode_idx_iblock(&iblock)?;
+        let last_ib_phys = top.last().expect("depth-2 has ≥1 idx").leaf as u32;
+
+        // Parse the last index block's idx entries.
+        let ib_bytes = self.staged_block_bytes(dev, last_ib_phys)?;
+        let ib_hdr = extent::decode_header(&ib_bytes[..12])?;
+        let mut ib_indices: Vec<extent::ExtentIdx> = (0..ib_hdr.entries as usize)
+            .map(|i| extent::decode_idx(&ib_bytes[12 + i * 12..24 + i * 12]))
+            .collect();
+        let last_leaf_phys = ib_indices.last().expect("index block has ≥1 leaf").leaf as u32;
+        self.track_extent_leaf_block(last_leaf_phys, inode_no);
+
+        // Try extending / adding into the last leaf.
+        let leaf_bytes = self.staged_block_bytes(dev, last_leaf_phys)?;
+        let (_, mut leaf_runs) = extent::decode_leaf_block(&leaf_bytes[..bs as usize])?;
+        let extended = if let Some(last) = leaf_runs.last_mut() {
+            last.physical + last.len as u64 == new_phys as u64
+                && (last.logical + last.len as u32) == new_logical
+                && last.len < extent::MAX_LEN_PER_EXTENT
+                && {
+                    last.len += 1;
+                    true
+                }
+        } else {
+            false
+        };
+        if extended || leaf_runs.len() < per {
+            if !extended {
+                leaf_runs.push(new_run);
+            }
+            let img = extent::encode_leaf_block(&leaf_runs, bs, csum_tail)?;
+            self.update_staged_block(last_leaf_phys, img);
+            return Ok(0);
+        }
+
+        // Last leaf full → new leaf.
+        let new_leaf_phys = self.alloc_data_block()?;
+        let mut allocated_meta = 1u32;
+        let new_leaf_image = extent::encode_leaf_block(&[new_run], bs, csum_tail)?;
+        self.push_data_block(new_leaf_phys, new_leaf_image);
+        self.track_extent_leaf_block(new_leaf_phys, inode_no);
+
+        if ib_indices.len() < per {
+            // Add the leaf to the last index block.
+            ib_indices.push(extent::ExtentIdx {
+                block: new_logical,
+                leaf: new_leaf_phys as u64,
+            });
+            let ib_img = extent::encode_idx_block(&ib_indices, bs, csum_tail, 1)?;
+            self.update_staged_block(last_ib_phys, ib_img);
+            return Ok(allocated_meta);
+        }
+
+        // Last index block full → new index block under i_block.
+        if top.len() >= extent::MAX_INDICES_IN_INODE {
+            return Err(crate::Error::Unsupported(
+                "ext4: depth-2 extent tree full; depth-3 growth not supported".into(),
+            ));
+        }
+        let new_ib_phys = self.alloc_data_block()?;
+        allocated_meta += 1;
+        let new_ib_image = extent::encode_idx_block(
+            &[extent::ExtentIdx {
+                block: new_logical,
+                leaf: new_leaf_phys as u64,
+            }],
+            bs,
+            csum_tail,
+            1,
+        )?;
+        self.push_data_block(new_ib_phys, new_ib_image);
+        self.track_extent_leaf_block(new_ib_phys, inode_no);
+        top.push(extent::ExtentIdx {
+            block: new_logical,
+            leaf: new_ib_phys as u64,
+        });
+        let packed = extent::encode_idx_iblock(&top, 2);
         self.patch_inode(dev, inode_no, |i| {
             i.block = extent::bytes_to_iblock(&packed);
         })?;

@@ -301,7 +301,7 @@ pub struct TreeBlock {
 /// view at tree depth `depth` (≥ 1). Panics in debug if more than
 /// [`MAX_INDICES_IN_INODE`] entries are supplied — the caller guarantees
 /// the top level fits inline.
-fn encode_idx_iblock(indices: &[ExtentIdx], depth: u16) -> [u8; 60] {
+pub fn encode_idx_iblock(indices: &[ExtentIdx], depth: u16) -> [u8; 60] {
     debug_assert!(indices.len() <= MAX_INDICES_IN_INODE);
     let mut out = [0u8; 60];
     let hdr = encode_header(indices.len() as u16, MAX_INDICES_IN_INODE as u16, depth);
@@ -317,7 +317,7 @@ fn encode_idx_iblock(indices: &[ExtentIdx], depth: u16) -> [u8; 60] {
 /// entries) into a `block_size`-byte buffer. Mirrors
 /// [`encode_leaf_block`] but for idx records; reserves the
 /// `ext4_extent_tail` when `csum_tail` is set.
-fn encode_idx_block(
+pub fn encode_idx_block(
     indices: &[ExtentIdx],
     block_size: u32,
     csum_tail: bool,

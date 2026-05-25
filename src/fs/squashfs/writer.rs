@@ -25,8 +25,11 @@
 //! buffer; full block payloads (≤ block_size, default 128 KiB) are
 //! held in memory only briefly during compression.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::Result;
 use crate::block::BlockDevice;
@@ -105,6 +108,10 @@ pub struct WriteState {
     dirs: BTreeMap<String, EntryDir>,
     /// Files / symlinks indexed by their absolute path.
     files: BTreeMap<String, BuiltEntry>,
+    /// Forces the compression worker count at `flush`; `None` reads
+    /// [`compress_threads`] (env / CPU count). Tests use this to compare
+    /// serial vs parallel output without racing on a process-global env.
+    compress_threads: Option<usize>,
 }
 
 struct EntryDir {
@@ -130,6 +137,7 @@ impl WriteState {
             compression,
             dirs,
             files: BTreeMap::new(),
+            compress_threads: None,
         }
     }
 
@@ -446,23 +454,41 @@ impl WriteState {
         let block_size = self.block_size;
         let mut scratch = vec![0u8; 65_536];
 
-        // Local helper to flush the current frag buffer if it's non-empty.
-        // Returns the index assigned to the just-flushed buffer.
-        let flush_frag_buf = |frag_buf: &mut Vec<u8>,
-                              fragment_entries: &mut Vec<(u64, u32)>,
-                              compression: Compression,
-                              dev: &mut dyn BlockDevice,
-                              next_disk_offset: &mut u64|
-         -> Result<()> {
+        // Compression runs on a pool of worker threads (one per logical
+        // CPU by default; `FSTOOL_COMPRESS_THREADS` overrides, `1` keeps
+        // the old serial path). The pool compresses blocks in parallel
+        // but the pipeline writes them to `dev` in submission order, so
+        // `next_disk_offset`, every file's `block_size_words`, and the
+        // fragment-table indices are byte-identical to the serial build.
+        // `targets[seq]` records where each block's results belong; we
+        // back-patch the layout after the pool drains.
+        let threads = self.compress_threads.unwrap_or_else(compress_threads);
+        let mut pipe = BlockPipeline::new(self.compression, next_disk_offset, threads);
+        // Number of fragment blocks submitted so far == index the *next*
+        // fragment block will occupy. A file whose tail lands in the
+        // current (not-yet-flushed) buffer records this as its
+        // `fragment_index`, matching the serial code's
+        // `fragment_entries.len()`.
+        let mut frag_block_count: u32 = 0;
+
+        // Flush the current fragment buffer (if any) into the pipeline as
+        // one fragment block; reserve its `fragment_entries` slot.
+        fn submit_frag(
+            pipe: &mut BlockPipeline,
+            dev: &mut dyn BlockDevice,
+            frag_buf: &mut Vec<u8>,
+            fragment_entries: &mut Vec<(u64, u32)>,
+            frag_block_count: &mut u32,
+        ) -> Result<()> {
             if frag_buf.is_empty() {
                 return Ok(());
             }
-            let start = *next_disk_offset;
-            let size_word = emit_data_block(dev, frag_buf, compression, next_disk_offset)?;
-            fragment_entries.push((start, size_word));
-            frag_buf.clear();
-            Ok(())
-        };
+            let buf = std::mem::take(frag_buf);
+            let entry_idx = *frag_block_count;
+            fragment_entries.push((0, 0)); // back-patched after the pool drains
+            *frag_block_count += 1;
+            pipe.submit(dev, buf, EmitTarget::Fragment { entry_idx })
+        }
 
         // Iterate files in deterministic order.
         let file_keys: Vec<String> = self.files.keys().cloned().collect();
@@ -489,7 +515,10 @@ impl WriteState {
                 .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
             let _ = len;
             let mut layout = FileLayout {
-                blocks_start: next_disk_offset,
+                // `blocks_start` is back-patched from the first data
+                // block's actual write offset; left 0 for fragment-only
+                // and empty files (where it is unused).
+                blocks_start: 0,
                 block_size_words: Vec::new(),
                 fragment_index: 0xFFFF_FFFF,
                 fragment_offset: 0,
@@ -505,56 +534,91 @@ impl WriteState {
                 // buffer first if appending this tail would push it past
                 // `block_size`.
                 if frag_buf.len() as u64 + total > block_size as u64 {
-                    flush_frag_buf(
+                    submit_frag(
+                        &mut pipe,
+                        dev,
                         &mut frag_buf,
                         &mut fragment_entries,
-                        self.compression,
-                        dev,
-                        &mut next_disk_offset,
+                        &mut frag_block_count,
                     )?;
                 }
                 let off = frag_buf.len();
                 copy_to_buf(&mut *reader, &mut scratch, total, &mut frag_buf)?;
-                layout.fragment_index = fragment_entries.len() as u32;
+                layout.fragment_index = frag_block_count;
                 layout.fragment_offset = off as u32;
                 file_layouts.insert(path.clone(), layout);
                 continue;
             }
-            let mut block_buf = vec![0u8; block_size as usize];
             while total - consumed >= block_size as u64 {
+                // Fresh buffer per block — it is moved to a worker thread.
+                let mut block_buf = vec![0u8; block_size as usize];
                 read_exact(&mut *reader, &mut block_buf)?;
-                let size_word =
-                    emit_data_block(dev, &block_buf, self.compression, &mut next_disk_offset)?;
-                layout.block_size_words.push(size_word);
+                layout.block_size_words.push(0); // back-patched with the size word
+                let block_idx = layout.block_size_words.len() - 1;
+                pipe.submit(
+                    dev,
+                    block_buf,
+                    EmitTarget::Data {
+                        file_key: path.clone(),
+                        block_idx,
+                        first: block_idx == 0,
+                    },
+                )?;
                 consumed += block_size as u64;
             }
             let tail = (total - consumed) as usize;
             if tail > 0 {
                 if frag_buf.len() + tail > block_size as usize {
-                    flush_frag_buf(
+                    submit_frag(
+                        &mut pipe,
+                        dev,
                         &mut frag_buf,
                         &mut fragment_entries,
-                        self.compression,
-                        dev,
-                        &mut next_disk_offset,
+                        &mut frag_block_count,
                     )?;
                 }
                 let off = frag_buf.len();
                 copy_to_buf(&mut *reader, &mut scratch, tail as u64, &mut frag_buf)?;
-                layout.fragment_index = fragment_entries.len() as u32;
+                layout.fragment_index = frag_block_count;
                 layout.fragment_offset = off as u32;
             }
             file_layouts.insert(path.clone(), layout);
         }
 
         // Emit the final (possibly only) fragment block, if any.
-        flush_frag_buf(
+        submit_frag(
+            &mut pipe,
+            dev,
             &mut frag_buf,
             &mut fragment_entries,
-            self.compression,
-            dev,
-            &mut next_disk_offset,
+            &mut frag_block_count,
         )?;
+
+        // Drain the pool (compress + ordered write all remaining blocks),
+        // then back-patch each block's size word + disk offset into the
+        // file layouts and fragment table.
+        let (targets, results) = pipe.finish(dev, &mut next_disk_offset)?;
+        for (seq, target) in targets.iter().enumerate() {
+            let (off, size_word) = results[seq];
+            match target {
+                EmitTarget::Data {
+                    file_key,
+                    block_idx,
+                    first,
+                } => {
+                    let layout = file_layouts
+                        .get_mut(file_key)
+                        .expect("data block targets an existing file layout");
+                    layout.block_size_words[*block_idx] = size_word;
+                    if *first {
+                        layout.blocks_start = off;
+                    }
+                }
+                EmitTarget::Fragment { entry_idx } => {
+                    fragment_entries[*entry_idx as usize] = (off, size_word);
+                }
+            }
+        }
 
         // ---- 5) Phase B — assign uid/gid + xattr indices, build inode metablocks. ----
         //
@@ -1234,19 +1298,17 @@ fn chunk_raw_to_metablocks(raw: &[u8], compression: Compression) -> Result<(Vec<
     Ok((rel_offsets, out))
 }
 
-/// Write `block` as one data block: compress when smaller, otherwise
-/// emit raw with the "uncompressed" high bit set. Returns the encoded
-/// size word for the file's block list.
-fn emit_data_block(
-    dev: &mut dyn BlockDevice,
-    block: &[u8],
-    compression: Compression,
-    next_disk_offset: &mut u64,
-) -> Result<u32> {
+/// Compress one data/fragment block. Returns the payload to write and
+/// the encoded size word for the block list: the compressed bytes when
+/// they are strictly smaller, otherwise the original buffer (reused, no
+/// copy) with the "uncompressed" high bit (`0x0100_0000`) set. Pure and
+/// `Send`-safe — every SquashFS codec is either pure Rust or a C library
+/// with stack-local state — so it runs on the compression worker pool.
+fn compress_block(compression: Compression, block: Vec<u8>) -> (Vec<u8>, u32) {
     let algo = compression_to_algo(compression);
-    let (payload, size_word): (Vec<u8>, u32) = if let Some(a) = algo
+    if let Some(a) = algo
         && a.enabled()
-        && let Ok(c) = crate::compression::compress(a, block)
+        && let Ok(c) = crate::compression::compress(a, &block)
         && !c.is_empty()
         && c.len() < block.len()
     {
@@ -1255,12 +1317,226 @@ fn emit_data_block(
     } else {
         // Uncompressed: high bit set in the size word.
         let sw = block.len() as u32 | 0x0100_0000;
-        (block.to_vec(), sw)
-    };
-    ensure_size(dev, *next_disk_offset + payload.len() as u64)?;
-    dev.write_at(*next_disk_offset, &payload)?;
-    *next_disk_offset += payload.len() as u64;
-    Ok(size_word)
+        (block, sw)
+    }
+}
+
+/// How many compression worker threads to run. `FSTOOL_COMPRESS_THREADS`
+/// overrides (clamped to ≥1); otherwise one per logical CPU. `1` selects
+/// the serial path (no threads spawned, identical behaviour).
+fn compress_threads() -> usize {
+    if let Ok(v) = std::env::var("FSTOOL_COMPRESS_THREADS")
+        && let Ok(n) = v.trim().parse::<usize>()
+    {
+        return n.max(1);
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// A written block's on-disk byte offset and its encoded size word.
+type BlockResult = (u64, u32);
+
+/// Where a submitted block's [`BlockResult`] is recorded once the pool
+/// has compressed and the pipeline has written it in submission order.
+enum EmitTarget {
+    /// Full data block: `block_size_words[block_idx]` of `file_key`; when
+    /// `first`, the block's offset is the file's `blocks_start`.
+    Data {
+        file_key: String,
+        block_idx: usize,
+        first: bool,
+    },
+    /// Fragment block: `fragment_entries[entry_idx]`.
+    Fragment { entry_idx: u32 },
+}
+
+/// Bounded, order-preserving parallel compression pipeline for Phase A.
+///
+/// Worker threads compress blocks in parallel; the owning (main) thread
+/// does **all** reading and `dev` writing, so neither the block device
+/// nor the file sources cross a thread boundary — workers only handle
+/// owned `Vec<u8>` payloads and a `Copy` [`Compression`]. Blocks are
+/// written to `dev` strictly in submission (`seq`) order via a reorder
+/// buffer, so the on-disk layout is byte-identical to a serial build.
+///
+/// Back-pressure: `submit` first drains any finished results, then sends
+/// on the bounded work channel; if that channel is full it blocks on a
+/// result instead — a full work channel means workers are busy and
+/// therefore producing, so a result always arrives. This bounds in-flight
+/// memory to O(threads) blocks and cannot deadlock.
+struct BlockPipeline {
+    parallel: bool,
+    compression: Compression,
+    work_tx: Option<SyncSender<(u64, Vec<u8>)>>,
+    res_rx: Option<Receiver<(u64, Vec<u8>, u32)>>,
+    workers: Vec<thread::JoinHandle<()>>,
+    /// Where each submitted block's result belongs; index == `seq`.
+    targets: Vec<EmitTarget>,
+    /// Next `seq` to write (parallel path only).
+    next_write_seq: u64,
+    /// Results recv'd out of order, awaiting their turn to be written.
+    reorder: HashMap<u64, (Vec<u8>, u32)>,
+    /// One [`BlockResult`] per `seq`, pushed in write order.
+    results: Vec<BlockResult>,
+    next_disk_offset: u64,
+}
+
+impl BlockPipeline {
+    fn new(compression: Compression, start_offset: u64, threads: usize) -> Self {
+        let n = threads.max(1);
+        let mut pipe = Self {
+            parallel: n > 1,
+            compression,
+            work_tx: None,
+            res_rx: None,
+            workers: Vec::new(),
+            targets: Vec::new(),
+            next_write_seq: 0,
+            reorder: HashMap::new(),
+            results: Vec::new(),
+            next_disk_offset: start_offset,
+        };
+        if !pipe.parallel {
+            return pipe;
+        }
+        let (work_tx, work_rx) = sync_channel::<(u64, Vec<u8>)>(n * 2);
+        let (res_tx, res_rx) = sync_channel::<(u64, Vec<u8>, u32)>(n * 2);
+        // A single mpsc receiver shared behind a mutex fans work out to N
+        // workers; the lock is held only for the (immediate, when work is
+        // queued) `recv`, never during compression, so contention is
+        // negligible against the cost of compressing a 128 KiB block.
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        for _ in 0..n {
+            let rx = Arc::clone(&work_rx);
+            let tx = res_tx.clone();
+            pipe.workers.push(thread::spawn(move || {
+                loop {
+                    let job = {
+                        let guard = rx.lock().unwrap();
+                        guard.recv()
+                    };
+                    match job {
+                        Ok((seq, block)) => {
+                            let (payload, sw) = compress_block(compression, block);
+                            if tx.send((seq, payload, sw)).is_err() {
+                                break;
+                            }
+                        }
+                        // Work channel closed: drain done, exit.
+                        Err(_) => break,
+                    }
+                }
+            }));
+        }
+        // Drop our extra sender clone so the result channel closes once
+        // every worker has exited.
+        drop(res_tx);
+        pipe.work_tx = Some(work_tx);
+        pipe.res_rx = Some(res_rx);
+        pipe
+    }
+
+    /// Write one fully-resolved block at the running offset and record
+    /// its `(offset, size_word)`.
+    fn write_block(&mut self, dev: &mut dyn BlockDevice, payload: Vec<u8>, sw: u32) -> Result<()> {
+        let off = self.next_disk_offset;
+        ensure_size(dev, off + payload.len() as u64)?;
+        dev.write_at(off, &payload)?;
+        self.results.push((off, sw));
+        self.next_disk_offset += payload.len() as u64;
+        Ok(())
+    }
+
+    /// Write every reorder-buffered result that is now contiguous from
+    /// `next_write_seq`.
+    fn flush_ready(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        while let Some((payload, sw)) = self.reorder.remove(&self.next_write_seq) {
+            self.write_block(dev, payload, sw)?;
+            self.next_write_seq += 1;
+        }
+        Ok(())
+    }
+
+    /// Non-blocking: move all currently-available results into the
+    /// reorder buffer, then write any that are now in order.
+    fn collect_ready(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        while let Ok((seq, payload, sw)) = self.res_rx.as_ref().unwrap().try_recv() {
+            self.reorder.insert(seq, (payload, sw));
+        }
+        self.flush_ready(dev)
+    }
+
+    /// Block for one result, buffer it, then write any in-order results.
+    fn drain_one(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let (seq, payload, sw) = self.res_rx.as_ref().unwrap().recv().map_err(|_| {
+            crate::Error::Io(std::io::Error::other(
+                "squashfs compression workers disconnected",
+            ))
+        })?;
+        self.reorder.insert(seq, (payload, sw));
+        self.flush_ready(dev)
+    }
+
+    /// Submit one block for compression + ordered writing. In serial mode
+    /// it compresses and writes inline.
+    fn submit(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        block: Vec<u8>,
+        target: EmitTarget,
+    ) -> Result<()> {
+        let seq = self.targets.len() as u64;
+        self.targets.push(target);
+        if !self.parallel {
+            let (payload, sw) = compress_block(self.compression, block);
+            return self.write_block(dev, payload, sw);
+        }
+        // Drain finished work first so memory stays bounded, then send —
+        // falling back to a blocking drain whenever the work channel is
+        // full (which can only happen while workers are producing).
+        self.collect_ready(dev)?;
+        let mut item = (seq, block);
+        loop {
+            match self.work_tx.as_ref().unwrap().try_send(item) {
+                Ok(()) => break,
+                Err(TrySendError::Full(back)) => {
+                    item = back;
+                    self.drain_one(dev)?;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(crate::Error::Io(std::io::Error::other(
+                        "squashfs compression workers disconnected",
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain all remaining blocks (writing them in order), join the
+    /// workers, and hand back the per-`seq` targets + `(offset,
+    /// size_word)` results plus the final disk offset.
+    fn finish(
+        mut self,
+        dev: &mut dyn BlockDevice,
+        next_disk_offset: &mut u64,
+    ) -> Result<(Vec<EmitTarget>, Vec<BlockResult>)> {
+        if self.parallel {
+            // Close the work channel so workers exit once it is drained.
+            self.work_tx.take();
+            let total = self.targets.len() as u64;
+            while self.next_write_seq < total {
+                self.drain_one(dev)?;
+            }
+            for h in self.workers.drain(..) {
+                let _ = h.join();
+            }
+        }
+        *next_disk_offset = self.next_disk_offset;
+        Ok((self.targets, self.results))
+    }
 }
 
 /// Make sure `dev` is at least `len` bytes long. Block backends with a
@@ -1434,6 +1710,70 @@ mod tests {
         std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
         drop(r);
         assert_eq!(buf, payload);
+    }
+
+    /// Parallel compression must produce a byte-identical image to the
+    /// serial path: same blocks, same order, deterministic codec. Build
+    /// a multi-file, multi-block tree (real gzip) once with one worker
+    /// and once with four, and compare the raw devices.
+    #[test]
+    fn parallel_compression_matches_serial() {
+        // Skip if gzip isn't compiled in (mirrors the codec guards used
+        // elsewhere); the uncompressed path is exercised by other tests.
+        if !crate::compression::Algo::Zlib.enabled() {
+            return;
+        }
+        let build = |threads: usize| -> Vec<u8> {
+            let cap = 16 * 1024 * 1024;
+            let mut dev = MemoryBackend::new(cap);
+            let mut state = WriteState::new(4096, Compression::Gzip);
+            state.compress_threads = Some(threads);
+            // A spread of file sizes: empty, sub-block (fragments),
+            // several multi-block files with tails. Compressible content
+            // so the codec actually shrinks blocks.
+            let sizes = [
+                0usize,
+                100,
+                4096,
+                4096 + 7,
+                4096 * 5 + 123,
+                9000,
+                200,
+                4096 * 3,
+            ];
+            for (i, &n) in sizes.iter().enumerate() {
+                let payload: Vec<u8> = (0..n).map(|j| ((i * 31 + j) % 97) as u8).collect();
+                state
+                    .create_file(
+                        &format!("/f{i:02}.bin"),
+                        FileSource::Reader {
+                            reader: Box::new(std::io::Cursor::new(payload.clone())),
+                            len: payload.len() as u64,
+                        },
+                        EntryMeta::default(),
+                        Vec::new(),
+                    )
+                    .unwrap();
+            }
+            let sb = state.flush(&mut dev).unwrap();
+            // Read the whole written image back out (image length is the
+            // end-of-superblock `bytes_used`).
+            let len = sb.bytes_used as usize;
+            let mut out = vec![0u8; len];
+            crate::block::BlockDevice::read_at(&mut dev, 0, &mut out).unwrap();
+            out
+        };
+        let serial = build(1);
+        let parallel = build(4);
+        assert_eq!(
+            serial.len(),
+            parallel.len(),
+            "image length differs between 1 and 4 worker threads"
+        );
+        assert!(
+            serial == parallel,
+            "parallel compression produced a different image than serial"
+        );
     }
 
     #[test]

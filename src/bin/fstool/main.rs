@@ -553,6 +553,10 @@ fn repack_cmd(
     let src_owned: String = if let Some(algo) = tar_input_codec(srcs[0].as_str()) {
         let raw = srcs[0].as_str();
         let path = std::path::Path::new(raw.split(':').next().unwrap_or(raw));
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(raw);
+        // Decompressing a multi-GB archive is the dominant silent cost
+        // before files start streaming — announce it.
+        fstool::repack::phase(&format!("decompressing {name} …"));
         let tmp = fstool::compression::decompress_to_tempfile(path, algo)?;
         let p = tmp.path().to_string_lossy().into_owned();
         _decompressed = Some(tmp);
@@ -711,6 +715,14 @@ fn repack_cmd(
             return Ok(());
         }
 
+        // Creating + formatting the destination (writing group
+        // descriptors, bitmaps, inode tables, journal for ext; the FAT
+        // tables for FAT32; …) runs before the first file streams, so
+        // announce it — on a multi-GB image this is several seconds.
+        fstool::repack::phase(&format!(
+            "formatting {target_fs_str} destination ({}) …",
+            human_size(dst_size)
+        ));
         let mut dst_dev = fstool::block::create_image(
             dst,
             dst_size,

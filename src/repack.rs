@@ -102,6 +102,28 @@ impl Progress {
         }
     }
 
+    /// Emit a coarse phase marker (decompress / scan / format) on its
+    /// own line. Unlike per-file [`note`], phases print in **every**
+    /// mode — TTY and pipe/log alike — because they're the milestones
+    /// that explain the otherwise-silent seconds before files start
+    /// streaming (decompressing a big `.tar.gz`, formatting a multi-GB
+    /// destination). There are only a handful per run, so they don't
+    /// spam a captured log.
+    fn phase_inner(&mut self, msg: &str) {
+        // Reset the throttle so the first `note` after a phase isn't
+        // swallowed by the 200 ms window.
+        self.last_emit = Instant::now();
+        if self.is_tty {
+            let mut err = std::io::stderr().lock();
+            // Clear any in-progress refreshing line first, then drop the
+            // phase on its own line so it stays above the file counter.
+            let _ = writeln!(err, "\r\x1b[Krepack: {msg}");
+            let _ = err.flush();
+        } else {
+            eprintln!("repack: {msg}");
+        }
+    }
+
     fn finish_inner(&self) {
         let elapsed = self.started.elapsed();
         if self.is_tty {
@@ -151,6 +173,17 @@ pub fn note(path: &str) {
     ACTIVE_PROGRESS.with(|cell| {
         if let Some(p) = cell.borrow_mut().as_mut() {
             p.note_inner(path);
+        }
+    });
+}
+
+/// Announce a coarse phase boundary (e.g. "decompressing …",
+/// "scanning source …", "formatting … destination"). Prints on its own
+/// line in both TTY and pipe/log modes. No-op when no sink is active.
+pub fn phase(msg: &str) {
+    ACTIVE_PROGRESS.with(|cell| {
+        if let Some(p) = cell.borrow_mut().as_mut() {
+            p.phase_inner(msg);
         }
     });
 }
@@ -658,6 +691,7 @@ pub fn walk_anyfs(
                 continue;
             }
             let child = join_fs_path(&dir, &e.name);
+            note(&child);
             let child_path = Path::new(&child);
             let attrs = src_fs.getattr(src_dev, child_path)?;
             let xattrs = src_fs.list_xattrs(src_dev, child_path)?;
@@ -728,6 +762,7 @@ fn walk_host_dir(root: &Path, sink: &mut dyn RepackSink) -> Result<()> {
                 crate::Error::InvalidArgument(format!("repack: non-UTF-8 host filename {name:?}"))
             })?;
             let dest = join_fs_path(&fs_dir, name_str);
+            note(&dest);
             // `DirEntry::metadata` does not traverse symlinks.
             let meta = entry.metadata()?;
             let ft = meta.file_type();

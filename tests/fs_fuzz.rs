@@ -22,7 +22,7 @@
 
 #![cfg(unix)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -94,6 +94,14 @@ enum Op {
     SetLen,
     /// `remove(path)`.
     Delete,
+    /// `clone_file(src, dst)` — copy or share extents from an existing
+    /// file to a fresh destination. Backends with
+    /// `clone_capability().shares_extents() == true` (XFS today) freeze
+    /// both inodes after the call (writes would corrupt the sharing
+    /// peer per `XFS_DIFLAG2_REFLINK` semantics); other backends get
+    /// the default byte-copy fallback and the destination stays
+    /// independently mutable.
+    Clone,
     /// `flush(dev)` — exercise the persist path mid-run, not just at
     /// the end.
     Flush,
@@ -178,14 +186,31 @@ fn fuzz_filesystem(
         "fuzz core requires add/remove support; got {cap:?}"
     );
     let supports_partial = caps.allow_partial && cap.supports_partial_writes();
+    // `clone_file` works on every mutable backend (the trait's default
+    // is a byte-copy fallback); reflink-capable backends override and
+    // produce shared extents. `shares_extents` controls the freezing
+    // policy: when the clone physically shares blocks (XFS), both
+    // peers must be treated as immutable thereafter or writes would
+    // corrupt the other side.
+    let shares_extents = fs.clone_capability().shares_extents();
 
     let mut rng = Rng::new(seed);
     let mut shadow: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut frozen: HashSet<String> = HashSet::new();
 
     for step in 0..iters {
-        let op = pick_op(&mut rng, &shadow, caps, supports_partial);
-        apply_op(fs, dev, &mut rng, &mut shadow, op, caps)
-            .unwrap_or_else(|e| panic!("seed={seed} step={step} op={op:?}: {e}"));
+        let op = pick_op(&mut rng, &shadow, &frozen, caps, supports_partial);
+        apply_op(
+            fs,
+            dev,
+            &mut rng,
+            &mut shadow,
+            &mut frozen,
+            op,
+            caps,
+            shares_extents,
+        )
+        .unwrap_or_else(|e| panic!("seed={seed} step={step} op={op:?}: {e}"));
 
         // After every op the live FS must match the shadow exactly:
         // same set of names, same bytes. We flush first so backends
@@ -219,6 +244,7 @@ fn fuzz_filesystem(
 fn pick_op(
     rng: &mut Rng,
     shadow: &HashMap<String, Vec<u8>>,
+    frozen: &HashSet<String>,
     caps: &Caps,
     supports_partial: bool,
 ) -> Op {
@@ -228,30 +254,51 @@ fn pick_op(
         return Op::Create;
     }
     let can_create = shadow.len() < caps.max_files;
-    let mut table: Vec<Op> = Vec::with_capacity(8);
+    // Most ops need a file we can still mutate; once a file has been
+    // reflinked (frozen), Overwrite / Append / PatchRange / SetLen /
+    // Delete would either corrupt the sharing peer or leave the
+    // refcount-btree inconsistent (no CoW-on-write or refcount
+    // decrement yet). If every existing file is frozen we fall back
+    // to Create / Flush only.
+    let has_unfrozen = shadow.keys().any(|n| !frozen.contains(n));
+
+    let mut table: Vec<Op> = Vec::with_capacity(16);
     if can_create {
         table.extend([Op::Create; 4]);
     }
-    table.extend([Op::Overwrite; 3]);
-    table.extend([Op::Append; 3]);
-    if supports_partial {
-        table.extend([Op::PatchRange; 3]);
+    if has_unfrozen {
+        table.extend([Op::Overwrite; 3]);
+        table.extend([Op::Append; 3]);
+        if supports_partial {
+            table.extend([Op::PatchRange; 3]);
+        }
+        if caps.allow_set_len {
+            table.extend([Op::SetLen; 2]);
+        }
+        table.extend([Op::Delete; 2]);
+        // Clone weight 1: rare but non-trivial — exercises the trait
+        // default byte-copy on most backends and the REFCNTBT update
+        // path on XFS. Gated on `has_unfrozen` since we need a live
+        // source, and on `can_create` since the destination is a new
+        // file in the same caps.max_files budget.
+        if can_create {
+            table.push(Op::Clone);
+        }
     }
-    if caps.allow_set_len {
-        table.extend([Op::SetLen; 2]);
-    }
-    table.extend([Op::Delete; 2]);
     table.push(Op::Flush);
     table[rng.range(table.len() as u64) as usize]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_op(
     fs: &mut dyn Filesystem,
     dev: &mut dyn BlockDevice,
     rng: &mut Rng,
     shadow: &mut HashMap<String, Vec<u8>>,
+    frozen: &mut HashSet<String>,
     op: Op,
     caps: &Caps,
+    shares_extents: bool,
 ) -> Result<(), String> {
     match op {
         Op::Create => {
@@ -263,7 +310,7 @@ fn apply_op(
             shadow.insert(name, body);
         }
         Op::Overwrite => {
-            let Some(name) = pick_present(rng, shadow) else {
+            let Some(name) = pick_present_unfrozen(rng, shadow, frozen) else {
                 return Ok(());
             };
             let path = format!("/{name}");
@@ -273,7 +320,7 @@ fn apply_op(
             shadow.insert(name, body);
         }
         Op::Append => {
-            let Some(name) = pick_present(rng, shadow) else {
+            let Some(name) = pick_present_unfrozen(rng, shadow, frozen) else {
                 return Ok(());
             };
             let path = format!("/{name}");
@@ -283,7 +330,7 @@ fn apply_op(
             shadow.get_mut(&name).unwrap().extend_from_slice(&chunk);
         }
         Op::PatchRange => {
-            let Some(name) = pick_present(rng, shadow) else {
+            let Some(name) = pick_present_unfrozen(rng, shadow, frozen) else {
                 return Ok(());
             };
             let cur = shadow.get(&name).cloned().unwrap();
@@ -306,7 +353,7 @@ fn apply_op(
             entry[off..off + chunk.len()].copy_from_slice(&chunk);
         }
         Op::SetLen => {
-            let Some(name) = pick_present(rng, shadow) else {
+            let Some(name) = pick_present_unfrozen(rng, shadow, frozen) else {
                 return Ok(());
             };
             let new_len = rng.range(caps.max_size as u64);
@@ -316,13 +363,35 @@ fn apply_op(
             entry.resize(new_len as usize, 0);
         }
         Op::Delete => {
-            let Some(name) = pick_present(rng, shadow) else {
+            let Some(name) = pick_present_unfrozen(rng, shadow, frozen) else {
                 return Ok(());
             };
             let path = format!("/{name}");
             fs.remove(dev, Path::new(&path))
                 .map_err(|e| format!("remove {path}: {e}"))?;
             shadow.remove(&name);
+        }
+        Op::Clone => {
+            // Need an unfrozen source (we'd freeze it on shares_extents
+            // backends) and a fresh destination name.
+            let Some(src_name) = pick_present_unfrozen(rng, shadow, frozen) else {
+                return Ok(());
+            };
+            let dst_name = pick_fresh_name(rng, shadow);
+            let src_path = format!("/{src_name}");
+            let dst_path = format!("/{dst_name}");
+            fs.clone_file(dev, Path::new(&src_path), Path::new(&dst_path))
+                .map_err(|e| format!("clone_file {src_path} → {dst_path}: {e}"))?;
+            // Mirror the bytes in the shadow.
+            let body = shadow.get(&src_name).cloned().unwrap();
+            shadow.insert(dst_name.clone(), body);
+            // If the backend physically shares extents (XFS today),
+            // writes through either side would corrupt the other; mark
+            // both immutable for the rest of this fuzz run.
+            if shares_extents {
+                frozen.insert(src_name);
+                frozen.insert(dst_name);
+            }
         }
         Op::Flush => {
             fs.flush(dev).map_err(|e| format!("flush: {e}"))?;
@@ -560,6 +629,22 @@ fn pick_present(rng: &mut Rng, shadow: &HashMap<String, Vec<u8>>) -> Option<Stri
     shadow.keys().nth(i).cloned()
 }
 
+/// Like [`pick_present`] but only over files not in the `frozen` set
+/// — i.e. files the fuzz hasn't reflinked. Returns `None` when every
+/// existing file is frozen, which the caller treats as "skip this op".
+fn pick_present_unfrozen(
+    rng: &mut Rng,
+    shadow: &HashMap<String, Vec<u8>>,
+    frozen: &HashSet<String>,
+) -> Option<String> {
+    let live: Vec<&String> = shadow.keys().filter(|n| !frozen.contains(*n)).collect();
+    if live.is_empty() {
+        return None;
+    }
+    let i = rng.range(live.len() as u64) as usize;
+    Some(live[i].clone())
+}
+
 /// Names that backends create as part of their on-disk layout and
 /// that the fuzz never touches — filtered out before comparing
 /// against the shadow.
@@ -749,6 +834,32 @@ fn fuzz_xfs() {
         &mut fs,
         &mut dev,
         0x5846_5300_C0DE,
+        FUZZ_ITERS,
+        &Caps::mutable_small(),
+    );
+}
+
+#[test]
+fn fuzz_ntfs() {
+    // NTFS landed `remove` in Phase 1 today, so it now satisfies the
+    // fuzz core's `supports_add_remove()` precondition. 16 MiB is the
+    // floor at which the writer's default layout (boot + MFT +
+    // $Bitmap + $LogFile + $UpCase + $Secure) fits with headroom; the
+    // existing external tests use the same size.
+    use fstool::fs::ntfs::Ntfs;
+    use fstool::fs::ntfs::format::FormatOpts;
+    const SIZE: u64 = 16 * 1024 * 1024;
+    let tmp = NamedTempFile::new().expect("tempfile");
+    let mut dev = FileBackend::create(tmp.path(), SIZE).expect("FileBackend create");
+    let opts = FormatOpts {
+        volume_label: "FSTOOL-FUZZ".to_string(),
+        ..Default::default()
+    };
+    let mut fs = Ntfs::format(&mut dev, &opts).expect("format ntfs");
+    fuzz_filesystem(
+        &mut fs,
+        &mut dev,
+        0x4E54_4653_C0DE, // "NTFS" + suffix
         FUZZ_ITERS,
         &Caps::mutable_small(),
     );

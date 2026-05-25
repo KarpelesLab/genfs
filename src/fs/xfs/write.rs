@@ -81,6 +81,13 @@ use super::symlink::XFS_SYMLINK_HDR_SIZE;
 /// Streaming-write scratch buffer size — never grow this above 64 KiB.
 pub const SCRATCH_SIZE: usize = 64 * 1024;
 
+/// INOBT leaf capacity: records of 16 B (`ir_startino` 4 + `ir_freecount`
+/// 4 + `ir_free` 8) after the 56 B v5 short-form btree header.
+const INOBT_RECS_PER_LEAF: usize = (XFS_BLOCKSIZE as usize - XFS_BTREE_SBLOCK_V5_SIZE) / 16;
+/// INOBT node fan-out (= node `maxrecs`): each child costs a 4 B key plus a
+/// 4 B pointer. The pointer array begins at `header + maxrecs * 4`.
+const INOBT_PTRS_PER_NODE: usize = (XFS_BLOCKSIZE as usize - XFS_BTREE_SBLOCK_V5_SIZE) / 8;
+
 /// Special-file kind for [`Xfs::add_device`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
@@ -1998,12 +2005,30 @@ impl Xfs {
             } else {
                 agblocks
             };
+            // Plan the INOBT. A single leaf (≤ INOBT_RECS_PER_LEAF chunks)
+            // lives at the pre-reserved block 6 (level 0, AGI level 1).
+            // More chunks need a 2-level tree: block 6 becomes the root
+            // node (level 1) and the leaves are carved off the AG tail so
+            // they're excluded from the free-space btrees below.
+            let n_chunks = ag_state.chunks.len();
+            let n_leaves = n_chunks.div_ceil(INOBT_RECS_PER_LEAF).max(1);
+            if n_leaves > INOBT_PTRS_PER_NODE {
+                return Err(crate::Error::Unsupported(
+                    "xfs: INOBT needs >2 levels (too many inode chunks)".into(),
+                ));
+            }
+            let inobt_multi = n_leaves > 1;
+            let inobt_leaf_start = ag_state.next_agblock;
+            let inobt_extra = if inobt_multi { n_leaves as u32 } else { 0 };
+            let effective_next = ag_state.next_agblock + inobt_extra;
+
             // Collect this AG's free-space extents: the trailing
-            // bump-pointer region plus any explicitly freed extents.
+            // bump-pointer region (after any INOBT leaves) plus any
+            // explicitly freed extents.
             let mut extents: Vec<(u32, u32)> = ag_state.freed_extents.clone();
-            let tail_free = this_ag_blocks.saturating_sub(ag_state.next_agblock);
+            let tail_free = this_ag_blocks.saturating_sub(effective_next);
             if tail_free > 0 {
-                extents.push((ag_state.next_agblock, tail_free));
+                extents.push((effective_next, tail_free));
             }
             // Sort by start-block, then coalesce adjacent extents.
             extents.sort_by_key(|(s, _)| *s);
@@ -2068,31 +2093,85 @@ impl Xfs {
             stamp_v5_btree_block_crc(&mut cnt);
             dev.write_at(ag_byte + 5 * bs, &cnt)?;
 
-            // -- INOBT (block 6) — leaf with this AG's chunks ---------
-            let mut inobt = vec![0u8; XFS_BLOCKSIZE as usize];
-            write_btree_header_for_ag(
-                &mut inobt,
-                XFS_IBT_CRC_MAGIC,
-                0,
-                ag_state.chunks.len() as u16,
-                &uuid,
-                ag,
-                agblocks,
-                6,
-            );
-            for (i, chunk) in ag_state.chunks.iter().enumerate() {
-                let off = XFS_BTREE_SBLOCK_V5_SIZE + i * 16;
-                if off + 16 > inobt.len() {
-                    return Err(crate::Error::Unsupported(
-                        "xfs: too many inode chunks for a single-leaf INOBT".into(),
-                    ));
+            // -- INOBT: single leaf at block 6, or a 2-level tree
+            // (root node at block 6 + leaves carved off the AG tail). ----
+            let write_inobt_leaf = |buf: &mut [u8],
+                                    recs: &[InodeChunk],
+                                    blkno_ag: u32,
+                                    leftsib: u32,
+                                    rightsib: u32| {
+                write_btree_header_for_ag(
+                    buf,
+                    XFS_IBT_CRC_MAGIC,
+                    0,
+                    recs.len() as u16,
+                    &uuid,
+                    ag,
+                    agblocks,
+                    blkno_ag,
+                );
+                buf[8..12].copy_from_slice(&leftsib.to_be_bytes());
+                buf[12..16].copy_from_slice(&rightsib.to_be_bytes());
+                for (i, chunk) in recs.iter().enumerate() {
+                    let off = XFS_BTREE_SBLOCK_V5_SIZE + i * 16;
+                    buf[off..off + 4].copy_from_slice(&chunk.startino_ag.to_be_bytes());
+                    buf[off + 4..off + 8].copy_from_slice(&chunk.freecount().to_be_bytes());
+                    buf[off + 8..off + 16].copy_from_slice(&chunk.ir_free.to_be_bytes());
                 }
-                inobt[off..off + 4].copy_from_slice(&chunk.startino_ag.to_be_bytes());
-                inobt[off + 4..off + 8].copy_from_slice(&chunk.freecount().to_be_bytes());
-                inobt[off + 8..off + 16].copy_from_slice(&chunk.ir_free.to_be_bytes());
+                stamp_v5_btree_block_crc(buf);
+            };
+
+            if !inobt_multi {
+                let mut inobt = vec![0u8; XFS_BLOCKSIZE as usize];
+                write_inobt_leaf(&mut inobt, &ag_state.chunks, 6, u32::MAX, u32::MAX);
+                dev.write_at(ag_byte + 6 * bs, &inobt)?;
+            } else {
+                // Leaves at inobt_leaf_start + j, chained left↔right; the
+                // root node's key[j] is leaf j's first (lowest) startino.
+                // Distribute records *evenly* so every leaf stays at or
+                // above minrecs (maxrecs/2) — a greedy fill that left the
+                // last leaf underfull makes xfs_repair reject it as a
+                // "dubious" header. `per_leaf <= maxrecs` always holds.
+                let per_leaf = n_chunks.div_ceil(n_leaves);
+                let mut node_keys: Vec<(u32, u32)> = Vec::with_capacity(n_leaves);
+                for j in 0..n_leaves {
+                    let lo = j * per_leaf;
+                    let hi = ((j + 1) * per_leaf).min(n_chunks);
+                    let recs = &ag_state.chunks[lo..hi];
+                    let leaf_agblk = inobt_leaf_start + j as u32;
+                    let leftsib = if j > 0 { leaf_agblk - 1 } else { u32::MAX };
+                    let rightsib = if j + 1 < n_leaves {
+                        leaf_agblk + 1
+                    } else {
+                        u32::MAX
+                    };
+                    let mut leaf = vec![0u8; XFS_BLOCKSIZE as usize];
+                    write_inobt_leaf(&mut leaf, recs, leaf_agblk, leftsib, rightsib);
+                    dev.write_at(ag_byte + (leaf_agblk as u64) * bs, &leaf)?;
+                    node_keys.push((recs[0].startino_ag, leaf_agblk));
+                }
+                // Root node (level 1) at block 6: packed keys then ptrs.
+                let mut node = vec![0u8; XFS_BLOCKSIZE as usize];
+                write_btree_header_for_ag(
+                    &mut node,
+                    XFS_IBT_CRC_MAGIC,
+                    1,
+                    n_leaves as u16,
+                    &uuid,
+                    ag,
+                    agblocks,
+                    6,
+                );
+                let ptr_base = XFS_BTREE_SBLOCK_V5_SIZE + INOBT_PTRS_PER_NODE * 4;
+                for (i, (startino, agblk)) in node_keys.iter().enumerate() {
+                    let k = XFS_BTREE_SBLOCK_V5_SIZE + i * 4;
+                    node[k..k + 4].copy_from_slice(&startino.to_be_bytes());
+                    let p = ptr_base + i * 4;
+                    node[p..p + 4].copy_from_slice(&agblk.to_be_bytes());
+                }
+                stamp_v5_btree_block_crc(&mut node);
+                dev.write_at(ag_byte + 6 * bs, &node)?;
             }
-            stamp_v5_btree_block_crc(&mut inobt);
-            dev.write_at(ag_byte + 6 * bs, &inobt)?;
 
             // -- AGF (sector 1, byte 512 of AG) ----------------------
             // AG headers are sector-aligned: the formatter laid them
@@ -2140,7 +2219,9 @@ impl Xfs {
             let agi_count = ag_state.usedcount_inodes() + ag_state.freecount_inodes();
             agi[16..20].copy_from_slice(&agi_count.to_be_bytes());
             agi[20..24].copy_from_slice(&6u32.to_be_bytes()); // inobt root
-            agi[24..28].copy_from_slice(&1u32.to_be_bytes()); // level
+            // Tree height: 1 (root is the leaf) or 2 (root node + leaves).
+            let agi_inobt_level: u32 = if inobt_multi { 2 } else { 1 };
+            agi[24..28].copy_from_slice(&agi_inobt_level.to_be_bytes());
             agi[28..32].copy_from_slice(&ag_state.freecount_inodes().to_be_bytes());
             if let Some(last) = ag_state.chunks.last() {
                 agi[32..36].copy_from_slice(&last.startino_ag.to_be_bytes());

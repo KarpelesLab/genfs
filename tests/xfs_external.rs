@@ -733,10 +733,12 @@ fn open_file_rw_refused_on_reflinked_file() {
 /// Large single-directory test: plant enough files in one directory that
 /// the writer must promote it past block format into **leaf** and then
 /// **node** format (a da-btree of leaf blocks over many data blocks, with
-/// a free-space block tracking per-data-block bests). Builds at two sizes
-/// — one that lands on leaf format, one on node format — and for each:
+/// a free-space block tracking per-data-block bests). The 20k case also
+/// pushes the inode count past one INOBT leaf (~252 chunks), exercising
+/// the 2-level INOBT (root node + balanced leaves). For each size:
 ///   * `xfs_repair -n` must complete cleanly (the directory index, the
-///     bestfree/bests arrays, and the now-aligned inode chunks all check);
+///     bestfree/bests arrays, the aligned/initialised inode chunks, and
+///     the multi-level INOBT all check);
 ///   * reopening and `list_path` must return every entry.
 #[cfg(unix)]
 #[test]
@@ -745,7 +747,7 @@ fn xfs_writer_large_directory_leaf_and_node() {
         eprintln!("skipping: xfs_repair not installed");
         return;
     };
-    for n in [400usize, 5000usize] {
+    for n in [400usize, 5000usize, 20000usize] {
         let size: u64 = 256 * 1024 * 1024;
         let tmp = NamedTempFile::new().unwrap();
         let mut dev = FileBackend::create(tmp.path(), size).unwrap();

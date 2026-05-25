@@ -500,6 +500,16 @@ pub trait Filesystem {
     /// no backend regresses. Backends whose writer already consumes a
     /// `&mut dyn Read` (ext, FAT32, the archive core, …) override this
     /// for true zero-copy streaming.
+    /// Whether [`create_file`](Self::create_file) consumes its
+    /// `FileSource` synchronously (`true`) rather than storing it to read
+    /// later at `flush` (`false` — e.g. SquashFS / ISO 9660 / GRF, which
+    /// keep every source until they serialise). Immediate backends let
+    /// [`create_file_streaming`](Self::create_file_streaming) buffer small
+    /// files in memory instead of spilling each one to a temp file.
+    fn streams_immediately(&self) -> bool {
+        false
+    }
+
     fn create_file_streaming(
         &mut self,
         dev: &mut dyn crate::block::BlockDevice,
@@ -508,15 +518,34 @@ pub trait Filesystem {
         len: u64,
         meta: FileMeta,
     ) -> crate::Result<()> {
+        // For backends that consume the source now, buffer small files in
+        // memory: this avoids creating, copying into, fsync-ing and
+        // reading back a temp file *per file* — the dominant per-file cost
+        // when repacking many small files. Larger files (and deferred
+        // backends, which must keep the bytes until `flush`) spill to a
+        // temp file — but we never fsync it: it's read back in this same
+        // process from the page cache, so durability is irrelevant.
+        const MEM_CAP: u64 = 8 * 1024 * 1024;
+        if self.streams_immediately() && len <= MEM_CAP {
+            let mut buf = Vec::with_capacity(len as usize);
+            body.take(len).read_to_end(&mut buf)?;
+            let actual = buf.len() as u64;
+            return self.create_file(
+                dev,
+                path,
+                FileSource::Reader {
+                    reader: Box::new(io::Cursor::new(buf)),
+                    len: actual,
+                },
+                meta,
+            );
+        }
         let mut tmp = tempfile::NamedTempFile::new()?;
         let mut limited = body.take(len);
         io::copy(&mut limited, tmp.as_file_mut())?;
-        tmp.as_file_mut().sync_all()?;
-        // Hand the temp file to the backend as an *owned* source: a
-        // deferred-write backend (SquashFS / ISO 9660 / GRF) stores the
-        // `FileSource` and reads it at `flush`, so the bytes must outlive
-        // this call. `FileSource::TempFile` keeps them alive until the
-        // backend consumes (and drops) the source.
+        // Deferred backends (SquashFS / ISO 9660 / GRF) store the
+        // `FileSource` and read it at `flush`; `FileSource::TempFile`
+        // keeps the bytes alive until then.
         self.create_file(dev, path, FileSource::TempFile(tmp), meta)
     }
 

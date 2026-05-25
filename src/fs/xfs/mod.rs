@@ -687,6 +687,13 @@ impl crate::fs::FilesystemFactory for Xfs {
 }
 
 impl crate::fs::Filesystem for Xfs {
+    // Consumes the FileSource during create_file, so let the
+    // streaming repack buffer small files in memory instead of
+    // spilling each to a temp file (see create_file_streaming).
+    fn streams_immediately(&self) -> bool {
+        true
+    }
+
     /// XFS images opt in to the REFLINK feature (`format::format`
     /// stamps `XFS_SB_FEAT_RO_COMPAT_REFLINK` and an empty per-AG
     /// REFCNTBT root), and `clone_file_path` shares extents through

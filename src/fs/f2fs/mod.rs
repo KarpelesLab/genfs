@@ -396,6 +396,13 @@ impl crate::fs::FilesystemFactory for F2fs {
 }
 
 impl crate::fs::Filesystem for F2fs {
+    // Consumes the FileSource during create_file, so let the
+    // streaming repack buffer small files in memory instead of
+    // spilling each to a temp file (see create_file_streaming).
+    fn streams_immediately(&self) -> bool {
+        true
+    }
+
     /// F2FS's writer accumulates the entire filesystem in memory and
     /// serializes it from scratch at flush (NAT both halves, fresh-image
     /// cursegs), so it can only mutate the handle returned by

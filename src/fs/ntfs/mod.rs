@@ -1586,6 +1586,13 @@ impl crate::fs::FilesystemFactory for Ntfs {
 }
 
 impl crate::fs::Filesystem for Ntfs {
+    // Consumes the FileSource during create_file, so let the
+    // streaming repack buffer small files in memory instead of
+    // spilling each to a temp file (see create_file_streaming).
+    fn streams_immediately(&self) -> bool {
+        true
+    }
+
     /// NTFS supports full in-place edits. A handle from [`Ntfs::open`]
     /// starts read-only (`writer: None`), but the first mutation lazily
     /// reconstructs the writer state from disk (see

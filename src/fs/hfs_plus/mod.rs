@@ -1300,6 +1300,13 @@ impl crate::fs::FilesystemFactory for HfsPlus {
 }
 
 impl crate::fs::Filesystem for HfsPlus {
+    // Consumes the FileSource during create_file, so let the
+    // streaming repack buffer small files in memory instead of
+    // spilling each to a temp file (see create_file_streaming).
+    fn streams_immediately(&self) -> bool {
+        true
+    }
+
     fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,

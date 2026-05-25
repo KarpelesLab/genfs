@@ -43,6 +43,10 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | GRF        | ✅    | ✅     | ✅              | Gravity Ragnarok Online archive — v0x102 / v0x103 / v0x200; permutation cipher (`MIXCRYPT` / `DES`); CP949 filenames |
 | qcow2      | ✅    | ✅     | ✅              | v2 + v3 backend, allocate-on-write writer                                                                          |
 | dmg        | ✅    | —     | —              | UDIF v4 trailer + mish chunks (zero / raw / zlib / ADC / bzip2 / LZFSE / LZMA); encrypted v2 (`encrcdsa`) read with PBKDF2 unlock |
+| zip        | ✅    | ✅     | —              | central-directory index, ZIP64, Stored + Deflate, Unix mode/symlinks, UTF-8/Shift-JIS/EUC-JP filename detection; repack-only writer |
+| cpio       | ✅    | ✅     | —              | newc / newc-crc / odc read; newc write; repack-only                                                              |
+| ar         | ✅    | ✅     | —              | GNU + BSD long names (read), GNU write; flat (no directories); repack-only                                       |
+| 7z / rar / arc / lha / lzx / cab / sit | 🚧 | — | — | detected by `info`; reader not implemented yet (returns a clear `Unsupported`) — pure-Rust decoders land behind per-format Cargo features |
 
 `🚧` marks writers / mutation paths with known gaps (see Limitations).
 All writable filesystems — ext2/3/4, FAT32, exFAT, XFS, HFS+, NTFS,
@@ -68,7 +72,7 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 
 | Command       | What it does                                                            |
 |---------------|-------------------------------------------------------------------------|
-| `create`      | Build a bare image of any supported FS (`-t ext4` / `fat32` / `xfs` / `hfs+` / `ntfs` / `f2fs` / `squashfs` / `iso` / `apfs` / `exfat` / `grf`) from a host directory tree. FS-specific knobs go through `-O key=val,key=val`. |
+| `create`      | Build a bare image of any supported FS (`-t ext4` / `fat32` / `xfs` / `hfs+` / `ntfs` / `f2fs` / `squashfs` / `iso` / `apfs` / `exfat` / `grf` / `zip` / `cpio` / `ar`) from a host directory tree. FS-specific knobs go through `-O key=val,key=val`. |
 | `build`       | Build from a TOML spec — bare FS or a partitioned disk image.           |
 | `info`        | Print partition table (whole-disk) or FS summary + root listing.        |
 | `ls`          | List a directory inside an image.                                       |
@@ -352,6 +356,43 @@ fstool cat  disc.iso /README.TXT
 fstool repack disc.iso plain.tar
 fstool repack plain.tar disc2.iso --fs-type iso
 ```
+
+## Archive formats
+
+Archives are treated as filesystems through the same `Filesystem` trait as
+tar and GRF, so `info` / `ls` / `cat` / `repack` work on them uniformly. They
+share a common core (`src/fs/archive/`): each format supplies a *scanner* that
+indexes the archive into an in-memory tree, and — where writable — a *builder*;
+the core provides the generic read path and decodes each entry's byte range
+through the existing compression codecs.
+
+```sh
+fstool create -t zip ./rootfs -o out.zip          # build a zip from a dir
+fstool create -t zip ./rootfs -o out.zip -O compression=stored
+fstool ls   app.zip /                             # walk any zip/cpio/ar
+fstool cat  app.zip /etc/config
+fstool repack app.zip out.cpio --fs-type cpio     # convert between archives
+```
+
+| Format | Read | Write | Notes |
+|--------|------|-------|-------|
+| zip    | ✅    | ✅     | ZIP64, Stored + Deflate, Unix mode + symlinks; reads archives from any tool; filenames decoded as UTF-8 (flagged) else auto-detected (Shift-JIS / EUC-JP / Latin-9). On write the UTF-8 flag is set only for non-ASCII names. |
+| cpio   | ✅    | ✅     | newc / newc-crc / odc read; newc write. |
+| ar     | ✅    | ✅     | GNU + BSD long names on read, GNU on write. Flat — a nested source tree is rejected with a pointer to tar/zip/cpio. |
+
+The writers are repack-only (`MutationCapability::Streaming`, like tar): an
+existing archive can't be edited in place — `add` / `rm` steer you to
+`repack`, which rebuilds. `7z`, `rar`, `arc`, `lha`, `lzx`, `cab`, and `sit`
+are recognised by `info` today but their readers are scaffolds that return a
+clear `Unsupported`; pure-Rust decoders will land behind per-format Cargo
+features. (`rar` and `sit` are read-only-at-best — their creation is
+proprietary.)
+
+zip's Deflate support rides the existing `gzip` Cargo feature (raw DEFLATE via
+`flate2`); a build without it falls back to Stored. `cpio` and `ar` need no
+codec. Archive-to-`ext`/`fat`/`tar` repack uses the specialised FS-to-FS
+copiers and isn't wired yet (same limitation as XFS/HFS+ sources) — convert
+between archives, or to `iso`/`grf`, via the generic trait path.
 
 ## Compression
 

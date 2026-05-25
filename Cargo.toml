@@ -22,6 +22,13 @@ path = "src/bin/fstool/main.rs"
 # Compression codecs for SquashFS reads and `.tar.<algo>` streaming I/O.
 # Enabled by default; disable with `default-features = false` and pick
 # a subset if you want to slim the binary or avoid a C-bundled build.
+#
+# Archive backends (zip / cpio / ar) are always compiled — they add no new
+# dependencies (zip's DEFLATE rides the `gzip` feature; cpio/ar need no
+# codec). The detection-only scaffolds (7z / rar / arc / lha / lzx / cab /
+# sit) are likewise always present; when a pure-Rust decoder is wired for
+# one, it gains its own optional dependency behind a per-format feature
+# here, matching the codec pattern above.
 default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
 gzip = ["dep:flate2"]
 xz = ["dep:lzma-rs"]

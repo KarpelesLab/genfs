@@ -388,6 +388,46 @@ fn mount_cmd(image: &str, mountpoint: &std::path::Path) -> fstool::Result<()> {
             Box::new(fstool::fs::grf::Grf::open_dev(dev.as_mut())?),
             "grf",
         ),
+        FsKind::Zip => (
+            Box::new(fstool::fs::archive::zip::ZipFs::open(dev.as_mut())?),
+            "zip",
+        ),
+        FsKind::Cpio => (
+            Box::new(fstool::fs::archive::cpio::CpioFs::open(dev.as_mut())?),
+            "cpio",
+        ),
+        FsKind::Ar => (
+            Box::new(fstool::fs::archive::ar::ArFs::open(dev.as_mut())?),
+            "ar",
+        ),
+        FsKind::SevenZ => (
+            Box::new(fstool::fs::archive::sevenz::SevenZFs::open(dev.as_mut())?),
+            "7z",
+        ),
+        FsKind::Rar => (
+            Box::new(fstool::fs::archive::rar::RarFs::open(dev.as_mut())?),
+            "rar",
+        ),
+        FsKind::Arc => (
+            Box::new(fstool::fs::archive::arc::ArcFs::open(dev.as_mut())?),
+            "arc",
+        ),
+        FsKind::Lha => (
+            Box::new(fstool::fs::archive::lha::LhaFs::open(dev.as_mut())?),
+            "lha",
+        ),
+        FsKind::Lzx => (
+            Box::new(fstool::fs::archive::lzx::LzxFs::open(dev.as_mut())?),
+            "lzx",
+        ),
+        FsKind::Cab => (
+            Box::new(fstool::fs::archive::cab::CabFs::open(dev.as_mut())?),
+            "cab",
+        ),
+        FsKind::Sit => (
+            Box::new(fstool::fs::archive::sit::SitFs::open(dev.as_mut())?),
+            "sit",
+        ),
         // FsKind is #[non_exhaustive]; new variants added in the
         // future error out here instead of silently falling through.
         _ => {
@@ -591,6 +631,14 @@ fn repack_cmd(
                     let bytes = sum_source_file_bytes(src_dev, &mut src_fs)?;
                     bytes.saturating_add(64 * 1024)
                 }
+                "zip" | "cpio" | "ar" => {
+                    // Archive writers stream into a sparse, over-sized
+                    // file that is truncated to the real length after
+                    // flush. ×2 + 16 MiB covers per-entry headers even
+                    // for a tree of many tiny files.
+                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs)?;
+                    bytes.saturating_mul(2).saturating_add(16 * 1024 * 1024)
+                }
                 other => {
                     return Err(fstool::Error::InvalidArgument(format!(
                         "repack: unknown --fs-type {other:?}"
@@ -613,6 +661,10 @@ fn repack_cmd(
                 "grf" => {
                     let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
                     bytes.saturating_add(64 * 1024)
+                }
+                "zip" | "cpio" | "ar" => {
+                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs).unwrap_or(0);
+                    bytes.saturating_mul(2).saturating_add(16 * 1024 * 1024)
                 }
                 _ => src_total,
             },
@@ -646,6 +698,9 @@ fn repack_cmd(
                 cluster_size: qcow2_cluster_size,
             },
         )?;
+        // `Some(len)` after the match for archive writers (zip/cpio/ar)
+        // so we truncate the over-provisioned file; `None` for FS images.
+        let mut archive_len: Option<u64> = None;
         match lower.as_str() {
             "ext2" | "ext3" | "ext4" => {
                 let plan = build_ext_plan(src_dev, &mut src_fs, block_size, &lower)?;
@@ -736,6 +791,27 @@ fn repack_cmd(
                 let opts = fstool::fs::grf::FormatOpts::default();
                 repack_via_trait::<fstool::fs::grf::Grf>(dst_dev.as_mut(), &opts, src)?;
             }
+            "zip" => {
+                archive_len = repack_via_trait::<fstool::fs::archive::zip::ZipFs>(
+                    dst_dev.as_mut(),
+                    &fstool::fs::archive::zip::ZipFormatOpts::default(),
+                    src,
+                )?;
+            }
+            "cpio" => {
+                archive_len = repack_via_trait::<fstool::fs::archive::cpio::CpioFs>(
+                    dst_dev.as_mut(),
+                    &fstool::fs::archive::cpio::CpioFormatOpts,
+                    src,
+                )?;
+            }
+            "ar" => {
+                archive_len = repack_via_trait::<fstool::fs::archive::ar::ArFs>(
+                    dst_dev.as_mut(),
+                    &fstool::fs::archive::ar::ArFormatOpts,
+                    src,
+                )?;
+            }
             other => {
                 return Err(fstool::Error::InvalidArgument(format!(
                     "repack: unknown --fs-type {other:?}"
@@ -743,8 +819,18 @@ fn repack_cmd(
             }
         }
         dst_dev.sync()?;
+        // Archives are exact-length: shrink the sparse backing file from
+        // its provisioned size down to what the writer actually wrote.
+        let report_size = match archive_len {
+            Some(len) => {
+                drop(dst_dev);
+                truncate_output_file(dst, len)?;
+                len
+            }
+            None => dst_size,
+        };
         eprintln!(
-            "repacked {src} → {} (fs: {source_kind} → {target_fs_str}, {dst_size} bytes)",
+            "repacked {src} → {} (fs: {source_kind} → {target_fs_str}, {report_size} bytes)",
             dst.display()
         );
         Ok(())
@@ -760,12 +846,14 @@ fn repack_via_trait<F: fstool::fs::FilesystemFactory>(
     dst_dev: &mut dyn fstool::block::BlockDevice,
     opts: &F::FormatOpts,
     src: &str,
-) -> fstool::Result<()> {
+) -> fstool::Result<Option<u64>> {
     let mut dst = F::format(dst_dev, opts)?;
     let source = fstool::repack::Source::detect(src)?;
     fstool::repack::populate_fs_from_source(dst_dev, &mut dst, &source)?;
     dst.flush(dst_dev)?;
-    Ok(())
+    // `Some` for archive writers (zip/cpio/ar) so the caller can
+    // truncate the over-provisioned file; `None` for sized FS images.
+    Ok(fstool::fs::Filesystem::image_len(&dst))
 }
 
 /// Walk the source filesystem and recreate every entry inside the
@@ -2661,10 +2749,46 @@ fn create_cmd(args: CreateArgs<'_>) -> fstool::Result<()> {
             |o, m| o.apply_options(m),
             DEFAULT_MIN_SIZE,
         )?,
+        "zip" => create_via_factory::<fstool::fs::archive::zip::ZipFs>(
+            "zip",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::archive::zip::ZipFormatOpts::default(),
+            |o, m| o.apply_options(m),
+            DEFAULT_MIN_SIZE,
+        )?,
+        "cpio" => create_via_factory::<fstool::fs::archive::cpio::CpioFs>(
+            "cpio",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::archive::cpio::CpioFormatOpts,
+            |o, m| o.apply_options(m),
+            DEFAULT_MIN_SIZE,
+        )?,
+        "ar" => create_via_factory::<fstool::fs::archive::ar::ArFs>(
+            "ar",
+            source.as_ref(),
+            args.output,
+            args.size,
+            opts,
+            is_device,
+            qcow2_cluster_size,
+            fstool::fs::archive::ar::ArFormatOpts,
+            |o, m| o.apply_options(m),
+            DEFAULT_MIN_SIZE,
+        )?,
         other => {
             return Err(fstool::Error::InvalidArgument(format!(
                 "create: unknown --type {other:?} (try ext4, fat32, exfat, hfs+, ntfs, \
-                 f2fs, squashfs, xfs, iso, grf, apfs)"
+                 f2fs, squashfs, xfs, iso, grf, apfs, zip, cpio, ar)"
             )));
         }
     }
@@ -2906,12 +3030,42 @@ where
     }
     fs.flush(dev.as_mut())?;
     dev.sync()?;
+    // Archive writers fill a generously-sized sparse file; truncate it
+    // to the true archive length (filesystem images return `None`).
+    let archive_len = fstool::fs::Filesystem::image_len(&fs);
+    drop(fs);
+    drop(dev);
+    let final_len = match archive_len {
+        Some(len) if !is_device => {
+            truncate_output_file(output, len)?;
+            len
+        }
+        _ => bytes,
+    };
     eprintln!(
         "wrote {} ({} bytes, {label}{})",
         output.display(),
-        bytes,
+        final_len,
         if is_device { ", block device" } else { "" }
     );
+    Ok(())
+}
+
+/// Truncate an over-provisioned archive output file to its true length.
+/// No-op for block devices and qcow2 containers — archives target plain
+/// files, and the provisioned sparse tail is only zeros.
+fn truncate_output_file(output: &std::path::Path, len: u64) -> fstool::Result<()> {
+    use fstool::block::file::is_block_device;
+    if is_block_device(output)
+        || output
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("qcow2"))
+    {
+        return Ok(());
+    }
+    let f = std::fs::OpenOptions::new().write(true).open(output)?;
+    f.set_len(len)?;
     Ok(())
 }
 
@@ -3134,6 +3288,9 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         fstool::inspect::AnyFs::Squashfs(sq) => print_squashfs_info(sq),
         fstool::inspect::AnyFs::Iso9660(iso) => print_iso9660_info(iso),
         fstool::inspect::AnyFs::Grf(grf) => print_grf_info(grf),
+        // Archive backends carry no extra summary beyond the kind line
+        // above; the `/ listing` below covers their contents.
+        fstool::inspect::AnyFs::Archive(..) => {}
     }
     println!();
     println!("/ listing:");

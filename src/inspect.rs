@@ -13,6 +13,16 @@ use crate::Result;
 use crate::block::BlockDevice;
 use crate::fs::DirEntry;
 use crate::fs::apfs::Apfs;
+use crate::fs::archive::ar::ArFs;
+use crate::fs::archive::arc::ArcFs;
+use crate::fs::archive::cab::CabFs;
+use crate::fs::archive::cpio::CpioFs;
+use crate::fs::archive::lha::LhaFs;
+use crate::fs::archive::lzx::LzxFs;
+use crate::fs::archive::rar::RarFs;
+use crate::fs::archive::sevenz::SevenZFs;
+use crate::fs::archive::sit::SitFs;
+use crate::fs::archive::zip::ZipFs;
 use crate::fs::exfat::Exfat;
 use crate::fs::ext::Ext;
 use crate::fs::f2fs::F2fs;
@@ -59,6 +69,26 @@ pub enum FsKind {
     Iso9660,
     /// GRF — Gravity Ragnarok Online archive. Read + write + add/rm.
     Grf,
+    /// ZIP archive. Read + repack (write via `repack`).
+    Zip,
+    /// cpio archive (newc / odc). Read + repack.
+    Cpio,
+    /// Unix `ar` archive. Read + repack.
+    Ar,
+    /// 7-Zip — detection-only scaffold.
+    SevenZ,
+    /// RAR — detection-only scaffold.
+    Rar,
+    /// SEA ARC — detection-only scaffold.
+    Arc,
+    /// LHA / LZH — detection-only scaffold.
+    Lha,
+    /// Amiga LZX — detection-only scaffold.
+    Lzx,
+    /// Microsoft Cabinet — detection-only scaffold.
+    Cab,
+    /// StuffIt — detection-only scaffold.
+    Sit,
 }
 
 /// Probe `dev` to decide which filesystem it carries. Reads only sector 0
@@ -69,8 +99,13 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     // could in principle live on a disk that also has a sector-0 boot
     // sector, but ext images start with all-zero (mke2fs leaves the first
     // 1024 bytes for boot code), so a real FAT32 signature here is decisive.
+    // Read up to the first sector. Small archives (a tiny `ar`, an empty
+    // zip) can be well under 512 bytes, so only read what's there and
+    // leave the rest of the buffer zero — the magic checks below then
+    // simply don't match on the absent bytes.
     let mut bs = [0u8; 512];
-    dev.read_at(0, &mut bs)?;
+    let head = (dev.total_size()).min(512) as usize;
+    dev.read_at(0, &mut bs[..head])?;
     if bs[510] == 0x55 && bs[511] == 0xAA && &bs[82..87] == b"FAT32" {
         return Ok(FsKind::Fat32);
     }
@@ -98,6 +133,46 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
         return Ok(FsKind::Grf);
     }
 
+    // --- archive formats (all offset 0 except lha at offset 2) ---
+    // ZIP: local-file-header "PK\x03\x04" or an empty archive's EOCD
+    // "PK\x05\x06".
+    if &bs[0..2] == b"PK" && ((bs[2] == 3 && bs[3] == 4) || (bs[2] == 5 && bs[3] == 6)) {
+        return Ok(FsKind::Zip);
+    }
+    // cpio: newc "070701" / newc-crc "070702" / odc "070707".
+    if &bs[0..6] == b"070701" || &bs[0..6] == b"070702" || &bs[0..6] == b"070707" {
+        return Ok(FsKind::Cpio);
+    }
+    // ar: "!<arch>\n".
+    if &bs[0..8] == b"!<arch>\n" {
+        return Ok(FsKind::Ar);
+    }
+    // 7z: "7z\xBC\xAF\x27\x1C".
+    if &bs[0..6] == b"7z\xBC\xAF\x27\x1C" {
+        return Ok(FsKind::SevenZ);
+    }
+    // RAR: "Rar!\x1A\x07" then 0x00 (v4) or 0x01 (v5).
+    if &bs[0..6] == b"Rar!\x1A\x07" {
+        return Ok(FsKind::Rar);
+    }
+    // Microsoft Cabinet: "MSCF".
+    if &bs[0..4] == b"MSCF" {
+        return Ok(FsKind::Cab);
+    }
+    // LHA / LZH: method tag "-lh?-" / "-lz?-" at offset 2 (bytes 0..2 are
+    // header size + checksum), with the trailing '-' at offset 6.
+    if &bs[2..4] == b"-l" && bs[6] == b'-' {
+        return Ok(FsKind::Lha);
+    }
+    // Amiga LZX: "LZX\0".
+    if &bs[0..4] == b"LZX\0" {
+        return Ok(FsKind::Lzx);
+    }
+    // StuffIt: classic "SIT!" or SIT5 "StuffIt".
+    if &bs[0..4] == b"SIT!" || &bs[0..7] == b"StuffIt" {
+        return Ok(FsKind::Sit);
+    }
+
     // Tar: "ustar\0" or "ustar " magic at offset 257 of the first block.
     if &bs[257..262] == b"ustar" {
         return Ok(FsKind::Tar);
@@ -122,9 +197,11 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
 
     // ext superblock starts at byte 1024; s_magic (0xEF53) is at offset 56.
     let mut sb_magic = [0u8; 2];
-    dev.read_at(1024 + 56, &mut sb_magic)?;
-    if sb_magic == [0x53, 0xEF] {
-        return Ok(FsKind::Ext);
+    if dev.total_size() >= 1024 + 56 + 2 {
+        dev.read_at(1024 + 56, &mut sb_magic)?;
+        if sb_magic == [0x53, 0xEF] {
+            return Ok(FsKind::Ext);
+        }
     }
 
     // HFS+ / HFSX volume header sig at byte 1024.
@@ -150,8 +227,15 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
         }
     }
 
+    // SEA ARC: no string magic — first byte 0x1A then a method byte in
+    // 1..=11. Heuristic, so it is checked last to avoid shadowing a real
+    // filesystem whose sector 0 happens to start with 0x1A.
+    if bs[0] == 0x1A && (1..=11).contains(&bs[1]) {
+        return Ok(FsKind::Arc);
+    }
+
     Err(crate::Error::InvalidImage(
-        "inspect: no recognised filesystem (ext2/3/4, FAT32, exFAT, XFS, HFS+, APFS, tar, NTFS, F2FS, SquashFS, ISO 9660, GRF) on this image".into(),
+        "inspect: no recognised filesystem (ext2/3/4, FAT32, exFAT, XFS, HFS+, APFS, tar, NTFS, F2FS, SquashFS, ISO 9660, GRF) or archive (zip, cpio, ar, 7z, rar, arc, lha, lzx, cab, sit) on this image".into(),
     ))
 }
 
@@ -187,6 +271,11 @@ pub enum AnyFs {
     Iso9660(Box<crate::fs::iso9660::Iso9660>),
     /// GRF — Ragnarok Online archive; full read/write/add/rm.
     Grf(Box<crate::fs::grf::Grf>),
+    /// Any archive-core backend (zip / cpio / ar / 7z / …), held behind
+    /// the [`crate::fs::Filesystem`] trait with its kind tag and name.
+    /// The 10 archive formats share one variant since they dispatch
+    /// uniformly through the trait.
+    Archive(Box<dyn crate::fs::Filesystem>, FsKind, &'static str),
 }
 
 impl AnyFs {
@@ -207,6 +296,52 @@ impl AnyFs {
                 dev,
             )?))),
             FsKind::Grf => Ok(Self::Grf(Box::new(crate::fs::grf::Grf::open_dev(dev)?))),
+            FsKind::Zip => Ok(Self::Archive(
+                Box::new(ZipFs::open(dev)?),
+                FsKind::Zip,
+                "zip",
+            )),
+            FsKind::Cpio => Ok(Self::Archive(
+                Box::new(CpioFs::open(dev)?),
+                FsKind::Cpio,
+                "cpio",
+            )),
+            FsKind::Ar => Ok(Self::Archive(Box::new(ArFs::open(dev)?), FsKind::Ar, "ar")),
+            FsKind::SevenZ => Ok(Self::Archive(
+                Box::new(SevenZFs::open(dev)?),
+                FsKind::SevenZ,
+                "7z",
+            )),
+            FsKind::Rar => Ok(Self::Archive(
+                Box::new(RarFs::open(dev)?),
+                FsKind::Rar,
+                "rar",
+            )),
+            FsKind::Arc => Ok(Self::Archive(
+                Box::new(ArcFs::open(dev)?),
+                FsKind::Arc,
+                "arc",
+            )),
+            FsKind::Lha => Ok(Self::Archive(
+                Box::new(LhaFs::open(dev)?),
+                FsKind::Lha,
+                "lha",
+            )),
+            FsKind::Lzx => Ok(Self::Archive(
+                Box::new(LzxFs::open(dev)?),
+                FsKind::Lzx,
+                "lzx",
+            )),
+            FsKind::Cab => Ok(Self::Archive(
+                Box::new(CabFs::open(dev)?),
+                FsKind::Cab,
+                "cab",
+            )),
+            FsKind::Sit => Ok(Self::Archive(
+                Box::new(SitFs::open(dev)?),
+                FsKind::Sit,
+                "sit",
+            )),
         }
     }
 
@@ -225,6 +360,7 @@ impl AnyFs {
             Self::Squashfs(_) => FsKind::Squashfs,
             Self::Iso9660(_) => FsKind::Iso9660,
             Self::Grf(_) => FsKind::Grf,
+            Self::Archive(_, kind, _) => *kind,
         }
     }
 
@@ -251,6 +387,7 @@ impl AnyFs {
                 use crate::fs::Filesystem;
                 grf.list(dev, std::path::Path::new(path))
             }
+            Self::Archive(fs, _, _) => fs.list(dev, std::path::Path::new(path)),
         }
     }
 
@@ -338,6 +475,10 @@ impl AnyFs {
                 })?;
                 let bytes = grf.read_entry(dev, &entry)?;
                 let mut r = std::io::Cursor::new(bytes);
+                pump(&mut r, out, &mut buf)
+            }
+            Self::Archive(fs, _, _) => {
+                let mut r = fs.read_file(dev, std::path::Path::new(path))?;
                 pump(&mut r, out, &mut buf)
             }
         }
@@ -438,6 +579,7 @@ impl AnyFs {
             Self::Apfs(a) => crate::fs::Filesystem::mutation_capability(a.as_ref()),
             Self::Exfat(e) => crate::fs::Filesystem::mutation_capability(e.as_ref()),
             Self::Grf(g) => crate::fs::Filesystem::mutation_capability(g.as_ref()),
+            Self::Archive(fs, _, _) => crate::fs::Filesystem::mutation_capability(fs.as_ref()),
         }
     }
 
@@ -486,6 +628,7 @@ impl AnyFs {
             Self::Exfat(e) => f(e.as_mut()),
             Self::Iso9660(iso) => f(iso.as_mut()),
             Self::Grf(g) => f(g.as_mut()),
+            Self::Archive(fs, _, _) => f(fs.as_mut()),
         }
     }
 
@@ -525,6 +668,10 @@ impl AnyFs {
             | Self::F2fs(_)
             | Self::Squashfs(_)
             | Self::Iso9660(_) => Ok(()),
+            // Archive handles opened via `AnyFs` are read-mode (a fresh
+            // writer is driven on the concrete type during `build`), so
+            // routing to the trait flush is a no-op here.
+            Self::Archive(fs, _, _) => crate::fs::Filesystem::flush(fs.as_mut(), dev),
         }
     }
 
@@ -559,6 +706,9 @@ impl AnyFs {
         if let Self::Grf(_) = self {
             return "grf";
         }
+        if let Self::Archive(_, _, name) = self {
+            return name;
+        }
         match self {
             Self::Ext(ext) => match ext.kind {
                 crate::fs::ext::FsKind::Ext2 => "ext2",
@@ -576,7 +726,8 @@ impl AnyFs {
             | Self::F2fs(_)
             | Self::Squashfs(_)
             | Self::Iso9660(_)
-            | Self::Grf(_) => unreachable!(),
+            | Self::Grf(_)
+            | Self::Archive(..) => unreachable!(),
         }
     }
 }
@@ -687,6 +838,7 @@ impl AnyFs {
             Self::Squashfs(b) => b,
             Self::Iso9660(b) => b,
             Self::Grf(b) => b,
+            Self::Archive(fs, _, _) => fs,
         }
     }
 }

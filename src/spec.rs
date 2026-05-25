@@ -216,10 +216,50 @@ fn build_bare_fs(fs: &FilesystemSpec, output: &Path) -> Result<()> {
             iso9660_format_opts(fs)?,
         ),
         "grf" => build_bare_via_trait::<crate::fs::grf::Grf>(fs, output, grf_format_opts(fs)?),
+        "zip" => {
+            build_bare_via_trait::<crate::fs::archive::zip::ZipFs>(fs, output, zip_format_opts(fs)?)
+        }
+        "cpio" => build_bare_via_trait::<crate::fs::archive::cpio::CpioFs>(
+            fs,
+            output,
+            cpio_format_opts(fs)?,
+        ),
+        "ar" => {
+            build_bare_via_trait::<crate::fs::archive::ar::ArFs>(fs, output, ar_format_opts(fs)?)
+        }
         other => Err(crate::Error::InvalidArgument(format!(
             "spec: unknown filesystem type {other:?}"
         ))),
     }
+}
+
+fn zip_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::zip::ZipFormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    // `volume_label` is meaningless for archives; drop it so check_empty
+    // doesn't reject a spec that set it generically.
+    let _ = bag.take_str("volume_label");
+    let mut opts = crate::fs::archive::zip::ZipFormatOpts::default();
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("zip")?;
+    Ok(opts)
+}
+
+fn cpio_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::cpio::CpioFormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let _ = bag.take_str("volume_label");
+    let mut opts = crate::fs::archive::cpio::CpioFormatOpts;
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("cpio")?;
+    Ok(opts)
+}
+
+fn ar_format_opts(fs: &FilesystemSpec) -> Result<crate::fs::archive::ar::ArFormatOpts> {
+    let mut bag = options_bag_for(fs)?;
+    let _ = bag.take_str("volume_label");
+    let mut opts = crate::fs::archive::ar::ArFormatOpts;
+    opts.apply_options(&mut bag)?;
+    bag.check_empty("ar")?;
+    Ok(opts)
 }
 
 /// Build a fresh [`OptionMap`] from the FS spec for use by a backend's
@@ -280,6 +320,31 @@ fn build_bare_via_trait<F: crate::fs::FilesystemFactory>(
     }
     fs_obj.flush(dev.as_mut())?;
     dev.sync()?;
+    // Archive writers (zip/cpio/ar) report their exact length; truncate
+    // the over-provisioned sparse file down to it. Filesystem images
+    // return `None` and keep their provisioned size.
+    let archive_len = crate::fs::Filesystem::image_len(&fs_obj);
+    drop(fs_obj);
+    drop(dev);
+    if let Some(len) = archive_len {
+        truncate_archive_file(output, len)?;
+    }
+    Ok(())
+}
+
+/// Shrink an over-provisioned archive output file to its true length.
+/// No-op for block devices and qcow2 containers.
+fn truncate_archive_file(output: &Path, len: u64) -> Result<()> {
+    if crate::block::file::is_block_device(output)
+        || output
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("qcow2"))
+    {
+        return Ok(());
+    }
+    let f = std::fs::OpenOptions::new().write(true).open(output)?;
+    f.set_len(len)?;
     Ok(())
 }
 

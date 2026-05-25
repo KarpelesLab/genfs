@@ -20,6 +20,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub mod apfs;
+pub mod archive;
 pub mod exfat;
 pub mod ext;
 pub mod f2fs;
@@ -521,6 +522,20 @@ pub trait Filesystem {
 
     /// Persist outstanding dirty state to the device.
     fn flush(&mut self, dev: &mut dyn crate::block::BlockDevice) -> crate::Result<()>;
+
+    /// For archive / streaming writers backed by a pre-sized device:
+    /// the exact number of bytes the output occupies after [`flush`].
+    /// The backing file is provisioned generously (and sparsely), so
+    /// the caller truncates it to this length — an archive must be
+    /// exactly its own size, not padded with a zero tail.
+    ///
+    /// Default `None`: filesystem images keep their provisioned size.
+    /// Only the archive backends (zip/cpio/ar) override this.
+    ///
+    /// [`flush`]: Self::flush
+    fn image_len(&self) -> Option<u64> {
+        None
+    }
 
     /// Capability of this filesystem with respect to mutating an
     /// already-flushed image. Three cases:

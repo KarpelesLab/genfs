@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(archive)* shared archive core (`src/fs/archive/`) — an indexed-entry
+  model plus a generic read-only `Filesystem` implementation that archive
+  formats plug into by supplying a scanner (and, if writable, a builder).
+- *(archive)* **zip** — full read (central-directory scan, robust EOCD
+  search, ZIP64, Unix mode/symlinks, Shift-JIS/EUC-JP/UTF-8 filename
+  detection) and write (Stored + Deflate, CRC-32, ZIP64 when needed).
+  Reads archives produced by other tools; output validates with `unzip`.
+- *(archive)* **cpio** — read newc/odc + write newc; round-trips through
+  system `cpio`.
+- *(archive)* **ar** — read GNU + BSD long names, write GNU; round-trips
+  through system `ar`. Flat archive (rejects nested paths).
+- *(archive)* detection-only scaffolds for **7z, rar, arc, lha, lzx, cab,
+  sit** — recognised by `info`, with a clean `Unsupported` on read until
+  pure-Rust decoders are wired (per format, behind a future Cargo feature).
+- *(cli)* `create -t {zip,cpio,ar}`, `repack --fs-type {zip,cpio,ar}`,
+  `build` with `type = "zip"|"cpio"|"ar"`, and `mount` for all archive
+  formats; archive output is truncated to its exact length.
+
 ## [0.4.1](https://github.com/KarpelesLab/fstool/compare/v0.4.0...v0.4.1) - 2026-05-22
 
 ### Added

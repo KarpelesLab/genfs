@@ -336,7 +336,7 @@ pub fn emit_record(
     attrs: &[Vec<u8>],
     sector_size: usize,
     usn: u16,
-) {
+) -> Result<()> {
     // Zero out
     for b in rec_buf.iter_mut() {
         *b = 0;
@@ -368,6 +368,15 @@ pub fn emit_record(
     let mut cursor = first_attr_off as usize;
     let mut next_attr_id: u16 = 1;
     for a in attrs {
+        // Every attribute plus the 4-byte 0xFFFFFFFF terminator must fit
+        // the record. Overflow here means the caller tried to keep too
+        // much resident (e.g. a long name + large resident $DATA); return
+        // a clean error instead of writing past the buffer.
+        if cursor + a.len() + 4 > rec_size {
+            return Err(crate::Error::Unsupported(
+                "ntfs: attributes exceed the MFT record size".into(),
+            ));
+        }
         rec[cursor..cursor + a.len()].copy_from_slice(a);
         // Stamp attribute id (offset 14..16) — every attr gets a unique id.
         rec[cursor + 14..cursor + 16].copy_from_slice(&next_attr_id.to_le_bytes());
@@ -386,6 +395,7 @@ pub fn emit_record(
 
     // Install fixup last.
     mft::install_fixup(rec, sector_size, usn);
+    Ok(())
 }
 
 /// Build a resident attribute (header + resident-specific fields + value).
@@ -740,7 +750,8 @@ pub fn build_attrdef_record(
         &[si, fname, data],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Volume information attribute: 12-byte value = reserved (8) + major + minor + flags.
@@ -789,7 +800,8 @@ pub fn build_volume_record(
         &[si, fname, vol_name, vol_info],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Build the root directory's MFT record (record 5). The index is empty
@@ -817,7 +829,8 @@ pub fn build_root_record(rec_buf: &mut [u8], rec_size: usize, filetime: u64, sec
         &[si, fname, idx_root],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Build the $Bitmap record (record 6) with non-resident $DATA pointing at
@@ -872,7 +885,8 @@ pub fn build_bitmap_record(
         &[si, fname, data],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Build the $Boot record (record 7): non-resident $DATA covering LBA 0.
@@ -924,7 +938,8 @@ pub fn build_boot_record(
         &[si, fname, data],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Build $BadClus (record 8): a sparse non-resident $DATA named "$Bad".
@@ -979,7 +994,8 @@ pub fn build_badclus_record(
         &[si, fname, data_unnamed, bad_data],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// File-attribute bits for `$Secure`: HIDDEN | SYSTEM | VIEW_INDEX.
@@ -1288,7 +1304,8 @@ pub fn build_secure_record(
         &[si, fname, sds, sdh, sii],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Build an `$INDEX_ROOT` value for `$SDH` / `$SII`. `entries` are the
@@ -1428,7 +1445,8 @@ pub fn build_upcase_record(
         &[si, fname, data],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Build $Extend (record 11): empty directory.
@@ -1461,7 +1479,8 @@ pub fn build_extend_record(
         &[si, fname, idx_root],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Build a reserved/unused but allocated record (records 12..15).
@@ -1493,7 +1512,8 @@ pub fn build_reserved_record(
         &[si, fname],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Build the $LogFile record (record 2). The $DATA is non-resident,
@@ -1542,7 +1562,8 @@ pub fn build_logfile_record(
         &[si, fname, data],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Build $MFT itself (record 0). $DATA is a non-resident attribute pointing
@@ -1615,7 +1636,8 @@ pub fn build_mft_record(
         &[si, fname, data, bitmap],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 /// Build $MFTMirr (record 1). Same shape as $MFT but the $DATA points at
@@ -1662,7 +1684,8 @@ pub fn build_mftmirr_record(
         &[si, fname, data],
         sector_size,
         1,
-    );
+    )
+    .expect("system MFT record fits");
 }
 
 // ----- INDEX_ROOT mutation helpers used by the writer -------------------
@@ -2489,6 +2512,30 @@ pub fn unix_to_filetime(unix_secs: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Attributes that don't leave room for the 0xFFFFFFFF terminator must
+    /// return a clean error, never panic by writing past the record. (A
+    /// long file name + near-budget resident $DATA used to overflow the
+    /// 1 KiB record — caught by the NTFS fuzzer.)
+    #[test]
+    fn emit_record_rejects_overflowing_attrs() {
+        let rec_size = 1024usize;
+        let mut rec = vec![0u8; rec_size];
+        // One oversized resident attribute that, with the terminator,
+        // can't fit the record.
+        let big = vec![0u8; rec_size]; // already == rec_size, no room for term
+        let err = emit_record(
+            &mut rec,
+            rec_size,
+            0,
+            mft::RecordHeader::FLAG_IN_USE,
+            std::slice::from_ref(&big),
+            512,
+            1,
+        )
+        .expect_err("oversized attrs must error, not panic");
+        assert!(matches!(err, crate::Error::Unsupported(_)), "got {err:?}");
+    }
 
     #[test]
     fn min_unsigned_bytes_basic() {

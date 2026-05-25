@@ -289,11 +289,47 @@ impl super::Ntfs {
         let rec_no = writer.allocate_mft_record(dev)?;
         let filetime = unix_to_filetime(meta.mtime);
 
-        // Decide resident vs non-resident.
         let rec_size = writer.layout.mft_record_size as usize;
         let cluster_size = writer.cluster_size;
-        // Resident budget: rec_size minus headers (~232 bytes for $SI, $FN, terminator).
-        let resident_budget = rec_size.saturating_sub(232);
+
+        // Build $STANDARD_INFORMATION and $FILE_NAME up front so the
+        // resident-data budget is sized against their *actual* lengths.
+        // A long file name makes $FILE_NAME large; a fixed estimate (the
+        // old `rec_size - 232`) lets a ~750-byte body stay resident and
+        // overflow the 1 KiB record.
+        let parent_ref = pack_mft_ref(parent_rec, 1);
+        let si = build_resident_attr(
+            TYPE_STANDARD_INFORMATION,
+            &[],
+            &build_si_value_with_security(
+                filetime,
+                dos_attrs_from_mode(meta.mode, false),
+                security_id_for(SecurityClass::User),
+            ),
+            0,
+            0,
+        );
+        let fn_value = build_file_name_value(
+            parent_ref,
+            base_name,
+            dos_flags_from_mode(meta.mode, false),
+            file_size,
+            (file_size + cluster_size - 1) & !(cluster_size - 1),
+            filetime,
+            FileName::NAMESPACE_WIN32,
+        );
+        let fn_attr = build_resident_attr(TYPE_FILE_NAME, &[], &fn_value, 0, 1);
+
+        // Space left for a resident $DATA value after the record header +
+        // USA, $SI, $FN, the resident-attr header and the 0xFFFFFFFF
+        // terminator (plus slack for 8-byte alignment).
+        const MFT_HEADER_OVERHEAD: usize = 64;
+        const RESIDENT_DATA_HDR: usize = 24;
+        const TERM_SLACK: usize = 16;
+        let resident_budget = rec_size.saturating_sub(
+            MFT_HEADER_OVERHEAD + si.len() + fn_attr.len() + RESIDENT_DATA_HDR + TERM_SLACK,
+        );
+        // Decide resident vs non-resident.
         let (data_attr, alloc_clusters) = if (file_size as usize) <= resident_budget {
             // Read full file into a Vec (small).
             let mut buf = Vec::with_capacity(file_size as usize);
@@ -365,30 +401,7 @@ impl super::Ntfs {
         };
         let _ = alloc_clusters;
 
-        let parent_ref = pack_mft_ref(parent_rec, 1);
-        let si = build_resident_attr(
-            TYPE_STANDARD_INFORMATION,
-            &[],
-            &build_si_value_with_security(
-                filetime,
-                dos_attrs_from_mode(meta.mode, false),
-                security_id_for(SecurityClass::User),
-            ),
-            0,
-            0,
-        );
-        let fn_value = build_file_name_value(
-            parent_ref,
-            base_name,
-            dos_flags_from_mode(meta.mode, false),
-            file_size,
-            (file_size + cluster_size - 1) & !(cluster_size - 1),
-            filetime,
-            FileName::NAMESPACE_WIN32,
-        );
-        let fn_attr = build_resident_attr(TYPE_FILE_NAME, &[], &fn_value, 0, 1);
-
-        // Emit the new MFT record.
+        // Emit the new MFT record ($SI / $FN built above).
         let mut rec_buf = vec![0u8; rec_size];
         emit_record(
             &mut rec_buf,
@@ -398,7 +411,7 @@ impl super::Ntfs {
             &[si, fn_attr, data_attr],
             writer.layout.bytes_per_sector as usize,
             1,
-        );
+        )?;
         let off = writer.mft_offset(rec_no)?;
         dev.write_at(off, &rec_buf)?;
 
@@ -464,7 +477,7 @@ impl super::Ntfs {
             &[si, fn_attr, idx_root],
             writer.layout.bytes_per_sector as usize,
             1,
-        );
+        )?;
         let off = writer.mft_offset(rec_no)?;
         dev.write_at(off, &rec_buf)?;
 
@@ -565,7 +578,7 @@ impl super::Ntfs {
             &[si, fn_attr, empty_data, reparse_attr],
             writer.layout.bytes_per_sector as usize,
             1,
-        );
+        )?;
         let off = writer.mft_offset(rec_no)?;
         dev.write_at(off, &rec_buf)?;
 

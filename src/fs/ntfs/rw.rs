@@ -472,7 +472,7 @@ impl<'a> NtfsFileHandle<'a> {
             &[si, fn_attr, data_attr],
             self.sector_size,
             1,
-        );
+        )?;
 
         // Pre-read the old MFT record bytes so we can journal the
         // (redo, undo) pair.

@@ -62,7 +62,7 @@ pub struct DirLayout {
     pub format: DirFormat,
     /// Entries assigned to each data block (logical db == index).
     pub data_blocks: Vec<Vec<(String, u64, u8)>>,
-    /// bestfree[0].length (free slack) of each data block.
+    /// `bestfree[0].length` (free slack) of each data block.
     pub bests: Vec<u16>,
     /// Sorted (hashval, dataptr) over every entry.
     pub leaf_ents: Vec<(u32, u32)>,

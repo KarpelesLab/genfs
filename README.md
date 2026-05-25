@@ -37,7 +37,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | HFS+/HFSX  | ✅    | ✅     | ✅              | inline + extents-overflow, symlinks, hard links; decmpfs read (zlib types 3 + 4); real journal (Path A); passes `fsck.hfsplus` |
 | APFS       | ✅    | ✅     | 🚧             | multi-level omap + fs-tree; spaceman with IP ring + SFQ free-queues; `open_file_rw` rebuilds a fresh COW checkpoint (whole-file overwrite only — no partial-extent COW yet); not yet `fsck_apfs` clean |
 | NTFS       | ✅    | ✅     | ✅              | MFT, attributes, $DATA + ADS, indexes; xattr map; multi-class `$Secure` ($SDS/$SDH/$SII); real `$LogFile` LFS records (Path A) |
-| F2FS       | ✅    | ✅     | ✅              | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs`                                              |
+| F2FS       | ✅    | ✅     | —              | CP / NAT / dnodes / inline data + dentries; writer passes `fsck.f2fs`; **build-once** — the writer serializes the whole FS from memory at flush, so a re-opened image is read-only (reports `Immutable`) |
 | SquashFS   | ✅    | ✅     | —              | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs`; repack-only           |
 | ISO 9660   | ✅    | ✅     | —              | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only                              |
 | GRF        | ✅    | ✅     | ✅              | Gravity Ragnarok Online archive — v0x102 / v0x103 / v0x200; permutation cipher (`MIXCRYPT` / `DES`); CP949 filenames |

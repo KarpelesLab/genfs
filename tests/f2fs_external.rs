@@ -254,3 +254,73 @@ fn writer_image_dump_f2fs_clean_exit() {
         out.status.code(),
     );
 }
+
+/// Large single directory: enough entries to drive the f2fs directory
+/// hash through several levels (well past the inline-dir and first
+/// regular-dir-block thresholds). The build + read-back run unconditionally
+/// so the writer's and reader's large-directory paths are always exercised;
+/// the `fsck.f2fs` cross-check runs in CI (and anywhere the tool is on
+/// PATH), guarding the on-disk directory structure at scale.
+#[test]
+fn writer_large_directory_passes_fsck_f2fs() {
+    const N: usize = 10_000;
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), 256 * 1024 * 1024).unwrap();
+    let opts = FormatOpts {
+        volume_label: "fstool-big".into(),
+        ..FormatOpts::default()
+    };
+    let mut fs = F2fs::format(&mut dev, &opts).unwrap();
+    fs.create_dir(
+        &mut dev,
+        std::path::Path::new("/big"),
+        FileMeta::with_mode(0o755),
+    )
+    .unwrap();
+    for i in 0..N {
+        let body = b"x";
+        fs.create_file(
+            &mut dev,
+            &std::path::PathBuf::from(format!("/big/file{i:05}")),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(body.to_vec())),
+                len: body.len() as u64,
+            },
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    fs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // Read-back: every entry must list back (writer + reader, no fsck needed).
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut fs = F2fs::open(&mut dev).unwrap();
+        let entries = fs.list_path(&mut dev, "/big").unwrap();
+        let files = entries
+            .iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .count();
+        assert_eq!(files, N, "listed {files} of {N} files in /big");
+    }
+
+    // Native cross-check when fsck.f2fs is available (always in CI).
+    if !tool_available("fsck.f2fs") {
+        eprintln!("skipping fsck.f2fs cross-check: not installed");
+        return;
+    }
+    let out = Command::new("fsck.f2fs")
+        .arg("-f")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "fsck.f2fs failed on {N}-file dir (exit {:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status.code(),
+    );
+}

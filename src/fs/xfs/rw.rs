@@ -707,6 +707,32 @@ impl Xfs {
                 "xfs: {path:?} is not a regular file"
             )));
         }
+
+        // Refuse open on files participating in a clone (REFLINK flag in
+        // di_flags2). A write through the existing rw path would update
+        // the shared physical extent in place and silently propagate the
+        // change to every other inode pointing at it — defeating the
+        // copy-on-write semantics that `clone_file` advertises.
+        //
+        // Safely supporting writes here requires per-block COW: detect
+        // that the target block is shared (refcount > 1 in the REFCNTBT),
+        // allocate a fresh extent, copy the unchanged portion, update
+        // the file's BMBT, and decrement the refcount record. That's a
+        // follow-up; for now we refuse cleanly so the failure mode is
+        // a typed `Unsupported` instead of data corruption.
+        let flags2 = if ino_buf.len() >= 128 {
+            u64::from_be_bytes(ino_buf[120..128].try_into().unwrap())
+        } else {
+            0
+        };
+        if flags2 & super::inode::XFS_DIFLAG2_REFLINK != 0 {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: open_file_rw on {path:?}: file participates in a reflink \
+                 clone (XFS_DIFLAG2_REFLINK set); writes would corrupt the \
+                 sharing peer. Use `read_file` for read-only access; \
+                 copy-on-write on the rw path is not yet implemented"
+            )));
+        }
         match core.format {
             DiFormat::Extents => {}
             DiFormat::Local => {

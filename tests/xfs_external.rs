@@ -641,3 +641,91 @@ fn clone_file_round_trip_via_reflink() {
         );
     }
 }
+
+/// Stage 3 contract: writing through the rw path to a file with the
+/// REFLINK flag set must be refused with a typed `Unsupported` error,
+/// not silently propagate into the sharing peer.
+///
+/// Workflow: format → plant /src.bin → clone to /dst.bin (both inodes
+/// now carry XFS_DIFLAG2_REFLINK). Attempt `open_file_rw` on each;
+/// both must reject. Confirm the bytes through `read_file` survive
+/// untouched. xfs_repair stays clean.
+#[test]
+fn open_file_rw_refused_on_reflinked_file() {
+    use fstool::fs::{Filesystem, OpenFlags};
+    use std::io::{Cursor, Read};
+
+    let Some(_) = which("xfs_repair") else {
+        eprintln!("skipping: xfs_repair not installed");
+        return;
+    };
+
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), 64 * 1024 * 1024).unwrap();
+    let opts = FormatOpts {
+        uuid: [0x43u8; 16],
+        ..Default::default()
+    };
+    let body: Vec<u8> = (0..16 * 1024).map(|i| (i & 0xFF) as u8).collect();
+    {
+        let mut x = xfs::format(&mut dev, &opts).unwrap();
+        x.begin_writes(opts.uuid);
+        let mut src = Cursor::new(&body[..]);
+        x.add_file_path(
+            &mut dev,
+            "/src.bin",
+            EntryMeta {
+                mode: 0o644,
+                ..EntryMeta::default()
+            },
+            body.len() as u64,
+            &mut src,
+        )
+        .unwrap();
+        <Xfs as Filesystem>::clone_file(
+            &mut x,
+            &mut dev,
+            std::path::Path::new("/src.bin"),
+            std::path::Path::new("/dst.bin"),
+        )
+        .unwrap();
+        x.flush_writes(&mut dev).unwrap();
+    }
+    dev.sync().unwrap();
+
+    // Reopen and attempt rw on both src and dst — both must reject.
+    {
+        let mut x = Xfs::open(&mut dev).unwrap();
+        for path in ["/src.bin", "/dst.bin"] {
+            let result = <Xfs as Filesystem>::open_file_rw(
+                &mut x,
+                &mut dev,
+                std::path::Path::new(path),
+                OpenFlags::default(),
+                None,
+            );
+            // `Box<dyn FileHandle>` doesn't implement Debug, so we
+            // can't use `expect_err`. Match manually instead.
+            match result {
+                Ok(_) => panic!("open_file_rw on reflinked {path} unexpectedly succeeded"),
+                Err(e) => assert!(
+                    matches!(e, fstool::Error::Unsupported(_)),
+                    "expected Unsupported for {path}, got: {e:?}"
+                ),
+            }
+        }
+
+        // Content readable via read_file (the read path is unaffected).
+        for path in ["/src.bin", "/dst.bin"] {
+            let mut r =
+                <Xfs as Filesystem>::read_file(&mut x, &mut dev, std::path::Path::new(path))
+                    .unwrap();
+            let mut got = Vec::new();
+            r.read_to_end(&mut got).unwrap();
+            assert_eq!(got, body, "{path} content drifted");
+        }
+    }
+    drop(dev);
+
+    assert_xfs_repair_clean(tmp.path());
+}

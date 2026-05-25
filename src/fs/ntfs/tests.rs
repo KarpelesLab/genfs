@@ -1565,3 +1565,83 @@ fn writer_format_emits_multiple_security_descriptors() {
         "resolved User SD differs from build_security_descriptor(User)"
     );
 }
+
+/// Exercise the directory-batch cache's eviction path: build more
+/// directories with pending children than the batch cache holds
+/// (`DEFAULT_CAPACITY`), so directories are serialized mid-run on
+/// eviction as well as at final flush. A two-level tree keeps every
+/// individual directory small (within the writer's single-INDX-block
+/// budget) while still creating > capacity distinct parent directories.
+#[test]
+fn dir_batch_eviction_round_trip() {
+    use crate::fs::FileMeta;
+    use crate::fs::ntfs::Ntfs;
+    use crate::fs::ntfs::format::FormatOpts;
+
+    let mut dev = MemoryBackend::new(48 * 1024 * 1024);
+    let opts = FormatOpts {
+        volume_label: "EVICT".into(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+
+    // 8 top-level dirs × 9 sub-dirs = 72 second-level directories, each
+    // holding one file. 1 (root) + 8 + 72 = 81 parent directories carry
+    // pending entries — past the 64-directory cache, forcing evictions.
+    let n_top = 8;
+    let n_sub = 9;
+    for a in 0..n_top {
+        ntfs.create_dir(&mut dev, &format!("/a{a}"), FileMeta::default())
+            .unwrap();
+        for b in 0..n_sub {
+            let d = format!("/a{a}/b{b}");
+            ntfs.create_dir(&mut dev, &d, FileMeta::default()).unwrap();
+            let f = format!("{d}/f");
+            ntfs.create_file(
+                &mut dev,
+                &f,
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(format!("{a}-{b}").into_bytes())),
+                    len: format!("{a}-{b}").len() as u64,
+                },
+                FileMeta::default(),
+            )
+            .unwrap();
+        }
+    }
+    ntfs.flush(&mut dev).unwrap();
+
+    // Reopen and verify every directory + file survived to the image.
+    let mut dev2 = dev;
+    let mut ro = Ntfs::open(&mut dev2).unwrap();
+    let top: Vec<String> = ro
+        .list_path(&mut dev2, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    for a in 0..n_top {
+        assert!(top.contains(&format!("a{a}")), "missing /a{a}: {top:?}");
+    }
+    for a in 0..n_top {
+        let subs: Vec<String> = ro
+            .list_path(&mut dev2, &format!("/a{a}"))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        for b in 0..n_sub {
+            assert!(
+                subs.contains(&format!("b{b}")),
+                "missing /a{a}/b{b}: {subs:?}"
+            );
+            let files: Vec<String> = ro
+                .list_path(&mut dev2, &format!("/a{a}/b{b}"))
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert_eq!(files, vec!["f".to_string()], "/a{a}/b{b} contents");
+        }
+    }
+}

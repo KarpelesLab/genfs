@@ -25,6 +25,7 @@ use std::io::Read;
 
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::fs::dir_batch::{DEFAULT_CAPACITY, DirBatch};
 use crate::fs::{DeviceKind, FileMeta, FileSource};
 
 use super::attribute::{
@@ -34,8 +35,7 @@ use super::attribute::{
 use super::format::{
     self, FIRST_USER_RECORD, FormatOpts, LayoutResult, REC_ROOT, build_file_name_value,
     build_non_resident_attr, build_resident_attr, build_si_value_with_security, emit_record,
-    encode_single_run, insert_into_index_root, pack_mft_ref, rewrite_resident_attr,
-    security_id_for, unix_to_filetime,
+    encode_single_run, pack_mft_ref, rewrite_resident_attr, security_id_for, unix_to_filetime,
 };
 use super::mft;
 use super::secure::SecurityClass;
@@ -60,6 +60,13 @@ pub struct WriterState {
     /// Path-to-record cache for directories. Populated on demand from the
     /// in-memory $INDEX_ROOT after a create_dir.
     pub dir_cache: std::collections::HashMap<String, u64>,
+    /// Pending `$I30` index entries per directory MFT record. Adding a
+    /// child stages its (already-built) index entry here instead of
+    /// re-reading, re-sorting, and re-writing the parent's index on
+    /// every create — that batch is serialized once, on eviction or at
+    /// flush. Keyed by the parent's MFT record number; the value is the
+    /// raw index-entry bytes from `build_index_entry`.
+    pub dir_batch: DirBatch<u64, Vec<u8>>,
     /// Cluster-size shortcut (matches layout.cluster_size).
     pub cluster_size: u64,
     /// Indicates we need to re-stamp boot/bitmap/MFT on next flush.
@@ -82,6 +89,7 @@ impl WriterState {
             mft_bitmap,
             next_user_record: FIRST_USER_RECORD,
             dir_cache,
+            dir_batch: DirBatch::new(DEFAULT_CAPACITY),
             cluster_size,
             dirty: true,
         }
@@ -1041,6 +1049,22 @@ impl super::Ntfs {
     /// Persist outstanding writer state to disk. Re-stamps $Bitmap, MFT
     /// record 0's $DATA run list (if MFT grew), and the boot sectors.
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if self.writer.is_none() {
+            return Ok(());
+        }
+        // Serialize every pending directory batch before re-stamping the
+        // volume metadata — these writes may allocate clusters (index
+        // promotion), which the bitmap restamp below must then capture.
+        let pending = self
+            .writer
+            .as_mut()
+            .expect("writer present")
+            .dir_batch
+            .drain_all();
+        for (dir_rec, entries) in pending {
+            self.serialize_dir(dev, dir_rec, &entries)?;
+        }
+
         let Some(w) = self.writer.as_mut() else {
             return Ok(());
         };
@@ -1118,10 +1142,15 @@ impl super::Ntfs {
         Ok(rec)
     }
 
-    /// Append an entry pointing at `(file_ref, file_name_value)` into the
-    /// $INDEX_ROOT of MFT record `dir_rec`. Re-reads, modifies, re-writes
-    /// the record. If the root would overflow, promotes the index to
-    /// $INDEX_ALLOCATION (a single block holding all entries).
+    /// Stage an entry pointing at `(file_ref, file_name_value)` for the
+    /// `$INDEX_ROOT` of MFT record `dir_rec`. The entry is built now (no
+    /// disk I/O) and parked in the per-directory batch cache; the parent
+    /// directory's index is serialized once — when this directory is
+    /// evicted to make room for another, when the volume is flushed, or
+    /// when something reads the directory back (see [`serialize_dir`] and
+    /// the flush-on-read in `read_directory`). This turns the old
+    /// re-read + re-sort + re-write **per child** (O(N²) for a big
+    /// directory) into one pass.
     fn add_entry_to_dir(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -1130,20 +1159,42 @@ impl super::Ntfs {
         file_rec: u64,
         _is_directory: bool,
     ) -> Result<()> {
+        let file_ref = pack_mft_ref(file_rec, 1);
+        let entry = build_index_entry(file_ref, file_name_value, 0, None);
+        let writer = self.writer.as_mut().expect("writer present");
+        // A staged create changes the volume; make sure flush re-stamps.
+        writer.dirty = true;
+        let victim = writer.dir_batch.stage(dir_rec, entry);
+        // If the cache evicted an older directory, serialize it now.
+        if let Some((victim_rec, entries)) = victim {
+            self.serialize_dir(dev, victim_rec, &entries)?;
+        }
+        Ok(())
+    }
+
+    /// Apply a directory's whole pending batch to its on-disk `$I30` in a
+    /// single pass: read the directory record once, merge every staged
+    /// entry, sort once, and write once — promoting `$INDEX_ROOT` →
+    /// `$INDEX_ALLOCATION` at most once if the combined index overflows
+    /// the resident budget. Output is byte-identical to having inserted
+    /// the same entries one at a time.
+    pub(super) fn serialize_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_rec: u64,
+        entries: &[Vec<u8>],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
         let writer = self.writer.as_mut().expect("writer present");
         let rec_size = writer.layout.mft_record_size as usize;
         let sector_size = writer.layout.bytes_per_sector as usize;
-        let cluster_size = writer.cluster_size;
-        let _ = cluster_size;
         // Read the directory record.
         let off = writer.mft_offset(dir_rec)?;
         let mut rec = vec![0u8; rec_size];
         dev.read_at(off, &mut rec)?;
         mft::apply_fixup(&mut rec, sector_size)?;
-
-        // Build the new index entry.
-        let file_ref = pack_mft_ref(file_rec, 1);
-        let entry = build_index_entry(file_ref, file_name_value, 0, None);
 
         // Find current $INDEX_ROOT $I30 value.
         let current =
@@ -1156,10 +1207,10 @@ impl super::Ntfs {
         // the allocation block.
         let is_large_index = current.len() >= 29 && current[28] & 0x01 != 0;
         if is_large_index {
-            return self.insert_into_allocation_block(dev, dir_rec, &entry);
+            return self.insert_into_allocation_block(dev, dir_rec, entries);
         }
 
-        match insert_into_index_root(&current, &entry, MAX_INDEX_ROOT_BYTES) {
+        match format::insert_entries_into_index_root(&current, entries, MAX_INDEX_ROOT_BYTES) {
             Ok(new_value) => {
                 rewrite_resident_attr(&mut rec, rec_size, TYPE_INDEX_ROOT, "$I30", &new_value)?;
                 // Re-install fixup and write.
@@ -1169,19 +1220,19 @@ impl super::Ntfs {
             }
             Err(crate::Error::Unsupported(_)) => {
                 // Promote the directory to $INDEX_ALLOCATION.
-                self.promote_index_to_allocation(dev, dir_rec, &entry)
+                self.promote_index_to_allocation(dev, dir_rec, entries)
             }
             Err(e) => Err(e),
         }
     }
 
     /// Read the INDX allocation block for a promoted directory, insert
-    /// `new_entry` into it, and write it back.
+    /// every entry in `new_entries` into it, and write it back once.
     fn insert_into_allocation_block(
         &mut self,
         dev: &mut dyn BlockDevice,
         dir_rec: u64,
-        new_entry: &[u8],
+        new_entries: &[Vec<u8>],
     ) -> Result<()> {
         let writer = self.writer.as_mut().expect("writer present");
         let rec_size = writer.layout.mft_record_size as usize;
@@ -1230,7 +1281,7 @@ impl super::Ntfs {
             existing_entries.push(block[cursor..cursor + entry_len].to_vec());
             cursor += entry_len;
         }
-        existing_entries.push(new_entry.to_vec());
+        existing_entries.extend(new_entries.iter().cloned());
         // Same rationale as `insert_into_index_root`: `ntfs-3g`'s
         // path lookup binary-searches the INDX block, so the on-disk
         // order must be the NTFS collation key.
@@ -1251,7 +1302,7 @@ impl super::Ntfs {
         &mut self,
         dev: &mut dyn BlockDevice,
         dir_rec: u64,
-        new_entry: &[u8],
+        new_entries: &[Vec<u8>],
     ) -> Result<()> {
         let writer = self.writer.as_mut().expect("writer present");
         let rec_size = writer.layout.mft_record_size as usize;
@@ -1297,7 +1348,12 @@ impl super::Ntfs {
             }
             cursor += entry_len;
         }
-        existing_entries.push(new_entry.to_vec());
+        existing_entries.extend(new_entries.iter().cloned());
+        // Sort into NTFS collation order. The old per-entry flow relied on
+        // a *following* `insert_into_allocation_block` to sort, but a
+        // batched promotion is the final write, so it must sort here —
+        // `ntfs-3g` binary-searches the INDX block.
+        existing_entries.sort_by_key(|e| format::entry_sort_key(e));
 
         // Build INDX block payload.
         let mut block_buf = build_indx_block(

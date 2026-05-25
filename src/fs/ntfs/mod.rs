@@ -348,6 +348,15 @@ impl Ntfs {
         dev: &mut dyn BlockDevice,
         dir_rec: u64,
     ) -> Result<Vec<IndexEntry>> {
+        // Flush any entries staged for this directory by the writer's
+        // batch cache so the on-disk `$I30` we are about to read reflects
+        // every child created so far (transparency for list / path
+        // lookups / remove).
+        if let Some(w) = self.writer.as_mut()
+            && let Some(entries) = w.dir_batch.take(&dir_rec)
+        {
+            self.serialize_dir(dev, dir_rec, &entries)?;
+        }
         let records = self.load_record_set(dev, dir_rec)?;
         let hdr = mft::RecordHeader::parse(&records[0].1)?;
         if !hdr.is_in_use() {

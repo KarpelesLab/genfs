@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 pub mod apfs;
 pub mod archive;
+pub(crate) mod dir_batch;
 pub mod exfat;
 pub mod ext;
 pub mod f2fs;

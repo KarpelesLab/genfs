@@ -299,6 +299,17 @@ pub struct Ext {
     /// Same csum scheme as dx_root but with the smaller 12-byte
     /// fake-dirent prefix (no `.` / `..` / dx_root_info overhead).
     dx_node_blocks: Vec<(u32, u32, u16)>,
+    /// `inode number -> index in `inodes`` so per-file lookups are O(1)
+    /// instead of a linear scan of every staged inode (which made a
+    /// many-files build O(n²)). Maintained at every `inodes` mutation;
+    /// `inodes` is never cleared at flush, so neither is this.
+    inode_idx: std::collections::HashMap<u32, usize>,
+    /// `block number -> index in `data_blocks``, same rationale. Cleared
+    /// with `data_blocks` at each flush.
+    data_block_idx: std::collections::HashMap<u32, usize>,
+    /// Set of block numbers present in `dir_blocks`, for O(1) membership
+    /// checks. Cleared with `dir_blocks` at each flush.
+    dir_block_set: std::collections::HashSet<u32>,
     /// True until the first flush after a `format_with` lands. The
     /// initial flush is a "blast everything fresh" write that doesn't
     /// ride a journal transaction (there's nothing yet to be consistent
@@ -440,6 +451,9 @@ impl Ext {
             extent_leaf_blocks: Vec::new(),
             dx_root_blocks: Vec::new(),
             dx_node_blocks: Vec::new(),
+            inode_idx: std::collections::HashMap::new(),
+            data_block_idx: std::collections::HashMap::new(),
+            dir_block_set: std::collections::HashSet::new(),
             // During format the journal SB is staged in `data_blocks`
             // and the file system as a whole is being assembled fresh;
             // the initial flush is a "blast everything" write rather
@@ -664,7 +678,7 @@ impl Ext {
             if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| b == phys) {
                 slot.1 = image;
             } else {
-                self.data_blocks.push((*phys, image));
+                self.push_data_block(*phys, image);
             }
             self.track_extent_leaf_block(*phys, ino);
         }
@@ -701,7 +715,7 @@ impl Ext {
                 for (i, &b) in range.iter().enumerate() {
                     buf[i * 4..i * 4 + 4].copy_from_slice(&b.to_le_bytes());
                 }
-                self.data_blocks.push((ind, buf));
+                self.push_data_block(ind, buf);
             }
             consumed += take;
         }
@@ -730,7 +744,7 @@ impl Ext {
                     for (i, &b) in range.iter().enumerate() {
                         ind_buf[i * 4..i * 4 + 4].copy_from_slice(&b.to_le_bytes());
                     }
-                    self.data_blocks.push((ind, ind_buf));
+                    self.push_data_block(ind, ind_buf);
                 }
                 consumed += take;
                 dind_slot += 1;
@@ -739,7 +753,7 @@ impl Ext {
                 let dind = self.alloc_data_block()?;
                 allocated_meta += 1;
                 inode.block[constants::IDX_DOUBLE_INDIRECT] = dind;
-                self.data_blocks.push((dind, dind_buf));
+                self.push_data_block(dind, dind_buf);
             }
         }
 
@@ -764,9 +778,9 @@ impl Ext {
 
         // Build the JBD2 v2 journal superblock for block 0 of the journal.
         let jsb = build_jbd2_superblock(bs, blocks);
-        self.data_blocks.push((data[0], jsb));
+        self.push_data_block(data[0], jsb);
 
-        self.inodes.push((ino, inode));
+        self.push_inode(ino, inode);
         Ok(())
     }
 
@@ -787,9 +801,9 @@ impl Ext {
         inode.blocks_512 = self.layout.block_size / 512;
 
         self.groups[0].desc.used_dirs_count += 1;
-        self.inodes.push((ino, inode));
-        self.data_blocks.push((blk, block_bytes));
-        self.dir_blocks.push((blk, ino));
+        self.push_inode(ino, inode);
+        self.push_data_block(blk, block_bytes);
+        self.track_dir_block(blk, ino);
         Ok(())
     }
 
@@ -817,18 +831,18 @@ impl Ext {
         let with_filetype = self.has_filetype();
         let dir_block =
             dir::make_initial_dir_block(ino, INO_ROOT_DIR, bs, with_filetype, csum_tail);
-        self.data_blocks.push((data_blocks[0], dir_block));
-        self.dir_blocks.push((data_blocks[0], ino));
+        self.push_data_block(data_blocks[0], dir_block);
+        self.track_dir_block(data_blocks[0], ino);
         // All trailing data blocks: empty-placeholder entry so e2fsck reads
         // them as well-formed empty dir blocks.
         for &blk in &data_blocks[1..] {
             self.data_blocks
                 .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
-            self.dir_blocks.push((blk, ino));
+            self.track_dir_block(blk, ino);
         }
 
         self.groups[0].desc.used_dirs_count += 1;
-        self.inodes.push((ino, inode));
+        self.push_inode(ino, inode);
 
         // Add to root dir + bump root's link count (a new subdir's ".." is
         // a fresh link to the parent).
@@ -849,6 +863,49 @@ impl Ext {
     /// with room; if every block is full, allocates a new data block,
     /// extends the inode's block-pointer storage, and writes into the
     /// fresh block.
+    /// Push a staged inode and keep [`inode_idx`](Self::inode_idx) in
+    /// sync. All `inodes` growth must go through here.
+    fn push_inode(&mut self, ino: u32, inode: Inode) {
+        self.inode_idx.insert(ino, self.inodes.len());
+        self.inodes.push((ino, inode));
+    }
+
+    /// Rebuild `inode_idx` from scratch after a structural edit (e.g. a
+    /// `retain` in the remove path) that invalidates positions.
+    fn rebuild_inode_idx(&mut self) {
+        self.inode_idx = self
+            .inodes
+            .iter()
+            .enumerate()
+            .map(|(i, (no, _))| (*no, i))
+            .collect();
+    }
+
+    /// O(1) staged-inode position by inode number.
+    fn inode_pos(&self, ino: u32) -> Option<usize> {
+        self.inode_idx.get(&ino).copied()
+    }
+
+    /// Push a staged data block and keep `data_block_idx` in sync. All
+    /// `data_blocks` growth must go through here.
+    fn push_data_block(&mut self, blk: u32, bytes: Vec<u8>) {
+        self.data_block_idx.insert(blk, self.data_blocks.len());
+        self.data_blocks.push((blk, bytes));
+    }
+
+    /// O(1) staged-data-block position by block number.
+    fn data_block_pos(&self, blk: u32) -> Option<usize> {
+        self.data_block_idx.get(&blk).copied()
+    }
+
+    /// Tag `blk` as a directory data block owned by `ino` (idempotent),
+    /// keeping `dir_block_set` in sync for O(1) membership checks.
+    fn track_dir_block(&mut self, blk: u32, ino: u32) {
+        if self.dir_block_set.insert(blk) {
+            self.dir_blocks.push((blk, ino));
+        }
+    }
+
     fn add_entry_to_dir_block_for(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -865,25 +922,14 @@ impl Ext {
         // HTree-indexed dir? Route by hash to the right leaf instead
         // of scanning linearly. The leaf is always non-block-0 (block 0
         // is the dx_root and never holds real entries).
-        let inode_copy = self
-            .inodes
-            .iter()
-            .find(|(i, _)| *i == dir_inode)
-            .map(|(_, i)| *i)
-            .unwrap();
+        let inode_copy = self.inodes[self.inode_pos(dir_inode).unwrap()].1;
         if inode_copy.flags & constants::EXT4_INDEX_FL != 0 {
             let logical_leaf = self.dx_route_logical_leaf(dev, dir_inode, name)?;
             let phys = self.file_block(dev, &inode_copy, logical_leaf)?;
             self.ensure_block_staged(dev, phys)?;
-            if !self.dir_blocks.iter().any(|(b, _)| *b == phys) {
-                self.dir_blocks.push((phys, dir_inode));
-            }
-            let block = self
-                .data_blocks
-                .iter_mut()
-                .find(|(b, _)| *b == phys)
-                .map(|(_, bytes)| bytes)
-                .unwrap();
+            self.track_dir_block(phys, dir_inode);
+            let pos = self.data_block_pos(phys).unwrap();
+            let block = &mut self.data_blocks[pos].1;
             if !try_append_dir_entry(block, name, child_ino, file_type, with_filetype, usable)? {
                 return Err(crate::Error::Unsupported(format!(
                     "ext: HTree leaf {phys} for dir {dir_inode} is full — bucket-split not implemented"
@@ -905,15 +951,9 @@ impl Ext {
                 continue;
             }
             self.ensure_block_staged(dev, blk)?;
-            if !self.dir_blocks.iter().any(|(b, _)| *b == blk) {
-                self.dir_blocks.push((blk, dir_inode));
-            }
-            let block = self
-                .data_blocks
-                .iter_mut()
-                .find(|(b, _)| *b == blk)
-                .map(|(_, bytes)| bytes)
-                .unwrap();
+            self.track_dir_block(blk, dir_inode);
+            let pos = self.data_block_pos(blk).unwrap();
+            let block = &mut self.data_blocks[pos].1;
             if try_append_dir_entry(block, name, child_ino, file_type, with_filetype, usable)? {
                 return Ok(());
             }
@@ -981,8 +1021,8 @@ impl Ext {
                 String::from_utf8_lossy(name)
             )));
         }
-        self.data_blocks.push((new_blk, new_buf));
-        self.dir_blocks.push((new_blk, dir_inode));
+        self.push_data_block(new_blk, new_buf);
+        self.track_dir_block(new_blk, dir_inode);
         Ok(())
     }
 
@@ -1121,7 +1161,7 @@ impl Ext {
             if let Some(slot) = self.data_blocks.iter_mut().find(|(b, _)| b == phys) {
                 slot.1 = image;
             } else {
-                self.data_blocks.push((*phys, image));
+                self.push_data_block(*phys, image);
             }
             self.track_extent_leaf_block(*phys, inode_no);
         }
@@ -1233,7 +1273,7 @@ impl Ext {
             physical: new_phys as u64,
         };
         let new_leaf_image = extent::encode_leaf_block(&[new_run], bs, csum_tail)?;
-        self.data_blocks.push((new_leaf_phys, new_leaf_image));
+        self.push_data_block(new_leaf_phys, new_leaf_image);
         self.track_extent_leaf_block(new_leaf_phys, inode_no);
         indices.push(extent::ExtentIdx {
             block: new_logical,
@@ -1288,7 +1328,7 @@ impl Ext {
                 // Initialise the indirect block to all zeros (the holes
                 // pattern); the slot we're about to write is the only
                 // non-zero entry initially.
-                self.data_blocks.push((blk, vec![0u8; bs as usize]));
+                self.push_data_block(blk, vec![0u8; bs as usize]);
                 (blk, 1u32)
             }
             existing => {
@@ -1333,23 +1373,23 @@ impl Ext {
         dev: &mut dyn BlockDevice,
         ino: u32,
     ) -> Result<()> {
-        if self.inodes.iter().any(|(i, _)| *i == ino) {
+        if self.inode_idx.contains_key(&ino) {
             return Ok(());
         }
         let inode = self.read_inode(dev, ino)?;
-        self.inodes.push((ino, inode));
+        self.push_inode(ino, inode);
         Ok(())
     }
 
     /// Ensure block `blk` is in the staged write set, fetching from disk
     /// if not. No-op if already staged.
     fn ensure_block_staged(&mut self, dev: &mut dyn BlockDevice, blk: u32) -> Result<()> {
-        if self.data_blocks.iter().any(|(b, _)| *b == blk) {
+        if self.data_block_idx.contains_key(&blk) {
             return Ok(());
         }
         let mut buf = vec![0u8; self.layout.block_size as usize];
         self.read_block(dev, blk, &mut buf)?;
-        self.data_blocks.push((blk, buf));
+        self.push_data_block(blk, buf);
         Ok(())
     }
 
@@ -1464,7 +1504,9 @@ impl Ext {
         // flush). `self.inodes` is kept around — open file handles
         // assume their inode stays staged across `sync` calls.
         self.data_blocks.clear();
+        self.data_block_idx.clear();
         self.dir_blocks.clear();
+        self.dir_block_set.clear();
         self.extent_leaf_blocks.clear();
         self.dx_root_blocks.clear();
         self.dx_node_blocks.clear();
@@ -1918,7 +1960,7 @@ impl Ext {
                 let off = i * 4;
                 *slot = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
             }
-            self.inodes.push((ino, inode));
+            self.push_inode(ino, inode);
             self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_REG)?;
             // Stamp the marker xattr. Value is empty for files that
             // fit entirely in i_block; for > 60 bytes (deferred — see
@@ -1966,7 +2008,7 @@ impl Ext {
         let allocated_meta_blocks = self.fill_block_pointers(ino, &mut inode, &data_blocks)?;
         inode.blocks_512 = (allocated_data + allocated_meta_blocks) * (bs / 512);
 
-        self.inodes.push((ino, inode));
+        self.push_inode(ino, inode);
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_REG)?;
         Ok(ino)
     }
@@ -1996,9 +2038,9 @@ impl Ext {
         let with_filetype = self.has_filetype();
         let block_bytes =
             dir::make_initial_dir_block(ino, parent_ino, bs, with_filetype, csum_tail);
-        self.data_blocks.push((blk, block_bytes));
-        self.dir_blocks.push((blk, ino));
-        self.inodes.push((ino, inode));
+        self.push_data_block(blk, block_bytes);
+        self.track_dir_block(blk, ino);
+        self.push_inode(ino, inode);
         self.groups[0].desc.used_dirs_count += 1;
 
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
@@ -2058,14 +2100,14 @@ impl Ext {
         // First block: "." / ".."; all trailing blocks: empty placeholder
         // so the linear-scan reader sees well-formed dir blocks.
         let head = dir::make_initial_dir_block(ino, parent_ino, bs, with_filetype, csum_tail);
-        self.data_blocks.push((blocks[0], head));
-        self.dir_blocks.push((blocks[0], ino));
+        self.push_data_block(blocks[0], head);
+        self.track_dir_block(blocks[0], ino);
         for &blk in &blocks[1..] {
             self.data_blocks
                 .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
-            self.dir_blocks.push((blk, ino));
+            self.track_dir_block(blk, ino);
         }
-        self.inodes.push((ino, inode));
+        self.push_inode(ino, inode);
         self.groups[0].desc.used_dirs_count += 1;
 
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
@@ -2215,7 +2257,7 @@ impl Ext {
                 with_filetype,
                 csum_tail,
             );
-            self.data_blocks.push((blocks[0], dx_root_buf));
+            self.push_data_block(blocks[0], dx_root_buf);
             self.dx_root_blocks.push((blocks[0], ino, n_leaves as u16));
         } else {
             // Two-level: dx_root entries map to dx_nodes; dx_node
@@ -2243,7 +2285,7 @@ impl Ext {
                 }
                 let node_buf = htree::make_dx_node_block(bs, &node_entries, csum_tail);
                 let phys = blocks[(nodes_start_logical as usize) + node_i];
-                self.data_blocks.push((phys, node_buf));
+                self.push_data_block(phys, node_buf);
                 self.dx_node_blocks.push((phys, ino, chunk_len as u16));
 
                 leaf_idx = chunk_end;
@@ -2272,7 +2314,7 @@ impl Ext {
                 with_filetype,
                 csum_tail,
             );
-            self.data_blocks.push((blocks[0], dx_root_buf));
+            self.push_data_block(blocks[0], dx_root_buf);
             self.dx_root_blocks.push((blocks[0], ino, n_nodes as u16));
         }
 
@@ -2281,10 +2323,10 @@ impl Ext {
             let blk = blocks[(leaves_start_logical as usize) + i];
             self.data_blocks
                 .push((blk, dir::make_empty_dir_block(bs, csum_tail)));
-            self.dir_blocks.push((blk, ino));
+            self.track_dir_block(blk, ino);
         }
 
-        self.inodes.push((ino, inode));
+        self.push_inode(ino, inode);
         self.groups[0].desc.used_dirs_count += 1;
 
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_DIR)?;
@@ -2395,7 +2437,7 @@ impl Ext {
             dev.write_at(blk as u64 * bs as u64, &buf)?;
         }
 
-        self.inodes.push((ino, inode));
+        self.push_inode(ino, inode);
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, constants::DENT_LNK)?;
         Ok(ino)
     }
@@ -2435,7 +2477,7 @@ impl Ext {
             DeviceKind::Fifo => constants::DENT_FIFO,
             DeviceKind::Socket => constants::DENT_SOCK,
         };
-        self.inodes.push((ino, inode));
+        self.push_inode(ino, inode);
         self.add_entry_to_dir_block_for(dev, parent_ino, name, ino, ft)?;
         Ok(ino)
     }
@@ -2534,7 +2576,9 @@ impl Ext {
             self.free_inode_blocks(dev, &target)?;
             self.free_inode(target_ino);
             self.inodes.retain(|(i, _)| *i != target_ino);
-            self.inodes.push((target_ino, Inode::default()));
+            // `retain` shifted positions; rebuild before re-staging.
+            self.rebuild_inode_idx();
+            self.push_inode(target_ino, Inode::default());
             self.patch_inode(dev, parent_ino, |i| {
                 i.links_count = i.links_count.saturating_sub(1);
             })?;
@@ -2553,7 +2597,9 @@ impl Ext {
             self.free_inode_blocks(dev, &target)?;
             self.free_inode(target_ino);
             self.inodes.retain(|(i, _)| *i != target_ino);
-            self.inodes.push((target_ino, Inode::default()));
+            // `retain` shifted positions; rebuild before re-staging.
+            self.rebuild_inode_idx();
+            self.push_inode(target_ino, Inode::default());
         }
         Ok(())
     }
@@ -2784,7 +2830,7 @@ impl Ext {
         }
         self.ensure_block_staged(dev, blk)?;
         if !self.dir_blocks.iter().any(|(b, _)| *b == blk) {
-            self.dir_blocks.push((blk, dir_ino));
+            self.track_dir_block(blk, dir_ino);
         }
         let block = self
             .data_blocks
@@ -2870,7 +2916,7 @@ impl Ext {
         let dir_block_num = self.file_block(dev, &inode_copy, 0)?;
         self.ensure_block_staged(dev, dir_block_num)?;
         if !self.dir_blocks.iter().any(|(b, _)| *b == dir_block_num) {
-            self.dir_blocks.push((dir_block_num, dir_inode));
+            self.track_dir_block(dir_block_num, dir_inode);
         }
         let with_filetype = self.has_filetype();
         let usable = dir::usable_dir_len(self.layout.block_size, self.has_metadata_csum());
@@ -3187,6 +3233,9 @@ impl Ext {
             extent_leaf_blocks: Vec::new(),
             dx_root_blocks: Vec::new(),
             dx_node_blocks: Vec::new(),
+            inode_idx: std::collections::HashMap::new(),
+            data_block_idx: std::collections::HashMap::new(),
+            dir_block_set: std::collections::HashSet::new(),
             // Opened (vs. just-formatted) images go through the journal
             // path on flush. `open()` itself runs JBD2 replay before
             // returning, so by the time we land here the on-disk journal

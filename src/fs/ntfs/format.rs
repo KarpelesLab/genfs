@@ -1771,6 +1771,82 @@ pub fn insert_into_index_root(
     Ok(out)
 }
 
+/// Batched form of [`insert_into_index_root`]: insert **all** of
+/// `new_entries` into a small `$INDEX_ROOT` and re-sort once, instead of
+/// re-parsing + re-sorting per entry. The result is byte-identical to
+/// inserting the same entries one at a time (same final set, same NTFS
+/// collation order, same encoding) — it just does it in one pass, which
+/// is what the writer's directory-batch cache replays at flush.
+///
+/// Returns `Err(Unsupported)` if the combined root would exceed
+/// `max_resident_bytes`; the caller promotes to `$INDEX_ALLOCATION`.
+pub fn insert_entries_into_index_root(
+    root_value: &[u8],
+    new_entries: &[Vec<u8>],
+    max_resident_bytes: usize,
+) -> Result<Vec<u8>> {
+    if root_value.len() < 32 {
+        return Err(crate::Error::InvalidImage(
+            "ntfs: $INDEX_ROOT too small to mutate".into(),
+        ));
+    }
+    let header_meta = &root_value[..16];
+    let bytes_in_use = u32::from_le_bytes(root_value[20..24].try_into().unwrap()) as usize;
+    let flags = root_value[28];
+    let entries_start = 16 + 16;
+    let entries_end = 16 + bytes_in_use;
+
+    let mut cursor = entries_start;
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut terminator: Vec<u8> = Vec::new();
+    while cursor + 16 <= entries_end {
+        let entry_len =
+            u16::from_le_bytes(root_value[cursor + 8..cursor + 10].try_into().unwrap()) as usize;
+        if entry_len < 16 || cursor + entry_len > entries_end {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: malformed $INDEX_ROOT entry length".into(),
+            ));
+        }
+        let e_flags = u32::from_le_bytes(root_value[cursor + 12..cursor + 16].try_into().unwrap());
+        let is_last = e_flags & 0x02 != 0;
+        let slice = root_value[cursor..cursor + entry_len].to_vec();
+        if is_last {
+            terminator = slice;
+            break;
+        }
+        entries.push(slice);
+        cursor += entry_len;
+    }
+    if terminator.is_empty() {
+        return Err(crate::Error::InvalidImage(
+            "ntfs: $INDEX_ROOT missing terminator".into(),
+        ));
+    }
+    entries.extend(new_entries.iter().cloned());
+    entries.sort_by_key(|e| entry_sort_key(e));
+
+    let entries_total: usize = entries.iter().map(|e| e.len()).sum::<usize>() + terminator.len();
+    let new_bytes_in_use = 16 + entries_total;
+    let new_total = 16 + new_bytes_in_use;
+    if new_total > max_resident_bytes {
+        return Err(crate::Error::Unsupported(
+            "ntfs: directory index would overflow $INDEX_ROOT — promotion to $INDEX_ALLOCATION needed".into(),
+        ));
+    }
+    let mut out = Vec::with_capacity(new_total);
+    out.extend_from_slice(header_meta);
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&(new_bytes_in_use as u32).to_le_bytes());
+    out.extend_from_slice(&(new_bytes_in_use as u32).to_le_bytes());
+    out.push(flags);
+    out.extend_from_slice(&[0u8; 3]);
+    for e in &entries {
+        out.extend_from_slice(e);
+    }
+    out.extend_from_slice(&terminator);
+    Ok(out)
+}
+
 /// Pure inverse of [`insert_into_index_root`]: splice every `$I30`
 /// entry whose `file_ref`'s low 48 bits equal `target_rec` out of the
 /// `$INDEX_ROOT` value, rebuilding the index header so `bytes_in_use`

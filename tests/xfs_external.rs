@@ -729,3 +729,65 @@ fn open_file_rw_refused_on_reflinked_file() {
 
     assert_xfs_repair_clean(tmp.path());
 }
+
+/// Large single-directory test: plant enough files in one directory that
+/// the writer must promote it past block format into **leaf** and then
+/// **node** format (a da-btree of leaf blocks over many data blocks, with
+/// a free-space block tracking per-data-block bests). Builds at two sizes
+/// — one that lands on leaf format, one on node format — and for each:
+///   * `xfs_repair -n` must complete cleanly (the directory index, the
+///     bestfree/bests arrays, and the now-aligned inode chunks all check);
+///   * reopening and `list_path` must return every entry.
+#[cfg(unix)]
+#[test]
+fn xfs_writer_large_directory_leaf_and_node() {
+    let Some(_) = which("xfs_repair") else {
+        eprintln!("skipping: xfs_repair not installed");
+        return;
+    };
+    for n in [400usize, 5000usize] {
+        let size: u64 = 256 * 1024 * 1024;
+        let tmp = NamedTempFile::new().unwrap();
+        let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+        let opts = FormatOpts {
+            uuid: [0x42u8; 16],
+            ..Default::default()
+        };
+        {
+            let mut x = xfs::format(&mut dev, &opts).unwrap();
+            x.begin_writes(opts.uuid);
+            let rootino = x.superblock().rootino;
+            let dir = x
+                .add_dir(&mut dev, rootino, "big", EntryMeta::default())
+                .unwrap();
+            for i in 0..n {
+                let body = b"x";
+                let mut src = std::io::Cursor::new(body.to_vec());
+                x.add_file(
+                    &mut dev,
+                    dir,
+                    &format!("file{i:05}"),
+                    EntryMeta::default(),
+                    body.len() as u64,
+                    &mut src,
+                )
+                .unwrap();
+            }
+            x.flush_writes(&mut dev).unwrap();
+        }
+        dev.sync().unwrap();
+        drop(dev);
+
+        assert_xfs_repair_clean(tmp.path());
+
+        // Reopen and confirm every entry is listed back.
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let x = Xfs::open(&mut dev).unwrap();
+        let entries = x.list_path(&mut dev, "/big").unwrap();
+        let files = entries
+            .iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .count();
+        assert_eq!(files, n, "directory of {n} files: listed {files} back");
+    }
+}

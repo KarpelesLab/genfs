@@ -37,6 +37,7 @@
 
 pub mod bmbt;
 pub mod dir;
+pub mod dir_build;
 pub mod format;
 pub mod inode;
 pub mod journal;

@@ -62,14 +62,14 @@ use crate::fs::dir_batch::{DEFAULT_CAPACITY, DirBatch};
 use super::Xfs;
 use super::bmbt::Extent;
 use super::dir::{
-    DataEntry, XFS_DIR3_FT_BLKDEV, XFS_DIR3_FT_CHRDEV, XFS_DIR3_FT_DIR, XFS_DIR3_FT_FIFO,
+    XFS_DIR3_FT_BLKDEV, XFS_DIR3_FT_CHRDEV, XFS_DIR3_FT_DIR, XFS_DIR3_FT_FIFO,
     XFS_DIR3_FT_REG_FILE, XFS_DIR3_FT_SOCK, XFS_DIR3_FT_SYMLINK, encode_v5_block_dir,
     stamp_v5_dir_block_crc,
 };
 use super::format::{
-    AG0_METADATA_BLOCKS, LOG_AGBLOCK, ROOT_CHUNK_AGBLOCK, XFS_ABTB_CRC_MAGIC, XFS_ABTC_CRC_MAGIC,
-    XFS_BLOCKSIZE, XFS_BTREE_SBLOCK_V5_SIZE, XFS_IBT_CRC_MAGIC, XFS_INODES_PER_CHUNK,
-    XFS_INODESIZE, XFS_INOPBLOCK, stamp_v5_btree_block_crc,
+    AG0_METADATA_BLOCKS, INODE_CHUNK_ALIGN, LOG_AGBLOCK, ROOT_CHUNK_AGBLOCK, XFS_ABTB_CRC_MAGIC,
+    XFS_ABTC_CRC_MAGIC, XFS_BLOCKSIZE, XFS_BTREE_SBLOCK_V5_SIZE, XFS_IBT_CRC_MAGIC,
+    XFS_INODES_PER_CHUNK, XFS_INODESIZE, XFS_INOPBLOCK, stamp_v5_btree_block_crc,
 };
 use super::inode::{
     S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK, V3DinodeBuilder, XfsTimestamp,
@@ -528,6 +528,14 @@ impl Xfs {
     /// available. Returns `(ag, agblock_start)` — the caller is
     /// responsible for translating to FSB / device byte.
     fn alloc_blocks_in_any_ag(&mut self, n: u32) -> Result<(u32, u32)> {
+        self.alloc_blocks_in_any_ag_aligned(n, 1)
+    }
+
+    /// Like [`alloc_blocks_in_any_ag`] but forces the start block to a
+    /// multiple of `align` FS blocks. The skipped alignment gap is returned
+    /// to the AG's freed-extent list so it stays accounted as free (and
+    /// reusable). Used for inode chunks, which must satisfy `sb_inoalignmt`.
+    fn alloc_blocks_in_any_ag_aligned(&mut self, n: u32, align: u32) -> Result<(u32, u32)> {
         let agblocks = self.sb.agblocks;
         let ws = self.ws_mut()?;
         let agcount = ws.ags.len() as u32;
@@ -535,19 +543,27 @@ impl Xfs {
         for offset in 0..agcount {
             let ag = (ws.next_block_ag + offset) % agcount;
             let ag_state = &mut ws.ags[ag as usize];
-            // Prefer a freed extent of exact size.
-            if let Some(idx) = ag_state.freed_extents.iter().position(|(_s, c)| *c == n) {
+            // Prefer a freed extent of exact size that satisfies alignment.
+            if let Some(idx) = ag_state
+                .freed_extents
+                .iter()
+                .position(|(s, c)| *c == n && s % align == 0)
+            {
                 let (start, _) = ag_state.freed_extents.swap_remove(idx);
                 ws.next_block_ag = (ag + 1) % agcount;
                 return Ok((ag, start));
             }
-            // Otherwise bump-allocate.
+            // Otherwise bump-allocate, rounding the start up to `align`.
             let next = ag_state.next_agblock;
-            if next.checked_add(n).is_some_and(|end| end <= agblocks) {
-                let start = next;
-                ag_state.next_agblock = next + n;
+            let aligned = next.next_multiple_of(align);
+            if aligned.checked_add(n).is_some_and(|end| end <= agblocks) {
+                if aligned > next {
+                    // Reclaim the alignment gap as free space.
+                    ag_state.freed_extents.push((next, aligned - next));
+                }
+                ag_state.next_agblock = aligned + n;
                 ws.next_block_ag = (ag + 1) % agcount;
-                return Ok((ag, start));
+                return Ok((ag, aligned));
             }
         }
         Err(crate::Error::InvalidArgument(format!(
@@ -569,7 +585,7 @@ impl Xfs {
     /// round-robin order; falls back to allocating a fresh 64-inode
     /// chunk when every existing chunk is full. Returns the absolute
     /// inode number.
-    fn alloc_inode(&mut self) -> Result<u64> {
+    fn alloc_inode(&mut self, dev: &mut dyn BlockDevice) -> Result<u64> {
         let inopblog = self.sb.inopblog as u32;
         let agblklog = self.sb.agblklog as u32;
         // Round-robin across AGs, trying existing chunks first.
@@ -602,20 +618,86 @@ impl Xfs {
         // No existing chunk had room. Allocate a new chunk in the next
         // AG with space.
         let chunk_blocks = XFS_INODES_PER_CHUNK / (XFS_INOPBLOCK as u32);
-        let (ag, agblk) = self.alloc_blocks_in_any_ag(chunk_blocks)?;
+        let (ag, agblk) = self.alloc_blocks_in_any_ag_aligned(chunk_blocks, INODE_CHUNK_ALIGN)?;
         let startino_ag = agblk * (XFS_INOPBLOCK as u32);
+        // All 64 slots free; `alloc` takes slot 0. (A previous `!1` here
+        // reserved slot 0 as *used* but it was never written, leaving a
+        // zeroed inode the inode B-tree claimed was allocated — xfs_repair
+        // flagged "bad magic, would clear".) Free slots stay zeroed, which
+        // xfs_repair accepts as the free-inode pattern (matching the
+        // formatter's zeroed root chunk).
         let mut chunk = InodeChunk {
             startino_ag,
-            ir_free: !1u64,
+            ir_free: !0u64,
             agblock: agblk,
         };
         let rel = chunk.alloc().expect("fresh chunk has 64 free inodes");
-        let ws = self.ws_mut()?;
-        ws.ags[ag as usize].chunks.push(chunk);
-        ws.inodes_used += 1;
-        ws.inodes_free += 63;
-        ws.next_inode_ag = (ag + 1) % (ws.ags.len() as u32);
+        {
+            let ws = self.ws_mut()?;
+            ws.ags[ag as usize].chunks.push(chunk);
+            ws.inodes_used += 1;
+            ws.inodes_free += 63;
+            ws.next_inode_ag = (ag + 1) % (ws.ags.len() as u32);
+        }
+        // Initialise all 64 inode slots with valid (free, mode-0) v3 inodes:
+        // XFS v5 verifies the magic + CRC of every inode in a chunk's
+        // cluster, so leaving free slots zeroed makes xfs_repair report
+        // "bad magic / CRC error". The caller overwrites slot 0 with the
+        // real inode; later allocations overwrite the others.
+        self.init_inode_chunk(dev, ag, startino_ag)?;
         Ok(((ag as u64) << (inopblog + agblklog)) | (rel as u64))
+    }
+
+    /// Stamp all 64 slots of a freshly allocated inode chunk with valid
+    /// free (mode-0) v3 inodes in one 32 KiB write, so every inode in the
+    /// chunk carries a correct magic, version, `di_next_unlinked` and CRC.
+    fn init_inode_chunk(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ag: u32,
+        startino_ag: u32,
+    ) -> Result<()> {
+        let inopblog = self.sb.inopblog as u32;
+        let agblklog = self.sb.agblklog as u32;
+        let isize = XFS_INODESIZE as usize;
+        let uuid = self.uuid_for_writes();
+        let zero = XfsTimestamp { sec: 0, nsec: 0 };
+        let mut buf = vec![0u8; XFS_INODES_PER_CHUNK as usize * isize];
+        for slot in 0..XFS_INODES_PER_CHUNK {
+            let rel = startino_ag + slot;
+            let ino = ((ag as u64) << (inopblog + agblklog)) | (rel as u64);
+            let builder = V3DinodeBuilder {
+                inodesize: isize,
+                mode: 0, // free
+                format: 0,
+                uid: 0,
+                gid: 0,
+                nlink: 0,
+                atime: zero,
+                mtime: zero,
+                ctime: zero,
+                crtime: zero,
+                size: 0,
+                nblocks: 0,
+                extsize: 0,
+                nextents: 0,
+                forkoff: 0,
+                aformat: 0,
+                flags: 0,
+                generation: 0,
+                di_ino: ino,
+                uuid,
+                flags2: 0,
+            };
+            let mut inode = builder.build();
+            stamp_v3_inode_crc(&mut inode);
+            let base = slot as usize * isize;
+            buf[base..base + isize].copy_from_slice(&inode);
+        }
+        let first_ino = ((ag as u64) << (inopblog + agblklog)) | (startino_ag as u64);
+        let off = self.ino_byte_offset(first_ino)?;
+        dev.write_at(off, &buf)?;
+        Ok(())
     }
 
     /// Free `n` blocks starting at FSB `start_fsb` back to its AG's
@@ -739,97 +821,264 @@ impl Xfs {
         if staged.is_empty() {
             return Ok(());
         }
-        // Read the parent inode. Block-format only.
         let (parent_buf, parent_core) = self.read_inode(dev, parent_ino)?;
         if !parent_core.is_dir() {
             return Err(crate::Error::InvalidArgument(format!(
                 "xfs: parent inode {parent_ino} is not a directory"
             )));
         }
-        // Only EXTENTS-format dirs with one extent supported by the
-        // writer (i.e. block-format with one logical FS block).
-        let extents = self.read_extent_list(dev, &parent_buf, &parent_core)?;
-        if extents.len() != 1 || extents[0].blockcount != 1 {
-            return Err(crate::Error::Unsupported(
-                "xfs: write path only supports block-format (single-extent) directories".into(),
-            ));
-        }
-        let parent_self_extent = extents[0];
-
-        // Re-decode the existing block-format directory to recover the
-        // user-visible entries (sans "." / "..").
         let dir_block_size = self.sb.dir_block_size() as usize;
-        let mut block = vec![0u8; dir_block_size];
-        let phys_byte = self.fsb_to_byte(parent_self_extent.startblock);
-        dev.read_at(phys_byte, &mut block)?;
-        let existing = super::dir::decode_block_dir(&block, self.sb.is_v5())?;
-        let mut all: Vec<(String, u64, u8)> = existing
-            .into_iter()
-            .filter(|e| e.name != "." && e.name != "..")
-            .map(|e: DataEntry| (e.name, e.inumber, e.ftype))
-            .collect();
-        all.extend(staged.iter().cloned());
 
-        // Find parent's parent. The shortform encoding kept it in the
-        // first two records' inumber for ".."; we decoded them out. For
-        // root, parent_of_parent == self.
-        // To avoid re-reading the dir-block "..", we assume root for
-        // now and store self-inum (which is correct for the root). For
-        // child directories we'd need to track parent inum; we look it
-        // up by reading the original "..":
-        let parent_parent = existing_parent(&block, self.sb.is_v5())?;
+        // Existing on-disk extents (data + any leaf/free runs) and the
+        // current entries (format-agnostic: block / leaf / node).
+        let existing_extents = self.read_extent_list(dev, &parent_buf, &parent_core)?;
+        let existing = self.read_dir_entries(dev, &parent_buf, &parent_core)?;
+        let mut parent_parent = parent_ino;
+        let mut merged: Vec<(String, u64, u8)> = Vec::with_capacity(existing.len() + staged.len());
+        for e in existing {
+            match e.name.as_str() {
+                "." => {}
+                ".." => parent_parent = e.inumber,
+                _ => merged.push((e.name, e.inumber, e.ftype)),
+            }
+        }
+        merged.extend(staged.iter().cloned());
 
-        let basic_blkno = phys_byte / 512;
-        let uuid = self.uuid_for_writes();
-        let new_block = encode_v5_block_dir(
-            dir_block_size,
-            parent_ino,
-            parent_parent,
-            &all,
-            &uuid,
-            basic_blkno,
-        )?;
-        dev.write_at(phys_byte, &new_block)?;
+        // Full record list including the synthetic "." / ".." at the front
+        // (data block 0 carries them).
+        let mut all: Vec<(String, u64, u8)> = Vec::with_capacity(merged.len() + 2);
+        all.push((".".to_string(), parent_ino, XFS_DIR3_FT_DIR));
+        all.push(("..".to_string(), parent_parent, XFS_DIR3_FT_DIR));
+        all.extend(merged.iter().cloned());
 
-        // Update parent inode: di_size = dir_block_size, di_nblocks =
-        // 1, di_nextents = 1, mtime, ctime. We rebuild the inode in
-        // place.
-        let new_size = dir_block_size as u64;
-        let (atime, mtime, ctime) = (parent_core.atime, parent_core.mtime, parent_core.ctime);
-        let crtime = mtime;
-        // Each staged subdirectory adds a ".." backref to the parent.
+        let plan = super::dir_build::plan_layout(&all, dir_block_size)?;
+
         let new_subdirs = staged
             .iter()
             .filter(|(_, _, ft)| *ft == XFS_DIR3_FT_DIR)
             .count() as u32;
         let nlink = parent_core.nlink + new_subdirs;
-        let builder = V3DinodeBuilder {
-            inodesize: XFS_INODESIZE as usize,
-            mode: parent_core.mode,
-            format: /*EXTENTS*/ 2,
-            uid: parent_core.uid,
-            gid: parent_core.gid,
+        let (atime, mtime, ctime) = (parent_core.atime, parent_core.mtime, parent_core.ctime);
+        let uuid = self.uuid_for_writes();
+
+        // ---- Block format: reuse the existing single dir block. ----
+        if plan.format == super::dir_build::DirFormat::Block {
+            if existing_extents.len() != 1 || existing_extents[0].blockcount != 1 {
+                return Err(crate::Error::Unsupported(
+                    "xfs: shrinking a promoted directory back to block format is unsupported"
+                        .into(),
+                ));
+            }
+            let self_extent = existing_extents[0];
+            let phys_byte = self.fsb_to_byte(self_extent.startblock);
+            let new_block = encode_v5_block_dir(
+                dir_block_size,
+                parent_ino,
+                parent_parent,
+                &merged,
+                &uuid,
+                phys_byte / 512,
+            )?;
+            dev.write_at(phys_byte, &new_block)?;
+            self.rebuild_dir_inode(
+                dev,
+                parent_ino,
+                &parent_core,
+                nlink,
+                atime,
+                mtime,
+                ctime,
+                dir_block_size as u64,
+                1,
+                &[self_extent],
+                &uuid,
+            )?;
+            return Ok(());
+        }
+
+        // ---- Leaf / node format: lay the directory out fresh in
+        // contiguous runs (data | leaf-space | free-space). Free the old
+        // blocks first so repeated promotions don't leak. ----
+        for ext in &existing_extents {
+            self.free_blocks_fsb(ext.startblock, ext.blockcount)?;
+        }
+
+        let n_data = plan.n_data();
+        let n_leaf = plan.n_leafspace();
+        let n_free = plan.n_free();
+        let data_fsb = self.alloc_blocks_fsb(n_data as u32)?;
+        let leaf_fsb = self.alloc_blocks_fsb(n_leaf as u32)?;
+        let free_fsb = if n_free > 0 {
+            self.alloc_blocks_fsb(n_free as u32)?
+        } else {
+            0
+        };
+        let leaf_db0 = super::dir_build::leaf_firstdb(dir_block_size);
+        let free_db0 = super::dir_build::free_firstdb(dir_block_size);
+
+        // Data blocks at logical 0..n_data.
+        for (i, ents) in plan.data_blocks.iter().enumerate() {
+            let phys = data_fsb + i as u64;
+            let byte = self.fsb_to_byte(phys);
+            let block = super::dir_build::build_data_block(
+                ents,
+                dir_block_size,
+                parent_ino,
+                &uuid,
+                byte / 512,
+            )?;
+            dev.write_at(byte, &block)?;
+        }
+
+        match plan.format {
+            super::dir_build::DirFormat::Leaf => {
+                let byte = self.fsb_to_byte(leaf_fsb);
+                let block = super::dir_build::build_leaf1_block(
+                    &plan.leaf_ents,
+                    &plan.bests,
+                    dir_block_size,
+                    parent_ino,
+                    &uuid,
+                    byte / 512,
+                )?;
+                dev.write_at(byte, &block)?;
+            }
+            super::dir_build::DirFormat::Node => {
+                // Node root lives at the first leaf-space block (leaf_db0);
+                // the M leafn blocks follow at leaf_db0 + 1 + j.
+                let m = plan.leafn_counts.len();
+                let mut node_children: Vec<(u32, u32)> = Vec::with_capacity(m);
+                let mut start = 0usize;
+                for (j, &cnt) in plan.leafn_counts.iter().enumerate() {
+                    let slice = &plan.leaf_ents[start..start + cnt];
+                    let leaf_db = leaf_db0 + 1 + j as u64;
+                    let phys = leaf_fsb + 1 + j as u64;
+                    let byte = self.fsb_to_byte(phys);
+                    let forw = if j + 1 < m { (leaf_db + 1) as u32 } else { 0 };
+                    let back = if j > 0 { (leaf_db - 1) as u32 } else { 0 };
+                    let block = super::dir_build::build_leafn_block(
+                        slice,
+                        dir_block_size,
+                        parent_ino,
+                        &uuid,
+                        byte / 512,
+                        forw,
+                        back,
+                    )?;
+                    dev.write_at(byte, &block)?;
+                    let max_hash = slice.last().map(|(h, _)| *h).unwrap_or(0);
+                    node_children.push((max_hash, leaf_db as u32));
+                    start += cnt;
+                }
+                // Node root.
+                let nbyte = self.fsb_to_byte(leaf_fsb);
+                let node = super::dir_build::build_da_node_block(
+                    &node_children,
+                    dir_block_size,
+                    parent_ino,
+                    &uuid,
+                    nbyte / 512,
+                )?;
+                dev.write_at(nbyte, &node)?;
+                // Free block carrying the bests array.
+                let fbyte = self.fsb_to_byte(free_fsb);
+                let freeb = super::dir_build::build_free_block(
+                    &plan.bests,
+                    0,
+                    dir_block_size,
+                    parent_ino,
+                    &uuid,
+                    fbyte / 512,
+                )?;
+                dev.write_at(fbyte, &freeb)?;
+            }
+            super::dir_build::DirFormat::Block => unreachable!("handled above"),
+        }
+
+        let mut extents: Vec<Extent> = Vec::with_capacity(3);
+        extents.push(Extent {
+            offset: 0,
+            startblock: data_fsb,
+            blockcount: n_data as u32,
+            unwritten: false,
+        });
+        extents.push(Extent {
+            offset: leaf_db0,
+            startblock: leaf_fsb,
+            blockcount: n_leaf as u32,
+            unwritten: false,
+        });
+        if n_free > 0 {
+            extents.push(Extent {
+                offset: free_db0,
+                startblock: free_fsb,
+                blockcount: n_free as u32,
+                unwritten: false,
+            });
+        }
+        let total_blocks = (n_data + n_leaf + n_free) as u64;
+        let di_size = (n_data as u64) * dir_block_size as u64;
+        self.rebuild_dir_inode(
+            dev,
+            parent_ino,
+            &parent_core,
             nlink,
             atime,
             mtime,
             ctime,
-            crtime,
-            size: new_size,
-            nblocks: 1,
+            di_size,
+            total_blocks,
+            &extents,
+            &uuid,
+        )?;
+        Ok(())
+    }
+
+    /// Rewrite a directory inode in EXTENTS format with the given extent
+    /// list and metadata. `extents` must be sorted by logical offset.
+    #[allow(clippy::too_many_arguments)]
+    fn rebuild_dir_inode(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        ino: u64,
+        core: &super::inode::DinodeCore,
+        nlink: u32,
+        atime: XfsTimestamp,
+        mtime: XfsTimestamp,
+        ctime: XfsTimestamp,
+        di_size: u64,
+        nblocks: u64,
+        extents: &[Extent],
+        uuid: &[u8; 16],
+    ) -> Result<()> {
+        let builder = V3DinodeBuilder {
+            inodesize: XFS_INODESIZE as usize,
+            mode: core.mode,
+            format: 2, // EXTENTS
+            uid: core.uid,
+            gid: core.gid,
+            nlink,
+            atime,
+            mtime,
+            ctime,
+            crtime: mtime,
+            size: di_size,
+            nblocks,
             extsize: 0,
-            nextents: 1,
+            nextents: extents.len() as u32,
             forkoff: 0,
             aformat: 2,
-            flags: parent_core.flags,
-            generation: parent_core.generation,
-            di_ino: parent_ino,
-            uuid,
+            flags: core.flags,
+            generation: core.generation,
+            di_ino: ino,
+            uuid: *uuid,
             flags2: 0,
         };
-        let mut lit = Vec::with_capacity(16);
-        lit.extend_from_slice(&parent_self_extent.encode());
-        self.write_inode(dev, parent_ino, builder, &lit)?;
-        Ok(())
+        let mut lit = Vec::with_capacity(extents.len() * 16);
+        for ext in extents {
+            lit.extend_from_slice(&ext.encode());
+        }
+        self.write_inode(dev, ino, builder, &lit)
     }
 
     /// Serialize every pending directory batch (at flush, or before a
@@ -935,7 +1184,7 @@ impl Xfs {
             }
         }
         // Allocate + write inode.
-        let ino = self.alloc_inode()?;
+        let ino = self.alloc_inode(dev)?;
         let (atime, mtime, ctime) = meta.ts();
         let builder = V3DinodeBuilder {
             inodesize: XFS_INODESIZE as usize,
@@ -988,7 +1237,7 @@ impl Xfs {
     ) -> Result<u64> {
         let dir_block_size = self.sb.dir_block_size() as usize;
         let dir_block_fsb = self.alloc_blocks_fsb(1)?;
-        let ino = self.alloc_inode()?;
+        let ino = self.alloc_inode(dev)?;
         let uuid = self.uuid_for_writes();
         let phys_byte = self.fsb_to_byte(dir_block_fsb);
         let basic_blkno = phys_byte / 512;
@@ -1044,7 +1293,7 @@ impl Xfs {
         let target_bytes = target.as_bytes();
         let bs = self.sb.blocksize as usize;
         let max_remote = bs - XFS_SYMLINK_HDR_SIZE;
-        let ino = self.alloc_inode()?;
+        let ino = self.alloc_inode(dev)?;
         let uuid = self.uuid_for_writes();
         let (atime, mtime, ctime) = meta.ts();
         if target_bytes.len() <= lit_max {
@@ -1149,7 +1398,7 @@ impl Xfs {
         minor: u32,
         meta: EntryMeta,
     ) -> Result<u64> {
-        let ino = self.alloc_inode()?;
+        let ino = self.alloc_inode(dev)?;
         let uuid = self.uuid_for_writes();
         let (atime, mtime, ctime) = meta.ts();
         // For dev nodes the literal area holds an 8-byte big-endian
@@ -2008,7 +2257,7 @@ impl Xfs {
         }
 
         // 4) Allocate the destination inode.
-        let dst_ino = self.alloc_inode()?;
+        let dst_ino = self.alloc_inode(dev)?;
 
         // 5) Re-read raw bytes the DinodeCore doesn't expose: extsize
         //    (72..76), aformat (83), existing flags2 (120..128).

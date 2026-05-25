@@ -161,6 +161,12 @@ pub const REFCNTBT_AGBLOCK: u32 = 7;
 /// "calculated root inode" heuristic agrees with our layout.
 pub const ROOT_CHUNK_AGBLOCK: u32 = 8;
 
+/// Inode-chunk start alignment in FS blocks (`sb_inoalignmt`): every inode
+/// chunk must begin at a multiple of this so `xfs_repair`'s inode-cluster
+/// reads (16 KiB = 4 blocks at 4 KiB) land on chunk boundaries. Matches the
+/// `sb_inoalignmt = 4` stamped by the formatter.
+pub const INODE_CHUNK_ALIGN: u32 = 4;
+
 /// AG-relative block where the first root-directory data block lives.
 /// Sits immediately after the root inode chunk so its FSB encodes
 /// cleanly inside the inode's single-extent literal area.

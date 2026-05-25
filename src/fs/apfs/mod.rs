@@ -1132,6 +1132,30 @@ impl Apfs {
         )))
     }
 
+    /// Read and decode the full inode record for `oid`.
+    fn read_inode_val(&self, dev: &mut dyn BlockDevice, oid: u64) -> Result<InodeVal> {
+        let rs = self.read_state()?;
+        let target = FsKeyTarget {
+            oid,
+            kind: APFS_TYPE_INODE,
+            tail: &[],
+            drec_layout: rs.drec_layout,
+        };
+        let block_size = self.block_size;
+        let mut ctx = rs.fs_ctx.borrow_mut();
+        let mut scan = RangeScan::start(&rs.fsroot_block, &target, &mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })?;
+        if let Some((_kb, vb)) = scan.next(&mut ctx, &mut |paddr, buf| {
+            read_at_paddr(dev, paddr, block_size, buf)
+        })? {
+            return InodeVal::decode(&vb);
+        }
+        Err(crate::Error::InvalidArgument(format!(
+            "apfs: no inode record for oid {oid:#x}"
+        )))
+    }
+
     /// Walk path components, resolving each name through its parent's
     /// directory records. Returns the target's object id.
     fn resolve_path_to_oid(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
@@ -1466,6 +1490,50 @@ impl crate::fs::Filesystem for Apfs {
             .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
         let r = self.open_file_reader(dev, s)?;
         Ok(Box::new(r))
+    }
+
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+        let oid = self.resolve_path_to_oid(dev, s)?;
+        let ino = self.read_inode_val(dev, oid)?;
+        let kind = match ino.mode & 0o170_000 {
+            0o100_000 => crate::fs::EntryKind::Regular,
+            0o040_000 => crate::fs::EntryKind::Dir,
+            0o120_000 => crate::fs::EntryKind::Symlink,
+            0o020_000 => crate::fs::EntryKind::Char,
+            0o060_000 => crate::fs::EntryKind::Block,
+            0o010_000 => crate::fs::EntryKind::Fifo,
+            0o140_000 => crate::fs::EntryKind::Socket,
+            _ => crate::fs::EntryKind::Regular,
+        };
+        let size = ino.dstream.map(|d| d.size).unwrap_or(0);
+        // APFS timestamps are nanoseconds since the Unix epoch.
+        let to_secs = |ns: u64| (ns / 1_000_000_000) as u32;
+        let nlink = if kind == crate::fs::EntryKind::Dir {
+            2
+        } else {
+            ino.nchildren_or_nlink.max(1) as u32
+        };
+        Ok(crate::fs::FileAttrs {
+            kind,
+            mode: ino.mode & 0o7777,
+            uid: ino.owner,
+            gid: ino.group,
+            size,
+            blocks: size.div_ceil(512),
+            nlink,
+            atime: to_secs(ino.access_time),
+            mtime: to_secs(ino.mod_time),
+            ctime: to_secs(ino.change_time),
+            rdev: 0,
+            inode: oid as u32,
+        })
     }
 
     fn open_file_ro<'a>(

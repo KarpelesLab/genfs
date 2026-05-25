@@ -41,8 +41,6 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | SquashFS   | ✅    | ✅     | —              | gzip / xz / lz4 / zstd / lzo / lzma via Cargo features; writer round-trips via `unsquashfs`; repack-only           |
 | ISO 9660   | ✅    | ✅     | —              | PVD + Joliet (UCS-2) + Rock Ridge (PX/NM/SL/TF) + El Torito boot catalog; repack-only                              |
 | GRF        | ✅    | ✅     | ✅              | Gravity Ragnarok Online archive — v0x102 / v0x103 / v0x200; permutation cipher (`MIXCRYPT` / `DES`); CP949 filenames |
-| qcow2      | ✅    | ✅     | ✅              | v2 + v3 backend, allocate-on-write writer                                                                          |
-| dmg        | ✅    | —     | —              | UDIF v4 trailer + mish chunks (zero / raw / zlib / ADC / bzip2 / LZFSE / LZMA); encrypted v2 (`encrcdsa`) read with PBKDF2 unlock |
 | zip        | ✅    | ✅     | —              | central-directory index, ZIP64, Stored + Deflate, Unix mode/symlinks, UTF-8/Shift-JIS/EUC-JP filename detection; repack-only writer |
 | cpio       | ✅    | ✅     | —              | newc / newc-crc / odc read; newc write; repack-only                                                              |
 | ar         | ✅    | ✅     | —              | GNU + BSD long names (read), GNU write; flat (no directories); repack-only                                       |
@@ -59,6 +57,15 @@ means an already-flushed image can be re-opened for `add` / `rm` /
 `open_file_rw` — for filesystems with a journal, that path commits
 through a real transaction so a crash mid-write leaves an image the
 host's `fsck` can replay.
+
+`qcow2` and `dmg` are **not** in the table above: they aren't
+filesystems but *disk-image containers*. They live one layer down, as
+`BlockDevice` backends (see the architecture diagram and "Partitions,
+block devices, qcow2"), presenting a flat byte-addressable device that
+any of the filesystems above is then laid down *inside* — fstool reads
+and writes through them transparently. qcow2 is read/write (v2 + v3,
+allocate-on-write); dmg is read-only (UDIF v4 mish chunks: zero / raw /
+zlib / ADC / bzip2 / LZFSE / LZMA, plus encrypted v2 `encrcdsa`).
 
 The reader for each FS streams: file contents are never fully resident in
 memory regardless of size. The writers do the same, two-pass: scan to size

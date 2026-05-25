@@ -42,7 +42,11 @@ struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {
         // Reject the all-zero state; xorshift would stick there.
-        Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
     }
     fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
@@ -374,8 +378,7 @@ fn overwrite_via_rw(
         .map_err(|e| format!("open_file_rw truncate {path}: {e}"))?;
     h.write_all(body)
         .map_err(|e| format!("write_all {path}: {e}"))?;
-    h.sync()
-        .map_err(|e| format!("sync {path}: {e}"))?;
+    h.sync().map_err(|e| format!("sync {path}: {e}"))?;
     Ok(())
 }
 
@@ -398,8 +401,7 @@ fn append_via_rw(
         .map_err(|e| format!("open_file_rw append {path}: {e}"))?;
     h.write_all(chunk)
         .map_err(|e| format!("write_all append {path}: {e}"))?;
-    h.sync()
-        .map_err(|e| format!("sync {path}: {e}"))?;
+    h.sync().map_err(|e| format!("sync {path}: {e}"))?;
     Ok(())
 }
 
@@ -417,8 +419,7 @@ fn patch_via_rw(
         .map_err(|e| format!("seek {off}: {e}"))?;
     h.write_all(chunk)
         .map_err(|e| format!("patch write {path}: {e}"))?;
-    h.sync()
-        .map_err(|e| format!("sync {path}: {e}"))?;
+    h.sync().map_err(|e| format!("sync {path}: {e}"))?;
     Ok(())
 }
 
@@ -433,8 +434,7 @@ fn set_len_via_rw(
         .map_err(|e| format!("open_file_rw {path}: {e}"))?;
     h.set_len(new_len)
         .map_err(|e| format!("set_len {path} -> {new_len}: {e}"))?;
-    h.sync()
-        .map_err(|e| format!("sync {path}: {e}"))?;
+    h.sync().map_err(|e| format!("sync {path}: {e}"))?;
     Ok(())
 }
 
@@ -601,7 +601,13 @@ fn fuzz_ext2() {
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = MemoryBackend::new(size);
     let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext2");
-    fuzz_filesystem(&mut ext, &mut dev, 0xE2_0202_C0DE, FUZZ_ITERS, &Caps::mutable_small());
+    fuzz_filesystem(
+        &mut ext,
+        &mut dev,
+        0xE2_0202_C0DE,
+        FUZZ_ITERS,
+        &Caps::mutable_small(),
+    );
 }
 
 #[test]
@@ -616,7 +622,13 @@ fn fuzz_ext3() {
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = MemoryBackend::new(size);
     let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext3");
-    fuzz_filesystem(&mut ext, &mut dev, 0xE3_0303_C0DE, FUZZ_ITERS, &Caps::mutable_small());
+    fuzz_filesystem(
+        &mut ext,
+        &mut dev,
+        0xE3_0303_C0DE,
+        FUZZ_ITERS,
+        &Caps::mutable_small(),
+    );
 }
 
 #[test]
@@ -631,7 +643,13 @@ fn fuzz_ext4() {
     let size = opts.blocks_count as u64 * opts.block_size as u64;
     let mut dev = MemoryBackend::new(size);
     let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
-    fuzz_filesystem(&mut ext, &mut dev, 0xE4_0404_C0DE, FUZZ_ITERS, &Caps::ext4_tight());
+    fuzz_filesystem(
+        &mut ext,
+        &mut dev,
+        0xE4_0404_C0DE,
+        FUZZ_ITERS,
+        &Caps::ext4_tight(),
+    );
 }
 
 #[test]
@@ -641,8 +659,8 @@ fn fuzz_fat32() {
     // 64 MiB to be safe and keep the cluster count reasonable.
     const TOTAL_SECTORS: u32 = 64 * 1024 * 1024 / 512;
     let tmp = NamedTempFile::new().expect("tempfile");
-    let mut dev = FileBackend::create(tmp.path(), TOTAL_SECTORS as u64 * 512)
-        .expect("FileBackend create");
+    let mut dev =
+        FileBackend::create(tmp.path(), TOTAL_SECTORS as u64 * 512).expect("FileBackend create");
     let opts = FatFormatOpts {
         total_sectors: TOTAL_SECTORS,
         ..FatFormatOpts::default()
@@ -735,4 +753,3 @@ fn fuzz_xfs() {
         &Caps::mutable_small(),
     );
 }
-

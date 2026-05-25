@@ -785,6 +785,50 @@ impl crate::fs::Filesystem for Squashfs {
         Ok(Box::new(r))
     }
 
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        let m = self.inode_meta(dev, s)?;
+        // SquashFS stores only mtime (unix seconds); atime/ctime mirror it.
+        Ok(crate::fs::FileAttrs {
+            kind: m.kind,
+            mode: m.mode & 0o7777,
+            uid: m.uid,
+            gid: m.gid,
+            size: m.file_size,
+            blocks: m.file_size.div_ceil(512),
+            nlink: 1,
+            atime: m.mtime,
+            mtime: m.mtime,
+            ctime: m.mtime,
+            rdev: 0,
+            inode: m.inode_number,
+        })
+    }
+
+    fn list_xattrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::XattrPair>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("squashfs: non-UTF-8 path".into()))?;
+        Ok(self
+            .read_xattrs(dev, s)?
+            .into_iter()
+            .map(|x| crate::fs::XattrPair {
+                name: x.key,
+                value: x.value,
+            })
+            .collect())
+    }
+
     fn open_file_ro<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,

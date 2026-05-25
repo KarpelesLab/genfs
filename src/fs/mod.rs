@@ -96,6 +96,14 @@ pub enum FileSource {
     /// the filesystem may either allocate zero blocks (true hole) or allocate
     /// data blocks and leave them zero, depending on its feature flags.
     Zero(u64),
+    /// Stream from an owned temporary file. The handle lives inside the
+    /// source, so deferred-write backends (SquashFS / ISO 9660 / GRF,
+    /// which keep the `FileSource` and read it at `flush`) keep the
+    /// backing bytes until they're consumed — then the temp file is
+    /// deleted on drop. Used by the default
+    /// [`Filesystem::create_file_streaming`] to bridge a borrowed reader
+    /// into the `FileSource` API without buffering the whole file in RAM.
+    TempFile(tempfile::NamedTempFile),
 }
 
 impl FileSource {
@@ -105,6 +113,7 @@ impl FileSource {
             FileSource::HostPath(p) => Ok(std::fs::metadata(p)?.len()),
             FileSource::Reader { len, .. } => Ok(*len),
             FileSource::Zero(n) => Ok(*n),
+            FileSource::TempFile(t) => Ok(t.as_file().metadata()?.len()),
         }
     }
 
@@ -126,6 +135,15 @@ impl FileSource {
             }
             FileSource::Reader { reader, len } => Ok((reader, len)),
             FileSource::Zero(n) => Ok((Box::new(ZeroReader { remaining: n }), n)),
+            FileSource::TempFile(t) => {
+                // Re-open the temp file by path for an independent cursor;
+                // the `NamedTempFile` is dropped here, but on a deferred
+                // backend the source was opened at flush time so the file
+                // still exists. (The backend owns the source until then.)
+                let len = t.as_file().metadata()?.len();
+                let f = File::open(t.path())?;
+                Ok((Box::new(f), len))
+            }
         }
     }
 }
@@ -448,10 +466,12 @@ pub trait Filesystem {
         let mut limited = body.take(len);
         io::copy(&mut limited, tmp.as_file_mut())?;
         tmp.as_file_mut().sync_all()?;
-        let path_buf = tmp.path().to_path_buf();
-        let res = self.create_file(dev, path, FileSource::HostPath(path_buf), meta);
-        drop(tmp);
-        res
+        // Hand the temp file to the backend as an *owned* source: a
+        // deferred-write backend (SquashFS / ISO 9660 / GRF) stores the
+        // `FileSource` and reads it at `flush`, so the bytes must outlive
+        // this call. `FileSource::TempFile` keeps them alive until the
+        // backend consumes (and drops) the source.
+        self.create_file(dev, path, FileSource::TempFile(tmp), meta)
     }
 
     /// Create a directory at `path`.

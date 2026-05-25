@@ -117,6 +117,80 @@ fn zip_source_repacks_to_ext4() {
     assert_eq!(out.stdout, b"deep contents\n");
 }
 
+/// `create` into the deferred-write backends (SquashFS / ISO 9660 / GRF)
+/// from a host directory. These keep the `FileSource` and read it at
+/// `flush`, so the body must outlive `create_file` — a regression guard
+/// for `FileSource::TempFile`. (Their lib-level tests drive the writer
+/// API directly and wouldn't catch a broken CLI `create` path.)
+#[test]
+fn create_deferred_write_backends_from_dir() {
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("src");
+    stage(&src);
+    for fs in ["squashfs", "iso", "grf"] {
+        let out = work.path().join(format!("o.{fs}"));
+        let (ok, err) = run(&[
+            "create",
+            "-t",
+            fs,
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+        assert!(ok, "create -t {fs} failed: {err}");
+        let cat = Command::new(FSTOOL)
+            .args(["cat", out.to_str().unwrap(), "/sub/deep.txt"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            cat.stdout, b"deep contents\n",
+            "{fs}: body wrong after create"
+        );
+    }
+}
+
+/// SquashFS source metadata fidelity: a `0640` file repacked to tar
+/// keeps its mode + uid/gid (SquashFS `getattr` reads them from the
+/// inode header + id table).
+#[test]
+#[cfg(unix)]
+fn squashfs_source_preserves_mode_into_tar() {
+    if !which("tar") {
+        eprintln!("skipping: tar not installed");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let f = src.join("s.txt");
+    std::fs::write(&f, b"x\n").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    let img = work.path().join("fs.sqsh");
+    assert!(
+        run(&[
+            "create",
+            "-t",
+            "squashfs",
+            src.to_str().unwrap(),
+            "-o",
+            img.to_str().unwrap()
+        ])
+        .0
+    );
+    let tar = work.path().join("out.tar");
+    assert!(run(&["repack", img.to_str().unwrap(), tar.to_str().unwrap()]).0);
+
+    let listing = Command::new("tar").arg("tvf").arg(&tar).output().unwrap();
+    let s = String::from_utf8_lossy(&listing.stdout);
+    let line = s.lines().find(|l| l.contains("s.txt")).unwrap_or("");
+    assert!(
+        line.contains("rw-r-----"),
+        "squashfs mode not preserved:\n{line}"
+    );
+}
+
 /// Metadata fidelity through a non-ext source: build an f2fs image with
 /// a `0640` file, repack it to tar, and confirm the mode + uid/gid
 /// survive — proving f2fs's `getattr` is faithful (it would default to

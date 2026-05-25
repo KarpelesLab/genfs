@@ -118,11 +118,19 @@ fn zip_source_repacks_to_ext4() {
 }
 
 /// A **compressed-tar** source streamed into ext4 — the path that must
-/// NOT decompress to a tempfile. Builds a `.tar.gz` (via fstool's own
-/// tar+gzip writer), then repacks it into an ext4 image and confirms
-/// the tree + a nested file + a symlink survive, with `--size`
-/// (single streaming pass) and `--shrink` (sizing pass + write pass)
-/// both producing an `e2fsck`-clean image.
+/// NOT decompress to a tempfile. Builds a `.tar.gz` (with system `tar`),
+/// then repacks it into an ext4 image and confirms the tree + a nested
+/// file + a symlink survive, with `--size` (single streaming pass) and
+/// `--shrink` (sizing pass + write pass) both producing an
+/// `e2fsck`-clean image.
+///
+/// Unix-only: Windows `tar.exe` writes archive member names with a
+/// different separator convention, so the *input* archive this test
+/// builds isn't portable. The streaming repack code itself is
+/// byte-oriented and platform-agnostic — it's exercised on the Linux
+/// and macOS runners (both of which also have `e2fsck` / a usable
+/// `tar`).
+#[cfg(unix)]
 #[test]
 fn compressed_tar_source_streams_to_ext4() {
     if !which("tar") {

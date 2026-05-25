@@ -174,6 +174,11 @@ pub struct Writer {
     pub(crate) indirect_nodes: BTreeMap<u32, IndirectNode>,
     /// Directory contents, indexed by directory nid.
     pub(crate) children: DirChildren,
+    /// `name → child-nid` index per directory, mirroring `children`, for
+    /// O(1) duplicate / path-component lookups. Without it, every
+    /// `resolve_for_create` rescans the whole (growing) directory, which
+    /// is O(n²) over a bulk insert of a large directory.
+    pub(crate) child_index: std::collections::HashMap<u32, std::collections::HashMap<Vec<u8>, u32>>,
     /// Inline-dentry directories that have already spilled to a block
     /// because they got too big. Once a dir spills it stays block-format.
     pub(crate) spilled_dirs: BTreeMap<u32, ()>,
@@ -208,6 +213,11 @@ impl Writer {
             },
         );
         children.insert(3, Vec::new());
+        let mut child_index: std::collections::HashMap<
+            u32,
+            std::collections::HashMap<Vec<u8>, u32>,
+        > = std::collections::HashMap::new();
+        child_index.insert(3, std::collections::HashMap::new());
 
         // Reserved layout for the 6 cursegs (matches mkfs.f2fs):
         //   main seg 0 → CURSEG_HOT_NODE (root inode lives here)
@@ -231,6 +241,7 @@ impl Writer {
             direct_nodes: BTreeMap::new(),
             indirect_nodes: BTreeMap::new(),
             children,
+            child_index,
             spilled_dirs: BTreeMap::new(),
         }
     }
@@ -317,25 +328,22 @@ impl Writer {
                 "f2fs: empty path {s:?}"
             )));
         }
-        // Walk the tree by descending through known children.
+        // Walk the tree by descending through known children, using the
+        // per-directory name index (O(1) per component, not O(dir size)).
         let mut cur = 3u32;
         for comp in &parts[..parts.len() - 1] {
-            let kids = self.children.get(&cur).ok_or_else(|| {
+            let idx = self.child_index.get(&cur).ok_or_else(|| {
                 crate::Error::InvalidArgument(format!("f2fs: parent of {s:?} not a known dir"))
             })?;
-            let found = kids
-                .iter()
-                .find(|d| d.name == comp.as_bytes())
-                .ok_or_else(|| {
-                    crate::Error::InvalidArgument(format!("f2fs: no such dir {comp:?} in {s:?}"))
-                })?;
-            cur = found.ino;
+            cur = *idx.get(comp.as_bytes()).ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("f2fs: no such dir {comp:?} in {s:?}"))
+            })?;
         }
         let leaf = parts[parts.len() - 1].as_bytes().to_vec();
         let existing = self
-            .children
+            .child_index
             .get(&cur)
-            .and_then(|kids| kids.iter().find(|d| d.name == leaf).map(|d| d.ino));
+            .and_then(|idx| idx.get(leaf.as_slice()).copied());
         Ok((cur, leaf, existing))
     }
 
@@ -796,6 +804,8 @@ impl Writer {
             },
         );
         self.children.insert(nid, Vec::new());
+        self.child_index
+            .insert(nid, std::collections::HashMap::new());
 
         // Parent gains a link (".." back-reference).
         if let Some(parent) = self.inodes.get_mut(&parent_nid) {
@@ -1011,11 +1021,17 @@ impl Writer {
             name: name.to_vec(),
         };
         self.children.entry(parent_nid).or_default().push(dentry);
-        // Re-check whether the parent still fits in inline space; spill
-        // to a regular dentry block if not.
-        let kids = self.children.get(&parent_nid).unwrap();
-        let inline_ok = fits_in_inline(kids);
-        if !inline_ok {
+        self.child_index
+            .entry(parent_nid)
+            .or_default()
+            .insert(name.to_vec(), child_nid);
+        // Re-check whether the parent still fits in inline space; spill to a
+        // regular dentry block if not. Once spilled the answer can't change,
+        // so skip the (O(n)) re-scan — otherwise a bulk insert of a large
+        // directory is O(n²).
+        if !self.spilled_dirs.contains_key(&parent_nid)
+            && !fits_in_inline(self.children.get(&parent_nid).unwrap())
+        {
             // Spill: clear INLINE_DENTRY and allocate a 4 KiB dentry block.
             let ino = self
                 .inodes
@@ -1055,11 +1071,15 @@ impl Writer {
         if let Some(kids) = self.children.get_mut(&parent_nid) {
             kids.retain(|d| d.name != leaf);
         }
+        if let Some(idx) = self.child_index.get_mut(&parent_nid) {
+            idx.remove(&leaf);
+        }
         // Drop bookkeeping for the child (its on-disk blocks become
         // "abandoned" but that's fine for a fresh-image writer; the
         // checkpoint will simply omit the nid from NAT).
         self.inodes.remove(&child);
         self.children.remove(&child);
+        self.child_index.remove(&child);
         // If the removed entry was a directory, the parent loses a link.
         if let Some(parent) = self.inodes.get_mut(&parent_nid) {
             if parent.links > 1 {

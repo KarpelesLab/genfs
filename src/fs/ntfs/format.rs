@@ -488,7 +488,7 @@ pub fn build_non_resident_attr(
 /// `start_lcn` of length `length` clusters. Returns the bytes (followed
 /// by the 0x00 terminator).
 pub fn encode_single_run(start_lcn: u64, length: u64) -> Vec<u8> {
-    let len_size = min_unsigned_bytes(length);
+    let len_size = min_run_length_bytes(length);
     let off_size = min_signed_bytes(start_lcn as i64);
     let mut out = Vec::with_capacity(1 + len_size + off_size + 1);
     out.push(((off_size as u8) << 4) | (len_size as u8));
@@ -506,7 +506,7 @@ pub fn encode_run_list(extents: &[(u64, u64)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut prev_lcn: i64 = 0;
     for &(lcn, length) in extents {
-        let len_size = min_unsigned_bytes(length);
+        let len_size = min_run_length_bytes(length);
         let delta = (lcn as i64) - prev_lcn;
         let off_size = min_signed_bytes(delta);
         out.push(((off_size as u8) << 4) | (len_size as u8));
@@ -530,6 +530,24 @@ fn min_unsigned_bytes(v: u64) -> usize {
         x >>= 8;
     }
     n
+}
+
+/// Bytes needed to encode an NTFS run **length**. Run lengths are
+/// semantically unsigned, but the on-disk mapping-pairs format stores the
+/// most-significant byte as signed: ntfs-3g (and Windows) read the length's
+/// top byte with `(s8)` and sign-extend it. A length whose minimal unsigned
+/// encoding leaves bit 7 of the top byte set (e.g. `128` → single byte
+/// `0x80`, which sign-extends to `-128`) is therefore rejected with
+/// "Invalid length in mapping pairs array". Pad with a leading zero byte in
+/// that case so the stored value stays non-negative — exactly the rule a
+/// positive signed integer follows.
+fn min_run_length_bytes(length: u64) -> usize {
+    let n = min_unsigned_bytes(length);
+    if length != 0 && (length >> ((n - 1) * 8)) & 0x80 != 0 {
+        n + 1
+    } else {
+        n
+    }
 }
 
 fn min_signed_bytes(v: i64) -> usize {
@@ -937,7 +955,7 @@ pub fn build_badclus_record(
         .collect();
     // Sparse run: length-only header.
     let mut sparse_runs = Vec::new();
-    let len_size = min_unsigned_bytes(total_clusters);
+    let len_size = min_run_length_bytes(total_clusters);
     sparse_runs.push(len_size as u8); // off_size = 0
     sparse_runs.extend_from_slice(&total_clusters.to_le_bytes()[..len_size]);
     sparse_runs.push(0); // terminator
@@ -2495,6 +2513,31 @@ mod tests {
         let r = encode_single_run(20, 1);
         // header: off_size=1, len_size=1 → 0x11; length=0x01; offset=0x14; terminator
         assert_eq!(r, vec![0x11, 0x01, 0x14, 0x00]);
+    }
+
+    #[test]
+    fn min_run_length_bytes_avoids_signed_misread() {
+        // Lengths whose minimal-unsigned top byte has bit 7 set must gain a
+        // leading zero byte — ntfs-3g sign-extends the run length's high
+        // byte, so a bare 0x80 reads as -128 ("Invalid length").
+        assert_eq!(min_run_length_bytes(0), 1);
+        assert_eq!(min_run_length_bytes(8), 1);
+        assert_eq!(min_run_length_bytes(0x7f), 1);
+        assert_eq!(min_run_length_bytes(0x80), 2); // 128 → 0x80,0x00
+        assert_eq!(min_run_length_bytes(0xff), 2);
+        assert_eq!(min_run_length_bytes(0x100), 2); // top byte 0x01, ok
+        assert_eq!(min_run_length_bytes(0x7fff), 2);
+        assert_eq!(min_run_length_bytes(0x8000), 3); // 32768 → 0x00,0x80,0x00
+    }
+
+    #[test]
+    fn encode_run_length_128_has_leading_zero() {
+        // A 128-cluster run at delta +64 must encode the length as two
+        // bytes (0x80, 0x00), not a single 0x80 that decodes as negative.
+        let r = encode_run_list(&[(64, 128)]);
+        // header low nibble = len_size = 2, high nibble = off_size = 1.
+        assert_eq!(r[0] & 0x0f, 2);
+        assert_eq!(&r[1..3], &[0x80, 0x00]);
     }
 
     #[test]

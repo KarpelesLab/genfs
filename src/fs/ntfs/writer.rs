@@ -125,19 +125,40 @@ impl WriterState {
         ))
     }
 
-    /// Allocate one additional MFT extent (8 clusters = 32 records).
+    /// Grow the $MFT. Doubles the current MFT data size (min 8 clusters)
+    /// so a large file count accrues in O(log n) extents — otherwise the
+    /// hundreds of 8-cluster extents make record 0's $DATA runlist overflow
+    /// the 1 KiB record. Also grows the non-resident MFT `$BITMAP`'s
+    /// backing clusters (relocating it) when one bit per record no longer
+    /// fits the current allocation.
     fn extend_mft(&mut self, _dev: &mut dyn BlockDevice) -> Result<()> {
-        let new_clusters = 8u64;
-        let new_lcn = self.layout.bitmap.allocate(new_clusters)?;
-        // Extend in-memory state.
+        let cluster_size = self.cluster_size;
         let rec_size = self.layout.mft_record_size as u64;
-        let new_records = new_clusters * self.cluster_size / rec_size;
+
+        // Double the MFT data region.
+        let cur_data: u64 = self.layout.mft_extents.iter().map(|(_, l)| *l).sum();
+        let new_clusters = cur_data.max(8);
+        let new_lcn = self.layout.bitmap.allocate(new_clusters)?;
+        let new_records = new_clusters * cluster_size / rec_size;
         self.layout.mft_extents.push((new_lcn, new_clusters));
         self.layout.mft_records += new_records;
-        // Grow MFT bitmap.
+
+        // Grow the in-memory bitmap to one bit per record.
         let new_bm_size = self.layout.mft_records.div_ceil(8) as usize;
         while self.mft_bitmap.len() < new_bm_size {
             self.mft_bitmap.push(0);
+        }
+        // Ensure the on-disk $BITMAP region is large enough; relocate to a
+        // fresh (doubled) contiguous run when it isn't. The old run leaks
+        // into used space — negligible against the MFT itself.
+        let needed_clusters = (new_bm_size as u64).div_ceil(cluster_size);
+        if needed_clusters > self.layout.mft_bitmap_clusters {
+            let grow_to = needed_clusters
+                .max(self.layout.mft_bitmap_clusters * 2)
+                .max(1);
+            let new_bm_lcn = self.layout.bitmap.allocate(grow_to)?;
+            self.layout.mft_bitmap_lcn = new_bm_lcn;
+            self.layout.mft_bitmap_clusters = grow_to;
         }
         self.dirty = true;
         Ok(())
@@ -1086,10 +1107,16 @@ impl super::Ntfs {
                 dev.write_at(off + w.layout.bitmap.bytes.len() as u64, &pad)?;
             }
         }
-        // 2) Restamp MFT-internal bitmap.
+        // 2) Restamp MFT-internal bitmap (padded to its full region; bits
+        //    past the record count read as free).
         {
             let off = w.layout.mft_bitmap_lcn * cluster_size;
             dev.write_at(off, &w.mft_bitmap)?;
+            let region = w.layout.mft_bitmap_clusters * cluster_size;
+            if (w.mft_bitmap.len() as u64) < region {
+                let pad = vec![0u8; (region - w.mft_bitmap.len() as u64) as usize];
+                dev.write_at(off + w.mft_bitmap.len() as u64, &pad)?;
+            }
         }
         // 3) Re-stamp $MFT record 0 with the updated $DATA run list.
         {
@@ -1111,6 +1138,18 @@ impl super::Ntfs {
             // First extent's start is record 0's home.
             let off = w.layout.mft_extents[0].0 * cluster_size;
             dev.write_at(off, &rec_buf)?;
+        }
+        // 3b) Re-sync $MFTMirr with the current first four MFT records.
+        //     Record 0's $DATA runlist changes when the MFT grows, so the
+        //     mirror must be refreshed or ntfs-3g refuses to mount
+        //     ("$MFTMirr does not match $MFT"); ntfsfix silently corrected
+        //     it, which masked the staleness in tests.
+        {
+            let mirr_off = w.layout.mftmirr_lcn * cluster_size;
+            let mft_start = w.layout.mft_extents[0].0 * cluster_size;
+            let mut buf = vec![0u8; 4 * rec_size];
+            dev.read_at(mft_start, &mut buf)?;
+            dev.write_at(mirr_off, &buf)?;
         }
         // 4) Boot sector: nothing structural changed, but stamp it again for
         //    durability — also re-write the backup at the last LBA.
@@ -1355,28 +1394,30 @@ impl super::Ntfs {
         // `ntfs-3g` binary-searches the INDX block.
         existing_entries.sort_by_key(|e| format::entry_sort_key(e));
 
-        // Build INDX block payload.
-        let mut block_buf = build_indx_block(
-            index_block_size as usize,
-            sector_size,
-            0, // this block's VCN
-            &existing_entries,
-        )?;
-        // Install fixup on the INDX block (it uses USA the same way MFT does).
-        mft::install_fixup(&mut block_buf, sector_size, 1);
+        // Bulk-load a balanced B-tree of INDX blocks (one VCN each). A
+        // small directory yields a single leaf at VCN 0; a large one a
+        // multi-level tree whose root the $INDEX_ROOT points at.
+        let (root_vcn, blocks) =
+            build_index_btree(&existing_entries, index_block_size as usize, sector_size)?;
+        let nblocks = blocks.len() as u64;
 
-        // Allocate clusters for $INDEX_ALLOCATION.
-        let alloc_lcn = writer.alloc_clusters(clusters_per_block)?;
-        let alloc_off = alloc_lcn * cluster_size;
-        dev.write_at(alloc_off, &block_buf)?;
-        if block_buf.len() < (clusters_per_block * cluster_size) as usize {
-            let pad = vec![0u8; (clusters_per_block * cluster_size) as usize - block_buf.len()];
-            dev.write_at(alloc_off + block_buf.len() as u64, &pad)?;
+        // One VCN per INDX block, `clusters_per_block` clusters each, in
+        // one contiguous run so VCN v → LCN base + v*cpb.
+        let total_clusters = nblocks * clusters_per_block;
+        let alloc_lcn = writer.alloc_clusters(total_clusters)?;
+        let block_span = (clusters_per_block * cluster_size) as usize;
+        for (vcn, block) in &blocks {
+            let off = (alloc_lcn + vcn * clusters_per_block) * cluster_size;
+            dev.write_at(off, block)?;
+            if block.len() < block_span {
+                let pad = vec![0u8; block_span - block.len()];
+                dev.write_at(off + block.len() as u64, &pad)?;
+            }
         }
 
-        // Build the new $INDEX_ROOT with LARGE_INDEX flag + a single
-        // "child" terminator entry pointing at VCN 0.
-        let new_root = build_large_index_root(0);
+        // $INDEX_ROOT: LARGE_INDEX with a single child terminator pointing
+        // at the tree root's VCN.
+        let new_root = build_large_index_root(root_vcn);
         rewrite_resident_attr(&mut rec, rec_size, TYPE_INDEX_ROOT, "$I30", &new_root)?;
 
         // Add $INDEX_ALLOCATION attribute (named "$I30").
@@ -1384,22 +1425,22 @@ impl super::Ntfs {
             .encode_utf16()
             .flat_map(|u| u.to_le_bytes())
             .collect();
-        let runs = encode_single_run(alloc_lcn, clusters_per_block);
+        let runs = encode_single_run(alloc_lcn, total_clusters);
+        let alloc_size = total_clusters * cluster_size;
         let alloc_attr = build_non_resident_attr(
             TYPE_INDEX_ALLOCATION,
             &i30_name,
             &runs,
             0,
-            clusters_per_block - 1,
-            clusters_per_block * cluster_size,
-            clusters_per_block * cluster_size,
-            clusters_per_block * cluster_size,
+            total_clusters - 1,
+            alloc_size,
+            alloc_size,
+            alloc_size,
             0,
             0,
         );
-        // Add $BITMAP attribute for $INDEX_ALLOCATION (1 bit per block).
-        // Resident: just one byte, with bit 0 set (block 0 in use).
-        let bm_value = vec![0x01u8, 0, 0, 0, 0, 0, 0, 0]; // 8 bytes for alignment
+        // $BITMAP: one bit per INDX block (VCN), all in use.
+        let bm_value = build_index_bitmap(nblocks);
         let bm_attr =
             build_resident_attr(super::attribute::TYPE_BITMAP, &i30_name, &bm_value, 0, 0);
 
@@ -1702,6 +1743,177 @@ fn build_indx_block(
     }
     buf[cursor..cursor + term_entry.len()].copy_from_slice(&term_entry);
     Ok(buf)
+}
+
+/// Build one INDX block at `vcn` from already-encoded index entries, with
+/// a terminator that ends a leaf (`None`, flags LAST) or an internal node
+/// (`Some(child)`, flags HAS_CHILD|LAST + the rightmost child VCN). The
+/// header's INDEX_NODE flag (0x24) is set for internal nodes; the USA
+/// fixup is installed here.
+fn build_indx_block_full(
+    block_size: usize,
+    sector_size: usize,
+    vcn: u64,
+    entries: &[Vec<u8>],
+    terminator_child: Option<u64>,
+) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; block_size];
+    buf[0..4].copy_from_slice(b"INDX");
+    buf[4..6].copy_from_slice(&0x28u16.to_le_bytes());
+    let sectors = block_size / sector_size;
+    let usa_size = sectors + 1;
+    buf[6..8].copy_from_slice(&(usa_size as u16).to_le_bytes());
+    buf[16..24].copy_from_slice(&vcn.to_le_bytes());
+    let usa_end = 0x28 + 2 * usa_size;
+    let entries_start = (usa_end + 7) & !7;
+    let first_entry_offset = (entries_start - 0x18) as u32;
+    let term_entry: Vec<u8> = match terminator_child {
+        Some(child) => {
+            let mut e = vec![0u8; 24];
+            e[8..10].copy_from_slice(&24u16.to_le_bytes());
+            e[12..16].copy_from_slice(&0x03u32.to_le_bytes()); // HAS_CHILD | LAST
+            e[16..24].copy_from_slice(&child.to_le_bytes());
+            e
+        }
+        None => {
+            let mut e = vec![0u8; 16];
+            e[8..10].copy_from_slice(&16u16.to_le_bytes());
+            e[12..16].copy_from_slice(&0x02u32.to_le_bytes()); // LAST
+            e
+        }
+    };
+    let entries_total: usize = entries.iter().map(|e| e.len()).sum::<usize>() + term_entry.len();
+    if entries_start + entries_total > block_size {
+        return Err(crate::Error::Unsupported(
+            "ntfs: INDX node entries overflow the block".into(),
+        ));
+    }
+    let bytes_in_use = (entries_start - 0x18) as u32 + entries_total as u32;
+    let bytes_allocated = (block_size - 0x18) as u32;
+    buf[0x24] = if terminator_child.is_some() { 0x01 } else { 0 };
+    buf[0x18..0x1C].copy_from_slice(&first_entry_offset.to_le_bytes());
+    buf[0x1C..0x20].copy_from_slice(&bytes_in_use.to_le_bytes());
+    buf[0x20..0x24].copy_from_slice(&bytes_allocated.to_le_bytes());
+    let mut cursor = entries_start;
+    for e in entries {
+        buf[cursor..cursor + e.len()].copy_from_slice(e);
+        cursor += e.len();
+    }
+    buf[cursor..cursor + term_entry.len()].copy_from_slice(&term_entry);
+    mft::install_fixup(&mut buf, sector_size, 1);
+    Ok(buf)
+}
+
+/// One pending B-tree item during bulk-load: the raw $I30 index entry plus
+/// the VCN of the subtree sorting to its left (`None` at the leaf level).
+#[derive(Clone)]
+struct BtreeItem {
+    raw: Vec<u8>,
+    left_child: Option<u64>,
+}
+
+/// Index-entry bytes this item contributes: a leaf entry verbatim, or an
+/// internal entry re-encoded with its left-child VCN appended (HAS_CHILD).
+fn btree_item_entry(it: &BtreeItem) -> Vec<u8> {
+    match it.left_child {
+        None => it.raw.clone(),
+        Some(child) => {
+            let file_ref = u64::from_le_bytes(it.raw[0..8].try_into().unwrap());
+            let key_len = u16::from_le_bytes(it.raw[10..12].try_into().unwrap()) as usize;
+            build_index_entry(file_ref, &it.raw[16..16 + key_len], 0, Some(child))
+        }
+    }
+}
+
+/// One serialized INDX block: its VCN within `$INDEX_ALLOCATION` and the
+/// block bytes (with USA fixup already installed).
+type IndxBlock = (u64, Vec<u8>);
+
+/// Bulk-load a balanced NTFS `$I30` B-tree from a sorted entry set. Splits
+/// entries across leaf INDX blocks; between two siblings a separator entry
+/// is pulled up into the parent (NTFS keeps real entries in internal
+/// nodes), carrying the left sibling's VCN; the parent's terminator points
+/// at the rightmost child. Repeats level by level until one node remains —
+/// the root. Returns `(root_vcn, [(vcn, block_bytes)])` (fixups installed).
+fn build_index_btree(
+    entries: &[Vec<u8>],
+    block_size: usize,
+    sector_size: usize,
+) -> Result<(u64, Vec<IndxBlock>)> {
+    let sectors = block_size / sector_size;
+    let usa_end = 0x28 + 2 * (sectors + 1);
+    let entries_start = (usa_end + 7) & !7;
+
+    let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut next_vcn = 0u64;
+    let mut items: Vec<BtreeItem> = entries
+        .iter()
+        .map(|e| BtreeItem {
+            raw: e.clone(),
+            left_child: None,
+        })
+        .collect();
+    let mut rightmost: Option<u64> = None;
+
+    loop {
+        let internal = items.first().is_some_and(|i| i.left_child.is_some());
+        let term_len = if internal { 24 } else { 16 };
+        let usable = block_size - entries_start - term_len;
+
+        let build_node = |vcn: u64, group: &[BtreeItem], term_child: Option<u64>| {
+            let encoded: Vec<Vec<u8>> = group.iter().map(btree_item_entry).collect();
+            build_indx_block_full(block_size, sector_size, vcn, &encoded, term_child)
+        };
+
+        let mut parent: Vec<BtreeItem> = Vec::new();
+        let mut cur: Vec<BtreeItem> = Vec::new();
+        let mut cur_bytes = 0usize;
+        let mut i = 0;
+        while i < items.len() {
+            let elen = btree_item_entry(&items[i]).len();
+            if elen > usable {
+                return Err(crate::Error::Unsupported(
+                    "ntfs: a single directory entry is too large for an INDX block".into(),
+                ));
+            }
+            if !cur.is_empty() && cur_bytes + elen > usable {
+                let vcn = next_vcn;
+                next_vcn += 1;
+                out.push((vcn, build_node(vcn, &cur, items[i].left_child)?));
+                parent.push(BtreeItem {
+                    raw: items[i].raw.clone(),
+                    left_child: Some(vcn),
+                });
+                cur.clear();
+                cur_bytes = 0;
+                i += 1; // separator pulled up
+            } else {
+                cur_bytes += elen;
+                cur.push(items[i].clone());
+                i += 1;
+            }
+        }
+        let vcn = next_vcn;
+        next_vcn += 1;
+        out.push((vcn, build_node(vcn, &cur, rightmost)?));
+        if parent.is_empty() {
+            return Ok((vcn, out));
+        }
+        items = parent;
+        rightmost = Some(vcn);
+    }
+}
+
+/// Resident `$BITMAP` value marking the first `n` INDX blocks (VCNs) in
+/// use, rounded up to an 8-byte multiple.
+fn build_index_bitmap(n: u64) -> Vec<u8> {
+    let nbytes = ((n as usize).div_ceil(8)).max(1);
+    let nbytes = (nbytes + 7) & !7;
+    let mut v = vec![0u8; nbytes];
+    for i in 0..n as usize {
+        v[i / 8] |= 1u8 << (i % 8);
+    }
+    v
 }
 
 /// Build a LARGE-INDEX $INDEX_ROOT carrying only a terminator with a child

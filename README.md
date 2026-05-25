@@ -294,10 +294,14 @@ are de-duplicated when the destination supports them (ext) and
 materialised as copies otherwise (tar, FAT, …); a destination that can't
 hold a symlink/device/xattr (FAT) drops it with a warning.
 
-Source metadata fidelity depends on the reader: ext, tar, the archive
-formats, F2FS, and XFS surface full POSIX metadata; HFS+, SquashFS,
-ISO 9660 (Rock Ridge), APFS, and NTFS currently fall back to defaults for
-some fields (names, structure, content, and sizes always round-trip).
+Every reader surfaces the metadata its format actually stores:
+ext, tar, the archive formats, F2FS, XFS, SquashFS, APFS, and HFS+ carry
+full POSIX mode/uid/gid + timestamps (HFS+ converts its 1904 epoch);
+ISO 9660 does too when Rock Ridge is present (plain/Joliet have none);
+NTFS — which has no POSIX ownership — surfaces real timestamps + a mode
+synthesised from its DOS attributes, and carries its native metadata
+(DOS attrs, ADS, security descriptor, reparse data, …) through repack as
+`user.ntfs.*` / `system.ntfs_security` xattrs.
 
 `fstool repack` writes any destination implementing the `Filesystem`
 trait — `ext2/3/4`, FAT32, exFAT, tar, XFS, HFS+, APFS, NTFS, F2FS,

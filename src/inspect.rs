@@ -646,6 +646,61 @@ impl AnyFs {
         }
     }
 
+    /// Reflink / clone capability of the inner filesystem. Same shape
+    /// as [`Self::mutation_capability`], delegating to
+    /// [`crate::fs::Filesystem::clone_capability`]. Backends that
+    /// natively share extents return `WholeFile` or `Range`; everything
+    /// else reports `None`, in which case [`Self::clone_file`] still
+    /// works by byte-copy but [`Self::clone_range`] errors
+    /// `Unsupported`.
+    pub fn clone_capability(&self) -> crate::fs::CloneCapability {
+        match self {
+            Self::Ext(ext) => crate::fs::Filesystem::clone_capability(ext.as_ref()),
+            Self::Fat32(fat) => crate::fs::Filesystem::clone_capability(fat.as_ref()),
+            Self::HfsPlus(h) => crate::fs::Filesystem::clone_capability(h.as_ref()),
+            Self::Ntfs(n) => crate::fs::Filesystem::clone_capability(n.as_ref()),
+            Self::F2fs(fs2) => crate::fs::Filesystem::clone_capability(fs2.as_ref()),
+            Self::Squashfs(sq) => crate::fs::Filesystem::clone_capability(sq.as_ref()),
+            Self::Xfs(x) => crate::fs::Filesystem::clone_capability(x.as_ref()),
+            Self::Iso9660(iso) => crate::fs::Filesystem::clone_capability(iso.as_ref()),
+            Self::Tar(t) => crate::fs::Filesystem::clone_capability(t.as_ref()),
+            Self::Apfs(a) => crate::fs::Filesystem::clone_capability(a.as_ref()),
+            Self::Exfat(e) => crate::fs::Filesystem::clone_capability(e.as_ref()),
+            Self::Grf(g) => crate::fs::Filesystem::clone_capability(g.as_ref()),
+            Self::Archive(fs, _, _) => crate::fs::Filesystem::clone_capability(fs.as_ref()),
+        }
+    }
+
+    /// Clone the file at `src` to `dst`. Routes through the underlying
+    /// filesystem's [`crate::fs::Filesystem::clone_file`]: reflink-
+    /// capable backends share extents, everything else byte-copies.
+    /// Guarded by [`Self::require_mutable`] so immutable / streaming
+    /// backends fail with a typed error up front instead of erroring
+    /// deep inside the writer.
+    pub fn clone_file(&mut self, dev: &mut dyn BlockDevice, src: &str, dst: &str) -> Result<()> {
+        self.require_mutable("clone_file")?;
+        let s = std::path::Path::new(src);
+        let d = std::path::Path::new(dst);
+        self.as_filesystem_dyn(|fs| fs.clone_file(dev, s, d))
+    }
+
+    /// Clone an arbitrary byte range. Only reflink-capable backends
+    /// implement this; everything else returns `Unsupported`.
+    pub fn clone_range(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        src: &str,
+        src_off: u64,
+        dst: &str,
+        dst_off: u64,
+        len: u64,
+    ) -> Result<()> {
+        self.require_mutable("clone_range")?;
+        let s = std::path::Path::new(src);
+        let d = std::path::Path::new(dst);
+        self.as_filesystem_dyn(|fs| fs.clone_range(dev, s, src_off, d, dst_off, len))
+    }
+
     /// Internal guard: emit the right typed error variant for the
     /// failure mode of a non-mutable filesystem before dispatching a
     /// write call. APFS/exFAT — whose writers simply aren't wired

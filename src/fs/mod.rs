@@ -414,6 +414,48 @@ impl MutationCapability {
     }
 }
 
+/// What kind of zero-copy extent sharing — *reflinks* — the backend
+/// can express. Returned by [`Filesystem::clone_capability`].
+///
+/// Reflinks let a destination file (or a range of it) point at the
+/// same physical extents as a source, with copy-on-write semantics on
+/// the next write to either side. The on-disk encoding differs per
+/// backend (XFS refcount-btree, APFS clone records, Btrfs shared
+/// extents), so the trait surface offers two operations and a
+/// capability gate, with sensible byte-copy fallbacks for backends
+/// that can't share extents natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneCapability {
+    /// No extent sharing. `clone_file` falls back to a stream-copy
+    /// (semantically equivalent, just not zero-copy); `clone_range`
+    /// returns [`crate::Error::Unsupported`].
+    None,
+    /// Whole-file clone only — the backend can share *every* extent
+    /// of the source into the destination as one atomic operation
+    /// (e.g. APFS file-clone records). Sub-file ranges aren't
+    /// individually shareable, so `clone_range` still errors
+    /// `Unsupported` unless the range exactly covers the whole file.
+    WholeFile,
+    /// Arbitrary range clone — `clone_range` works for any allocation-
+    /// unit-aligned `(src_off, dst_off, len)` triple. XFS reflink,
+    /// Btrfs `BTRFS_IOC_CLONE_RANGE`, and `FICLONERANGE` in general.
+    Range,
+}
+
+impl CloneCapability {
+    /// True for [`CloneCapability::WholeFile`] or [`CloneCapability::Range`].
+    /// `clone_file` is guaranteed not to byte-copy in this case.
+    pub fn shares_extents(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// True only for [`CloneCapability::Range`] — i.e. sub-file
+    /// `clone_range` calls will succeed (assuming alignment etc.).
+    pub fn supports_range(self) -> bool {
+        matches!(self, Self::Range)
+    }
+}
+
 /// File-type bucket exposed by [`DirEntry`]. Mirrors POSIX `d_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -617,6 +659,97 @@ pub trait Filesystem {
     /// [`Self::mutation_capability`] directly.
     fn supports_mutation(&self) -> bool {
         self.mutation_capability().supports_add_remove()
+    }
+
+    /// Reflink / clone capability of this filesystem — does it natively
+    /// share extents, and at what granularity?
+    ///
+    /// Default: [`CloneCapability::None`] — `clone_file` will byte-copy
+    /// and `clone_range` will return `Unsupported`. Reflink-capable
+    /// backends (XFS once the REFLINK feature is on, APFS clones,
+    /// Btrfs) override to surface the right variant.
+    fn clone_capability(&self) -> CloneCapability {
+        CloneCapability::None
+    }
+
+    /// Clone the file at `src` into a new file at `dst`. Reflink-capable
+    /// backends share extents (zero data copy, refcount-btree updates);
+    /// everything else falls back to the default byte-copy.
+    ///
+    /// **Default behaviour.** Spools `src` to a host tempfile so the
+    /// read-borrow on `self` is dropped, then runs `create_file(dst,
+    /// FileSource::TempFile, ...)`. Best-effort metadata via
+    /// [`Self::getattr`] (mode / uid / gid / mtime); falls back to
+    /// [`FileMeta::default`] when the source backend has no `getattr`
+    /// implementation.
+    ///
+    /// **Contracts.**
+    /// * `src` must exist; `dst` must not already exist.
+    /// * `dst`'s parent directory must exist.
+    /// * The result is observable through `read_file` / `getattr`
+    ///   regardless of whether extents were shared — callers needn't
+    ///   inspect `clone_capability` to use this method.
+    ///
+    /// Returns `Err(Unsupported)` only when neither sharing nor the
+    /// default fallback can satisfy the call (e.g. an immutable
+    /// backend can't create files at all).
+    fn clone_file(
+        &mut self,
+        dev: &mut dyn crate::block::BlockDevice,
+        src: &Path,
+        dst: &Path,
+    ) -> crate::Result<()> {
+        // Best-effort metadata snapshot before the read borrow.
+        let meta = match self.getattr(dev, src) {
+            Ok(a) => FileMeta {
+                mode: a.mode,
+                uid: a.uid,
+                gid: a.gid,
+                mtime: a.mtime,
+                atime: a.atime,
+                ctime: a.ctime,
+            },
+            Err(_) => FileMeta::default(),
+        };
+        // Spool to a tempfile so the read borrow ends before create_file.
+        let mut tmp = tempfile::NamedTempFile::new().map_err(crate::Error::from)?;
+        {
+            let mut reader = self.read_file(dev, src)?;
+            io::copy(&mut reader, &mut tmp).map_err(crate::Error::from)?;
+        }
+        self.create_file(dev, dst, FileSource::TempFile(tmp), meta)
+    }
+
+    /// Clone an arbitrary byte range `src[src_off..src_off+len]` into
+    /// `dst[dst_off..dst_off+len]`. Reflink-capable backends share the
+    /// underlying extents (`BTRFS_IOC_CLONE_RANGE` / `FICLONERANGE`
+    /// semantics: writes through either side trigger COW).
+    ///
+    /// **Default:** [`crate::Error::Unsupported`]. Sub-file extent
+    /// sharing is fundamentally a refcount-btree operation; backends
+    /// without that machinery cannot satisfy it (a byte-copy would
+    /// have different semantics — writes through `src` *after* the
+    /// "clone" would NOT propagate, defeating the point).
+    ///
+    /// **Contracts** (when supported):
+    /// * `src` and `dst` must both exist (`dst` may equal `src`).
+    /// * `src_off + len` must not exceed `src`'s size; `dst_off` may
+    ///   extend `dst` (the backend grows it).
+    /// * Offsets and length must be aligned to the backend's
+    ///   allocation unit (typically the cluster / block size); the
+    ///   backend's docs specify the exact rule.
+    fn clone_range(
+        &mut self,
+        _dev: &mut dyn crate::block::BlockDevice,
+        _src: &Path,
+        _src_off: u64,
+        _dst: &Path,
+        _dst_off: u64,
+        _len: u64,
+    ) -> crate::Result<()> {
+        Err(crate::Error::Unsupported(
+            "this filesystem does not implement clone_range (no extent sharing)".into(),
+        ))
     }
 
     /// Read a symbolic link's target. Default returns `Unsupported`

@@ -536,7 +536,20 @@ pub fn encode_v5_block_dir(
     }
     let leaf_count = all.len() as u32;
     let leaf_bytes = (leaf_count as usize) * 8;
-    let tail_off = dir_block_size - 8 - leaf_bytes;
+    // The leaf array + 8-byte block tail grow down from the end of the
+    // block; the data records grow up from the header. If the leaf array
+    // alone would not leave room for the header, `dir_block_size - 8 -
+    // leaf_bytes` underflows (it's `usize`) and defeats the per-entry
+    // overflow guard below — surface a clean error instead of writing past
+    // the block. (The caller promotes to leaf/node format on this error.)
+    let tail_off = match dir_block_size.checked_sub(8 + leaf_bytes) {
+        Some(t) if t >= V5_DATA_HDR_SIZE => t,
+        _ => {
+            return Err(crate::Error::InvalidArgument(
+                "xfs: block dir overflowed available space".into(),
+            ));
+        }
+    };
 
     let mut pos = V5_DATA_HDR_SIZE;
     let mut leaf_pairs: Vec<(u32, u32)> = Vec::with_capacity(all.len());
@@ -1059,6 +1072,24 @@ mod tests {
             );
             prev_hash = h;
         }
+    }
+
+    /// A block directory with more entries than fit must return a clean
+    /// error, never panic. Regression guard: the leaf array + tail used to
+    /// underflow `dir_block_size - 8 - leaf_bytes` (usize) for large entry
+    /// counts, defeating the per-entry overflow check and writing past the
+    /// block (slice-index panic at ~1000 entries).
+    #[test]
+    fn encode_v5_block_dir_overflow_is_clean_error() {
+        let entries: Vec<(String, u64, u8)> = (0..2000)
+            .map(|i| (format!("file{i:05}"), 1000 + i as u64, XFS_DIR3_FT_REG_FILE))
+            .collect();
+        let err = encode_v5_block_dir(4096, 64, 64, &entries, &[0u8; 16], 0)
+            .expect_err("2000 entries must overflow a 4 KiB block dir");
+        assert!(
+            matches!(err, crate::Error::InvalidArgument(_)),
+            "expected a clean InvalidArgument, got {err:?}"
+        );
     }
 
     /// Shortform directories where the parent inode (or any child) exceeds

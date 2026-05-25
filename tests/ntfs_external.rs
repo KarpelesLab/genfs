@@ -471,6 +471,140 @@ fn reopen_then_add_file_roundtrips_and_validates() {
     }
 }
 
+/// NTFS char / block device round-trip through ntfs-3g's `INTX_FILE`
+/// representation. Plants a `/null` (char 1:3) and `/loop0` (block 7:0)
+/// on a fresh volume, flushes, and verifies:
+///   * `ntfsfix --no-action` reports clean;
+///   * `ntfscat /<path>` returns exactly 24 bytes whose first 8 bytes
+///     are `IntxCHR\0` / `IntxBLK\0` and whose remaining 16 bytes
+///     decode to the (major, minor) we asked for — i.e. ntfs-3g sees
+///     the same `INTX_FILE` payload it would have written itself.
+///
+/// Also pins the negative contract: FIFO and socket return Unsupported
+/// (ntfs-3g's `INTX_FILE_TYPES` enum only knows LNK / CHR / BLK).
+#[test]
+fn writer_device_nodes_round_trip_via_ntfscat() {
+    if which("ntfsfix").is_none() {
+        eprintln!("skipping: ntfsfix not installed");
+        return;
+    }
+    if which("ntfscat").is_none() {
+        eprintln!("skipping: ntfscat not installed");
+        return;
+    }
+
+    // Fresh image (we don't reuse build_image_with_tree because we want
+    // a tighter root for the device-node assertions below).
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), 16 * 1024 * 1024).unwrap();
+    let opts = FormatOpts {
+        volume_label: "FSTOOL-DEV".to_string(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+
+    use fstool::fs::DeviceKind;
+    ntfs.create_device(
+        &mut dev,
+        "/null",
+        DeviceKind::Char,
+        1,
+        3,
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.create_device(
+        &mut dev,
+        "/loop0",
+        DeviceKind::Block,
+        7,
+        0,
+        FileMeta::default(),
+    )
+    .unwrap();
+
+    // Negative cases: FIFO / Socket reject cleanly.
+    let err = ntfs
+        .create_device(
+            &mut dev,
+            "/pipe",
+            DeviceKind::Fifo,
+            0,
+            0,
+            FileMeta::default(),
+        )
+        .expect_err("FIFO must reject on NTFS");
+    assert!(
+        matches!(err, fstool::Error::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+    let err = ntfs
+        .create_device(
+            &mut dev,
+            "/sock",
+            DeviceKind::Socket,
+            0,
+            0,
+            FileMeta::default(),
+        )
+        .expect_err("socket must reject on NTFS");
+    assert!(matches!(err, fstool::Error::Unsupported(_)));
+
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // ntfsfix --no-action stays clean.
+    let out = Command::new("ntfsfix")
+        .arg("--no-action")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Mounting volume... OK"),
+        "ntfsfix did not cleanly mount the device-node image:\n{combined}"
+    );
+
+    // ntfscat returns the 24-byte INTX_FILE payload byte-exact.
+    for (path, want_magic, major, minor) in [
+        ("/null", b"IntxCHR\0", 1u32, 3u32),
+        ("/loop0", b"IntxBLK\0", 7u32, 0u32),
+    ] {
+        let out = Command::new("ntfscat")
+            .arg("--force")
+            .arg(tmp.path())
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ntfscat failed on {path}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.stdout.len(),
+            24,
+            "expected 24-byte INTX_FILE payload for {path}, got {} bytes",
+            out.stdout.len()
+        );
+        assert_eq!(
+            &out.stdout[..8],
+            want_magic,
+            "magic mismatch for {path}: got {:02x?}",
+            &out.stdout[..8]
+        );
+        let got_major = u64::from_le_bytes(out.stdout[8..16].try_into().unwrap());
+        let got_minor = u64::from_le_bytes(out.stdout[16..24].try_into().unwrap());
+        assert_eq!(got_major, major as u64, "major mismatch for {path}");
+        assert_eq!(got_minor, minor as u64, "minor mismatch for {path}");
+    }
+}
+
 /// Remove round-trip: build the standard tree (resident `hello.txt`,
 /// non-resident `sub/big.bin`, `link` symlink, `sub/` directory), drop
 /// the handle, reopen, remove each of them in dependency order, flush,

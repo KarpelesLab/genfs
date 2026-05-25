@@ -1656,6 +1656,44 @@ pub fn build_mftmirr_record(
 /// Returns `Err(Unsupported)` if the resulting root would exceed the
 /// `max_resident_bytes` budget — the caller should promote the directory
 /// to $INDEX_ALLOCATION at that point.
+/// Extract the NTFS-collation sort key from an `$I30` index entry: the
+/// UTF-16LE name from the embedded `$FILE_NAME` attribute, ASCII-folded
+/// to upper case. For pure-ASCII names (everything fstool's own writer
+/// emits) this matches the canonical `$UpCase` collation byte-for-byte;
+/// for non-ASCII code units we leave them as-is — the result is still a
+/// total order, so user-provided non-ASCII names sort consistently
+/// among themselves even if the exact key isn't strictly identical to
+/// what a Windows-installed `$UpCase` table would produce.
+///
+/// Returns the empty key for malformed entries — those sort first and
+/// surface in tests rather than corrupting the index.
+pub fn entry_sort_key(entry: &[u8]) -> Vec<u16> {
+    // FILE_NAME body starts at offset 16 within the entry. Name length
+    // (u8) at +64, namespace at +65 (unused for the key), name
+    // (UTF-16LE) at +66.
+    const NAME_LEN_OFF: usize = 16 + 64;
+    const NAME_OFF: usize = 16 + 66;
+    if entry.len() <= NAME_LEN_OFF {
+        return Vec::new();
+    }
+    let name_chars = entry[NAME_LEN_OFF] as usize;
+    if entry.len() < NAME_OFF + name_chars * 2 {
+        return Vec::new();
+    }
+    let mut key = Vec::with_capacity(name_chars);
+    for i in 0..name_chars {
+        let cu = u16::from_le_bytes([entry[NAME_OFF + i * 2], entry[NAME_OFF + i * 2 + 1]]);
+        // ASCII-only uppercase fold (a..z -> A..Z); leave the rest alone.
+        let folded = if (b'a' as u16..=b'z' as u16).contains(&cu) {
+            cu - 0x20
+        } else {
+            cu
+        };
+        key.push(folded);
+    }
+    key
+}
+
 pub fn insert_into_index_root(
     root_value: &[u8],
     new_entry: &[u8],
@@ -1674,10 +1712,11 @@ pub fn insert_into_index_root(
     let entries_start = 16 + 16; // index header starts at 16; entries at 16+16
     let entries_end = 16 + bytes_in_use; // bytes_in_use is measured from index header start
 
-    // Walk to find the terminator and the insertion point. We keep entries
-    // in input order (caller is responsible for ordering by collation if
-    // they care — for our SMALL_INDEX directories, NTFS will sort on next
-    // mount).
+    // Walk entries. We rebuild the index with the new entry inserted
+    // and the whole list sorted in NTFS collation order — `ntfs-3g`
+    // (and `ntfscat`'s path resolver) do binary-search lookups, so an
+    // unsorted index would only be readable by linear-walking tools
+    // like `ntfsls`.
     let mut cursor = entries_start;
     let mut entries: Vec<Vec<u8>> = Vec::new();
     let mut terminator: Vec<u8> = Vec::new();
@@ -1706,6 +1745,7 @@ pub fn insert_into_index_root(
         ));
     }
     entries.push(new_entry.to_vec());
+    entries.sort_by_key(|e| entry_sort_key(e));
 
     // Rebuild
     let entries_total: usize = entries.iter().map(|e| e.len()).sum::<usize>() + terminator.len();

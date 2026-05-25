@@ -544,20 +544,59 @@ impl super::Ntfs {
         Ok(())
     }
 
-    /// Special-file creation (FIFO / device nodes / sockets). NTFS doesn't
-    /// natively model these — we refuse with `Unsupported`.
+    /// Create a char or block device node. NTFS-3G represents these as
+    /// regular files whose `$DATA` carries an `INTX_FILE` header — an
+    /// 8-byte magic (`"IntxCHR\0"` / `"IntxBLK\0"`) followed by 8-byte
+    /// LE `major` and 8-byte LE `minor` (layout from
+    /// `/usr/include/ntfs-3g/layout.h`). The file is otherwise an
+    /// ordinary small-resident-$DATA regular file, so the entire
+    /// existing `create_file` path is reused.
+    ///
+    /// FIFOs and sockets have no `INTX_FILE` magic in `ntfs-3g`'s
+    /// vocabulary (only `IntxLNK` / `IntxCHR` / `IntxBLK` are defined),
+    /// so they are rejected with `Unsupported`. A consumer that needs
+    /// FIFO/socket semantics on NTFS should pick one of the other
+    /// writable backends (ext / FAT / HFS+).
     pub fn create_device(
         &mut self,
-        _dev: &mut dyn BlockDevice,
-        _path: &str,
-        _kind: DeviceKind,
-        _major: u32,
-        _minor: u32,
-        _meta: FileMeta,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        kind: DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "ntfs: special files (char/block/fifo/socket) are not representable".into(),
-        ))
+        // Build the 24-byte INTX_FILE payload (magic + major + minor LE).
+        // The magic bytes are the literal ASCII of `IntxCHR\0` / `IntxBLK\0`
+        // — matching `INTX_FILE_TYPES` in ntfs-3g's `layout.h`. Wider
+        // device numbers are accepted (u32 fits in the u64 field).
+        let magic: &[u8; 8] = match kind {
+            DeviceKind::Char => b"IntxCHR\0",
+            DeviceKind::Block => b"IntxBLK\0",
+            DeviceKind::Fifo | DeviceKind::Socket => {
+                return Err(crate::Error::Unsupported(
+                    "ntfs: FIFO / socket nodes are not representable in ntfs-3g's Intx \
+                     vocabulary (only char / block / symlink); use ext or HFS+ instead"
+                        .into(),
+                ));
+            }
+        };
+        let mut payload: Vec<u8> = Vec::with_capacity(24);
+        payload.extend_from_slice(magic);
+        payload.extend_from_slice(&(major as u64).to_le_bytes());
+        payload.extend_from_slice(&(minor as u64).to_le_bytes());
+        debug_assert_eq!(payload.len(), 24);
+
+        // Hand the payload to create_file. The 24-byte body is well
+        // under the resident-$DATA budget so the file stays resident
+        // (no clusters allocated), exactly how `ntfs-3g` writes its
+        // own device nodes.
+        let len = payload.len() as u64;
+        let src = FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(payload)),
+            len,
+        };
+        self.create_file(dev, path, src, meta)
     }
 
     /// Remove the file / empty directory / symlink at `path`. The inverse
@@ -1192,6 +1231,10 @@ impl super::Ntfs {
             cursor += entry_len;
         }
         existing_entries.push(new_entry.to_vec());
+        // Same rationale as `insert_into_index_root`: `ntfs-3g`'s
+        // path lookup binary-searches the INDX block, so the on-disk
+        // order must be the NTFS collation key.
+        existing_entries.sort_by_key(|e| format::entry_sort_key(e));
 
         // Rebuild and write.
         let mut new_block = build_indx_block(block_size, sector_size, 0, &existing_entries)?;

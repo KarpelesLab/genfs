@@ -1072,19 +1072,69 @@ fn writer_creates_symlink() {
 }
 
 #[test]
-fn writer_refuses_device_creation() {
+fn writer_accepts_char_block_devices_via_intx() {
+    // Char and block devices are encoded as 24-byte INTX_FILE payloads
+    // in $DATA (magic + 8B major LE + 8B minor LE), matching ntfs-3g's
+    // `INTX_FILE_TYPES` vocabulary. The lib test confirms the on-disk
+    // payload byte-for-byte; the external test in tests/ntfs_external.rs
+    // additionally cross-validates via `ntfscat` + `ntfsfix`.
     let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
-    let err = ntfs
-        .create_device(
-            &mut dev,
-            "/dev/null",
-            crate::fs::DeviceKind::Char,
-            1,
-            3,
-            FileMeta::default(),
-        )
-        .unwrap_err();
-    assert!(matches!(err, crate::Error::Unsupported(_)));
+    ntfs.create_device(
+        &mut dev,
+        "/null",
+        crate::fs::DeviceKind::Char,
+        1,
+        3,
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.create_device(
+        &mut dev,
+        "/loop0",
+        crate::fs::DeviceKind::Block,
+        7,
+        0,
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Read back the $DATA byte-for-byte through fstool's own reader.
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let mut r = ntfs2.open_file_reader(&mut dev, "/null").unwrap();
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+    assert_eq!(got.len(), 24);
+    assert_eq!(&got[..8], b"IntxCHR\0");
+    assert_eq!(u64::from_le_bytes(got[8..16].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(got[16..24].try_into().unwrap()), 3);
+    drop(r);
+
+    let mut r = ntfs2.open_file_reader(&mut dev, "/loop0").unwrap();
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+    assert_eq!(&got[..8], b"IntxBLK\0");
+    assert_eq!(u64::from_le_bytes(got[8..16].try_into().unwrap()), 7);
+    assert_eq!(u64::from_le_bytes(got[16..24].try_into().unwrap()), 0);
+}
+
+#[test]
+fn writer_refuses_fifo_and_socket() {
+    // FIFOs and sockets have no INTX_FILE magic in ntfs-3g's
+    // vocabulary, so the writer rejects them up front with
+    // Unsupported — better than silently producing a file ntfs-3g
+    // cannot identify as a special node.
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    for kind in [crate::fs::DeviceKind::Fifo, crate::fs::DeviceKind::Socket] {
+        let err = ntfs
+            .create_device(&mut dev, "/x", kind, 0, 0, FileMeta::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "expected Unsupported for {kind:?}, got: {err:?}"
+        );
+    }
 }
 
 #[test]

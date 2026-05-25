@@ -1678,7 +1678,8 @@ impl crate::fs::Filesystem for Ntfs {
     /// from the DOS attribute bits (directory + read-only). uid/gid stay
     /// 0. The kind/size come from the directory index (authoritative, and
     /// the size is what the repack walker streams). Native NTFS metadata
-    /// (DOS attrs, ADS, security, …) round-trips via [`Self::list_xattrs`].
+    /// (DOS attrs, ADS, security, …) round-trips via the trait
+    /// [`crate::fs::Filesystem::list_xattrs`] impl below.
     fn getattr(
         &mut self,
         dev: &mut dyn BlockDevice,

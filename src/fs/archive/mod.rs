@@ -23,7 +23,7 @@
 //!
 //! A concrete format therefore supplies only (a) a scanner that
 //! populates an [`ArchiveIndex`] and (b) — if writable — an
-//! [`ArchiveBuilder`]. The [`impl_archive_fs_filesystem`] macro
+//! [`ArchiveBuilder`]. The `impl_archive_fs_filesystem` macro
 //! generates the one-line `Filesystem` forwarding for each format's
 //! newtype so none of it is hand-written ten times.
 

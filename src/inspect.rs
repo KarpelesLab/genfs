@@ -512,7 +512,7 @@ impl AnyFs {
     /// destination's `create_file_streaming` without a tempfile. The
     /// returned reader borrows both `self` and `dev` for `'a`.
     ///
-    /// (An inline match rather than [`Self::as_filesystem_dyn`]: the
+    /// (An inline match rather than the `as_filesystem_dyn` helper: the
     /// closure-based helper fixes the return type's lifetime too early
     /// to hand back a reader borrowing `dev`.)
     pub fn open_body_reader<'a>(
@@ -674,9 +674,9 @@ impl AnyFs {
     /// Clone the file at `src` to `dst`. Routes through the underlying
     /// filesystem's [`crate::fs::Filesystem::clone_file`]: reflink-
     /// capable backends share extents, everything else byte-copies.
-    /// Guarded by [`Self::require_mutable`] so immutable / streaming
-    /// backends fail with a typed error up front instead of erroring
-    /// deep inside the writer.
+    /// Guarded by the internal `require_mutable` check so immutable /
+    /// streaming backends fail with a typed error up front instead of
+    /// erroring deep inside the writer.
     pub fn clone_file(&mut self, dev: &mut dyn BlockDevice, src: &str, dst: &str) -> Result<()> {
         self.require_mutable("clone_file")?;
         let s = std::path::Path::new(src);

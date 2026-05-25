@@ -250,10 +250,24 @@ fn ar_create_and_round_trip() {
         let listing = Command::new("ar").arg("t").arg(&out).output().unwrap();
         assert!(listing.status.success());
         let names = String::from_utf8_lossy(&listing.stdout);
+        // fstool emits GNU-format `ar` (long names indexed through the
+        // `//` table). GNU `ar` on Linux decodes that and prints the
+        // full long name; BSD `ar` on macOS doesn't follow the GNU
+        // long-name lookup, so it prints `/0` (the raw table-offset
+        // marker) in place of the long name. We assert what each
+        // dialect actually emits: the short name on every flavour,
+        // the decoded long name only where the system `ar` knows how
+        // to decode it.
         assert!(
-            names.contains("a_long_member_name.txt"),
-            "system ar t: {names}"
+            names.contains("short.o"),
+            "system ar t didn't list short.o: {names}"
         );
+        if cfg!(target_os = "linux") {
+            assert!(
+                names.contains("a_long_member_name.txt"),
+                "GNU ar t: {names}"
+            );
+        }
     } else {
         eprintln!("skipping ar cross-check: ar not installed");
     }

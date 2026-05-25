@@ -3,8 +3,8 @@
 //! - **Read:** a full central-directory scan — robust EOCD search past
 //!   a trailing comment, ZIP64 (locator + EOCD record + per-entry
 //!   extra field `0x0001`), Unix permissions/symlinks from the
-//!   external-attributes field, and the encoding handling in
-//!   [`encoding`]. `Stored` and `Deflate` bodies decode; other methods
+//!   external-attributes field, and the encoding handling in the
+//!   `encoding` submodule. `Stored` and `Deflate` bodies decode; other methods
 //!   index but report `Unsupported` on read.
 //! - **Write:** streams local headers + bodies at a bumping cursor
 //!   (CRC-32 + sizes back-patched after each body), then the central

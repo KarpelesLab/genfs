@@ -9,7 +9,7 @@
 //!   compression codec. Compressed archives go through a two-pass
 //!   stream-index → replay flow; plain `.tar` falls through to the
 //!   `Image` path (the regular tar reader sits on top of a
-//!   [`BlockDevice`](crate::block::BlockDevice)).
+//!   [`crate::block::BlockDevice`]).
 //! * An **existing image** (`Source::Image`) — a raw or qcow2 file,
 //!   optionally with a `:N` partition selector. Walks the source FS
 //!   through [`AnyFs`](crate::inspect::AnyFs) and copies entries

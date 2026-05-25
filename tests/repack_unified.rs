@@ -236,6 +236,47 @@ fn iso_rock_ridge_source_preserves_mode_into_tar() {
     );
 }
 
+/// HFS+ source fidelity: a `0640` file repacked to tar keeps its mode +
+/// uid/gid (HFS+ `getattr` reads `HFSPlusBSDInfo`).
+#[test]
+#[cfg(unix)]
+fn hfs_plus_source_preserves_mode_into_tar() {
+    if !which("tar") {
+        eprintln!("skipping: tar not installed");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let f = src.join("h.txt");
+    std::fs::write(&f, b"x\n").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    let img = work.path().join("fs.img");
+    assert!(
+        run(&[
+            "create",
+            "-t",
+            "hfs+",
+            src.to_str().unwrap(),
+            "-o",
+            img.to_str().unwrap()
+        ])
+        .0
+    );
+    let tar = work.path().join("out.tar");
+    assert!(run(&["repack", img.to_str().unwrap(), tar.to_str().unwrap()]).0);
+
+    let listing = Command::new("tar").arg("tvf").arg(&tar).output().unwrap();
+    let s = String::from_utf8_lossy(&listing.stdout);
+    let line = s.lines().find(|l| l.contains("h.txt")).unwrap_or("");
+    assert!(
+        line.contains("rw-r-----"),
+        "hfs+ mode not preserved:\n{line}"
+    );
+}
+
 /// APFS source mode fidelity: a `0642` file repacked to tar keeps its
 /// mode bits (APFS `getattr` reads `InodeVal.mode`). (APFS *create*
 /// doesn't yet persist uid/gid/mtime, so only the mode is asserted.)

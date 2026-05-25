@@ -1322,6 +1322,77 @@ impl crate::fs::Filesystem for HfsPlus {
         Ok(Box::new(r))
     }
 
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        use crate::fs::hfs_plus::catalog::{CatalogRecord, mode};
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        let rec = self.lookup_path(dev, s)?;
+        // (bsd, cnid, content_mod_date, dir?, file size)
+        let (bsd, cnid, mtime_hfs, is_dir, size) = match &rec {
+            CatalogRecord::Folder(f) => (f.bsd, f.folder_id, f.content_mod_date, true, 0),
+            CatalogRecord::File(f) => (
+                f.bsd,
+                f.file_id,
+                f.content_mod_date,
+                false,
+                f.data_fork.logical_size,
+            ),
+            CatalogRecord::Thread(_) => {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: {s:?} resolved to a thread record"
+                )));
+            }
+        };
+        let kind = if is_dir {
+            crate::fs::EntryKind::Dir
+        } else {
+            match bsd.file_mode & mode::S_IFMT {
+                mode::S_IFLNK => crate::fs::EntryKind::Symlink,
+                mode::S_IFCHR => crate::fs::EntryKind::Char,
+                mode::S_IFBLK => crate::fs::EntryKind::Block,
+                mode::S_IFIFO => crate::fs::EntryKind::Fifo,
+                mode::S_IFSOCK => crate::fs::EntryKind::Socket,
+                _ => crate::fs::EntryKind::Regular,
+            }
+        };
+        let perm = bsd.file_mode & 0o7777;
+        let mode = if perm != 0 {
+            perm
+        } else if is_dir {
+            0o755
+        } else {
+            0o644
+        };
+        // `special` doubles as the device number for char/block nodes
+        // and the link count for hard-linked inodes.
+        let (nlink, rdev) = match kind {
+            crate::fs::EntryKind::Char | crate::fs::EntryKind::Block => (1, bsd.special),
+            _ if is_dir => (2, 0),
+            _ => (bsd.special.max(1), 0),
+        };
+        // HFS+ dates are seconds since 1904-01-01; Unix is 1904 + 66 yrs.
+        let mtime = mtime_hfs.saturating_sub(2_082_844_800);
+        Ok(crate::fs::FileAttrs {
+            kind,
+            mode,
+            uid: bsd.owner_id,
+            gid: bsd.group_id,
+            size,
+            blocks: size.div_ceil(512),
+            nlink,
+            atime: mtime,
+            mtime,
+            ctime: mtime,
+            rdev,
+            inode: cnid,
+        })
+    }
+
     fn open_file_ro<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,

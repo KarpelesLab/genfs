@@ -275,6 +275,8 @@ pub struct CatalogFolder {
     pub folder_id: u32,
     pub valence: u32,
     pub bsd: BsdInfo,
+    /// `contentModDate` — seconds since the HFS+ epoch (1904-01-01).
+    pub content_mod_date: u32,
 }
 
 /// HFSPlusCatalogFile — a file leaf record (kHFSPlusFileRecord).
@@ -304,6 +306,8 @@ pub struct CatalogFolder {
 pub struct CatalogFile {
     pub file_id: u32,
     pub bsd: BsdInfo,
+    /// `contentModDate` — seconds since the HFS+ epoch (1904-01-01).
+    pub content_mod_date: u32,
     pub file_type: [u8; 4],
     pub creator: [u8; 4],
     pub data_fork: ForkData,
@@ -371,11 +375,13 @@ impl CatalogRecord {
         }
         let valence = u32::from_be_bytes(body[4..8].try_into().unwrap());
         let folder_id = u32::from_be_bytes(body[8..12].try_into().unwrap());
+        let content_mod_date = u32::from_be_bytes(body[16..20].try_into().unwrap());
         let bsd = BsdInfo::decode(&body[32..48]);
         Ok(Self::Folder(CatalogFolder {
             folder_id,
             valence,
             bsd,
+            content_mod_date,
         }))
     }
 
@@ -389,6 +395,7 @@ impl CatalogRecord {
             ));
         }
         let file_id = u32::from_be_bytes(body[8..12].try_into().unwrap());
+        let content_mod_date = u32::from_be_bytes(body[16..20].try_into().unwrap());
         let bsd = BsdInfo::decode(&body[32..48]);
         // FileInfo lives at 48..64. The first two OSType tags are the
         // Finder fileType (48..52) and creator (52..56).
@@ -404,6 +411,7 @@ impl CatalogRecord {
         Ok(Self::File(CatalogFile {
             file_id,
             bsd,
+            content_mod_date,
             file_type,
             creator,
             data_fork,

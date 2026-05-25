@@ -292,6 +292,20 @@ pub struct RepackMeta {
 }
 
 impl RepackMeta {
+    /// Default metadata for a directory created on demand (e.g. a tar
+    /// entry whose parent dir wasn't an explicit archive member):
+    /// `0755`, root-owned, zero times.
+    fn dir_default() -> Self {
+        Self {
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+        }
+    }
+
     fn to_file_meta(self) -> FileMeta {
         FileMeta {
             mode: self.mode,
@@ -354,6 +368,23 @@ pub trait RepackSink {
         meta: RepackMeta,
         xattrs: &[XattrPair],
     ) -> Result<bool>;
+    /// Materialise `path` as an independent copy of the already-written
+    /// `target`. Used by the streaming tar walker when `put_hardlink`
+    /// returns `false` (the destination can't represent a hard link)
+    /// and the source body has already streamed past — so the copy is
+    /// sourced from the destination, not the source. Default errors;
+    /// only [`FsSink`] implements it.
+    fn materialise_copy(
+        &mut self,
+        _path: &str,
+        _target: &str,
+        _meta: RepackMeta,
+        _xattrs: &[XattrPair],
+    ) -> Result<()> {
+        Err(crate::Error::Unsupported(
+            "repack: sink can't materialise a hard-link copy".into(),
+        ))
+    }
     /// Finalise the destination (flush / write the archive trailer).
     fn finish(&mut self) -> Result<()>;
 }
@@ -508,6 +539,35 @@ impl RepackSink for FsSink<'_> {
         }
     }
 
+    fn materialise_copy(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: RepackMeta,
+        xattrs: &[XattrPair],
+    ) -> Result<()> {
+        // The streaming walker has no source body to replay, so copy the
+        // already-written `target` back out of the destination FS and
+        // re-create it at `path`. Buffers the body in memory — only the
+        // rare "hard link into a destination that can't link"
+        // (FAT/exFAT) path reaches here, where it's a clean fallback.
+        let mut buf = Vec::new();
+        {
+            let mut r = self.dst.read_file(self.dev, Path::new(target))?;
+            r.read_to_end(&mut buf).map_err(crate::Error::from)?;
+        }
+        let len = buf.len() as u64;
+        let mut cur = std::io::Cursor::new(buf);
+        self.dst.create_file_streaming(
+            self.dev,
+            Path::new(path),
+            &mut cur,
+            len,
+            meta.to_file_meta(),
+        )?;
+        self.apply_xattrs(path, xattrs)
+    }
+
     fn finish(&mut self) -> Result<()> {
         self.dst.flush(self.dev)
     }
@@ -623,13 +683,11 @@ pub fn walk_source_into_sink(source: &Source, sink: &mut dyn RepackSink) -> Resu
             path,
             codec: Some(algo),
         } => {
-            // Decompress once to a tempfile, then walk it as a plain tar
-            // image — reuses the AnyFs walk and its full fidelity.
-            let tmp = crate::compression::decompress_to_tempfile(path, *algo)?;
-            let target = crate::inspect::Target::parse(&tmp.path().to_string_lossy());
-            let res = walk_image(&target, sink);
-            drop(tmp);
-            res
+            // Stream the compressed tar forward — decompress on the fly,
+            // no tempfile. Like the other arms, the caller owns
+            // `sink.finish()`.
+            let mut reader = open_tar_stream(path, Some(*algo))?;
+            walk_tar_stream(&mut reader, sink)
         }
         Source::TarArchive { path, codec: None } => {
             let target = crate::inspect::Target::parse(&path.to_string_lossy());
@@ -741,6 +799,278 @@ pub fn walk_anyfs(
                 EntryKind::Unknown => {
                     eprintln!("repack: skipping unknown entry {child:?}");
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A no-op-output `RepackSink` that accumulates an ext [`BuildPlan`]
+/// from a walk — lets the destination be sized from a streaming source
+/// (no random access, no tempfile). Used for the compressed-tar
+/// `--shrink` sizing pre-pass; mirrors `scan_into_build_plan`'s
+/// per-kind `plan.add_*` accounting.
+///
+/// [`BuildPlan`]: crate::fs::ext::BuildPlan
+pub struct PlanSink<'a> {
+    plan: &'a mut crate::fs::ext::BuildPlan,
+}
+
+impl<'a> PlanSink<'a> {
+    pub fn new(plan: &'a mut crate::fs::ext::BuildPlan) -> Self {
+        Self { plan }
+    }
+}
+
+impl RepackSink for PlanSink<'_> {
+    fn put_dir(&mut self, _path: &str, _meta: RepackMeta, _xattrs: &[XattrPair]) -> Result<()> {
+        self.plan.add_dir();
+        Ok(())
+    }
+    fn put_file(
+        &mut self,
+        _path: &str,
+        _body: &mut dyn Read,
+        len: u64,
+        _meta: RepackMeta,
+        _xattrs: &[XattrPair],
+    ) -> Result<()> {
+        // Body is ignored — the stream reader skips the unread payload
+        // on the next entry. We only need the length for block sizing.
+        self.plan.add_file(len);
+        Ok(())
+    }
+    fn put_symlink(
+        &mut self,
+        _path: &str,
+        target: &str,
+        _meta: RepackMeta,
+        _xattrs: &[XattrPair],
+    ) -> Result<()> {
+        self.plan.add_symlink(target.len());
+        Ok(())
+    }
+    fn put_device(
+        &mut self,
+        _path: &str,
+        _kind: DeviceKind,
+        _major: u32,
+        _minor: u32,
+        _meta: RepackMeta,
+        _xattrs: &[XattrPair],
+    ) -> Result<()> {
+        self.plan.add_device();
+        Ok(())
+    }
+    fn put_hardlink(
+        &mut self,
+        _path: &str,
+        _target: &str,
+        _meta: RepackMeta,
+        _xattrs: &[XattrPair],
+    ) -> Result<bool> {
+        // Over-reserve one inode for the link (safe upper bound — the
+        // write pass shares the target's inode and allocates none).
+        self.plan.add_file(0);
+        Ok(true)
+    }
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A no-op-output `RepackSink` that just sums regular-file byte
+/// lengths — feeds the FAT32 / ISO / GRF / archive size heuristics
+/// from a streaming source.
+#[derive(Default)]
+pub struct ByteSumSink {
+    pub bytes: u64,
+}
+
+impl RepackSink for ByteSumSink {
+    fn put_dir(&mut self, _path: &str, _meta: RepackMeta, _xattrs: &[XattrPair]) -> Result<()> {
+        Ok(())
+    }
+    fn put_file(
+        &mut self,
+        _path: &str,
+        _body: &mut dyn Read,
+        len: u64,
+        _meta: RepackMeta,
+        _xattrs: &[XattrPair],
+    ) -> Result<()> {
+        self.bytes = self.bytes.saturating_add(len);
+        Ok(())
+    }
+    fn put_symlink(
+        &mut self,
+        _path: &str,
+        _target: &str,
+        _meta: RepackMeta,
+        _xattrs: &[XattrPair],
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn put_device(
+        &mut self,
+        _path: &str,
+        _kind: DeviceKind,
+        _major: u32,
+        _minor: u32,
+        _meta: RepackMeta,
+        _xattrs: &[XattrPair],
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn put_hardlink(
+        &mut self,
+        _path: &str,
+        _target: &str,
+        _meta: RepackMeta,
+        _xattrs: &[XattrPair],
+    ) -> Result<bool> {
+        Ok(true)
+    }
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Open a (possibly compressed) tar at `path` as a forward-only byte
+/// stream — `make_reader` decompresses on the fly, so no tempfile is
+/// ever written. Each call re-opens from byte 0; callers that need a
+/// sizing pre-pass simply call this twice (the "read twice" the
+/// streaming repack trades for not staging to disk).
+pub fn open_tar_stream(path: &Path, codec: Option<Algo>) -> Result<Box<dyn Read>> {
+    let file = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+    match codec {
+        Some(algo) => crate::compression::make_reader(algo, file),
+        None => Ok(Box::new(file)),
+    }
+}
+
+/// Ensure every ancestor directory of `path` exists in `sink`, creating
+/// any that are missing with default `0755` metadata. `created` tracks
+/// what's already there (seed it with `"/"`). GNU tar emits parent dirs
+/// before their contents, so this normally only fills genuine gaps; a
+/// real dir entry that arrives later still lands via `put_dir` with its
+/// true metadata (it won't be in `created` yet).
+fn ensure_parents(
+    path: &str,
+    created: &mut std::collections::HashSet<String>,
+    sink: &mut dyn RepackSink,
+) -> Result<()> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    // All ancestors, shallow → deep (exclude the leaf itself).
+    let mut cur = String::new();
+    for seg in &parts[..parts.len() - 1] {
+        cur.push('/');
+        cur.push_str(seg);
+        if created.insert(cur.clone()) {
+            sink.put_dir(&cur, RepackMeta::dir_default(), &[])?;
+        }
+    }
+    Ok(())
+}
+
+/// Stream a (decompressed) tar `reader` straight into `sink` — the
+/// non-random-access counterpart to [`walk_anyfs`]. Drives
+/// `tar::stream::TarStreamReader`, which resolves PAX / GNU long-name +
+/// long-link overrides and exposes each entry's body as a `Read`. Bodies are
+/// streamed (never fully resident); parent directories are created on
+/// demand; hard links the destination can't represent fall back to a
+/// destination-sourced copy via [`RepackSink::materialise_copy`].
+///
+/// Used for compressed-tar sources so they never decompress to a
+/// tempfile. Does **not** call `sink.finish()` — the caller does that
+/// after any final bookkeeping (matching `walk_anyfs`).
+pub fn walk_tar_stream(reader: &mut dyn Read, sink: &mut dyn RepackSink) -> Result<()> {
+    use crate::fs::tar::EntryKind as TarKind;
+    use crate::fs::tar::stream::TarStreamReader;
+
+    // Collapse `.` and empty path segments (a `tar -C dir .` archive
+    // emits `./`-prefixed members; the stream reader's `normalise_path`
+    // only fixes leading/trailing slashes, leaving interior `.`s that
+    // would otherwise create a bogus `/.` directory).
+    fn collapse(p: &str) -> String {
+        let mut out = String::new();
+        for seg in p.split('/').filter(|s| !s.is_empty() && *s != ".") {
+            out.push('/');
+            out.push_str(seg);
+        }
+        if out.is_empty() { "/".to_string() } else { out }
+    }
+
+    let mut tsr = TarStreamReader::new(reader);
+    let mut created: std::collections::HashSet<String> =
+        std::collections::HashSet::from(["/".to_string()]);
+
+    while let Some(mut se) = tsr.next_entry()? {
+        // Snapshot metadata off the entry before borrowing `se` as the
+        // body reader for `put_file`.
+        let path = collapse(&se.entry.path);
+        let kind = se.entry.kind;
+        let size = se.entry.size;
+        let link = se.entry.link_target.clone();
+        let (dmaj, dmin) = (se.entry.device_major, se.entry.device_minor);
+        let meta = RepackMeta {
+            mode: se.entry.mode,
+            uid: se.entry.uid,
+            gid: se.entry.gid,
+            mtime: se.entry.mtime as u32,
+            atime: se.entry.mtime as u32,
+            ctime: se.entry.mtime as u32,
+        };
+        let xattrs: Vec<XattrPair> = se
+            .entry
+            .xattrs
+            .iter()
+            .map(|x| XattrPair {
+                name: x.name.clone(),
+                value: x.value.clone(),
+            })
+            .collect();
+
+        if path == "/" {
+            // The archive's root entry (rare) — nothing to create.
+            continue;
+        }
+        note(&path);
+        ensure_parents(&path, &mut created, sink)?;
+
+        match kind {
+            TarKind::Dir => {
+                sink.put_dir(&path, meta, &xattrs)?;
+                created.insert(path);
+            }
+            TarKind::Regular => {
+                sink.put_file(&path, &mut se, size, meta, &xattrs)?;
+            }
+            TarKind::Symlink => {
+                let target = link.as_deref().unwrap_or("");
+                sink.put_symlink(&path, target, meta, &xattrs)?;
+            }
+            TarKind::HardLink => {
+                // tar link targets are archive-relative; resolve to the
+                // same absolute, `.`-collapsed form the entry paths use.
+                let raw = link.as_deref().unwrap_or("");
+                let target = collapse(&crate::fs::tar::normalise_path(raw));
+                if !sink.put_hardlink(&path, &target, meta, &xattrs)? {
+                    sink.materialise_copy(&path, &target, meta, &xattrs)?;
+                }
+            }
+            TarKind::CharDev => {
+                sink.put_device(&path, DeviceKind::Char, dmaj, dmin, meta, &xattrs)?;
+            }
+            TarKind::BlockDev => {
+                sink.put_device(&path, DeviceKind::Block, dmaj, dmin, meta, &xattrs)?;
+            }
+            TarKind::Fifo => {
+                sink.put_device(&path, DeviceKind::Fifo, 0, 0, meta, &xattrs)?;
             }
         }
     }

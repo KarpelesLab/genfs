@@ -681,7 +681,7 @@ fn read_exact_at(dev: &mut dyn BlockDevice, offset: u64, len: usize) -> Result<V
 }
 
 /// Normalise a path to start with `/` and not end with `/` (root is `/`).
-fn normalise_path(p: &str) -> String {
+pub(crate) fn normalise_path(p: &str) -> String {
     let trimmed = p.trim_end_matches('/');
     if trimmed.is_empty() {
         return "/".into();

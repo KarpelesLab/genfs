@@ -117,6 +117,94 @@ fn zip_source_repacks_to_ext4() {
     assert_eq!(out.stdout, b"deep contents\n");
 }
 
+/// A **compressed-tar** source streamed into ext4 — the path that must
+/// NOT decompress to a tempfile. Builds a `.tar.gz` (via fstool's own
+/// tar+gzip writer), then repacks it into an ext4 image and confirms
+/// the tree + a nested file + a symlink survive, with `--size`
+/// (single streaming pass) and `--shrink` (sizing pass + write pass)
+/// both producing an `e2fsck`-clean image.
+#[test]
+fn compressed_tar_source_streams_to_ext4() {
+    if !which("tar") {
+        eprintln!("skipping: tar not installed (needed to build the .tar.gz source)");
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let src = work.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("top.txt"), b"top\n").unwrap();
+    std::fs::write(src.join("sub/deep.txt"), b"deep contents\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../top.txt", src.join("sub/lnk")).unwrap();
+
+    // Build a gzip-compressed tar of the host tree with system `tar`.
+    let targz = work.path().join("seed.tar.gz");
+    let made = Command::new("tar")
+        .arg("czf")
+        .arg(&targz)
+        .arg("-C")
+        .arg(&src)
+        .arg(".")
+        .status()
+        .expect("spawn tar");
+    assert!(made.success(), "tar czf failed");
+
+    for size_flag in [&["--size", "32MiB"][..], &["--shrink"][..]] {
+        let img = work.path().join(format!("out{}.img", size_flag.len()));
+        let mut args = vec![
+            "repack",
+            targz.to_str().unwrap(),
+            img.to_str().unwrap(),
+            "--fs-type",
+            "ext4",
+        ];
+        args.extend_from_slice(size_flag);
+        let (ok, err) = run(&args);
+        assert!(ok, "tar.gz → ext4 stream ({size_flag:?}) failed: {err}");
+
+        // Nested file content round-trips through the streaming walk.
+        let cat = Command::new(FSTOOL)
+            .args(["cat", img.to_str().unwrap(), "/sub/deep.txt"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            cat.stdout, b"deep contents\n",
+            "wrong body after stream ({size_flag:?})"
+        );
+
+        // Symlink survived (listing marks it with `@`).
+        #[cfg(unix)]
+        {
+            let ls = Command::new(FSTOOL)
+                .args(["ls", img.to_str().unwrap(), "/sub"])
+                .output()
+                .unwrap();
+            let names = String::from_utf8_lossy(&ls.stdout);
+            // `ls` prints `<inode>\t<kind>\t<name>` per line.
+            assert!(
+                names
+                    .lines()
+                    .any(|l| l.contains("Symlink") && l.ends_with("lnk")),
+                "symlink missing in {names:?}"
+            );
+        }
+
+        // The raw image must be e2fsck-clean.
+        if which("e2fsck") {
+            let out = Command::new("e2fsck")
+                .args(["-fn"])
+                .arg(&img)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "e2fsck not clean ({size_flag:?}):\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+}
+
 /// `create` into the deferred-write backends (SquashFS / ISO 9660 / GRF)
 /// from a host directory. These keep the `FileSource` and read it at
 /// `flush`, so the body must outlive `create_file` — a regression guard

@@ -546,6 +546,56 @@ fn repack_cmd(
         return res;
     }
 
+    // Streaming fast path: a compressed-tar source bound for a
+    // block-device filesystem never needs the decompress-to-tempfile —
+    // decode on the fly and walk forward into the destination (a second
+    // decode pass handles sizing for ext / `--shrink` / default). Only
+    // block FSes that the writer can size + format this way take the
+    // branch; tar→tar and archive/ISO/GRF destinations fall through to
+    // the random-access tempfile path below.
+    if let Some(algo) = tar_input_codec(srcs[0].as_str()) {
+        let raw = srcs[0].as_str();
+        let tar_path = std::path::PathBuf::from(raw.split(':').next().unwrap_or(raw));
+        // Resolve the destination FS the same way the main path does;
+        // a tar source defaults to ext4 when nothing else specifies one.
+        let target_fs = fs_type_override
+            .map(|s| s.to_string())
+            .or_else(|| {
+                dst.extension()
+                    .and_then(|s| s.to_str())
+                    .filter(|e| e.eq_ignore_ascii_case("tar"))
+                    .map(|_| "tar".to_string())
+            })
+            .or_else(|| tar_output_codec(dst).map(|_| "tar".to_string()))
+            .unwrap_or_else(|| "ext4".to_string());
+        let lower = target_fs.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "ext2"
+                | "ext3"
+                | "ext4"
+                | "fat32"
+                | "vfat"
+                | "xfs"
+                | "hfsplus"
+                | "hfs+"
+                | "ntfs"
+                | "f2fs"
+        ) {
+            return repack_tar_stream_to_fs(
+                &tar_path,
+                algo,
+                dst,
+                &lower,
+                size_arg,
+                shrink,
+                block_size,
+                qcow2_cluster_size,
+            );
+        }
+        // else: tar→tar / iso / grf / archive output — fall through.
+    }
+
     // Compressed-tar source: decompress once to a tempfile and treat
     // that plain `.tar` as the source — the unified walker then handles
     // it like any other image, for every destination.
@@ -901,6 +951,206 @@ fn repack_via_trait<F: fstool::fs::FilesystemFactory>(
     }
     dst.flush(dst_dev)?;
     Ok(fstool::fs::Filesystem::image_len(&dst))
+}
+
+/// Streaming counterpart of [`repack_via_trait`]: format `dst_dev` and
+/// populate it by walking the compressed tar at `tar_path` forward
+/// (decoded on the fly via [`fstool::repack::open_tar_stream`]) — no
+/// tempfile, no random access.
+fn repack_stream_via_trait<F: fstool::fs::FilesystemFactory>(
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    opts: &F::FormatOpts,
+    tar_path: &std::path::Path,
+    algo: fstool::compression::Algo,
+    lossy: bool,
+) -> fstool::Result<Option<u64>> {
+    let mut dst = F::format(dst_dev, opts)?;
+    {
+        let mut sink = fstool::repack::FsSink::new(&mut dst, dst_dev);
+        if lossy {
+            sink = sink.lossy();
+        }
+        let mut reader = fstool::repack::open_tar_stream(tar_path, Some(algo))?;
+        fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
+    }
+    dst.flush(dst_dev)?;
+    Ok(fstool::fs::Filesystem::image_len(&dst))
+}
+
+/// Repack a compressed-tar source into a freshly-formatted block-device
+/// filesystem **without decompressing to a tempfile**. The archive is
+/// decoded on the fly; sizing (for ext, `--shrink`, or a defaulted
+/// size) runs a first streaming pass into a counting sink, then the
+/// write pass re-opens the source and decodes from byte 0 again. Only
+/// reached for the block-FS targets gated by the caller.
+#[allow(clippy::too_many_arguments)]
+fn repack_tar_stream_to_fs(
+    tar_path: &std::path::Path,
+    algo: fstool::compression::Algo,
+    dst: &std::path::Path,
+    lower: &str,
+    size_arg: Option<&str>,
+    shrink: bool,
+    block_size: u32,
+    qcow2_cluster_size: u32,
+) -> fstool::Result<()> {
+    use fstool::fs::ext::{BuildPlan, Ext, FsKind};
+    let _ = shrink; // sizing always uses a pass when no explicit size
+
+    let explicit = match size_arg {
+        Some(s) => Some(fstool::spec::parse_size(s)?),
+        None => None,
+    };
+
+    // ext needs full FormatOpts (inode count, group layout) which only
+    // a content scan yields — run a streaming plan pass regardless of
+    // whether the size is explicit.
+    let mut ext_opts = match lower {
+        "ext2" | "ext3" | "ext4" => {
+            let kind = match lower {
+                "ext2" => FsKind::Ext2,
+                "ext3" => FsKind::Ext3,
+                _ => FsKind::Ext4,
+            };
+            let mut plan = BuildPlan::new(block_size, kind);
+            {
+                let mut sink = fstool::repack::PlanSink::new(&mut plan);
+                let mut reader = fstool::repack::open_tar_stream(tar_path, Some(algo))?;
+                fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
+            }
+            let mut opts = plan.to_format_opts();
+            opts.sparse = true;
+            Some(opts)
+        }
+        _ => None,
+    };
+
+    // Destination size: explicit wins; ext derives from its plan;
+    // everything else sums file bytes in a streaming pass + headroom.
+    let dst_size = if let Some(sz) = explicit {
+        sz
+    } else if let Some(opts) = &ext_opts {
+        opts.blocks_count as u64 * opts.block_size as u64
+    } else {
+        let mut sum = fstool::repack::ByteSumSink::default();
+        {
+            let mut reader = fstool::repack::open_tar_stream(tar_path, Some(algo))?;
+            fstool::repack::walk_tar_stream(&mut reader, &mut sum)?;
+        }
+        let bytes = sum.bytes;
+        match lower {
+            "fat32" | "vfat" => {
+                bytes
+                    .saturating_mul(2)
+                    .max(fstool::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024)
+                    .div_ceil(512)
+                    * 512
+            }
+            _ => bytes.saturating_mul(2).saturating_add(64 * 1024 * 1024),
+        }
+    };
+
+    // Grow the ext plan's image to an explicitly-requested larger size
+    // (mirrors the random-access path's adjustment).
+    if let Some(opts) = ext_opts.as_mut() {
+        let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
+        if dst_size > plan_size {
+            let max = (dst_size / opts.block_size as u64) as u32;
+            opts.blocks_count = (max / 8) * 8;
+            let by_density = (opts.blocks_count as u64 * opts.block_size as u64 / 16_384) as u32;
+            opts.inodes_count = opts.inodes_count.max(by_density);
+        }
+    }
+
+    fstool::repack::phase(&format!(
+        "formatting {lower} destination ({}) …",
+        human_size(dst_size)
+    ));
+    let mut dst_dev = fstool::block::create_image(
+        dst,
+        dst_size,
+        &fstool::block::CreateOpts {
+            cluster_size: qcow2_cluster_size,
+        },
+    )?;
+
+    match lower {
+        "ext2" | "ext3" | "ext4" => {
+            let opts = ext_opts.expect("ext opts computed above");
+            let mut dst_ext = Ext::format_with(dst_dev.as_mut(), &opts)?;
+            {
+                let mut sink = fstool::repack::FsSink::new(&mut dst_ext, dst_dev.as_mut());
+                let mut reader = fstool::repack::open_tar_stream(tar_path, Some(algo))?;
+                fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
+            }
+            dst_ext.flush(dst_dev.as_mut())?;
+        }
+        "fat32" | "vfat" => {
+            let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
+                fstool::Error::InvalidArgument(
+                    "repack: FAT32 size doesn't fit in a u32 sector count".into(),
+                )
+            })?;
+            let opts = fstool::fs::fat::FatFormatOpts {
+                total_sectors,
+                volume_id: 0,
+                volume_label: *b"REPACKED   ",
+            };
+            let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
+            {
+                let mut sink = fstool::repack::FsSink::new(&mut dst_fat, dst_dev.as_mut()).lossy();
+                let mut reader = fstool::repack::open_tar_stream(tar_path, Some(algo))?;
+                fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
+            }
+            dst_fat.flush(dst_dev.as_mut())?;
+        }
+        "xfs" => {
+            repack_stream_via_trait::<fstool::fs::xfs::Xfs>(
+                dst_dev.as_mut(),
+                &fstool::fs::xfs::format::FormatOpts::default(),
+                tar_path,
+                algo,
+                false,
+            )?;
+        }
+        "hfsplus" | "hfs+" => {
+            repack_stream_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
+                dst_dev.as_mut(),
+                &fstool::fs::hfs_plus::FormatOpts::default(),
+                tar_path,
+                algo,
+                false,
+            )?;
+        }
+        "ntfs" => {
+            repack_stream_via_trait::<fstool::fs::ntfs::Ntfs>(
+                dst_dev.as_mut(),
+                &fstool::fs::ntfs::format::FormatOpts::default(),
+                tar_path,
+                algo,
+                false,
+            )?;
+        }
+        "f2fs" => {
+            repack_stream_via_trait::<fstool::fs::f2fs::F2fs>(
+                dst_dev.as_mut(),
+                &fstool::fs::f2fs::FormatOpts::default(),
+                tar_path,
+                algo,
+                false,
+            )?;
+        }
+        other => unreachable!("repack_tar_stream_to_fs reached for ungated fs {other:?}"),
+    }
+    dst_dev.sync()?;
+    drop(dst_dev);
+
+    eprintln!(
+        "repacked {} → {} (fs: tar → {lower}, {dst_size} bytes)",
+        tar_path.display(),
+        dst.display()
+    );
+    Ok(())
 }
 
 /// Repack-source error for the four read-only FSes (xfs/exfat/hfs+/apfs)

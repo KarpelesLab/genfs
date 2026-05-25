@@ -730,18 +730,42 @@ pub trait Filesystem {
         dst: &Path,
     ) -> crate::Result<()> {
         // Best-effort metadata snapshot before the read borrow.
-        let meta = match self.getattr(dev, src) {
-            Ok(a) => FileMeta {
-                mode: a.mode,
-                uid: a.uid,
-                gid: a.gid,
-                mtime: a.mtime,
-                atime: a.atime,
-                ctime: a.ctime,
-            },
-            Err(_) => FileMeta::default(),
+        let (meta, size) = match self.getattr(dev, src) {
+            Ok(a) => (
+                FileMeta {
+                    mode: a.mode,
+                    uid: a.uid,
+                    gid: a.gid,
+                    mtime: a.mtime,
+                    atime: a.atime,
+                    ctime: a.ctime,
+                },
+                a.size,
+            ),
+            // Unknown size → take the conservative temp-file path below.
+            Err(_) => (FileMeta::default(), u64::MAX),
         };
-        // Spool to a tempfile so the read borrow ends before create_file.
+        // Buffer the source so the read borrow ends before `create_file`.
+        // Small files go through memory (no temp file); larger ones spool
+        // to a temp file — never fsync'd, as it's read back in-process.
+        const MEM_CAP: u64 = 8 * 1024 * 1024;
+        if size <= MEM_CAP {
+            let mut buf = Vec::with_capacity(size as usize);
+            {
+                let mut reader = self.read_file(dev, src)?;
+                reader.read_to_end(&mut buf).map_err(crate::Error::from)?;
+            }
+            let actual = buf.len() as u64;
+            return self.create_file(
+                dev,
+                dst,
+                FileSource::Reader {
+                    reader: Box::new(io::Cursor::new(buf)),
+                    len: actual,
+                },
+                meta,
+            );
+        }
         let mut tmp = tempfile::NamedTempFile::new().map_err(crate::Error::from)?;
         {
             let mut reader = self.read_file(dev, src)?;

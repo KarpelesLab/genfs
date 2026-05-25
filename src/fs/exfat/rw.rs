@@ -431,6 +431,9 @@ impl Exfat {
         flags: crate::fs::OpenFlags,
         meta: Option<crate::fs::FileMeta>,
     ) -> Result<Box<dyn FileHandle + 'a>> {
+        // This path locates directory entries on disk (and the handle
+        // updates them in place), so serialize any staged entries first.
+        self.flush_dir_batches(dev)?;
         // Resolve parent directory + leaf name.
         let parts = split_path(path);
         if parts.is_empty() {
@@ -493,9 +496,11 @@ impl Exfat {
                     )
                 })?;
                 let ts = super::unix_to_exfat_timestamp(m.mtime);
-                // Create empty file via existing path.
+                // Create empty file via existing path; serialize it so its
+                // on-disk entry exists (the handle updates it in place).
                 let _ =
                     self.create_file_in(dev, parent_cluster, leaf, &mut std::io::empty(), 0, ts)?;
+                self.flush_dir_batches(dev)?;
                 // Re-find the entry we just wrote — its position is the
                 // first free slot in the parent, but it's simplest to
                 // look it up by name.

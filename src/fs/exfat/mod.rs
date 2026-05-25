@@ -30,12 +30,26 @@ pub mod rw;
 pub mod upcase;
 
 use boot::BootSector;
-use dir::{ENTRY_SIZE, FileEntrySet, RawSlot};
+use dir::{ENTRY_FILE, ENTRY_INUSE, ENTRY_SIZE, FileEntrySet, RawSlot};
 use fat::Fat;
 use upcase::Upcase;
 
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::fs::dir_batch::{DEFAULT_CAPACITY, DirBatch};
+
+/// One child entry staged in [`Exfat`]'s directory-batch cache instead of
+/// being written to the parent's cluster chain immediately. `bytes` is
+/// the assembled file entry set (primary + stream-extension + name slots,
+/// checksum already computed); `name` / `first_cluster` / `is_dir` let
+/// path lookups resolve the staged child as an in-memory overlay.
+#[derive(Debug, Clone)]
+struct PendingEntry {
+    bytes: Vec<u8>,
+    name: String,
+    first_cluster: u32,
+    is_dir: bool,
+}
 
 pub use format::FormatOpts;
 
@@ -76,6 +90,10 @@ pub struct Exfat {
     fat_dirty: bool,
     /// True if the bitmap has unwritten changes.
     bitmap_dirty: bool,
+    /// Pending child entries keyed by parent directory start cluster.
+    /// Staged instead of rewriting the parent's cluster chain on every
+    /// child; serialized once on eviction or at flush.
+    dir_batch: DirBatch<u32, PendingEntry>,
 }
 
 impl Exfat {
@@ -116,6 +134,7 @@ impl Exfat {
             next_free_hint: 2,
             fat_dirty: false,
             bitmap_dirty: false,
+            dir_batch: DirBatch::new(DEFAULT_CAPACITY),
         };
         let root_bytes = tmp.read_chain_bytes(
             dev,
@@ -230,6 +249,7 @@ impl Exfat {
             next_free_hint: 5, // first free cluster after metadata
             fat_dirty: false,
             bitmap_dirty: false,
+            dir_batch: DirBatch::new(DEFAULT_CAPACITY),
         })
     }
 
@@ -662,119 +682,138 @@ impl Exfat {
         let mut cluster = self.boot.first_cluster_of_root_directory;
         for part in prefix {
             let bytes = self.read_dir_bytes(dev, cluster)?;
-            let next = iter_file_sets(&bytes)?
+            // On-disk entry, or one still staged in this directory's batch
+            // (created this session, not yet serialized).
+            let (first_cluster, is_dir) = match iter_file_sets(&bytes)?
                 .into_iter()
                 .find(|e| self.name_matches(&e.name_utf16, part))
-                .ok_or_else(|| {
+            {
+                Some(e) => (e.first_cluster, e.is_directory),
+                None => self.pending_child(cluster, part).ok_or_else(|| {
                     crate::Error::InvalidArgument(format!(
                         "exfat: no such entry {part:?} under {path:?}"
                     ))
-                })?;
-            if !next.is_directory {
+                })?,
+            };
+            if !is_dir {
                 return Err(crate::Error::InvalidArgument(format!(
                     "exfat: {part:?} is not a directory"
                 )));
             }
-            cluster = next.first_cluster;
+            cluster = first_cluster;
         }
         Ok((cluster, last))
     }
 
-    /// Append `entry_set_bytes` (a 32n-byte file entry set) to the
-    /// directory whose chain begins at `first_cluster`, allocating a new
-    /// cluster on overflow and writing the bytes through `dev`.
-    ///
-    /// Strategy: walk the chain, scan each cluster for a run of
-    /// `entry_set_bytes.len() / 32` consecutive free slots (`0x00` or
-    /// high-bit-clear), then write into that run. If no run exists,
-    /// extend the chain by one cluster and place the bytes at the start
-    /// of the new cluster.
-    fn append_to_directory(
+    /// Stage a child entry for `dir_cluster` instead of rewriting the
+    /// parent's cluster chain immediately. Serialized once on eviction or
+    /// at flush; [`split_path_for_create`](Self::split_path_for_create)
+    /// reads the batch as an overlay so staged children stay resolvable.
+    fn stage_dir_entry(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        entry: PendingEntry,
+    ) -> Result<()> {
+        if let Some((victim, entries)) = self.dir_batch.stage(dir_cluster, entry) {
+            self.serialize_one_dir(dev, victim, entries)?;
+        }
+        Ok(())
+    }
+
+    /// Serialize every pending directory batch (at flush, or before a
+    /// read path that consumes on-disk directory entries).
+    fn flush_dir_batches(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        for (dir_cluster, entries) in self.dir_batch.drain_all() {
+            self.serialize_one_dir(dev, dir_cluster, entries)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve a child of `dir_cluster` by name from the pending batch
+    /// (staged but not yet written). Returns `(first_cluster, is_dir)`.
+    fn pending_child(&self, dir_cluster: u32, name: &str) -> Option<(u32, bool)> {
+        let want: Vec<u16> = name.encode_utf16().collect();
+        self.dir_batch.peek(&dir_cluster)?.iter().find_map(|e| {
+            let have: Vec<u16> = e.name.encode_utf16().collect();
+            if self.upcase.eq_ignore_case(&have, &want) {
+                Some((e.first_cluster, e.is_dir))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Append a directory's whole pending batch to its cluster chain in
+    /// one pass: read the chain once, place every staged entry set
+    /// contiguously at the end-of-directory point (growing the chain as
+    /// needed), and write back only the affected clusters. Equivalent to
+    /// appending each entry set individually, but O(1) chain scans.
+    fn serialize_one_dir(
         &mut self,
         dev: &mut dyn BlockDevice,
         first_cluster: u32,
-        entry_set_bytes: &[u8],
+        entries: Vec<PendingEntry>,
     ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut combined = Vec::new();
+        for e in &entries {
+            combined.extend_from_slice(&e.bytes);
+        }
         let cb = self.boot.bytes_per_cluster() as usize;
-        let need_slots = entry_set_bytes.len() / ENTRY_SIZE;
-        if entry_set_bytes.len() % ENTRY_SIZE != 0 || need_slots == 0 {
-            return Err(crate::Error::InvalidArgument(
-                "exfat: entry set must be a non-empty multiple of 32 bytes".into(),
-            ));
+        let mut chain = self.dir_chain(first_cluster)?;
+        // Read the whole directory into a flat buffer.
+        let mut buf = vec![0u8; chain.len() * cb];
+        for (i, &c) in chain.iter().enumerate() {
+            dev.read_at(
+                self.boot.cluster_byte_offset(c),
+                &mut buf[i * cb..(i + 1) * cb],
+            )?;
         }
-        let chain = self.dir_chain(first_cluster)?;
-        for &cluster in &chain {
-            let off = self.boot.cluster_byte_offset(cluster);
-            let mut buf = vec![0u8; cb];
-            dev.read_at(off, &mut buf)?;
-            // Scan slot-by-slot for a run of free slots large enough.
-            let mut i = 0;
-            while i + need_slots * ENTRY_SIZE <= cb {
-                let mut all_free = true;
-                for j in 0..need_slots {
-                    let slot_off = i + j * ENTRY_SIZE;
-                    let t = buf[slot_off];
-                    if t != 0x00 && t & dir::ENTRY_INUSE != 0 {
-                        all_free = false;
-                        break;
-                    }
-                }
-                if all_free {
-                    buf[i..i + entry_set_bytes.len()].copy_from_slice(entry_set_bytes);
-                    dev.write_at(off, &buf)?;
-                    return Ok(());
-                }
-                // Skip past a known in-use set (or one slot).
-                let t = buf[i];
-                if t & dir::ENTRY_INUSE != 0 && t == dir::ENTRY_FILE {
-                    let sec = buf[i + 1] as usize;
-                    i += (1 + sec) * ENTRY_SIZE;
-                } else {
-                    i += ENTRY_SIZE;
-                }
+        // Find the end-of-directory point: the first slot whose type byte
+        // is 0x00 (never-used). Skip past in-use file sets so we don't
+        // mistake a set's secondary slot for the end.
+        let mut end_pos = buf.len();
+        let mut i = 0;
+        while i + ENTRY_SIZE <= buf.len() {
+            let t = buf[i];
+            if t == 0x00 {
+                end_pos = i;
+                break;
+            } else if t & ENTRY_INUSE != 0 && t == ENTRY_FILE {
+                let sec = buf[i + 1] as usize;
+                i += (1 + sec) * ENTRY_SIZE;
+            } else {
+                i += ENTRY_SIZE;
             }
         }
-        // No room in any existing cluster — extend the chain.
-        //
-        // Before linking a new cluster, we must ensure no `0x00` byte at
-        // slot[0] terminates the directory scan inside any earlier
-        // cluster. Reader semantics: `t == 0x00` at slot[0] is end-of-
-        // directory and stops iteration. So we walk every cluster of
-        // the existing chain and rewrite each slot whose type byte is
-        // 0x00 to 0x05 (an Unused slot — high bit clear, non-zero).
-        // This is safe: readers classify high-bit-clear as Unused and
-        // continue past it.
-        for &cluster in &chain {
-            let off = self.boot.cluster_byte_offset(cluster);
-            let mut buf = vec![0u8; cb];
-            dev.read_at(off, &mut buf)?;
-            let mut changed = false;
-            let mut i = 0;
-            while i + ENTRY_SIZE <= cb {
-                let t = buf[i];
-                if t == 0x00 {
-                    buf[i] = 0x05; // any value with high bit clear works
-                    changed = true;
-                    i += ENTRY_SIZE;
-                } else if t & dir::ENTRY_INUSE != 0 && t == dir::ENTRY_FILE {
-                    let sec = buf[i + 1] as usize;
-                    i += (1 + sec) * ENTRY_SIZE;
-                } else {
-                    i += ENTRY_SIZE;
-                }
+        let need = combined.len();
+        let avail = buf.len() - end_pos;
+        if avail < need {
+            // Grow the chain by enough clusters to hold the overflow.
+            let extra = (need - avail).div_ceil(cb);
+            let mut last = *chain.last().unwrap();
+            for _ in 0..extra {
+                let nc = self.alloc_cluster()?;
+                self.fat.set_raw(last, nc);
+                self.fat_dirty = true;
+                chain.push(nc);
+                last = nc;
             }
-            if changed {
-                dev.write_at(off, &buf)?;
-            }
+            buf.resize(chain.len() * cb, 0);
         }
-        let new_cluster = self.alloc_cluster()?;
-        let last = *chain.last().unwrap();
-        self.fat.set_raw(last, new_cluster);
-        self.fat_dirty = true;
-        let mut buf = vec![0u8; cb];
-        buf[..entry_set_bytes.len()].copy_from_slice(entry_set_bytes);
-        let off = self.boot.cluster_byte_offset(new_cluster);
-        dev.write_at(off, &buf)?;
+        buf[end_pos..end_pos + need].copy_from_slice(&combined);
+        // Write back only the clusters the new entries touched.
+        let first_ci = end_pos / cb;
+        let last_ci = (end_pos + need - 1) / cb;
+        for ci in first_ci..=last_ci {
+            dev.write_at(
+                self.boot.cluster_byte_offset(chain[ci]),
+                &buf[ci * cb..(ci + 1) * cb],
+            )?;
+        }
         Ok(())
     }
 
@@ -978,7 +1017,16 @@ impl Exfat {
             timestamp,
             self.name_hash_for(name),
         );
-        self.append_to_directory(dev, dir_cluster, &entry)?;
+        self.stage_dir_entry(
+            dev,
+            dir_cluster,
+            PendingEntry {
+                bytes: entry,
+                name: name.to_string(),
+                first_cluster,
+                is_dir: false,
+            },
+        )?;
         Ok(first_cluster)
     }
 
@@ -1031,7 +1079,16 @@ impl Exfat {
             timestamp,
             self.name_hash_for(name),
         );
-        self.append_to_directory(dev, dir_cluster, &entry)?;
+        self.stage_dir_entry(
+            dev,
+            dir_cluster,
+            PendingEntry {
+                bytes: entry,
+                name: name.to_string(),
+                first_cluster: new_cluster,
+                is_dir: true,
+            },
+        )?;
         Ok(new_cluster)
     }
 
@@ -1057,6 +1114,9 @@ impl Exfat {
                 "exfat: cannot remove root".into(),
             ));
         }
+        // The splice + emptiness check below read on-disk directory
+        // entries; serialize all staged entries first so they are present.
+        self.flush_dir_batches(dev)?;
         let (last, prefix) = parts.split_last().unwrap();
         let mut parent_cluster = self.boot.first_cluster_of_root_directory;
         for part in prefix {
@@ -1122,6 +1182,9 @@ impl Exfat {
     /// copies if NumberOfFats == 2 — currently we only emit one), rewrite
     /// the allocation bitmap, and `sync()` the device.
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        // Serialize pending directory batches first — they may allocate
+        // clusters the FAT/bitmap written below must reflect.
+        self.flush_dir_batches(dev)?;
         if self.fat_dirty {
             let fat_off = self.boot.fat_byte_offset();
             let fat_byte_len = self.boot.fat_byte_length() as usize;
@@ -1255,6 +1318,8 @@ impl crate::fs::Filesystem for Exfat {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        // Materialize staged entries so the listing reflects them.
+        self.flush_dir_batches(dev)?;
         Exfat::list_path(self, dev, s)
     }
 
@@ -1266,6 +1331,7 @@ impl crate::fs::Filesystem for Exfat {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        self.flush_dir_batches(dev)?;
         let r = self.open_file_reader(dev, s)?;
         Ok(Box::new(r))
     }
@@ -1278,6 +1344,7 @@ impl crate::fs::Filesystem for Exfat {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        self.flush_dir_batches(dev)?;
         Exfat::open_ro(self, dev, s)
     }
 
@@ -1884,6 +1951,45 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, payload);
+    }
+
+    /// Batched directory writes: create many files in one directory in a
+    /// single session (accumulated in the dir batch, serialized once at
+    /// flush), reopen, and confirm every file lists and reads back.
+    #[test]
+    fn batched_many_files_one_dir_round_trip() {
+        let (mut dev, mut fs) = fresh_volume("BAT");
+        fs.create_dir(&mut dev, "/d", 0).unwrap();
+        let n = 40usize;
+        for i in 0..n {
+            let body = format!("exfat-body-{i:03}");
+            let mut reader: &[u8] = body.as_bytes();
+            fs.create_file(
+                &mut dev,
+                &format!("/d/f{i:03}.txt"),
+                &mut reader,
+                body.len() as u64,
+                0,
+            )
+            .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+
+        let fs2 = Exfat::open(&mut dev).unwrap();
+        let listed: std::collections::HashSet<String> = fs2
+            .list_path(&mut dev, "/d")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(listed.len(), n, "expected {n} files, got {listed:?}");
+        let mut fs2 = fs2;
+        for i in 0..n {
+            let name = format!("f{i:03}.txt");
+            assert!(listed.contains(&name), "missing {name}");
+            let got = read_file_contents(&mut fs2, &mut dev, &format!("/d/{name}"));
+            assert_eq!(got, format!("exfat-body-{i:03}").into_bytes());
+        }
     }
 
     #[test]

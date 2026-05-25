@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/KarpelesLab/fstool/compare/v0.4.1...v0.4.2) - 2026-05-25
+
+### Added
+
+- *(xfs)* refuse open_file_rw on REFLINK files — prevent clone corruption (Phase 3b stage 3)
+- *(xfs)* clone_file via shared extents + REFCNTBT records (Phase 3b stage 2)
+- *(xfs)* REFLINK feature opt-in + per-AG REFCNTBT root (Phase 3b stage 1)
+- *(fs)* clone API — Filesystem::clone_file / clone_range + CloneCapability (Phase 3a)
+- *(ntfs)* create_device for char/block via INTX_FILE; sort $I30 entries
+- *(hfs+)* create_device — char / block / FIFO / socket nodes
+- *(ntfs)* implement remove (file / empty-dir / symlink), the inverse of create
+- *(ntfs)* make a reopened image mutable (lazy writer reconstruction)
+- *(ntfs)* getattr (times + synthesised mode) and list_xattrs
+- *(hfs+)* faithful getattr
+- *(iso9660)* faithful getattr from Rock Ridge
+- *(apfs)* faithful getattr
+- *(archive)* shared archive core + zip/cpio/ar backends, 7 scaffolds
+
+### Fixed
+
+- *(fs)* owned-tempfile FileSource for deferred-write backends; SquashFS getattr
+
+### Other
+
+- fix 5 broken intra-doc links + BSD-ar cross-check on macOS
+- *(dmg)* end-to-end against hdiutil on macOS (UDRW / UDZO / UDBZ / ULFO)
+- *(fuzz)* NTFS fuzz target + Op::Clone with shares_extents freezing
+- F2FS is build-once — correct the in-place-edits column
+- cross-backend reopen-mutate sweep; make F2FS advertise build-once
+- every repack source reader now surfaces faithful metadata
+- move qcow2 / dmg out of the filesystem-support table
+- *(repack)* unify pipeline — one walker + sink, no per-pair paths
+- lib-level fuzz across 8 mutable backends
+- *(ext)* cover multi-open_file_rw write extending file across drops
+
 ### Changed
 
 - *(repack)* unified the repack pipeline: one generic source walker feeds

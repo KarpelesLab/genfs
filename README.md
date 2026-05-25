@@ -271,11 +271,26 @@ when an unlock password is supplied.
 
 `fstool repack` walks the source filesystem and rebuilds the tree into a
 fresh image. With `--fs-type` it changes filesystem on the fly; `--shrink`
-auto-sizes the output to the minimum that fits the content. The ext → ext
-path uses a direct FS-to-FS copier (no host-filesystem intermediation),
-preserving symlinks, device nodes, mode, uid/gid, and xattrs. tar in either
-direction round-trips content + mode + uid/gid + mtime + symlinks + device
-nodes + xattrs.
+auto-sizes the output to the minimum that fits the content.
+
+The pipeline is **one generic walker feeding one of two sinks** — a
+streaming-tar sink (tar / `.tar.<codec>`) or a block-device `Filesystem`
+sink — with no per-`(source,dest)`-type special cases. So **any readable
+source repacks into any writable destination** through a single path
+(`fstool repack app.zip out.tar`, `fstool repack disk.xfs out.iso`, …).
+The walker reads each entry's metadata through the source's trait
+`getattr` / `list_xattrs` / `read_symlink`, so mode, uid/gid, mtime,
+symlinks, device numbers, xattrs, and hard links round-trip wherever both
+ends can represent them. File bodies stream straight from source to
+destination (`create_file_streaming`, no per-file tempfile). Hard links
+are de-duplicated when the destination supports them (ext) and
+materialised as copies otherwise (tar, FAT, …); a destination that can't
+hold a symlink/device/xattr (FAT) drops it with a warning.
+
+Source metadata fidelity depends on the reader: ext, tar, the archive
+formats, F2FS, and XFS surface full POSIX metadata; HFS+, SquashFS,
+ISO 9660 (Rock Ridge), APFS, and NTFS currently fall back to defaults for
+some fields (names, structure, content, and sizes always round-trip).
 
 `fstool repack` writes any destination implementing the `Filesystem`
 trait — `ext2/3/4`, FAT32, exFAT, tar, XFS, HFS+, APFS, NTFS, F2FS,

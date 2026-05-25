@@ -511,6 +511,7 @@ fn repack_cmd(
     block_size: u32,
     cluster_size: &str,
 ) -> fstool::Result<()> {
+    use fstool::repack::RepackSink;
     let qcow2_cluster_size = parse_cluster_size(cluster_size)?;
 
     if srcs.is_empty() {
@@ -545,16 +546,23 @@ fn repack_cmd(
         return res;
     }
 
-    let src = srcs[0].as_str();
+    // Compressed-tar source: decompress once to a tempfile and treat
+    // that plain `.tar` as the source — the unified walker then handles
+    // it like any other image, for every destination.
+    let _decompressed; // keeps the tempfile alive for the call
+    let src_owned: String = if let Some(algo) = tar_input_codec(srcs[0].as_str()) {
+        let raw = srcs[0].as_str();
+        let path = std::path::Path::new(raw.split(':').next().unwrap_or(raw));
+        let tmp = fstool::compression::decompress_to_tempfile(path, algo)?;
+        let p = tmp.path().to_string_lossy().into_owned();
+        _decompressed = Some(tmp);
+        p
+    } else {
+        _decompressed = None;
+        srcs[0].clone()
+    };
+    let src = src_owned.as_str();
     let src_target = fstool::inspect::Target::parse(src);
-
-    // Compressed-tar source: stream the archive directly into the
-    // destination without spooling through a tempfile. Only the
-    // tar → tar combination is fully wired here; for other targets
-    // the function returns an actionable error.
-    if let Some(algo) = tar_input_codec(src) {
-        return repack_from_tar_stream(src, algo, dst, fs_type_override);
-    }
 
     // Open the source once and walk it; the source FS stays open across
     // the destination build so we stream each file straight through
@@ -616,7 +624,9 @@ fn repack_cmd(
                         .max(fstool::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024);
                     needed.div_ceil(512) * 512
                 }
-                "tar" => tar_size_upper_bound(src_dev, &src_fs)?,
+                // Tar output streams to a file; no pre-sized device, so
+                // the destination size is unused.
+                "tar" => 0,
                 "iso" | "iso9660" => {
                     // ISO writer needs ~32 MiB headroom for a small tree.
                     // Real sizing happens during flush; we just want enough
@@ -649,7 +659,9 @@ fn repack_cmd(
             // archive grows to whatever fits. Without --shrink either
             // we still upper-bound the destination from the source.
             (None, false) => match lower.as_str() {
-                "tar" => tar_size_upper_bound(src_dev, &src_fs)?,
+                // Tar output streams to a file; no pre-sized device, so
+                // the destination size is unused.
+                "tar" => 0,
                 "iso" | "iso9660" => {
                     // ISO writer needs enough room for descriptors,
                     // path tables, dir records, and file data. Use a
@@ -670,27 +682,35 @@ fn repack_cmd(
             },
         };
 
-        // Tar output is special: a tar archive is sequential, not a
-        // pre-sized block device. We open `dst` directly as a `Write`
-        // (optionally codec-wrapped for `.tar.gz` / `.tar.zst` / etc.)
-        // and stream every entry through a `TarStreamWriter`. No
-        // tempfile, no `set_len`, no `create_image`.
+        // Tar output is special: a tar archive is sequential, written to
+        // a `Write` (optionally codec-wrapped) rather than a pre-sized
+        // block device. This is the one stream-vs-non-stream branch.
         if lower == "tar" {
-            let written = repack_into_tar_streaming(src_dev, &src_fs, dst, dst_tar_codec)?;
-            if let Some(algo) = dst_tar_codec {
-                eprintln!(
+            let file = std::fs::File::create(dst)?;
+            let buffered: Box<dyn std::io::Write> =
+                Box::new(std::io::BufWriter::with_capacity(64 * 1024, file));
+            let inner = match dst_tar_codec {
+                Some(algo) => fstool::compression::make_writer(algo, buffered)?,
+                None => buffered,
+            };
+            let mut sink = fstool::repack::TarStreamSink::new(inner);
+            fstool::repack::walk_anyfs(&mut src_fs, src_dev, &mut sink)?;
+            sink.finish()?;
+            let written = sink.bytes_written();
+            match dst_tar_codec {
+                Some(algo) => eprintln!(
                     "repacked {src} → {} (fs: {source_kind} → tar.{}, {written} bytes plain)",
                     dst.display(),
                     algo.name()
-                );
-            } else {
-                eprintln!(
+                ),
+                None => eprintln!(
                     "repacked {src} → {} (fs: {source_kind} → tar, {written} bytes)",
                     dst.display()
-                );
+                ),
             }
             return Ok(());
         }
+
         let mut dst_dev = fstool::block::create_image(
             dst,
             dst_size,
@@ -698,24 +718,16 @@ fn repack_cmd(
                 cluster_size: qcow2_cluster_size,
             },
         )?;
-        // `Some(len)` after the match for archive writers (zip/cpio/ar)
-        // so we truncate the over-provisioned file; `None` for FS images.
-        let mut archive_len: Option<u64> = None;
-        match lower.as_str() {
+        // `Some(len)` for archive writers (zip/cpio/ar) so we truncate
+        // the over-provisioned file; `None` for fixed-size FS images.
+        let archive_len: Option<u64> = match lower.as_str() {
             "ext2" | "ext3" | "ext4" => {
                 let plan = build_ext_plan(src_dev, &mut src_fs, block_size, &lower)?;
                 let mut opts = plan.to_format_opts();
-                // Preserve sparse-file extent: the source reader emits
-                // zero bytes wherever the source has a hole, and the
-                // destination writer turns all-zero blocks into holes
-                // when sparse is on. End result: holes round-trip
-                // through repack instead of being inflated to dense
-                // zero blocks. Semantically transparent for non-sparse
-                // files (their blocks aren't all-zero so nothing
-                // changes).
+                // Sparse: the source reader emits zeros over holes and
+                // the ext writer re-sparsifies all-zero blocks, so holes
+                // round-trip.
                 opts.sparse = true;
-                // Grow to fill the destination if the user requested an
-                // explicit size larger than the auto-min.
                 let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
                 if dst_size > plan_size {
                     let max = (dst_size / opts.block_size as u64) as u32;
@@ -725,8 +737,12 @@ fn repack_cmd(
                     opts.inodes_count = opts.inodes_count.max(by_density);
                 }
                 let mut dst_ext = fstool::fs::ext::Ext::format_with(dst_dev.as_mut(), &opts)?;
-                copy_into_ext(src_dev, &src_fs, dst_dev.as_mut(), &mut dst_ext)?;
+                {
+                    let mut sink = fstool::repack::FsSink::new(&mut dst_ext, dst_dev.as_mut());
+                    fstool::repack::walk_anyfs(&mut src_fs, src_dev, &mut sink)?;
+                }
                 dst_ext.flush(dst_dev.as_mut())?;
+                None
             }
             "fat32" | "vfat" => {
                 let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
@@ -734,93 +750,104 @@ fn repack_cmd(
                         "repack: FAT32 size doesn't fit in a u32 sector count".into(),
                     )
                 })?;
-                let label = *b"REPACKED   ";
                 let opts = fstool::fs::fat::FatFormatOpts {
                     total_sectors,
                     volume_id: 0,
-                    volume_label: label,
+                    volume_label: *b"REPACKED   ",
                 };
                 let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
-                copy_into_fat32(src_dev, &src_fs, dst_dev.as_mut(), &mut dst_fat)?;
+                {
+                    let mut sink =
+                        fstool::repack::FsSink::new(&mut dst_fat, dst_dev.as_mut()).lossy();
+                    fstool::repack::walk_anyfs(&mut src_fs, src_dev, &mut sink)?;
+                }
                 dst_fat.flush(dst_dev.as_mut())?;
+                None
             }
-            "hfsplus" | "hfs+" => {
-                repack_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
-                    dst_dev.as_mut(),
-                    &fstool::fs::hfs_plus::FormatOpts::default(),
-                    src,
-                )?;
-            }
-            "ntfs" => {
-                repack_via_trait::<fstool::fs::ntfs::Ntfs>(
-                    dst_dev.as_mut(),
-                    &fstool::fs::ntfs::format::FormatOpts::default(),
-                    src,
-                )?;
-            }
-            "f2fs" => {
-                repack_via_trait::<fstool::fs::f2fs::F2fs>(
-                    dst_dev.as_mut(),
-                    &fstool::fs::f2fs::FormatOpts::default(),
-                    src,
-                )?;
-            }
-            "squashfs" => {
-                repack_via_trait::<fstool::fs::squashfs::Squashfs>(
-                    dst_dev.as_mut(),
-                    &fstool::fs::squashfs::FormatOpts::default(),
-                    src,
-                )?;
-            }
-            "xfs" => {
-                repack_via_trait::<fstool::fs::xfs::Xfs>(
-                    dst_dev.as_mut(),
-                    &fstool::fs::xfs::format::FormatOpts::default(),
-                    src,
-                )?;
-            }
+            "hfsplus" | "hfs+" => repack_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
+                dst_dev.as_mut(),
+                &fstool::fs::hfs_plus::FormatOpts::default(),
+                &mut src_fs,
+                src_dev,
+                false,
+            )?,
+            "ntfs" => repack_via_trait::<fstool::fs::ntfs::Ntfs>(
+                dst_dev.as_mut(),
+                &fstool::fs::ntfs::format::FormatOpts::default(),
+                &mut src_fs,
+                src_dev,
+                false,
+            )?,
+            "f2fs" => repack_via_trait::<fstool::fs::f2fs::F2fs>(
+                dst_dev.as_mut(),
+                &fstool::fs::f2fs::FormatOpts::default(),
+                &mut src_fs,
+                src_dev,
+                false,
+            )?,
+            "squashfs" => repack_via_trait::<fstool::fs::squashfs::Squashfs>(
+                dst_dev.as_mut(),
+                &fstool::fs::squashfs::FormatOpts::default(),
+                &mut src_fs,
+                src_dev,
+                false,
+            )?,
+            "xfs" => repack_via_trait::<fstool::fs::xfs::Xfs>(
+                dst_dev.as_mut(),
+                &fstool::fs::xfs::format::FormatOpts::default(),
+                &mut src_fs,
+                src_dev,
+                false,
+            )?,
             "iso" | "iso9660" => {
                 let opts = fstool::fs::iso9660::FormatOpts {
                     volume_id: "FSTOOL".into(),
                     application_id: "fstool".into(),
                     ..fstool::fs::iso9660::FormatOpts::default()
                 };
-                repack_via_trait::<fstool::fs::iso9660::Iso9660>(dst_dev.as_mut(), &opts, src)?;
-            }
-            "grf" => {
-                let opts = fstool::fs::grf::FormatOpts::default();
-                repack_via_trait::<fstool::fs::grf::Grf>(dst_dev.as_mut(), &opts, src)?;
-            }
-            "zip" => {
-                archive_len = repack_via_trait::<fstool::fs::archive::zip::ZipFs>(
+                repack_via_trait::<fstool::fs::iso9660::Iso9660>(
                     dst_dev.as_mut(),
-                    &fstool::fs::archive::zip::ZipFormatOpts::default(),
-                    src,
-                )?;
+                    &opts,
+                    &mut src_fs,
+                    src_dev,
+                    false,
+                )?
             }
-            "cpio" => {
-                archive_len = repack_via_trait::<fstool::fs::archive::cpio::CpioFs>(
-                    dst_dev.as_mut(),
-                    &fstool::fs::archive::cpio::CpioFormatOpts,
-                    src,
-                )?;
-            }
-            "ar" => {
-                archive_len = repack_via_trait::<fstool::fs::archive::ar::ArFs>(
-                    dst_dev.as_mut(),
-                    &fstool::fs::archive::ar::ArFormatOpts,
-                    src,
-                )?;
-            }
+            "grf" => repack_via_trait::<fstool::fs::grf::Grf>(
+                dst_dev.as_mut(),
+                &fstool::fs::grf::FormatOpts::default(),
+                &mut src_fs,
+                src_dev,
+                false,
+            )?,
+            "zip" => repack_via_trait::<fstool::fs::archive::zip::ZipFs>(
+                dst_dev.as_mut(),
+                &fstool::fs::archive::zip::ZipFormatOpts::default(),
+                &mut src_fs,
+                src_dev,
+                true,
+            )?,
+            "cpio" => repack_via_trait::<fstool::fs::archive::cpio::CpioFs>(
+                dst_dev.as_mut(),
+                &fstool::fs::archive::cpio::CpioFormatOpts,
+                &mut src_fs,
+                src_dev,
+                false,
+            )?,
+            "ar" => repack_via_trait::<fstool::fs::archive::ar::ArFs>(
+                dst_dev.as_mut(),
+                &fstool::fs::archive::ar::ArFormatOpts,
+                &mut src_fs,
+                src_dev,
+                true,
+            )?,
             other => {
                 return Err(fstool::Error::InvalidArgument(format!(
                     "repack: unknown --fs-type {other:?}"
                 )));
             }
-        }
+        };
         dst_dev.sync()?;
-        // Archives are exact-length: shrink the sparse backing file from
-        // its provisioned size down to what the writer actually wrote.
         let report_size = match archive_len {
             Some(len) => {
                 drop(dst_dev);
@@ -838,63 +865,30 @@ fn repack_cmd(
 }
 
 /// Generic repack pipeline driven by [`fstool::fs::FilesystemFactory`].
-/// Formats `F` onto `dst_dev`, walks the source `src` (passed as the
-/// CLI's `disk.img:N` / tar / dir spec) through
-/// [`fstool::repack::Source::detect`], and replays every entry into
-/// `F` via the trait. The destination is flushed before this returns.
+/// Formats `F` onto `dst_dev`, then walks the already-open source
+/// (`src_fs` + `src_dev`) into it through the unified [`fstool::repack`]
+/// sink. `lossy` drops entries the destination can't represent
+/// (symlinks/devices/xattrs) rather than erroring. The destination is
+/// flushed before returning; the `Option<u64>` is the exact archive
+/// length for stream-style writers (zip/cpio/ar), `None` for sized
+/// filesystem images.
 fn repack_via_trait<F: fstool::fs::FilesystemFactory>(
     dst_dev: &mut dyn fstool::block::BlockDevice,
     opts: &F::FormatOpts,
-    src: &str,
+    src_fs: &mut fstool::inspect::AnyFs,
+    src_dev: &mut dyn fstool::block::BlockDevice,
+    lossy: bool,
 ) -> fstool::Result<Option<u64>> {
     let mut dst = F::format(dst_dev, opts)?;
-    let source = fstool::repack::Source::detect(src)?;
-    fstool::repack::populate_fs_from_source(dst_dev, &mut dst, &source)?;
-    dst.flush(dst_dev)?;
-    // `Some` for archive writers (zip/cpio/ar) so the caller can
-    // truncate the over-provisioned file; `None` for sized FS images.
-    Ok(fstool::fs::Filesystem::image_len(&dst))
-}
-
-/// Walk the source filesystem and recreate every entry inside the
-/// destination ext. Preserves mode, uid/gid, mtime, atime, ctime; copies
-/// symlinks and device nodes verbatim when the source is ext (FAT
-/// source has none of those).
-fn copy_into_ext(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src_fs: &fstool::inspect::AnyFs,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::ext::Ext,
-) -> fstool::Result<()> {
-    use fstool::fs::FileMeta;
-    use fstool::inspect::AnyFs;
-    match src_fs {
-        AnyFs::Ext(src_ext) => copy_ext_dir(src_dev, src_ext, 2, dst_dev, dst, 2),
-        AnyFs::Fat32(src_fat) => {
-            copy_fat_dir_into_ext(src_dev, src_fat, "/", dst_dev, dst, 2, &FileMeta::default())
+    {
+        let mut sink = fstool::repack::FsSink::new(&mut dst, dst_dev);
+        if lossy {
+            sink = sink.lossy();
         }
-        AnyFs::Tar(src_tar) => copy_tar_into_ext(src_dev, src_tar, dst_dev, dst),
-        _ => Err(unsupported_repack_src(src_fs)),
+        fstool::repack::walk_anyfs(src_fs, src_dev, &mut sink)?;
     }
-}
-
-/// Walk the source filesystem and recreate every entry inside the
-/// destination FAT32. FAT can't represent symlinks / device nodes /
-/// per-file permissions — those are dropped (with a stderr note when
-/// the source had them).
-fn copy_into_fat32(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src_fs: &fstool::inspect::AnyFs,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::fat::Fat32,
-) -> fstool::Result<()> {
-    use fstool::inspect::AnyFs;
-    match src_fs {
-        AnyFs::Ext(src_ext) => copy_ext_dir_into_fat(src_dev, src_ext, 2, "/", dst_dev, dst),
-        AnyFs::Fat32(src_fat) => copy_fat_dir_into_fat(src_dev, src_fat, "/", dst_dev, dst),
-        AnyFs::Tar(src_tar) => copy_tar_into_fat(src_dev, src_tar, dst_dev, dst),
-        _ => Err(unsupported_repack_src(src_fs)),
-    }
+    dst.flush(dst_dev)?;
+    Ok(fstool::fs::Filesystem::image_len(&dst))
 }
 
 /// Repack-source error for the four read-only FSes (xfs/exfat/hfs+/apfs)
@@ -930,142 +924,6 @@ fn tar_input_codec(path: &str) -> Option<fstool::compression::Algo> {
     tar_output_codec(p)
 }
 
-/// Repack from a streaming compressed-tar source.
-///
-/// Three destinations are wired:
-/// - **tar / tar.<algo>**: one decompression pass, transcoded straight
-///   into the output writer. Hard links are now materialised properly
-///   thanks to [`TarStreamIndex`] (a tiny upfront pre-walk builds an
-///   index so the writer can re-decompress the prefix needed to copy
-///   each link target's bytes).
-/// - **ext{2,3,4} / fat32**: two decompression passes. The first walk
-///   sizes the destination (entry counts + byte totals); the second
-///   replays the entries into the freshly-formatted destination via
-///   [`TarStreamIndex::open_body`], which seeks a fresh decoder to
-///   each regular file's body offset. The destination FS isn't
-///   append-only, which is why the size has to be known up front.
-///   This is the deliberate streaming-invariant-honouring alternative
-///   to spooling the whole archive through a tempfile.
-fn repack_from_tar_stream(
-    src: &str,
-    algo: fstool::compression::Algo,
-    dst: &std::path::Path,
-    fs_type_override: Option<&str>,
-) -> fstool::Result<()> {
-    use fstool::fs::tar::{EntryKind as TarKind, TarEntryMeta, TarStreamWriter};
-    let dst_codec = tar_output_codec(dst);
-    let target_fs_str = fs_type_override
-        .map(|s| s.to_ascii_lowercase())
-        .or_else(|| {
-            dst.extension()
-                .and_then(|s| s.to_str())
-                .filter(|e| e.eq_ignore_ascii_case("tar"))
-                .map(|_| "tar".to_string())
-        })
-        .or_else(|| dst_codec.map(|_| "tar".to_string()))
-        .unwrap_or_else(|| "tar".to_string());
-    let target_lower = target_fs_str.to_ascii_lowercase();
-
-    if target_lower != "tar" {
-        // Non-tar destination: two-pass build (size, format, replay).
-        return repack_from_tar_stream_into_fs(src, algo, dst, &target_lower);
-    }
-
-    // Build an in-memory index over the source so hard links can be
-    // resolved. The index walk is one full decompression pass; the
-    // transcoding pump below is the second.
-    let index = build_tar_stream_index(src, algo)?;
-
-    let file = std::fs::File::create(dst)?;
-    let buffered: Box<dyn std::io::Write> =
-        Box::new(std::io::BufWriter::with_capacity(64 * 1024, file));
-    let inner: Box<dyn std::io::Write> = match dst_codec {
-        Some(a) => fstool::compression::make_writer(a, buffered)?,
-        None => buffered,
-    };
-    let mut writer = TarStreamWriter::new(inner);
-
-    let mut reader = open_tar_stream_reader(src, Some(algo))?;
-    while let Some(mut ent) = reader.next_entry()? {
-        let entry = ent.entry.clone();
-        let meta = TarEntryMeta {
-            mode: entry.mode,
-            uid: entry.uid,
-            gid: entry.gid,
-            mtime: entry.mtime,
-            uname: String::new(),
-            gname: String::new(),
-        };
-        match entry.kind {
-            TarKind::Regular => {
-                writer.add_file(&entry.path, &mut ent, entry.size, meta, &entry.xattrs)?;
-            }
-            TarKind::Dir => writer.add_dir(&entry.path, meta, &entry.xattrs)?,
-            TarKind::Symlink => {
-                let target = entry.link_target.as_deref().unwrap_or("");
-                writer.add_symlink(&entry.path, target, meta, &entry.xattrs)?;
-            }
-            TarKind::HardLink => {
-                // Materialise the link target's body via the index: a
-                // fresh decompression stream is opened and skipped
-                // forward to the target's body offset, yielding the
-                // bytes through a bounded Read.
-                let mut body = index.open_body(&entry.path, || open_decoded_stream(src, algo))?;
-                let size = body.remaining();
-                writer.add_file(&entry.path, &mut body, size, meta, &entry.xattrs)?;
-            }
-            TarKind::CharDev => {
-                writer.add_device(
-                    &entry.path,
-                    fstool::fs::DeviceKind::Char,
-                    entry.device_major,
-                    entry.device_minor,
-                    meta,
-                    &entry.xattrs,
-                )?;
-            }
-            TarKind::BlockDev => {
-                writer.add_device(
-                    &entry.path,
-                    fstool::fs::DeviceKind::Block,
-                    entry.device_major,
-                    entry.device_minor,
-                    meta,
-                    &entry.xattrs,
-                )?;
-            }
-            TarKind::Fifo => {
-                writer.add_device(
-                    &entry.path,
-                    fstool::fs::DeviceKind::Fifo,
-                    0,
-                    0,
-                    meta,
-                    &entry.xattrs,
-                )?;
-            }
-        }
-    }
-    writer.finish()?;
-    let written = writer.bytes_written();
-    drop(writer);
-    if let Some(a) = dst_codec {
-        eprintln!(
-            "repacked {src} → {} (fs: tar.{} → tar.{}, {written} bytes plain)",
-            dst.display(),
-            algo.name(),
-            a.name()
-        );
-    } else {
-        eprintln!(
-            "repacked {src} → {} (fs: tar.{} → tar, {written} bytes)",
-            dst.display(),
-            algo.name()
-        );
-    }
-    Ok(())
-}
-
 /// Open `src` as a freshly-decoded `Read` positioned at the
 /// decompressed stream's byte 0. Boxed so it composes with the
 /// existing helpers; callers feed this to [`TarStreamIndex::open_body`]
@@ -1079,313 +937,6 @@ fn open_decoded_stream(
     let buffered: Box<dyn std::io::Read> =
         Box::new(std::io::BufReader::with_capacity(64 * 1024, file));
     fstool::compression::make_reader(algo, buffered)
-}
-
-/// Single-pass walk that builds a [`TarStreamIndex`] for a compressed
-/// tar source. Bodies are NOT consumed: the underlying reader skips
-/// past each body's bytes during `next_entry`, so the only buffered
-/// data is the per-entry metadata.
-fn build_tar_stream_index(
-    src: &str,
-    algo: fstool::compression::Algo,
-) -> fstool::Result<fstool::fs::tar::TarStreamIndex> {
-    let reader = open_tar_stream_reader(src, Some(algo))?;
-    fstool::fs::tar::TarStreamIndex::build_from(reader)
-}
-
-/// Two-pass repack from a compressed tar into a pre-sized destination
-/// (ext{2,3,4} or fat32). Pass 1 walks the archive to build an index
-/// (which also gives us entry counts + total file bytes for sizing);
-/// Pass 2 replays the entries into the freshly-formatted destination,
-/// re-decompressing the source per regular-file body via the index's
-/// seek-by-offset helper.
-///
-/// The two-pass cost is the price of honouring the streaming
-/// invariant: no whole-archive tempfile, no decompressed RAM spool.
-/// Worst case (lots of small files) the second pass re-decompresses
-/// nearly the entire archive; in practice tar archives are seek-light
-/// enough that the index drives a single linear progression through
-/// the source.
-fn repack_from_tar_stream_into_fs(
-    src: &str,
-    algo: fstool::compression::Algo,
-    dst: &std::path::Path,
-    target_lower: &str,
-) -> fstool::Result<()> {
-    use fstool::fs::tar::EntryKind as TarKind;
-    // ── Pass 1: walk + index + sizing aggregates ──
-    let index = build_tar_stream_index(src, algo)?;
-    let (size_estimate, total_files, total_dirs, total_symlinks, total_devices, total_bytes) =
-        size_from_tar_index(&index, target_lower)?;
-    let _ = (
-        total_files,
-        total_dirs,
-        total_symlinks,
-        total_devices,
-        total_bytes,
-    ); // counts kept for reporting only
-
-    let mut dst_dev =
-        fstool::block::create_image(dst, size_estimate, &fstool::block::CreateOpts::default())?;
-
-    // ── Pass 2: format + replay ──
-    match target_lower {
-        "ext2" | "ext3" | "ext4" => {
-            let kind = match target_lower {
-                "ext2" => fstool::fs::ext::FsKind::Ext2,
-                "ext3" => fstool::fs::ext::FsKind::Ext3,
-                _ => fstool::fs::ext::FsKind::Ext4,
-            };
-            let mut plan = fstool::fs::ext::BuildPlan::new(4096, kind);
-            for ix in index.entries() {
-                match ix.entry.kind {
-                    TarKind::Regular | TarKind::HardLink => plan.add_file(ix.entry.size),
-                    TarKind::Dir => plan.add_dir(),
-                    TarKind::Symlink => plan.add_symlink(
-                        ix.entry
-                            .link_target
-                            .as_deref()
-                            .map(|s| s.len())
-                            .unwrap_or(0),
-                    ),
-                    TarKind::CharDev | TarKind::BlockDev | TarKind::Fifo => plan.add_device(),
-                }
-            }
-            let mut opts = plan.to_format_opts();
-            // Same sparse-preserve rationale as the FS-to-ext repack
-            // path: tar archives can carry long zero runs (sparse-form
-            // entries unpacked dense, or just zero-filled files). The
-            // writer's all-zero-block check turns them back into
-            // holes on the destination.
-            opts.sparse = true;
-            let mut dst_ext = fstool::fs::ext::Ext::format_with(dst_dev.as_mut(), &opts)?;
-            replay_tar_index_into_ext(src, algo, &index, dst_dev.as_mut(), &mut dst_ext)?;
-            dst_ext.flush(dst_dev.as_mut())?;
-        }
-        "fat32" | "vfat" => {
-            let total_sectors: u32 = (size_estimate / 512).try_into().map_err(|_| {
-                fstool::Error::InvalidArgument(
-                    "repack: FAT32 size doesn't fit in a u32 sector count".into(),
-                )
-            })?;
-            let fat_opts = fstool::fs::fat::FatFormatOpts {
-                total_sectors,
-                volume_id: 0,
-                volume_label: *b"REPACKED   ",
-            };
-            let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &fat_opts)?;
-            replay_tar_index_into_fat(src, algo, &index, dst_dev.as_mut(), &mut dst_fat)?;
-            dst_fat.flush(dst_dev.as_mut())?;
-        }
-        other => {
-            return Err(fstool::Error::Unsupported(format!(
-                "repack: streaming a `.tar.{}` source into a {other} destination is not yet wired",
-                algo.name()
-            )));
-        }
-    }
-    dst_dev.sync()?;
-    eprintln!(
-        "repacked {src} → {} (fs: tar.{} → {target_lower}, ~{size_estimate} bytes; two-pass)",
-        dst.display(),
-        algo.name(),
-    );
-    Ok(())
-}
-
-/// Aggregate the size-relevant counters from a built [`TarStreamIndex`]
-/// and return `(size_estimate, files, dirs, symlinks, devices, bytes)`.
-/// `target_lower` tunes the size estimate per destination FS.
-fn size_from_tar_index(
-    index: &fstool::fs::tar::TarStreamIndex,
-    target_lower: &str,
-) -> fstool::Result<(u64, u64, u64, u64, u64, u64)> {
-    use fstool::fs::tar::EntryKind as TarKind;
-    let mut files = 0u64;
-    let mut dirs = 0u64;
-    let mut symlinks = 0u64;
-    let mut devices = 0u64;
-    let mut bytes = 0u64;
-    for ix in index.entries() {
-        match ix.entry.kind {
-            TarKind::Regular => {
-                files += 1;
-                bytes += ix.entry.size;
-            }
-            TarKind::HardLink => {
-                files += 1;
-                bytes += ix.entry.size;
-            }
-            TarKind::Dir => dirs += 1,
-            TarKind::Symlink => symlinks += 1,
-            TarKind::CharDev | TarKind::BlockDev | TarKind::Fifo => devices += 1,
-        }
-    }
-    let size_estimate = match target_lower {
-        "ext2" | "ext3" | "ext4" => {
-            // Conservative ext sizing: file bytes + dir/inode overhead.
-            // We give 4 KiB per inode + 1 MiB structural pad; min 8 MiB.
-            let inodes = files + dirs + symlinks + devices + 16;
-            let raw = bytes + inodes * 4096 + 1024 * 1024;
-            raw.max(8 * 1024 * 1024).div_ceil(4096) * 4096
-        }
-        "fat32" | "vfat" => {
-            // FAT32 needs at least MIN_FAT32_CLUSTERS clusters of 1 KiB
-            // overhead per cluster. Double the byte total to leave room
-            // for cluster fragmentation + FAT tables + dir entries.
-            let needed = bytes
-                .saturating_mul(2)
-                .max(fstool::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024);
-            needed.div_ceil(512) * 512
-        }
-        _ => bytes + 16 * 1024 * 1024,
-    };
-    Ok((size_estimate, files, dirs, symlinks, devices, bytes))
-}
-
-/// Pass 2 (ext): replay the indexed entries into a freshly-formatted
-/// ext destination, re-decompressing per regular file via
-/// `TarStreamIndex::open_body`.
-fn replay_tar_index_into_ext(
-    src: &str,
-    algo: fstool::compression::Algo,
-    index: &fstool::fs::tar::TarStreamIndex,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::ext::Ext,
-) -> fstool::Result<()> {
-    use fstool::fs::tar::EntryKind as TarKind;
-    use fstool::fs::{DeviceKind, FileMeta};
-    let mut path_to_ino: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    path_to_ino.insert("/".into(), 2);
-
-    for ix in index.entries() {
-        let e = &ix.entry;
-        let parent_path = parent_of(&e.path);
-        let parent_ino = ensure_ext_dir(dst_dev, dst, &mut path_to_ino, &parent_path)?;
-        let leaf = leaf_of(&e.path);
-        let meta = FileMeta {
-            mode: e.mode & 0o7777,
-            uid: e.uid,
-            gid: e.gid,
-            mtime: e.mtime as u32,
-            atime: e.mtime as u32,
-            ctime: e.mtime as u32,
-        };
-        let new_ino = match e.kind {
-            TarKind::Regular => {
-                let mut body = index.open_body(&e.path, || open_decoded_stream(src, algo))?;
-                dst.add_file_to_streaming(
-                    dst_dev,
-                    parent_ino,
-                    leaf.as_bytes(),
-                    &mut body,
-                    e.size,
-                    meta,
-                )?
-            }
-            TarKind::HardLink => {
-                // Materialise the linked target's content. Preserving
-                // ext hard-link semantics across FS types is out of
-                // scope; we copy the bytes instead.
-                let mut body = index.open_body(&e.path, || open_decoded_stream(src, algo))?;
-                let len = body.remaining();
-                dst.add_file_to_streaming(
-                    dst_dev,
-                    parent_ino,
-                    leaf.as_bytes(),
-                    &mut body,
-                    len,
-                    meta,
-                )?
-            }
-            TarKind::Dir => ensure_ext_dir(dst_dev, dst, &mut path_to_ino, &e.path)?,
-            TarKind::Symlink => {
-                let target = e.link_target.as_deref().unwrap_or("");
-                dst.add_symlink_to(
-                    dst_dev,
-                    parent_ino,
-                    leaf.as_bytes(),
-                    target.as_bytes(),
-                    meta,
-                )?
-            }
-            TarKind::CharDev => dst.add_device_to(
-                dst_dev,
-                parent_ino,
-                leaf.as_bytes(),
-                DeviceKind::Char,
-                e.device_major,
-                e.device_minor,
-                meta,
-            )?,
-            TarKind::BlockDev => dst.add_device_to(
-                dst_dev,
-                parent_ino,
-                leaf.as_bytes(),
-                DeviceKind::Block,
-                e.device_major,
-                e.device_minor,
-                meta,
-            )?,
-            TarKind::Fifo => dst.add_device_to(
-                dst_dev,
-                parent_ino,
-                leaf.as_bytes(),
-                DeviceKind::Fifo,
-                0,
-                0,
-                meta,
-            )?,
-        };
-        if matches!(e.kind, TarKind::Dir) {
-            path_to_ino.insert(e.path.clone(), new_ino);
-        }
-        if !e.xattrs.is_empty() {
-            dst.set_xattrs(dst_dev, new_ino, &e.xattrs)?;
-        }
-    }
-    Ok(())
-}
-
-/// Pass 2 (FAT32): same as the ext replay, minus the metadata FAT
-/// can't carry. Entries that aren't regular / dir / hard-link are
-/// dropped with a stderr note.
-fn replay_tar_index_into_fat(
-    src: &str,
-    algo: fstool::compression::Algo,
-    index: &fstool::fs::tar::TarStreamIndex,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::fat::Fat32,
-) -> fstool::Result<()> {
-    use fstool::fs::tar::EntryKind as TarKind;
-    let mut made_dirs: std::collections::HashSet<String> =
-        std::collections::HashSet::from(["/".into()]);
-    for ix in index.entries() {
-        let e = &ix.entry;
-        let parent = parent_of(&e.path);
-        ensure_fat_dir(dst_dev, dst, &mut made_dirs, &parent)?;
-        match e.kind {
-            TarKind::Regular => {
-                let mut body = index.open_body(&e.path, || open_decoded_stream(src, algo))?;
-                dst.add_file_from_reader(dst_dev, &e.path, &mut body, e.size)?;
-            }
-            TarKind::HardLink => {
-                let mut body = index.open_body(&e.path, || open_decoded_stream(src, algo))?;
-                let len = body.remaining();
-                dst.add_file_from_reader(dst_dev, &e.path, &mut body, len)?;
-            }
-            TarKind::Dir => {
-                ensure_fat_dir(dst_dev, dst, &mut made_dirs, &e.path)?;
-            }
-            _ => {
-                eprintln!(
-                    "repack: dropping {:?} — FAT32 can't represent {:?}",
-                    e.path, e.kind
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Open a (possibly codec-wrapped) tar archive as a streaming reader.
@@ -1597,535 +1148,17 @@ fn open_decoded_stream_plain(image: &str) -> fstool::Result<Box<dyn std::io::Rea
     Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, file)))
 }
 
-fn unsupported_repack_src(src_fs: &fstool::inspect::AnyFs) -> fstool::Error {
-    fstool::Error::Unsupported(format!(
-        "repack: {} source is not yet wired into the FS-to-FS copy path (it's inspectable via `ls`/`cat`/`info` but can't yet be a repack source)",
-        src_fs.kind_string()
-    ))
-}
-
 // ─── ext → ext (full metadata preservation) ─────────────────────────────
-
-fn copy_ext_dir(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::ext::Ext,
-    src_ino: u32,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::ext::Ext,
-    dst_ino: u32,
-) -> fstool::Result<()> {
-    let mut link_map = std::collections::HashMap::new();
-    copy_ext_dir_at(
-        src_dev,
-        src,
-        src_ino,
-        dst_dev,
-        dst,
-        dst_ino,
-        "",
-        &mut link_map,
-    )
-}
-
-#[allow(clippy::too_many_arguments)] // recursive walker — splitting would just shuffle state
-fn copy_ext_dir_at(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::ext::Ext,
-    src_ino: u32,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::ext::Ext,
-    dst_ino: u32,
-    parent_path: &str,
-    link_map: &mut std::collections::HashMap<u32, u32>,
-) -> fstool::Result<()> {
-    use fstool::fs::ext::dir as ext_dir;
-    use fstool::fs::ext::inode::decode_devnum;
-    use fstool::fs::{DeviceKind, FileMeta};
-
-    let entries = src.list_inode(src_dev, src_ino)?;
-    for e in entries {
-        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
-            continue;
-        }
-        let inode = src.read_inode(src_dev, e.inode)?;
-        let meta = FileMeta {
-            mode: inode.mode & 0o7777,
-            uid: inode.uid as u32,
-            gid: inode.gid as u32,
-            mtime: inode.mtime,
-            atime: inode.atime,
-            ctime: inode.ctime,
-        };
-        let name = e.name.as_bytes();
-        let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
-        // Read source xattrs once per entry; preserve them across the
-        // create + (optional) recursion.
-        let xattrs = src.read_xattrs(src_dev, e.inode)?;
-        let mut entry_path = String::with_capacity(parent_path.len() + 1 + e.name.len());
-        entry_path.push_str(parent_path);
-        entry_path.push('/');
-        entry_path.push_str(&e.name);
-        fstool::repack::note(&entry_path);
-
-        // Hard-link short circuit: subsequent encounters of a
-        // multi-link source inode reuse the dst inode that was
-        // created the first time, instead of duplicating the file
-        // body. Skipped for directories (POSIX disallows dir links).
-        if inode.links_count > 1
-            && mode_type != fstool::fs::ext::constants::S_IFDIR
-            && let Some(&existing_dst) = link_map.get(&e.inode)
-        {
-            dst.add_link_to(dst_dev, dst_ino, name, existing_dst)?;
-            continue;
-        }
-
-        let new_ino = match mode_type {
-            t if t == fstool::fs::ext::constants::S_IFREG => {
-                let mut reader = src.open_file_reader(src_dev, e.inode)?;
-                dst.add_file_to_streaming(
-                    dst_dev,
-                    dst_ino,
-                    name,
-                    &mut reader,
-                    inode.size as u64,
-                    meta,
-                )?
-            }
-            t if t == fstool::fs::ext::constants::S_IFDIR => {
-                // For ext4 destinations with enough children, emit an
-                // HTree (DIR_INDEX) directory; otherwise pre-size the
-                // dir with one contiguous extent and use a plain
-                // unindexed layout.
-                let child_entries = src.list_inode(src_dev, e.inode).unwrap_or_default();
-                let real_children: Vec<&fstool::fs::DirEntry> = child_entries
-                    .iter()
-                    .filter(|c| c.name != "." && c.name != "..")
-                    .collect();
-                let use_htree =
-                    matches!(dst.kind, fstool::fs::ext::FsKind::Ext4) && real_children.len() >= 250;
-                let child_ino = if use_htree {
-                    let names: Vec<&[u8]> =
-                        real_children.iter().map(|c| c.name.as_bytes()).collect();
-                    dst.add_dir_indexed(dst_dev, dst_ino, name, meta, &names)?
-                } else {
-                    let mut bytes: usize = 24;
-                    for c in &real_children {
-                        bytes += ext_dir::min_rec_len(c.name.len());
-                    }
-                    let usable =
-                        ext_dir::usable_dir_len(dst.layout.block_size, dst.has_metadata_csum_pub());
-                    let child_blocks = bytes.div_ceil(usable).max(1) as u32;
-                    dst.add_dir_to_with_blocks(dst_dev, dst_ino, name, meta, child_blocks)?
-                };
-                copy_ext_dir_at(
-                    src_dev,
-                    src,
-                    e.inode,
-                    dst_dev,
-                    dst,
-                    child_ino,
-                    &entry_path,
-                    link_map,
-                )?;
-                child_ino
-            }
-            t if t == fstool::fs::ext::constants::S_IFLNK => {
-                let target = src.read_symlink_target(src_dev, e.inode)?;
-                dst.add_symlink_to(dst_dev, dst_ino, name, target.as_bytes(), meta)?
-            }
-            t if t == fstool::fs::ext::constants::S_IFCHR => {
-                let (major, minor) = decode_devnum(inode.block[0]);
-                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Char, major, minor, meta)?
-            }
-            t if t == fstool::fs::ext::constants::S_IFBLK => {
-                let (major, minor) = decode_devnum(inode.block[0]);
-                dst.add_device_to(
-                    dst_dev,
-                    dst_ino,
-                    name,
-                    DeviceKind::Block,
-                    major,
-                    minor,
-                    meta,
-                )?
-            }
-            t if t == fstool::fs::ext::constants::S_IFIFO => {
-                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Fifo, 0, 0, meta)?
-            }
-            t if t == fstool::fs::ext::constants::S_IFSOCK => {
-                dst.add_device_to(dst_dev, dst_ino, name, DeviceKind::Socket, 0, 0, meta)?
-            }
-            _ => {
-                eprintln!(
-                    "repack: skipping inode {} ({:?}) — unknown mode {:#o}",
-                    e.inode, e.name, inode.mode
-                );
-                continue;
-            }
-        };
-        if !xattrs.is_empty() {
-            dst.set_xattrs(dst_dev, new_ino, &xattrs)?;
-        }
-        // Record src→dst for multi-link non-directory inodes so the
-        // hard-link short circuit above catches the next occurrence.
-        if inode.links_count > 1 && mode_type != fstool::fs::ext::constants::S_IFDIR {
-            link_map.insert(e.inode, new_ino);
-        }
-    }
-    Ok(())
-}
 
 // ─── FAT32 → FAT32 ──────────────────────────────────────────────────────
 
-fn copy_fat_dir_into_fat(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::fat::Fat32,
-    src_path: &str,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::fat::Fat32,
-) -> fstool::Result<()> {
-    use fstool::fs::EntryKind;
-    let entries = src.list_path(src_dev, src_path)?;
-    for e in entries {
-        let child = join_fs_path(src_path, &e.name);
-        match e.kind {
-            EntryKind::Dir => {
-                dst.add_dir(dst_dev, &child)?;
-                copy_fat_dir_into_fat(src_dev, src, &child, dst_dev, dst)?;
-            }
-            EntryKind::Regular => {
-                // Resolve the source entry to get its actual file_size.
-                let (entry, _) = src.resolve_entry(src_dev, &child)?;
-                let mut reader = src.open_file_reader(src_dev, &child)?;
-                dst.add_file_from_reader(dst_dev, &child, &mut reader, entry.file_size as u64)?;
-            }
-            _ => {} // FAT can't carry anything else
-        }
-    }
-    Ok(())
-}
-
 // ─── ext → FAT32 (drops metadata FAT can't store) ───────────────────────
-
-fn copy_ext_dir_into_fat(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::ext::Ext,
-    src_ino: u32,
-    cur_path: &str,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::fat::Fat32,
-) -> fstool::Result<()> {
-    let entries = src.list_inode(src_dev, src_ino)?;
-    for e in entries {
-        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
-            continue;
-        }
-        let inode = src.read_inode(src_dev, e.inode)?;
-        let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
-        let child = join_fs_path(cur_path, &e.name);
-        match mode_type {
-            t if t == fstool::fs::ext::constants::S_IFREG => {
-                let mut reader = src.open_file_reader(src_dev, e.inode)?;
-                dst.add_file_from_reader(dst_dev, &child, &mut reader, inode.size as u64)?;
-            }
-            t if t == fstool::fs::ext::constants::S_IFDIR => {
-                dst.add_dir(dst_dev, &child)?;
-                copy_ext_dir_into_fat(src_dev, src, e.inode, &child, dst_dev, dst)?;
-            }
-            t if t == fstool::fs::ext::constants::S_IFLNK
-                || t == fstool::fs::ext::constants::S_IFCHR
-                || t == fstool::fs::ext::constants::S_IFBLK
-                || t == fstool::fs::ext::constants::S_IFIFO
-                || t == fstool::fs::ext::constants::S_IFSOCK =>
-            {
-                eprintln!(
-                    "repack: dropping {child:?} ({:?}) — FAT32 can't represent it",
-                    fstool_mode_kind(mode_type)
-                );
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
 
 // ─── FAT32 → ext ────────────────────────────────────────────────────────
 
-fn copy_fat_dir_into_ext(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::fat::Fat32,
-    src_path: &str,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::ext::Ext,
-    dst_ino: u32,
-    meta: &fstool::fs::FileMeta,
-) -> fstool::Result<()> {
-    use fstool::fs::EntryKind;
-    let entries = src.list_path(src_dev, src_path)?;
-    for e in entries {
-        let child = join_fs_path(src_path, &e.name);
-        match e.kind {
-            EntryKind::Dir => {
-                let new_ino = dst.add_dir_to(dst_dev, dst_ino, e.name.as_bytes(), *meta)?;
-                copy_fat_dir_into_ext(src_dev, src, &child, dst_dev, dst, new_ino, meta)?;
-            }
-            EntryKind::Regular => {
-                let (entry, _) = src.resolve_entry(src_dev, &child)?;
-                let mut reader = src.open_file_reader(src_dev, &child)?;
-                dst.add_file_to_streaming(
-                    dst_dev,
-                    dst_ino,
-                    e.name.as_bytes(),
-                    &mut reader,
-                    entry.file_size as u64,
-                    *meta,
-                )?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 // ─── Tar → ext ──────────────────────────────────────────────────────────
 
-/// Replay a tar archive's entries into a fresh ext destination.
-/// Preserves mode, uid/gid, mtime, symlinks, device nodes, and xattrs.
-fn copy_tar_into_ext(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    tar: &fstool::fs::tar::Tar,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::ext::Ext,
-) -> fstool::Result<()> {
-    use fstool::fs::tar::EntryKind;
-    use fstool::fs::{DeviceKind, FileMeta};
-    // Map every absolute path in the tar to its destination inode,
-    // creating ancestor dirs on demand so an entry can land before its
-    // parent dir appears in the archive.
-    let mut path_to_ino: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    path_to_ino.insert("/".into(), 2);
-
-    let entries: Vec<fstool::fs::tar::Entry> = tar.entries().to_vec();
-    for e in entries {
-        let parent_path = parent_of(&e.path);
-        let parent_ino = ensure_ext_dir(dst_dev, dst, &mut path_to_ino, &parent_path)?;
-        let leaf = leaf_of(&e.path);
-        let meta = FileMeta {
-            mode: e.mode & 0o7777,
-            uid: e.uid,
-            gid: e.gid,
-            mtime: e.mtime as u32,
-            atime: e.mtime as u32,
-            ctime: e.mtime as u32,
-        };
-        let new_ino = match e.kind {
-            EntryKind::Regular => {
-                let mut reader = tar.open_file_reader(src_dev, &e.path)?;
-                dst.add_file_to_streaming(
-                    dst_dev,
-                    parent_ino,
-                    leaf.as_bytes(),
-                    &mut reader,
-                    e.size,
-                    meta,
-                )?
-            }
-            EntryKind::Dir => {
-                // ensure_ext_dir already creates it if missing; we just
-                // need its inode.
-                ensure_ext_dir(dst_dev, dst, &mut path_to_ino, &e.path)?
-            }
-            EntryKind::Symlink => {
-                let target = e.link_target.as_deref().unwrap_or("");
-                dst.add_symlink_to(
-                    dst_dev,
-                    parent_ino,
-                    leaf.as_bytes(),
-                    target.as_bytes(),
-                    meta,
-                )?
-            }
-            EntryKind::HardLink => {
-                // Materialise the link target's content again. Preserves
-                // file content across the conversion at the cost of a
-                // copy; preserving the link itself across FS types is
-                // out of scope.
-                let target = e.link_target.as_deref().unwrap_or("");
-                let abs_target = if target.starts_with('/') {
-                    target.to_string()
-                } else {
-                    format!("/{target}")
-                };
-                let target_entry = tar.lookup(&abs_target).ok_or_else(|| {
-                    fstool::Error::InvalidImage(format!(
-                        "tar: hard link {:?} → {abs_target:?} (target missing)",
-                        e.path
-                    ))
-                })?;
-                let mut reader = tar.open_file_reader(src_dev, &abs_target)?;
-                dst.add_file_to_streaming(
-                    dst_dev,
-                    parent_ino,
-                    leaf.as_bytes(),
-                    &mut reader,
-                    target_entry.size,
-                    meta,
-                )?
-            }
-            EntryKind::CharDev => dst.add_device_to(
-                dst_dev,
-                parent_ino,
-                leaf.as_bytes(),
-                DeviceKind::Char,
-                e.device_major,
-                e.device_minor,
-                meta,
-            )?,
-            EntryKind::BlockDev => dst.add_device_to(
-                dst_dev,
-                parent_ino,
-                leaf.as_bytes(),
-                DeviceKind::Block,
-                e.device_major,
-                e.device_minor,
-                meta,
-            )?,
-            EntryKind::Fifo => dst.add_device_to(
-                dst_dev,
-                parent_ino,
-                leaf.as_bytes(),
-                DeviceKind::Fifo,
-                0,
-                0,
-                meta,
-            )?,
-        };
-        if matches!(e.kind, EntryKind::Dir) {
-            path_to_ino.insert(e.path.clone(), new_ino);
-        }
-        if !e.xattrs.is_empty() {
-            dst.set_xattrs(dst_dev, new_ino, &e.xattrs)?;
-        }
-    }
-    Ok(())
-}
-
-fn ensure_ext_dir(
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::ext::Ext,
-    path_to_ino: &mut std::collections::HashMap<String, u32>,
-    path: &str,
-) -> fstool::Result<u32> {
-    use fstool::fs::FileMeta;
-    if let Some(&ino) = path_to_ino.get(path) {
-        return Ok(ino);
-    }
-    let parent = parent_of(path);
-    let parent_ino = ensure_ext_dir(dst_dev, dst, path_to_ino, &parent)?;
-    let leaf = leaf_of(path);
-    let meta = FileMeta {
-        mode: 0o755,
-        ..FileMeta::default()
-    };
-    let ino = dst.add_dir_to(dst_dev, parent_ino, leaf.as_bytes(), meta)?;
-    path_to_ino.insert(path.to_string(), ino);
-    Ok(ino)
-}
-
 // ─── Tar → FAT32 ────────────────────────────────────────────────────────
-
-fn copy_tar_into_fat(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    tar: &fstool::fs::tar::Tar,
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::fat::Fat32,
-) -> fstool::Result<()> {
-    use fstool::fs::tar::EntryKind;
-    let mut made_dirs: std::collections::HashSet<String> =
-        std::collections::HashSet::from(["/".into()]);
-    let entries: Vec<fstool::fs::tar::Entry> = tar.entries().to_vec();
-    for e in entries {
-        let parent = parent_of(&e.path);
-        ensure_fat_dir(dst_dev, dst, &mut made_dirs, &parent)?;
-        match e.kind {
-            EntryKind::Regular => {
-                let mut reader = tar.open_file_reader(src_dev, &e.path)?;
-                dst.add_file_from_reader(dst_dev, &e.path, &mut reader, e.size)?;
-            }
-            EntryKind::Dir => {
-                ensure_fat_dir(dst_dev, dst, &mut made_dirs, &e.path)?;
-            }
-            EntryKind::HardLink => {
-                let target = e.link_target.as_deref().unwrap_or("");
-                let abs_target = if target.starts_with('/') {
-                    target.to_string()
-                } else {
-                    format!("/{target}")
-                };
-                if let Some(target_entry) = tar.lookup(&abs_target) {
-                    let mut reader = tar.open_file_reader(src_dev, &abs_target)?;
-                    dst.add_file_from_reader(dst_dev, &e.path, &mut reader, target_entry.size)?;
-                }
-            }
-            _ => {
-                eprintln!(
-                    "repack: dropping {:?} — FAT32 can't represent {:?}",
-                    e.path, e.kind
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ensure_fat_dir(
-    dst_dev: &mut dyn fstool::block::BlockDevice,
-    dst: &mut fstool::fs::fat::Fat32,
-    made: &mut std::collections::HashSet<String>,
-    path: &str,
-) -> fstool::Result<()> {
-    if made.contains(path) {
-        return Ok(());
-    }
-    let parent = parent_of(path);
-    ensure_fat_dir(dst_dev, dst, made, &parent)?;
-    dst.add_dir(dst_dev, path)?;
-    made.insert(path.to_string());
-    Ok(())
-}
-
-fn parent_of(path: &str) -> String {
-    let p = path.trim_end_matches('/');
-    match p.rfind('/') {
-        Some(0) | None => "/".into(),
-        Some(i) => p[..i].into(),
-    }
-}
-
-fn leaf_of(path: &str) -> &str {
-    let p = path.trim_end_matches('/');
-    p.rsplit('/').next().unwrap_or(p)
-}
-
-fn join_fs_path(parent: &str, leaf: &str) -> String {
-    if parent.ends_with('/') {
-        format!("{parent}{leaf}")
-    } else {
-        format!("{parent}/{leaf}")
-    }
-}
-
-fn fstool_mode_kind(mode_type: u16) -> &'static str {
-    use fstool::fs::ext::constants::*;
-    match mode_type {
-        t if t == S_IFLNK => "symlink",
-        t if t == S_IFCHR => "char-device",
-        t if t == S_IFBLK => "block-device",
-        t if t == S_IFIFO => "fifo",
-        t if t == S_IFSOCK => "socket",
-        _ => "other",
-    }
-}
 
 // ─── shrink sizing ───────────────────────────────────────────────────────
 
@@ -2162,369 +1195,6 @@ fn sum_source_file_bytes(
     src_fs: &mut fstool::inspect::AnyFs,
 ) -> fstool::Result<u64> {
     src_fs.total_file_bytes(src_dev)
-}
-
-/// Upper-bound the size of a tar archive built from `src_fs`. Walks the
-/// source once, accumulating header + content + worst-case PAX overhead
-/// for each entry, plus a 1 KiB safety pad. The actual archive almost
-/// always comes out smaller; the destination file is truncated to the
-/// real length after the write.
-fn tar_size_upper_bound(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src_fs: &fstool::inspect::AnyFs,
-) -> fstool::Result<u64> {
-    use fstool::inspect::AnyFs;
-    let mut total: u64 = 0;
-    // Conservative per-entry header allowance: 512 (ustar) + 2 * 512
-    // (one PAX header + body) + a generous xattr payload buffer.
-    let per_entry_overhead = |xattr_bytes: u64| 1536 + xattr_bytes + 512;
-    match src_fs {
-        AnyFs::Ext(src_ext) => {
-            tar_size_walk_ext(src_dev, src_ext, 2, &mut total, &per_entry_overhead)?;
-        }
-        AnyFs::Fat32(src_fat) => {
-            tar_size_walk_fat(src_dev, src_fat, "/", &mut total, &per_entry_overhead)?;
-        }
-        AnyFs::Tar(src_tar) => {
-            for e in src_tar.entries() {
-                let xb: u64 = e
-                    .xattrs
-                    .iter()
-                    .map(|x| (x.name.len() + x.value.len()) as u64)
-                    .sum();
-                let content = if matches!(e.kind, fstool::fs::tar::EntryKind::Regular) {
-                    (e.size + 511) & !511
-                } else {
-                    0
-                };
-                total += per_entry_overhead(xb) + content;
-            }
-        }
-        AnyFs::Grf(src_grf) => {
-            // GRF stores file *sizes* uncompressed in the entry
-            // table — no need to inflate to size the output tar.
-            // No xattrs, so the per-entry overhead is constant.
-            for entry in src_grf.entries.values() {
-                let content = (u64::from(entry.size) + 511) & !511;
-                total += per_entry_overhead(0) + content;
-            }
-        }
-        _ => return Err(unsupported_repack_src(src_fs)),
-    }
-    // Two zero blocks for EOF + 1 KiB pad.
-    Ok(total + 1024 + 1024)
-}
-
-fn tar_size_walk_ext(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::ext::Ext,
-    src_ino: u32,
-    total: &mut u64,
-    overhead: &dyn Fn(u64) -> u64,
-) -> fstool::Result<()> {
-    for e in src.list_inode(src_dev, src_ino)? {
-        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
-            continue;
-        }
-        let inode = src.read_inode(src_dev, e.inode)?;
-        let xattrs = src.read_xattrs(src_dev, e.inode)?;
-        let xb: u64 = xattrs
-            .iter()
-            .map(|x| (x.name.len() + x.value.len()) as u64)
-            .sum();
-        let mode_type = inode.mode & fstool::fs::ext::constants::S_IFMT;
-        let content = if mode_type == fstool::fs::ext::constants::S_IFREG {
-            ((inode.size as u64) + 511) & !511
-        } else {
-            0
-        };
-        *total += overhead(xb) + content;
-        if mode_type == fstool::fs::ext::constants::S_IFDIR {
-            tar_size_walk_ext(src_dev, src, e.inode, total, overhead)?;
-        }
-    }
-    Ok(())
-}
-
-fn tar_size_walk_fat(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::fat::Fat32,
-    src_path: &str,
-    total: &mut u64,
-    overhead: &dyn Fn(u64) -> u64,
-) -> fstool::Result<()> {
-    use fstool::fs::EntryKind;
-    for e in src.list_path(src_dev, src_path)? {
-        let child = join_fs_path(src_path, &e.name);
-        match e.kind {
-            EntryKind::Dir => {
-                *total += overhead(0);
-                tar_size_walk_fat(src_dev, src, &child, total, overhead)?;
-            }
-            EntryKind::Regular => {
-                let (entry, _) = src.resolve_entry(src_dev, &child)?;
-                *total += overhead(0) + (((entry.file_size as u64) + 511) & !511);
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// Walk every entry in `src_fs` and emit it as a tar archive directly
-/// to `dst` (optionally codec-wrapped). Returns the number of plain
-/// (uncompressed) bytes written through the writer; the on-disk file
-/// is whatever the codec produces.
-///
-/// Streaming output path: the destination file is opened once, wrapped
-/// in a compressing writer if needed, and never seeked. No tempfile.
-fn repack_into_tar_streaming(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src_fs: &fstool::inspect::AnyFs,
-    dst: &std::path::Path,
-    codec: Option<fstool::compression::Algo>,
-) -> fstool::Result<u64> {
-    use fstool::fs::tar::TarStreamWriter;
-    let file = std::fs::File::create(dst)?;
-    let buffered: Box<dyn std::io::Write> =
-        Box::new(std::io::BufWriter::with_capacity(64 * 1024, file));
-    let inner: Box<dyn std::io::Write> = match codec {
-        Some(algo) => fstool::compression::make_writer(algo, buffered)?,
-        None => buffered,
-    };
-    let mut writer = TarStreamWriter::new(inner);
-    repack_walk_into_sink(src_dev, src_fs, &mut writer)?;
-    writer.finish()?;
-    let written = writer.bytes_written();
-    drop(writer);
-    Ok(written)
-}
-
-/// Walk every entry in `src_fs` and emit it through the given
-/// [`TarSink`]. Used by the streaming output path; the BlockDevice-
-/// backed `TarWriter` is no longer wired into the CLI for tar output.
-fn repack_walk_into_sink(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src_fs: &fstool::inspect::AnyFs,
-    sink: &mut dyn fstool::fs::tar::TarSink,
-) -> fstool::Result<()> {
-    use fstool::inspect::AnyFs;
-    match src_fs {
-        AnyFs::Ext(src_ext) => tar_walk_ext(src_dev, src_ext, 2, "", sink),
-        AnyFs::Fat32(src_fat) => tar_walk_fat(src_dev, src_fat, "/", sink),
-        AnyFs::Tar(src_tar) => tar_replay_tar(src_dev, src_tar, sink),
-        AnyFs::Grf(src_grf) => tar_walk_grf(src_dev, src_grf, sink),
-        _ => Err(unsupported_repack_src(src_fs)),
-    }
-}
-
-fn tar_walk_grf(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::grf::Grf,
-    writer: &mut dyn fstool::fs::tar::TarSink,
-) -> fstool::Result<()> {
-    use fstool::fs::tar::TarEntryMeta;
-    // GRF entries are flat archives — no POSIX metadata, no
-    // directory entries (parents are implicit from `/`-separated
-    // path components). We synthesise tar dir entries for each
-    // unique parent so the output is well-formed.
-    let mut emitted_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let meta = TarEntryMeta {
-        mode: 0o644,
-        uid: 0,
-        gid: 0,
-        mtime: 0,
-        uname: String::new(),
-        gname: String::new(),
-    };
-    let dir_meta = TarEntryMeta {
-        mode: 0o755,
-        ..meta.clone()
-    };
-    for (name, entry) in &src.entries {
-        let path = format!("/{name}");
-        fstool::repack::note(&path);
-        // Emit each prefix directory exactly once.
-        let mut acc = String::new();
-        for part in name.split('/').collect::<Vec<_>>().split_last().unwrap().1 {
-            if !acc.is_empty() {
-                acc.push('/');
-            }
-            acc.push_str(part);
-            if emitted_dirs.insert(acc.clone()) {
-                writer.add_dir(&format!("/{acc}"), dir_meta.clone(), &[])?;
-            }
-        }
-        let bytes = src.read_entry(src_dev, entry)?;
-        let len = bytes.len() as u64;
-        let mut reader = std::io::Cursor::new(bytes);
-        writer.add_file(&path, &mut reader, len, meta.clone(), &[])?;
-    }
-    Ok(())
-}
-
-fn tar_walk_ext(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::ext::Ext,
-    src_ino: u32,
-    prefix: &str,
-    writer: &mut dyn fstool::fs::tar::TarSink,
-) -> fstool::Result<()> {
-    use fstool::fs::DeviceKind;
-    use fstool::fs::ext::constants::*;
-    use fstool::fs::ext::inode::decode_devnum;
-    use fstool::fs::tar::TarEntryMeta;
-    for e in src.list_inode(src_dev, src_ino)? {
-        if e.name == "." || e.name == ".." || (src_ino == 2 && e.name == "lost+found") {
-            continue;
-        }
-        let inode = src.read_inode(src_dev, e.inode)?;
-        let xattrs = src.read_xattrs(src_dev, e.inode)?;
-        let path = if prefix.is_empty() {
-            format!("/{}", e.name)
-        } else {
-            format!("{prefix}/{}", e.name)
-        };
-        fstool::repack::note(&path);
-        let meta = TarEntryMeta {
-            mode: inode.mode & 0o7777,
-            uid: inode.uid as u32,
-            gid: inode.gid as u32,
-            mtime: inode.mtime as u64,
-            uname: String::new(),
-            gname: String::new(),
-        };
-        let mode_type = inode.mode & S_IFMT;
-        match mode_type {
-            t if t == S_IFREG => {
-                let mut reader = src.open_file_reader(src_dev, e.inode)?;
-                writer.add_file(&path, &mut reader, inode.size as u64, meta, &xattrs)?;
-            }
-            t if t == S_IFDIR => {
-                writer.add_dir(&path, meta, &xattrs)?;
-                tar_walk_ext(src_dev, src, e.inode, &path, writer)?;
-            }
-            t if t == S_IFLNK => {
-                let target = src.read_symlink_target(src_dev, e.inode)?;
-                writer.add_symlink(&path, &target, meta, &xattrs)?;
-            }
-            t if t == S_IFCHR => {
-                let (maj, min) = decode_devnum(inode.block[0]);
-                writer.add_device(&path, DeviceKind::Char, maj, min, meta, &xattrs)?;
-            }
-            t if t == S_IFBLK => {
-                let (maj, min) = decode_devnum(inode.block[0]);
-                writer.add_device(&path, DeviceKind::Block, maj, min, meta, &xattrs)?;
-            }
-            t if t == S_IFIFO => {
-                writer.add_device(&path, DeviceKind::Fifo, 0, 0, meta, &xattrs)?;
-            }
-            _ => {
-                eprintln!(
-                    "repack: skipping {path:?} — unsupported mode {:#o}",
-                    inode.mode
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn tar_walk_fat(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::fat::Fat32,
-    src_path: &str,
-    writer: &mut dyn fstool::fs::tar::TarSink,
-) -> fstool::Result<()> {
-    use fstool::fs::EntryKind;
-    use fstool::fs::tar::TarEntryMeta;
-    for e in src.list_path(src_dev, src_path)? {
-        let child = join_fs_path(src_path, &e.name);
-        fstool::repack::note(&child);
-        let meta = TarEntryMeta::default();
-        match e.kind {
-            EntryKind::Dir => {
-                writer.add_dir(&child, meta, &[])?;
-                tar_walk_fat(src_dev, src, &child, writer)?;
-            }
-            EntryKind::Regular => {
-                let (entry, _) = src.resolve_entry(src_dev, &child)?;
-                let mut reader = src.open_file_reader(src_dev, &child)?;
-                writer.add_file(&child, &mut reader, entry.file_size as u64, meta, &[])?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn tar_replay_tar(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src: &fstool::fs::tar::Tar,
-    writer: &mut dyn fstool::fs::tar::TarSink,
-) -> fstool::Result<()> {
-    use fstool::fs::DeviceKind;
-    use fstool::fs::tar::{EntryKind, TarEntryMeta};
-    let entries: Vec<fstool::fs::tar::Entry> = src.entries().to_vec();
-    for e in entries {
-        fstool::repack::note(&e.path);
-        let meta = TarEntryMeta {
-            mode: e.mode,
-            uid: e.uid,
-            gid: e.gid,
-            mtime: e.mtime,
-            uname: String::new(),
-            gname: String::new(),
-        };
-        match e.kind {
-            EntryKind::Regular => {
-                let mut reader = src.open_file_reader(src_dev, &e.path)?;
-                writer.add_file(&e.path, &mut reader, e.size, meta, &e.xattrs)?;
-            }
-            EntryKind::Dir => writer.add_dir(&e.path, meta, &e.xattrs)?,
-            EntryKind::Symlink => {
-                let target = e.link_target.as_deref().unwrap_or("");
-                writer.add_symlink(&e.path, target, meta, &e.xattrs)?;
-            }
-            EntryKind::HardLink => {
-                // Preserve content for the link's apparent file.
-                let target = e.link_target.as_deref().unwrap_or("");
-                let abs = if target.starts_with('/') {
-                    target.to_string()
-                } else {
-                    format!("/{target}")
-                };
-                if let Some(target_entry) = src.lookup(&abs) {
-                    let mut reader = src.open_file_reader(src_dev, &abs)?;
-                    writer.add_file(&e.path, &mut reader, target_entry.size, meta, &e.xattrs)?;
-                }
-            }
-            EntryKind::CharDev => {
-                writer.add_device(
-                    &e.path,
-                    DeviceKind::Char,
-                    e.device_major,
-                    e.device_minor,
-                    meta,
-                    &e.xattrs,
-                )?;
-            }
-            EntryKind::BlockDev => {
-                writer.add_device(
-                    &e.path,
-                    DeviceKind::Block,
-                    e.device_major,
-                    e.device_minor,
-                    meta,
-                    &e.xattrs,
-                )?;
-            }
-            EntryKind::Fifo => {
-                writer.add_device(&e.path, DeviceKind::Fifo, 0, 0, meta, &e.xattrs)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn shell_cmd(image: &str) -> fstool::Result<()> {

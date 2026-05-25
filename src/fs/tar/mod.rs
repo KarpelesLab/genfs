@@ -258,11 +258,29 @@ impl Tar {
         children.entry("/".into()).or_default();
         for (i, e) in entries.iter().enumerate() {
             by_path.insert(e.path.clone(), i);
-            let (parent, leaf) = split_path(&e.path);
-            children
-                .entry(parent.to_string())
-                .or_default()
-                .push(leaf.to_string());
+            // Register every path component under its parent — not just
+            // the direct parent — so an archive that stores `etc/conf`
+            // without an explicit `etc/` entry still lists `etc` under
+            // `/`. (A recursive `list()` walk depends on this.)
+            let comps: Vec<&str> = e.path.trim_start_matches('/').split('/').collect();
+            let mut parent = String::from("/");
+            for (depth, comp) in comps.iter().enumerate() {
+                let child_path = if parent == "/" {
+                    format!("/{comp}")
+                } else {
+                    format!("{parent}/{comp}")
+                };
+                let kids = children.entry(parent.clone()).or_default();
+                if !kids.iter().any(|k| k == comp) {
+                    kids.push((*comp).to_string());
+                }
+                // Intermediate components are directories; give them a
+                // children bucket so they list as dirs.
+                if depth + 1 < comps.len() {
+                    children.entry(child_path.clone()).or_default();
+                }
+                parent = child_path;
+            }
             if matches!(e.kind, EntryKind::Dir) {
                 children.entry(e.path.clone()).or_default();
             }
@@ -342,15 +360,32 @@ impl Tar {
         let e = self
             .lookup(path)
             .ok_or_else(|| crate::Error::InvalidArgument(format!("tar: no such entry {path:?}")))?;
-        if !matches!(e.kind, EntryKind::Regular | EntryKind::HardLink) {
-            return Err(crate::Error::InvalidArgument(format!(
-                "tar: {path:?} is not a regular file"
-            )));
-        }
+        // A hard-link entry carries no body of its own — resolve to the
+        // target's data range so callers (incl. the repack walker) read
+        // the linked content rather than zero bytes.
+        let (offset, remaining) = match e.kind {
+            EntryKind::Regular => (e.data_offset, e.size),
+            EntryKind::HardLink => {
+                let tgt = e.link_target.clone().ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!("tar: hardlink {path:?} has no target"))
+                })?;
+                let te = self.lookup(&tgt).ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "tar: hardlink {path:?} → {tgt:?} target not found"
+                    ))
+                })?;
+                (te.data_offset, te.size)
+            }
+            _ => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "tar: {path:?} is not a regular file"
+                )));
+            }
+        };
         Ok(TarFileReader {
             dev,
-            offset: e.data_offset,
-            remaining: e.size,
+            offset,
+            remaining,
         })
     }
 }
@@ -475,6 +510,108 @@ impl crate::fs::Filesystem for Tar {
                 crate::Error::InvalidArgument(format!("tar: symlink {s:?} has no link target"))
             })
     }
+
+    /// Surface the per-entry metadata tar carries (mode/uid/gid/mtime,
+    /// device numbers) so a generic walker preserves it. Hard links
+    /// report the target's size; synthesised intermediate dirs report
+    /// directory defaults.
+    fn getattr(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
+        let dir_attrs = |inode: u32| crate::fs::FileAttrs {
+            kind: crate::fs::EntryKind::Dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            blocks: 0,
+            nlink: 2,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            rdev: 0,
+            inode,
+        };
+        if s == "/" || s.is_empty() {
+            return Ok(dir_attrs(1));
+        }
+        let p = normalise_path(s);
+        let Some(&i) = self.by_path.get(&p) else {
+            // Intermediate directory present only as a path component.
+            if self.children.contains_key(&p) {
+                return Ok(dir_attrs(0));
+            }
+            return Err(crate::Error::InvalidArgument(format!(
+                "tar: no entry at {p:?}"
+            )));
+        };
+        let e = &self.entries[i];
+        let (kind, size) = match e.kind {
+            EntryKind::Regular => (crate::fs::EntryKind::Regular, e.size),
+            EntryKind::HardLink => {
+                let sz = e
+                    .link_target
+                    .as_ref()
+                    .and_then(|t| self.lookup(t))
+                    .map(|te| te.size)
+                    .unwrap_or(0);
+                (crate::fs::EntryKind::Regular, sz)
+            }
+            EntryKind::Dir => (crate::fs::EntryKind::Dir, 0),
+            EntryKind::Symlink => (crate::fs::EntryKind::Symlink, 0),
+            EntryKind::CharDev => (crate::fs::EntryKind::Char, 0),
+            EntryKind::BlockDev => (crate::fs::EntryKind::Block, 0),
+            EntryKind::Fifo => (crate::fs::EntryKind::Fifo, 0),
+        };
+        let rdev = match e.kind {
+            EntryKind::CharDev | EntryKind::BlockDev => {
+                crate::fs::ext::inode::encode_devnum(e.device_major, e.device_minor)
+            }
+            _ => 0,
+        };
+        Ok(crate::fs::FileAttrs {
+            kind,
+            mode: e.mode,
+            uid: e.uid,
+            gid: e.gid,
+            size,
+            blocks: size.div_ceil(512),
+            nlink: 1,
+            atime: e.mtime as u32,
+            mtime: e.mtime as u32,
+            ctime: e.mtime as u32,
+            rdev,
+            inode: i as u32 + 1,
+        })
+    }
+
+    /// Surface the `SCHILY.xattr.*` PAX records tar parsed for `path`.
+    fn list_xattrs(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::XattrPair>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
+        Ok(self
+            .lookup(s)
+            .map(|e| {
+                e.xattrs
+                    .iter()
+                    .map(|x| crate::fs::XattrPair {
+                        name: x.name.clone(),
+                        value: x.value.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
 }
 
 #[derive(Default, Debug)]
@@ -553,15 +690,6 @@ fn normalise_path(p: &str) -> String {
         trimmed.to_string()
     } else {
         format!("/{trimmed}")
-    }
-}
-
-fn split_path(p: &str) -> (&str, &str) {
-    // p is normalised to start with '/' and not end with '/'.
-    match p.rfind('/') {
-        Some(0) => ("/", &p[1..]),
-        Some(i) => (&p[..i], &p[i + 1..]),
-        None => ("/", p),
     }
 }
 

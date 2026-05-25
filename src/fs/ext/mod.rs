@@ -3690,6 +3690,23 @@ impl crate::fs::Filesystem for Ext {
         Ok(())
     }
 
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: FileMeta,
+    ) -> Result<()> {
+        let (parent, name) = split_path(path)?;
+        let parent_str = parent
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 parent path".into()))?;
+        let parent_ino = self.path_to_inode(dev, parent_str)?;
+        self.add_file_to_streaming(dev, parent_ino, name.as_bytes(), body, len, meta)?;
+        Ok(())
+    }
+
     fn create_dir(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -3938,6 +3955,31 @@ impl crate::fs::Filesystem for Ext {
                 value: x.value,
             })
             .collect())
+    }
+
+    fn set_xattrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        xattrs: &[crate::fs::XattrPair],
+    ) -> Result<()> {
+        if xattrs.is_empty() {
+            return Ok(());
+        }
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("ext: non-UTF-8 path".into()))?;
+        let ino = self.path_to_inode(dev, s)?;
+        let converted: Vec<xattr::Xattr> = xattrs
+            .iter()
+            .map(|x| xattr::Xattr {
+                name: x.name.clone(),
+                value: x.value.clone(),
+            })
+            .collect();
+        // Inherent batch writer (one external block) — resolved over the
+        // trait method by argument types.
+        self.set_xattrs(dev, ino, &converted)
     }
 
     fn statfs(&mut self, _dev: &mut dyn BlockDevice) -> Result<crate::fs::StatFs> {

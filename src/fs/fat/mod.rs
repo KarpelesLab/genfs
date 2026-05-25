@@ -891,6 +891,20 @@ impl crate::fs::Filesystem for Fat32 {
         self.add_file_from_reader(dev, s, &mut reader, len)
     }
 
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        self.add_file_from_reader(dev, s, body, len)
+    }
+
     fn create_dir(
         &mut self,
         dev: &mut dyn BlockDevice,

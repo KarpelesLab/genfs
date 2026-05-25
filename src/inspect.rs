@@ -399,6 +399,28 @@ impl AnyFs {
         self.as_filesystem_dyn(|fs| fs.total_file_bytes(dev))
     }
 
+    /// Full attributes for `path` — delegates to the inner backend's
+    /// [`crate::fs::Filesystem::getattr`]. Used by the repack walker to
+    /// read source metadata uniformly.
+    pub fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        self.as_filesystem_dyn(|fs| fs.getattr(dev, path))
+    }
+
+    /// Extended attributes for `path` — delegates to the inner backend's
+    /// [`crate::fs::Filesystem::list_xattrs`] (empty for backends without
+    /// xattr storage).
+    pub fn list_xattrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+    ) -> Result<Vec<crate::fs::XattrPair>> {
+        self.as_filesystem_dyn(|fs| fs.list_xattrs(dev, path))
+    }
+
     /// Read a symbolic link's target as a UTF-8 string. Delegates to
     /// the inner backend's [`crate::fs::Filesystem::read_symlink`].
     /// Returns `Unsupported` for filesystems that don't carry symlinks
@@ -481,6 +503,47 @@ impl AnyFs {
                 let mut r = fs.read_file(dev, std::path::Path::new(path))?;
                 pump(&mut r, out, &mut buf)
             }
+        }
+    }
+
+    /// Open a borrowed streaming reader over a regular file's body.
+    /// Pull-based counterpart to [`Self::copy_file_to`] — the repack
+    /// walker uses it to hand a `&mut dyn Read` straight to a
+    /// destination's `create_file_streaming` without a tempfile. The
+    /// returned reader borrows both `self` and `dev` for `'a`.
+    ///
+    /// (An inline match rather than [`Self::as_filesystem_dyn`]: the
+    /// closure-based helper fixes the return type's lifetime too early
+    /// to hand back a reader borrowing `dev`.)
+    pub fn open_body_reader<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        match self {
+            Self::Ext(ext) => {
+                let ino = ext.path_to_inode(dev, path)?;
+                Ok(Box::new(ext.open_file_reader(dev, ino)?))
+            }
+            Self::Fat32(fat) => Ok(Box::new(fat.open_file_reader(dev, path)?)),
+            Self::Tar(tar) => Ok(Box::new(tar.open_file_reader(dev, path)?)),
+            Self::Xfs(xfs) => Ok(Box::new(xfs.open_file_reader(dev, path)?)),
+            Self::Exfat(exfat) => Ok(Box::new(exfat.open_file_reader(dev, path)?)),
+            Self::HfsPlus(hfs) => Ok(Box::new(hfs.open_file_reader(dev, path)?)),
+            Self::Apfs(apfs) => Ok(Box::new(apfs.open_file_reader(dev, path)?)),
+            Self::Ntfs(ntfs) => Ok(Box::new(ntfs.open_file_reader(dev, path)?)),
+            Self::F2fs(f2) => Ok(Box::new(f2.open_file_reader(dev, path)?)),
+            Self::Squashfs(sq) => Ok(Box::new(sq.open_file_reader(dev, path)?)),
+            Self::Iso9660(iso) => Ok(Box::new(iso.open_file_reader(dev, path)?)),
+            Self::Grf(grf) => {
+                let key = path.trim_start_matches('/').to_string();
+                let entry = grf.entries.get(&key).cloned().ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!("grf: no entry at {key:?}"))
+                })?;
+                let bytes = grf.read_entry(dev, &entry)?;
+                Ok(Box::new(std::io::Cursor::new(bytes)))
+            }
+            Self::Archive(fs, _, _) => fs.read_file(dev, std::path::Path::new(path)),
         }
     }
 

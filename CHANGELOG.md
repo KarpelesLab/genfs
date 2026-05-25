@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(repack)* unified the repack pipeline: one generic source walker feeds
+  one of two sinks (a streaming-tar sink or a block-device `Filesystem`
+  sink). The per-`(source,dest)`-type copiers are gone — any readable
+  source now repacks into any writable destination through a single
+  trait-driven path. The only branch is streaming (tar / `.tar.<codec>`)
+  vs non-streaming output. Previously-rejected combinations now work
+  (e.g. `repack app.zip out.tar`, `repack image.xfs out.tar`).
+- *(fs)* `Filesystem` gains `create_file_streaming` (zero-copy body
+  streaming, no per-file tempfile; ext/fat32/exfat override it) and a
+  batch `set_xattrs`. Faithful `getattr` (real mode/uid/gid/times, and
+  xattrs/device numbers where stored) now on tar, f2fs, and XFS sources
+  in addition to ext — so repacking from them preserves metadata.
+
 ### Added
 
 - *(archive)* shared archive core (`src/fs/archive/`) — an indexed-entry

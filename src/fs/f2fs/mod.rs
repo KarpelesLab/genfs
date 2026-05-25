@@ -464,6 +464,49 @@ impl crate::fs::Filesystem for F2fs {
         self.open_file_reader(dev, s)
     }
 
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        use crate::fs::f2fs::constants as c;
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("f2fs: non-UTF-8 path".into()))?;
+        let ino = self.resolve_path(dev, s)?;
+        let (_blk, inode) = self.read_inode(dev, ino)?;
+        let kind = match inode.mode & c::S_IFMT {
+            c::S_IFREG => crate::fs::EntryKind::Regular,
+            c::S_IFDIR => crate::fs::EntryKind::Dir,
+            c::S_IFLNK => crate::fs::EntryKind::Symlink,
+            c::S_IFCHR => crate::fs::EntryKind::Char,
+            c::S_IFBLK => crate::fs::EntryKind::Block,
+            c::S_IFIFO => crate::fs::EntryKind::Fifo,
+            c::S_IFSOCK => crate::fs::EntryKind::Socket,
+            _ => crate::fs::EntryKind::Regular,
+        };
+        // Device nodes store their dev_t in the first block pointer,
+        // Linux-encoded — same convention ext uses.
+        let rdev = match kind {
+            crate::fs::EntryKind::Char | crate::fs::EntryKind::Block => inode.i_addr[0],
+            _ => 0,
+        };
+        Ok(crate::fs::FileAttrs {
+            kind,
+            mode: inode.mode & 0o7777,
+            uid: inode.uid,
+            gid: inode.gid,
+            size: inode.size,
+            blocks: inode.size.div_ceil(512),
+            nlink: inode.links,
+            atime: inode.atime,
+            mtime: inode.mtime,
+            ctime: inode.ctime,
+            rdev,
+            inode: ino,
+        })
+    }
+
     fn open_file_ro<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,

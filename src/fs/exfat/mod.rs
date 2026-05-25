@@ -1186,6 +1186,21 @@ impl crate::fs::Filesystem for Exfat {
         Exfat::create_file(self, dev, s, &mut reader, len, ts).map(|_| ())
     }
 
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("exfat: non-UTF-8 path".into()))?;
+        let ts = unix_to_exfat_timestamp(meta.mtime);
+        Exfat::create_file(self, dev, s, body, len, ts).map(|_| ())
+    }
+
     fn create_dir(
         &mut self,
         dev: &mut dyn BlockDevice,

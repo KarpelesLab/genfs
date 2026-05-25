@@ -777,6 +777,43 @@ impl crate::fs::Filesystem for Xfs {
         Ok(Box::new(r))
     }
 
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        use crate::fs::xfs::inode as xi;
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        let (ino, _buf, core) = self.resolve_path(dev, s)?;
+        let kind = match core.mode & xi::S_IFMT {
+            xi::S_IFREG => crate::fs::EntryKind::Regular,
+            xi::S_IFDIR => crate::fs::EntryKind::Dir,
+            xi::S_IFLNK => crate::fs::EntryKind::Symlink,
+            xi::S_IFCHR => crate::fs::EntryKind::Char,
+            xi::S_IFBLK => crate::fs::EntryKind::Block,
+            0o010_000 => crate::fs::EntryKind::Fifo,
+            0o140_000 => crate::fs::EntryKind::Socket,
+            _ => crate::fs::EntryKind::Regular,
+        };
+        Ok(crate::fs::FileAttrs {
+            kind,
+            mode: core.mode & 0o7777,
+            uid: core.uid,
+            gid: core.gid,
+            size: core.size,
+            blocks: core.size.div_ceil(512),
+            nlink: core.nlink,
+            atime: core.atime.sec,
+            mtime: core.mtime.sec,
+            ctime: core.ctime.sec,
+            // Device-node rdev lives in the data fork; not surfaced yet.
+            rdev: 0,
+            inode: ino as u32,
+        })
+    }
+
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         self.flush_writes(dev)
     }

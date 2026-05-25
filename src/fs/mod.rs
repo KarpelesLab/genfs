@@ -423,6 +423,37 @@ pub trait Filesystem {
         meta: FileMeta,
     ) -> crate::Result<()>;
 
+    /// Create a regular file at `path` streaming exactly `len` bytes from
+    /// `body`. Unlike [`create_file`](Self::create_file)'s
+    /// [`FileSource::Reader`] (which needs an owned `ReadSeek + Send`),
+    /// `body` is a plain borrowed [`Read`] — so a body borrowed from
+    /// another open filesystem can be piped straight through without an
+    /// intermediate tempfile or a `Seek`/`Send` bound. Implementations
+    /// MUST NOT retain `body` past the call.
+    ///
+    /// Default: spool `body` into a tempfile and delegate to
+    /// `create_file(FileSource::HostPath(..))` — correct everywhere, so
+    /// no backend regresses. Backends whose writer already consumes a
+    /// `&mut dyn Read` (ext, FAT32, the archive core, …) override this
+    /// for true zero-copy streaming.
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn crate::block::BlockDevice,
+        path: &Path,
+        body: &mut dyn Read,
+        len: u64,
+        meta: FileMeta,
+    ) -> crate::Result<()> {
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        let mut limited = body.take(len);
+        io::copy(&mut limited, tmp.as_file_mut())?;
+        tmp.as_file_mut().sync_all()?;
+        let path_buf = tmp.path().to_path_buf();
+        let res = self.create_file(dev, path, FileSource::HostPath(path_buf), meta);
+        drop(tmp);
+        res
+    }
+
     /// Create a directory at `path`.
     fn create_dir(
         &mut self,
@@ -701,6 +732,26 @@ pub trait Filesystem {
         Err(crate::Error::Unsupported(
             "this filesystem does not implement set_xattr".into(),
         ))
+    }
+
+    /// Write a whole set of xattrs onto `path` at once, replacing any
+    /// existing set. Backends that store xattrs in a single on-disk
+    /// structure (ext's external attribute block) override this to write
+    /// them atomically — applying them one at a time via [`set_xattr`]
+    /// would orphan the previous block on each call. The default applies
+    /// them individually.
+    ///
+    /// [`set_xattr`]: Self::set_xattr
+    fn set_xattrs(
+        &mut self,
+        dev: &mut dyn crate::block::BlockDevice,
+        path: &Path,
+        xattrs: &[XattrPair],
+    ) -> crate::Result<()> {
+        for x in xattrs {
+            self.set_xattr(dev, path, &x.name, &x.value)?;
+        }
+        Ok(())
     }
 
     /// Remove the xattr `name` from `path`. Returns `Unsupported`

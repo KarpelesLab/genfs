@@ -84,11 +84,13 @@ pub const JOURNAL_HEADER_ENDIAN: u32 = 0x1234_5678;
 /// satisfy a kernel that mounts the volume read-only.
 pub const DEFAULT_JOURNAL_BUFFER_BLOCKS: u32 = 16;
 
-/// File-type modes used on disk (`HFSPlusBSDInfo.fileMode`).
+/// File-type modes used on disk (`HFSPlusBSDInfo.fileMode`). The full
+/// set (S_IFCHR / S_IFBLK / S_IFIFO / S_IFSOCK for `create_device`)
+/// lives in [`super::catalog::mode`] — public callers compose modes
+/// from there.
 mod m {
     pub const S_IFDIR: u16 = 0o040000;
     pub const S_IFREG: u16 = 0o100000;
-    pub const S_IFLNK: u16 = 0o120000;
 }
 
 /// Options for [`super::HfsPlus::format`].
@@ -606,7 +608,11 @@ pub(crate) fn encode_folder_body(
     out
 }
 
-/// Encode an `HFSPlusCatalogFile` record body (248 bytes).
+/// Encode an `HFSPlusCatalogFile` record body (248 bytes). `special`
+/// goes into the last 4 bytes of the `HFSPlusBSDInfo` struct — used
+/// for the device-number `rdev` on char/block nodes, the link count
+/// on the iNode side of a hard-link, and the link-inode CNID on the
+/// hlnk side. Pass `0` for regular files and symlinks.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_file_body(
     file_id: u32,
@@ -617,6 +623,7 @@ pub(crate) fn encode_file_body(
     file_type: [u8; 4],
     creator: [u8; 4],
     data_fork: &ForkData,
+    special: u32,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(248);
     out.extend_from_slice(&REC_FILE.to_be_bytes());
@@ -627,7 +634,7 @@ pub(crate) fn encode_file_body(
     for _ in 0..5 {
         out.extend_from_slice(&create_date.to_be_bytes());
     }
-    encode_bsd(&mut out, file_mode, uid, gid, 0);
+    encode_bsd(&mut out, file_mode, uid, gid, special);
     // FileInfo (16 bytes): fileType, creator, then 8 reserved bytes.
     out.extend_from_slice(&file_type);
     out.extend_from_slice(&creator);
@@ -1597,20 +1604,23 @@ pub(crate) fn insert_folder(
     Ok(())
 }
 
-/// Insert a file record with the given encoded body and a thread record.
+/// Insert a file record with the given encoded body and a thread
+/// record. `file_mode` carries the full mode bits (`S_IF*` | permission
+/// bits — caller composes); `special` populates `BSDInfo.special`
+/// (rdev for char/block, 0 for everything else the public API surfaces).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_file(
     writer: &mut Writer,
     parent_id: u32,
     name: &UniStr,
     file_id: u32,
-    mode: u16,
+    file_mode: u16,
     uid: u32,
     gid: u32,
     file_type: [u8; 4],
     creator: [u8; 4],
     data_fork: &ForkData,
-    is_symlink: bool,
+    special: u32,
 ) -> Result<()> {
     if name.code_units.is_empty() {
         return Err(crate::Error::InvalidArgument(
@@ -1632,16 +1642,16 @@ pub(crate) fn insert_file(
             name.to_string_lossy()
         )));
     }
-    let mode_full = mode | if is_symlink { m::S_IFLNK } else { m::S_IFREG };
     let body = encode_file_body(
         file_id,
-        mode_full,
+        file_mode,
         uid,
         gid,
         writer.create_date,
         file_type,
         creator,
         data_fork,
+        special,
     );
     writer.catalog.insert(key, body);
 
@@ -2062,6 +2072,9 @@ pub(crate) fn promote_to_hardlink(
     //   pointing at this iNode).
     let inode_name_str = format!("iNode{link_inode}");
     let inode_name = UniStr::from_str_lossy(&inode_name_str);
+    // iNode side of a hard link: `BSDInfo.special` carries the link
+    // count (one for the src hlnk, one for the dst — i.e. 2 right
+    // after promotion). `encode_file_body` takes it directly now.
     let mut inode_body = encode_file_body(
         inode_cnid,
         mode_full,
@@ -2071,6 +2084,7 @@ pub(crate) fn promote_to_hardlink(
         [0u8; 4], // fileType (zero — Apple convention)
         [0u8; 4], // creator
         &src_fork,
+        2,
     );
     inode_body[2..4].copy_from_slice(&0x00a2u16.to_be_bytes());
     // The "reserved1" slot at body[4..8] in HFSPlusCatalogFile is
@@ -2080,10 +2094,6 @@ pub(crate) fn promote_to_hardlink(
     // = N" / "first link ID = 0 is < 16" debug output if missing).
     // src_file_id is our head hlnk (chain prev = 0).
     inode_body[4..8].copy_from_slice(&src_file_id.to_be_bytes());
-    // BSDInfo starts at byte 32; `special` is the last u32 of the
-    // 16-byte BSDInfo struct (byte 32+12 = 44). Set link count = 2
-    // (one for the src hlnk, one for the dst).
-    inode_body[44..48].copy_from_slice(&2u32.to_be_bytes());
     writer.catalog.insert(
         OwnedKey {
             parent_id: private_dir,
@@ -3153,13 +3163,13 @@ mod tests {
             ROOT_FOLDER_ID,
             &name,
             file_cnid,
-            0o644,
+            0o644 | crate::fs::hfs_plus::catalog::mode::S_IFREG,
             0,
             0,
             *b"\0\0\0\0",
             *b"\0\0\0\0",
             &fork,
-            false,
+            0,
         )
         .unwrap();
 
@@ -3214,13 +3224,13 @@ mod tests {
             ROOT_FOLDER_ID,
             &UniStr::from_str_lossy("multi.bin"),
             cnid,
-            0o644,
+            0o644 | crate::fs::hfs_plus::catalog::mode::S_IFREG,
             0,
             0,
             *b"\0\0\0\0",
             *b"\0\0\0\0",
             &fork,
-            false,
+            0,
         )
         .unwrap();
         flush(&mut writer, &mut vh, &mut dev).unwrap();
@@ -3258,13 +3268,13 @@ mod tests {
             ROOT_FOLDER_ID,
             &name,
             cnid,
-            0o644,
+            0o644 | crate::fs::hfs_plus::catalog::mode::S_IFREG,
             0,
             0,
             *b"\0\0\0\0",
             *b"\0\0\0\0",
             &fork,
-            false,
+            0,
         )
         .unwrap();
         // Sanity: overflow records were created.

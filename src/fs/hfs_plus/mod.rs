@@ -250,13 +250,13 @@ impl HfsPlus {
             parent_id,
             &name,
             cnid,
-            mode,
+            mode | catalog::mode::S_IFREG,
             uid,
             gid,
             *b"\0\0\0\0",
             *b"\0\0\0\0",
             &fork,
-            false,
+            0,
         )?;
         Ok(cnid)
     }
@@ -284,7 +284,78 @@ impl HfsPlus {
             .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
         let fork = writer::write_inline_data(w, dev, target.as_bytes())?;
         writer::insert_file(
-            w, parent_id, &name, cnid, mode, uid, gid, *b"slnk", *b"rhap", &fork, true,
+            w,
+            parent_id,
+            &name,
+            cnid,
+            mode | catalog::mode::S_IFLNK,
+            uid,
+            gid,
+            *b"slnk",
+            *b"rhap",
+            &fork,
+            0,
+        )?;
+        Ok(cnid)
+    }
+
+    /// Create a device, FIFO, or socket node. HFS+ encodes the kind
+    /// through the `BSDInfo.fileMode` `S_IF*` bits, and packs the rdev
+    /// for char/block devices into `BSDInfo.special` using the same
+    /// Linux "new"-style encoding fstool uses elsewhere
+    /// ([`crate::fs::ext::inode::encode_devnum`]) so a tar round-trip
+    /// through HFS+ preserves `(major, minor)`. FIFOs and sockets
+    /// store `special = 0`.
+    ///
+    /// The data fork is empty (special files have no content). Catalog
+    /// `fileType` / `creator` are zero, mirroring how Apple writes
+    /// these on a real volume.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_device(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        path: &str,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u32> {
+        let (parent_id, name) = self.resolve_create_target(path)?;
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
+        let cnid = w.next_cnid;
+        w.next_cnid = w
+            .next_cnid
+            .checked_add(1)
+            .ok_or_else(|| crate::Error::Unsupported("hfs+: CNID space exhausted".into()))?;
+        let (kind_bits, special) = match kind {
+            crate::fs::DeviceKind::Char => (
+                catalog::mode::S_IFCHR,
+                crate::fs::ext::inode::encode_devnum(major, minor),
+            ),
+            crate::fs::DeviceKind::Block => (
+                catalog::mode::S_IFBLK,
+                crate::fs::ext::inode::encode_devnum(major, minor),
+            ),
+            crate::fs::DeviceKind::Fifo => (catalog::mode::S_IFIFO, 0),
+            crate::fs::DeviceKind::Socket => (catalog::mode::S_IFSOCK, 0),
+        };
+        writer::insert_file(
+            w,
+            parent_id,
+            &name,
+            cnid,
+            mode | kind_bits,
+            uid,
+            gid,
+            *b"\0\0\0\0",
+            *b"\0\0\0\0",
+            &ForkData::default(),
+            special,
         )?;
         Ok(cnid)
     }
@@ -1280,16 +1351,19 @@ impl crate::fs::Filesystem for HfsPlus {
 
     fn create_device(
         &mut self,
-        _dev: &mut dyn BlockDevice,
-        _path: &std::path::Path,
-        _kind: crate::fs::DeviceKind,
-        _major: u32,
-        _minor: u32,
-        _meta: crate::fs::FileMeta,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "hfs+: device / FIFO / socket nodes are not yet implemented".into(),
-        ))
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        let mode = if meta.mode != 0 { meta.mode } else { 0o644 };
+        self.create_device(dev, s, kind, major, minor, mode, meta.uid, meta.gid)
+            .map(|_| ())
     }
 
     fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {

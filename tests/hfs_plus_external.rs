@@ -242,6 +242,80 @@ fn newfs_hfsplus_image_opens_via_fstool() {
     );
 }
 
+/// HFS+ device / FIFO / socket nodes round-trip through the catalog
+/// without corrupting the volume. Plants one of each kind under root,
+/// flushes, reopens, and confirms `getattr` surfaces the right
+/// `EntryKind` plus the `rdev` we stored — encoded the same way fstool
+/// encodes elsewhere (`ext::inode::encode_devnum`). `fsck.hfsplus`
+/// stays clean: it doesn't interpret the device-number bytes, only the
+/// surrounding catalog structure, so this proves the structural side
+/// of the encoder.
+#[test]
+fn writer_device_nodes_round_trip() {
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        volume_name: "FstoolDev".into(),
+        ..FormatOpts::default()
+    };
+    let (mut dev, mut hfs) = fresh_image(&tmp, &opts);
+
+    use fstool::fs::DeviceKind;
+    // (path, kind, major, minor)
+    let plan: [(&str, DeviceKind, u32, u32); 4] = [
+        ("/null", DeviceKind::Char, 1, 3),   // /dev/null
+        ("/loop0", DeviceKind::Block, 7, 0), // /dev/loop0
+        ("/pipe.fifo", DeviceKind::Fifo, 0, 0),
+        ("/srv.sock", DeviceKind::Socket, 0, 0),
+    ];
+    for (path, kind, major, minor) in plan {
+        hfs.create_device(&mut dev, path, kind, major, minor, 0o644, 0, 0)
+            .unwrap();
+    }
+    hfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // Reopen + inspect via the generic Filesystem trait so we exercise
+    // the same path a consumer would.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let mut fs = fstool::inspect::open(&mut dev).unwrap();
+    use std::path::Path;
+    for (path, kind, major, minor) in plan {
+        let attrs = fs.getattr(&mut dev, Path::new(path)).unwrap();
+        let want_kind = match kind {
+            DeviceKind::Char => fstool::fs::EntryKind::Char,
+            DeviceKind::Block => fstool::fs::EntryKind::Block,
+            DeviceKind::Fifo => fstool::fs::EntryKind::Fifo,
+            DeviceKind::Socket => fstool::fs::EntryKind::Socket,
+        };
+        assert_eq!(attrs.kind, want_kind, "kind mismatch for {path}");
+        let expected_rdev = match kind {
+            DeviceKind::Char | DeviceKind::Block => {
+                fstool::fs::ext::inode::encode_devnum(major, minor)
+            }
+            _ => 0,
+        };
+        assert_eq!(
+            attrs.rdev, expected_rdev,
+            "rdev mismatch for {path} (kind {kind:?}, major={major}, minor={minor})"
+        );
+        // Mode bits we requested (0o644) survive in the low bits.
+        assert_eq!(
+            attrs.mode & 0o777,
+            0o644,
+            "permission bits got mangled for {path}"
+        );
+    }
+    drop(dev);
+
+    // fsck.hfsplus stays clean.
+    if let Some((fsck, label)) = find_fsck_hfs() {
+        assert_fsck_clean(&fsck, label, tmp.path());
+    } else {
+        eprintln!("skipping fsck oracle: not installed");
+    }
+}
+
 /// Debug helper: dumps mkfs.hfsplus's extents-overflow header bytes
 /// alongside ours. Always fails to surface the diff in CI logs.
 #[test]

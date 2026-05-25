@@ -410,6 +410,73 @@ impl crate::fs::Filesystem for Iso9660 {
         self.open_file_reader(dev, p)
     }
 
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        let p = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("iso9660: non-UTF-8 path".into()))?;
+        let rec = self.resolve_path(dev, p)?;
+        let mut kind = if rec.is_dir() {
+            crate::fs::EntryKind::Dir
+        } else {
+            crate::fs::EntryKind::Regular
+        };
+        let mut mode: u16 = if rec.is_dir() { 0o755 } else { 0o644 };
+        let (mut uid, mut gid, mut mtime) = (0u32, 0u32, 0u32);
+        // Rock Ridge carries POSIX mode/uid/gid (PX) + timestamps (TF);
+        // plain ISO / Joliet have none, so defaults stand.
+        if self.rock_ridge
+            && let Some(rr) = rock_ridge::parse_system_use(dev, &rec.system_use)
+        {
+            if let Some(m) = rr.mode {
+                mode = (m & 0o7777) as u16;
+                kind = match m & 0o170_000 {
+                    0o040_000 => crate::fs::EntryKind::Dir,
+                    0o120_000 => crate::fs::EntryKind::Symlink,
+                    0o020_000 => crate::fs::EntryKind::Char,
+                    0o060_000 => crate::fs::EntryKind::Block,
+                    0o010_000 => crate::fs::EntryKind::Fifo,
+                    0o140_000 => crate::fs::EntryKind::Socket,
+                    _ => crate::fs::EntryKind::Regular,
+                };
+            }
+            if let Some(u) = rr.uid {
+                uid = u;
+            }
+            if let Some(g) = rr.gid {
+                gid = g;
+            }
+            if let Some(t) = rr.mtime {
+                mtime = t as u32;
+            }
+            if rr.symlink_target.is_some() {
+                kind = crate::fs::EntryKind::Symlink;
+            }
+        }
+        let size = if matches!(kind, crate::fs::EntryKind::Dir) {
+            0
+        } else {
+            rec.length
+        };
+        Ok(crate::fs::FileAttrs {
+            kind,
+            mode,
+            uid,
+            gid,
+            size,
+            blocks: size.div_ceil(512),
+            nlink: 1,
+            atime: mtime,
+            mtime,
+            ctime: mtime,
+            rdev: 0,
+            inode: rec.extent_lba,
+        })
+    }
+
     fn open_file_ro<'a>(
         &'a mut self,
         dev: &'a mut dyn BlockDevice,

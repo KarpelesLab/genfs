@@ -319,7 +319,7 @@ impl crate::fs::FilesystemFactory for Iso9660 {
 impl crate::fs::Filesystem for Iso9660 {
     fn create_file(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &std::path::Path,
         src: crate::fs::FileSource,
         meta: crate::fs::FileMeta,
@@ -330,7 +330,27 @@ impl crate::fs::Filesystem for Iso9660 {
                 kind: "iso9660",
                 op: "write",
             })?
-            .add_file(path, src, meta)
+            .add_file(dev, path, src, meta)
+    }
+
+    /// Stream the body straight into the data area — no temp file, no
+    /// buffering of the whole body. The ISO writer keeps only the LBA and
+    /// size per file.
+    fn create_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        body: &mut dyn std::io::Read,
+        len: u64,
+        meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        self.writer
+            .as_mut()
+            .ok_or(crate::Error::Immutable {
+                kind: "iso9660",
+                op: "write",
+            })?
+            .add_file_streaming(dev, path, body, len, meta)
     }
 
     fn create_dir(

@@ -1,27 +1,30 @@
-//! ISO 9660 writer — mkisofs-style two-pass builder.
+//! ISO 9660 writer — data-first, single-pass-data builder.
 //!
-//! The writer buffers create_*-call entries in memory, then on `flush()`
-//! walks the tree twice:
+//! File payloads are written to the device **as each `create_file` call
+//! arrives**, into a data area that begins immediately after the volume
+//! descriptors at a fixed LBA. The writer keeps only `(lba, size)` per
+//! file — never the bytes — so RAM stays bounded by metadata regardless of
+//! how large the contents are, and no temp file is ever created.
 //!
-//! 1. **Pass 1** — assign LBAs. Counts sectors needed for PVD, optional
-//!    Joliet SVD, VDST, path tables (L + M, plus Joliet equivalents),
-//!    directory records, and file data. Each directory and each file
-//!    gets a starting LBA + byte size.
+//! On-disk order:
+//!   - LBAs 0..15: system area (zero)
+//!   - LBA 16: Primary Volume Descriptor
+//!   - LBA 17: Joliet Supplementary Volume Descriptor (when enabled)
+//!   - next LBA: Volume Descriptor Set Terminator
+//!   - **file data** — each file sector-aligned, streamed in during add
+//!   - L-path table + M-path table (PVD names)
+//!   - L-path table + M-path table (Joliet names, when enabled)
+//!   - PVD directory records (each dir's stream of records)
+//!   - Joliet directory records
 //!
-//! 2. **Pass 2** — write everything out. Order:
-//!    - LBAs 0..15: system area (zero)
-//!    - LBA 16: Primary Volume Descriptor
-//!    - LBA 17: Joliet Supplementary Volume Descriptor (when enabled)
-//!    - next LBA: Volume Descriptor Set Terminator
-//!    - L-path table + M-path table (PVD names)
-//!    - L-path table + M-path table (Joliet names, when enabled)
-//!    - PVD directory records (each dir's stream of records)
-//!    - Joliet directory records
-//!    - File data, each file aligned to the start of a sector
+//! Data precedes the path tables and directory records, which is legal:
+//! every extent is referenced by absolute LBA, so a conformant reader does
+//! not care that data comes first. The metadata can only be sized once the
+//! whole tree is known, so it is laid out and written at `flush()` — after
+//! the data cursor has come to rest.
 //!
-//! Streaming invariant: file payloads come in as [`FileSource`] and are
-//! pumped through a 64 KiB scratch buffer during pass 2. The writer
-//! never loads a file fully into memory.
+//! Streaming invariant: payloads are pumped through a 64 KiB scratch buffer
+//! straight to the device. The writer never loads a file fully into memory.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -109,17 +112,17 @@ impl FormatOpts {
 /// One in-memory entry the writer is buffering. Kept private — the
 /// public API speaks through [`crate::fs::Filesystem`].
 ///
-/// `File::body` holds the file's bytes in RAM. This buys us correctness
-/// when the source is a tempfile (as `populate_image_via_trait`
-/// produces — those vanish between `create_file` and `flush`). Pay-as-
-/// you-go: typical ISO contents fit comfortably; if a future caller
-/// needs multi-GiB files we can revisit with a temp-file pool the
-/// writer owns.
+/// A `File` records only the LBA where its data was streamed and the byte
+/// size — the payload itself lives on the device, written during the
+/// `create_file` call. Nothing here grows with file contents.
 enum PendingEntry {
     File {
         #[allow(dead_code)]
         meta: FileMeta,
-        body: Vec<u8>,
+        /// Sector LBA where the body was streamed during add.
+        lba: u32,
+        /// Actual byte length written.
+        size: u64,
     },
     Dir {
         #[allow(dead_code)]
@@ -149,29 +152,90 @@ pub struct Iso9660Writer {
     opts: FormatOpts,
     /// Tree of entries keyed by normalized path. Root is implicit.
     entries: BTreeMap<PathBuf, PendingEntry>,
+    /// Next free LBA in the data area. Initialised to the first sector
+    /// past the volume descriptors and advanced as files stream in.
+    data_cursor: u32,
     /// Set once `flush` has run successfully.
     flushed: bool,
 }
 
 impl Iso9660Writer {
     pub fn new(opts: FormatOpts) -> Self {
+        let data_cursor = data_start_lba(opts.joliet);
         Self {
             opts,
             entries: BTreeMap::new(),
+            data_cursor,
             flushed: false,
         }
     }
 
-    pub fn add_file(&mut self, path: &Path, src: FileSource, meta: FileMeta) -> Result<()> {
+    /// Stream a file body to the device immediately, recording only its
+    /// LBA + size. The body is consumed here (the source may be a one-shot
+    /// reader), so nothing needs to be re-opened at flush.
+    pub fn add_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        src: FileSource,
+        meta: FileMeta,
+    ) -> Result<()> {
+        let (mut reader, _total) = src.open()?;
+        self.stream_file(dev, path, &mut reader, meta)
+    }
+
+    /// Streaming entry point used by `create_file_streaming`: pull at most
+    /// `len` bytes from `body` straight onto the device.
+    pub fn add_file_streaming(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        body: &mut dyn Read,
+        len: u64,
+        meta: FileMeta,
+    ) -> Result<()> {
+        let mut take = body.take(len);
+        self.stream_file(dev, path, &mut take, meta)
+    }
+
+    /// Shared core: write `reader` to the data area at the current cursor,
+    /// sector-pad the tail, advance the cursor, and record the entry.
+    fn stream_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+        reader: &mut dyn Read,
+        meta: FileMeta,
+    ) -> Result<()> {
         let path = normalize(path)?;
-        // Read the file body eagerly. The caller may pass a HostPath
-        // pointing at a tempfile that gets dropped before flush — and
-        // the writer can't lay out the data area until all entries are
-        // in, so we hold the bytes ourselves.
-        let (mut reader, total) = src.open()?;
-        let mut body = Vec::with_capacity(total as usize);
-        reader.read_to_end(&mut body)?;
-        self.entries.insert(path, PendingEntry::File { meta, body });
+        let lba = self.data_cursor;
+        let base = u64::from(lba) * SECTOR;
+        let mut scratch = vec![0u8; 64 * 1024];
+        let mut written: u64 = 0;
+        loop {
+            let n = reader.read(&mut scratch)?;
+            if n == 0 {
+                break;
+            }
+            dev.write_at(base + written, &scratch[..n])?;
+            written += n as u64;
+        }
+        // Zero-pad the final partial sector so the next file starts clean.
+        let used = written % SECTOR;
+        if used != 0 {
+            let pad = vec![0u8; (SECTOR - used) as usize];
+            dev.write_at(base + written, &pad)?;
+        }
+        // Empty files still occupy one LBA (an extent must point somewhere).
+        self.data_cursor += sectors_for(written.max(1));
+        self.entries.insert(
+            path,
+            PendingEntry::File {
+                meta,
+                lba,
+                size: written,
+            },
+        );
         Ok(())
     }
 
@@ -229,18 +293,35 @@ impl Iso9660Writer {
         self.entries.len()
     }
 
-    /// Write the buffered tree to `dev`. Idempotent.
+    /// Write the metadata (volume descriptors, path tables, directory
+    /// records) to `dev`. File data was already streamed in during the
+    /// `create_file` calls; this only lays out everything that references
+    /// it. Idempotent.
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         if self.flushed {
             return Ok(());
         }
+        // Recover the LBA/size of every streamed file from the entries map.
+        let mut file_lba: BTreeMap<PathBuf, (u32, u64)> = BTreeMap::new();
+        for (path, entry) in &self.entries {
+            if let PendingEntry::File { lba, size, .. } = entry {
+                file_lba.insert(path.clone(), (*lba, *size));
+            }
+        }
         // Build the directory tree from the flat entries map.
         let tree = build_tree(&self.entries)?;
-        let layout = compute_layout(&tree, &self.opts);
-        write_image(dev, &tree, &mut self.entries, &layout, &self.opts)?;
+        // Metadata begins where the data area came to rest.
+        let layout = compute_layout(&tree, &self.opts, self.data_cursor, file_lba);
+        write_image(dev, &tree, &layout, &self.opts)?;
         self.flushed = true;
         Ok(())
     }
+}
+
+/// First sector of the data area: LBA 16 (PVD) + 1, plus an optional
+/// Joliet SVD, plus the VDST.
+fn data_start_lba(joliet: bool) -> u32 {
+    16 + 1 + if joliet { 1 } else { 0 } + 1
 }
 
 /// One node in the layout tree. Constructed by `build_tree`; references
@@ -277,9 +358,7 @@ fn build_tree(entries: &BTreeMap<PathBuf, PendingEntry>) -> Result<Node> {
     for (path, entry) in entries {
         let kind = match entry {
             PendingEntry::Dir { .. } => NodeKind::Dir,
-            PendingEntry::File { body, .. } => NodeKind::File {
-                size: body.len() as u64,
-            },
+            PendingEntry::File { size, .. } => NodeKind::File { size: *size },
             PendingEntry::Symlink { target, .. } => NodeKind::Symlink {
                 target: target.clone(),
             },
@@ -383,18 +462,25 @@ struct Layout {
     total_sectors: u32,
 }
 
-/// Compute LBAs without writing anything. Pass 1.
-fn compute_layout(root: &Node, opts: &FormatOpts) -> Layout {
+/// Lay out the metadata regions. File data has already been streamed to
+/// the device (its LBAs/sizes arrive in `file_lba`); the path tables and
+/// directory records are placed starting at `metadata_start`, the first
+/// sector past the data area.
+fn compute_layout(
+    root: &Node,
+    opts: &FormatOpts,
+    metadata_start: u32,
+    file_lba: BTreeMap<PathBuf, (u32, u64)>,
+) -> Layout {
     let joliet = opts.joliet;
-    let mut cursor: u32 = 16; // PVD lives here
-    cursor += 1; // PVD
-    if joliet {
-        cursor += 1; // Joliet SVD
-    }
-    let vdst_lba = cursor;
-    cursor += 1; // VDST
+    // The VDST sits at a fixed sector right after the volume descriptors,
+    // just before the data area.
+    let vdst_lba = 16 + 1 + if joliet { 1 } else { 0 };
+    // Metadata begins past the data area.
+    let mut cursor: u32 = metadata_start;
 
-    // Path tables come next. Compute sizes by walking the tree.
+    // Path tables come first in the metadata area. Compute sizes by
+    // walking the tree.
     let pvd_dirs = collect_directories(root);
     let path_table_size = path_table_byte_size(&pvd_dirs, /*joliet*/ false);
     let l_path_lba = cursor;
@@ -434,15 +520,9 @@ fn compute_layout(root: &Node, opts: &FormatOpts) -> Layout {
         }
     }
 
-    // File data. We walk in path order so the cursor advances
-    // deterministically; each file gets a fresh sector start.
-    let mut file_lba: BTreeMap<PathBuf, (u32, u64)> = BTreeMap::new();
-    walk_files(root, &mut |n| {
-        if let NodeKind::File { size } = n.kind {
-            file_lba.insert(n.path.clone(), (cursor, size));
-            cursor += sectors_for(size.max(1));
-        }
-    });
+    // File data already lives at the front of the image (streamed during
+    // add); `file_lba` carries each file's LBA + size. `cursor` now points
+    // at the end of all metadata, which is the total image size.
 
     Layout {
         dir_lba,
@@ -492,13 +572,6 @@ fn find_node<'a>(root: &'a Node, path: &Path) -> Option<&'a Node> {
         cur = cur.children.iter().find(|c| c.name == comp)?;
     }
     Some(cur)
-}
-
-fn walk_files<F: FnMut(&Node)>(root: &Node, f: &mut F) {
-    f(root);
-    for c in &root.children {
-        walk_files(c, f);
-    }
 }
 
 fn sectors_for(bytes: u64) -> u32 {
@@ -595,11 +668,12 @@ fn dir_record_size(node: &Node, rock_ridge: bool, joliet: bool) -> usize {
     }
 }
 
-/// Pass 2: stamp the actual bytes.
+/// Write the metadata: system area, volume descriptors, path tables, and
+/// directory records. File data is already on the device (streamed during
+/// add), so this never touches the data area.
 fn write_image(
     dev: &mut dyn BlockDevice,
     root: &Node,
-    entries: &mut BTreeMap<PathBuf, PendingEntry>,
     layout: &Layout,
     opts: &FormatOpts,
 ) -> Result<()> {
@@ -686,28 +760,8 @@ fn write_image(
         }
     }
 
-    // 8. File data. Body is held in RAM by add_file (see PendingEntry
-    //    docstring for the rationale) — we still emit zero-padding for
-    //    the final sector so subsequent records start aligned.
-    for (path, (lba, _size)) in layout.file_lba.iter() {
-        let Some(entry) = entries.get(path) else {
-            continue;
-        };
-        let PendingEntry::File { body, .. } = entry else {
-            continue;
-        };
-        let base = u64::from(*lba) * SECTOR;
-        let total = body.len() as u64;
-        if !body.is_empty() {
-            dev.write_at(base, body)?;
-        }
-        let used = total % SECTOR;
-        if used != 0 {
-            let pad = (SECTOR - used) as usize;
-            let z = vec![0u8; pad];
-            dev.write_at(base + total, &z)?;
-        }
-    }
+    // File data needs no pass here: it was streamed straight to the data
+    // area (LBAs from `layout.file_lba`) during each `create_file` call.
 
     Ok(())
 }
@@ -1222,7 +1276,7 @@ mod tests {
             reader: Box::new(Cursor::new(body.clone())),
             len: body.len() as u64,
         };
-        w.add_file(Path::new("/etc/conf"), src, FileMeta::default())
+        w.add_file(&mut dev, Path::new("/etc/conf"), src, FileMeta::default())
             .unwrap();
         w.flush(&mut dev).unwrap();
 

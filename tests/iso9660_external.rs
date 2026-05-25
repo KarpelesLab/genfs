@@ -48,7 +48,7 @@ fn build_tiny_iso(path: &Path) {
         reader: Box::new(std::io::Cursor::new(body.clone())),
         len: body.len() as u64,
     };
-    w.add_file(Path::new("/etc/conf"), src, FileMeta::default())
+    w.add_file(&mut dev, Path::new("/etc/conf"), src, FileMeta::default())
         .unwrap();
     w.flush(&mut dev).unwrap();
 }

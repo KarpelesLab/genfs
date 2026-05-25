@@ -511,3 +511,56 @@ fn dump_fstool_catalog_leaf() {
     }
     panic!("\n{}", out);
 }
+
+/// Large single directory on a volume big enough to exercise both
+/// follow-up fixes at once. 6,000 files force several hundred catalog
+/// nodes, so the catalog B-tree must grow past the nodes reserved at
+/// format (`grow_catalog_fork` appends an extent); and on a ≥512 MiB
+/// volume `fsck.hfsplus` enforces the catalog fork's clump size (it must
+/// be the ≈0.8%/1 MiB-capped value, not the node size), so this also
+/// guards the `btree_clump_size` formula. fsck must stay clean throughout.
+#[test]
+fn writer_large_directory_grows_catalog_passes_fsck() {
+    let Some((fsck, label)) = find_fsck_hfs() else {
+        eprintln!("skipping: fsck.hfs / fsck.hfsplus not installed");
+        return;
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    // 600 MiB: above the ~512 MiB point where fsck checks the clump size.
+    let mut dev = FileBackend::create(tmp.path(), 600 * 1024 * 1024).unwrap();
+    let opts = FormatOpts {
+        volume_name: "FstoolBig".into(),
+        ..FormatOpts::default()
+    };
+    let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+    hfs.create_dir(&mut dev, "/big", 0o755, 0, 0).unwrap();
+    for i in 0..6000 {
+        let body = b"x";
+        let mut src = Cursor::new(&body[..]);
+        hfs.create_file(
+            &mut dev,
+            &format!("/big/file{i:05}"),
+            &mut src,
+            body.len() as u64,
+            0o644,
+            0,
+            0,
+        )
+        .unwrap();
+    }
+    hfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    assert_fsck_clean(&fsck, label, tmp.path());
+
+    // Reopen and confirm every entry is listed back.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let hfs = HfsPlus::open(&mut dev).unwrap();
+    let entries = hfs.list_path(&mut dev, "/big").unwrap();
+    let files = entries
+        .iter()
+        .filter(|e| e.name != "." && e.name != "..")
+        .count();
+    assert_eq!(files, 6000, "listed {files} of 6000 files in /big");
+}

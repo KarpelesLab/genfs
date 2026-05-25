@@ -859,6 +859,38 @@ fn write_node(
 /// Node 0 is the header node; nodes 1.. are leaves followed by index
 /// nodes. The caller is responsible for ensuring `nodes_capacity`
 /// holds at least the number of nodes we emit.
+/// Grow the catalog B-tree fork so it can hold at least `needed_nodes`
+/// nodes, appending one fresh extent allocated from free space. Lets a
+/// directory exceed the catalog nodes reserved at format time. Forks hold
+/// up to 8 extents; beyond that (an enormous catalog) it errors cleanly.
+fn grow_catalog_fork(writer: &mut Writer, needed_nodes: u32) -> Result<()> {
+    let needed_blocks = blocks_for_nodes(needed_nodes, writer.node_size, writer.block_size)?;
+    if needed_blocks <= writer.catalog_file.total_blocks {
+        return Ok(());
+    }
+    let extra = needed_blocks - writer.catalog_file.total_blocks;
+    let start = writer.allocate(extra)?;
+    let slot = writer
+        .catalog_file
+        .extents
+        .iter()
+        .position(|e| e.block_count == 0)
+        .ok_or_else(|| {
+            crate::Error::Unsupported(
+                "hfs+ writer: catalog fork needs more than 8 extents (directory too large)".into(),
+            )
+        })?;
+    writer.catalog_file.extents[slot] = ExtentDescriptor {
+        start_block: start,
+        block_count: extra,
+    };
+    writer.catalog_file.total_blocks += extra;
+    // A B-tree fork is fully allocated: logical size == its block span.
+    writer.catalog_file.logical_size =
+        u64::from(writer.catalog_file.total_blocks) * u64::from(writer.block_size);
+    Ok(())
+}
+
 fn build_btree(
     records: Vec<PackedRecord>,
     node_size: u32,
@@ -1000,14 +1032,10 @@ fn build_btree(
         nodes_capacity.saturating_sub(nodes.len() as u32),
     )?;
 
-    if nodes.len() as u32 > nodes_capacity {
-        return Err(crate::Error::Unsupported(format!(
-            "hfs+ writer: B-tree needs {} nodes but only {nodes_capacity} \
-             were reserved (raise FormatOpts::catalog_nodes)",
-            nodes.len()
-        )));
-    }
-
+    // Note: `nodes.len()` may exceed `nodes_capacity` here; the caller
+    // (flush) grows the fork to fit and rebuilds with the right capacity
+    // so the header's total/free node counts are correct. The downstream
+    // `write_btree_to_fork` is the backstop if the fork is still too small.
     Ok(BuiltTree {
         nodes,
         tree_depth,
@@ -1169,11 +1197,16 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<(VolumeHea
     // node size (the BTHeaderRec.clumpSize and ForkData.clumpSize agree).
     // fsck.hfsplus rejects an extents-overflow fork whose clumpSize is
     // smaller than its declared nodeSize ("Invalid B-tree node size").
+    // Catalog / extents B-tree forks carry the clump size fsck.hfsplus
+    // expects for the volume (≈0.8%, capped at 1 MiB), not merely the node
+    // size — otherwise fsck rejects "Invalid file clump size" on volumes
+    // ≳512 MiB.
+    let btree_clump = btree_clump_size(total_blocks, bs, opts.node_size);
     let ext_blocks = blocks_for_nodes(opts.extents_nodes, opts.node_size, bs)?;
-    let extents_file = layout_special(&mut cursor, ext_blocks, bs, opts.node_size)?;
+    let extents_file = layout_special(&mut cursor, ext_blocks, bs, btree_clump)?;
 
     let cat_blocks = blocks_for_nodes(opts.catalog_nodes, opts.node_size, bs)?;
-    let catalog_file = layout_special(&mut cursor, cat_blocks, bs, opts.node_size)?;
+    let catalog_file = layout_special(&mut cursor, cat_blocks, bs, btree_clump)?;
 
     // Attributes B-tree and startup file: empty (zero fork data).
     let attributes_file = ForkData::default();
@@ -1350,6 +1383,21 @@ fn blocks_for_nodes(nodes: u32, node_size: u32, block_size: u32) -> Result<u32> 
     u32::try_from(blocks).map_err(|_| {
         crate::Error::InvalidArgument("hfs+ format: special-file too large for u32".into())
     })
+}
+
+/// Clump size fsck.hfsplus expects for a catalog/extents B-tree fork
+/// (`CalcHFSPlusBTreeClumpSize`): roughly 0.8% of the volume, rounded down
+/// to a node-size multiple and capped at 1 MiB. fsck enforces this on
+/// volumes from ~512 MiB up (where the cap is reached, so it wants exactly
+/// 1 MiB); below that it doesn't check, and this formula still yields a
+/// node-aligned value ≥ the node size, so it's safe everywhere.
+fn btree_clump_size(volume_blocks: u32, block_size: u32, node_size: u32) -> u32 {
+    const CLUMP_CAP: u64 = 1024 * 1024;
+    let vol_bytes = u64::from(volume_blocks) * u64::from(block_size);
+    let raw = (vol_bytes / 128).min(CLUMP_CAP);
+    let ns = u64::from(node_size);
+    let aligned = (raw / ns) * ns;
+    aligned.max(ns) as u32
 }
 
 fn layout_special(
@@ -2338,23 +2386,34 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
         super::journal::FlushSink::Direct(dev)
     };
 
-    // 1. Build catalog records list in key order.
-    let mut records: Vec<PackedRecord> = Vec::with_capacity(writer.catalog.len());
-    for (key, body) in &writer.catalog {
-        let key_bytes = encode_catalog_key(key.parent_id, &key.name);
-        records.push(PackedRecord {
-            key: key_bytes,
-            body: body.clone(),
-        });
-    }
-    let cat_total_nodes = {
-        let bytes = u64::from(writer.catalog_file.total_blocks) * u64::from(writer.block_size);
-        u32::try_from(bytes / u64::from(writer.node_size)).map_err(|_| {
+    // 1. Build the catalog B-tree in key order. The fork was sized for a
+    //    default node count at format; a large directory can need more, so
+    //    build once and — if the tree overflows the reserved fork — grow
+    //    the fork (appending a fresh extent from free space) and rebuild,
+    //    so the header records the correct total / free node counts.
+    let cat_records = |w: &Writer| -> Vec<PackedRecord> {
+        w.catalog
+            .iter()
+            .map(|(key, body)| PackedRecord {
+                key: encode_catalog_key(key.parent_id, &key.name),
+                body: body.clone(),
+            })
+            .collect()
+    };
+    let cat_capacity = |w: &Writer| -> Result<u32> {
+        let bytes = u64::from(w.catalog_file.total_blocks) * u64::from(w.block_size);
+        u32::try_from(bytes / u64::from(w.node_size)).map_err(|_| {
             crate::Error::Unsupported("hfs+ writer: catalog node count overflow".into())
-        })?
+        })
     };
 
-    let built = build_btree(records, writer.node_size, cat_total_nodes)?;
+    let mut cat_total_nodes = cat_capacity(writer)?;
+    let mut built = build_btree(cat_records(writer), writer.node_size, cat_total_nodes)?;
+    if built.nodes.len() as u32 > cat_total_nodes {
+        grow_catalog_fork(writer, built.nodes.len() as u32)?;
+        cat_total_nodes = cat_capacity(writer)?;
+        built = build_btree(cat_records(writer), writer.node_size, cat_total_nodes)?;
+    }
     write_btree_to_fork(
         &mut sink,
         &built.nodes,
@@ -2441,6 +2500,9 @@ pub fn flush(writer: &mut Writer, vh: &mut VolumeHeader, dev: &mut dyn BlockDevi
     // 5. Volume header (primary + alternate).
     vh.free_blocks = writer.free_blocks;
     vh.next_catalog_id = writer.next_cnid;
+    // The catalog fork may have grown (extra extents appended) while
+    // building the B-tree; sync the header's fork descriptor so it matches.
+    vh.catalog_file = writer.catalog_file;
     // Count files vs. folders by scanning catalog (record types 1/2).
     let mut file_count: u32 = 0;
     let mut folder_count: u32 = 0;

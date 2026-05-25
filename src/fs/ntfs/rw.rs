@@ -949,13 +949,10 @@ impl super::Ntfs {
         flags: crate::fs::OpenFlags,
         meta: Option<crate::fs::FileMeta>,
     ) -> Result<Box<dyn FileHandle + 'a>> {
-        // Writer state required: NTFS doesn't yet have a "load writer
-        // state from disk" path. Tests format then keep the same handle.
-        if self.writer.is_none() {
-            return Err(crate::Error::Unsupported(
-                "ntfs: open_file_rw requires a writable handle (use Ntfs::format)".into(),
-            ));
-        }
+        // Make the handle writable. A freshly `open`ed image has
+        // `writer: None`; reconstruct it from disk so reopened volumes
+        // (e.g. NTFS inside a qcow2) accept byte-level edits.
+        self.ensure_writer(dev)?;
 
         // Refuse if the existing $LogFile has non-zero content — that
         // would mean the volume carries a real journal we don't

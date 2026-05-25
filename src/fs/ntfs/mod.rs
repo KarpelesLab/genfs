@@ -1577,6 +1577,16 @@ impl crate::fs::FilesystemFactory for Ntfs {
 }
 
 impl crate::fs::Filesystem for Ntfs {
+    /// NTFS supports full in-place edits. A handle from [`Ntfs::open`]
+    /// starts read-only (`writer: None`), but the first mutation lazily
+    /// reconstructs the writer state from disk (see
+    /// `writer::ensure_writer`), so a reopened image — e.g. one inside a
+    /// qcow2 used as a read/write store — accepts add / `open_file_rw`
+    /// just like a freshly-formatted one.
+    fn mutation_capability(&self) -> crate::fs::MutationCapability {
+        crate::fs::MutationCapability::Mutable
+    }
+
     fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,

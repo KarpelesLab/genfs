@@ -361,6 +361,116 @@ fn mkntfs_image_opens_and_label_matches() {
     );
 }
 
+/// Reopen-mutate: a *flushed* NTFS image (handle dropped) must accept new
+/// files when re-opened via `Ntfs::open`, the way a consumer would use an
+/// NTFS filesystem inside a qcow2 as a read/write store. Exercises the
+/// lazy writer reconstruction (`ensure_writer`): no `format` on the
+/// reopened handle.
+///
+/// Verifies: (1) the new file round-trips through a *third* open;
+/// (2) a pre-existing file is untouched; (3) `ntfsfix --no-action` stays
+/// clean; (4) `ntfsls` lists the added name.
+#[test]
+fn reopen_then_add_file_roundtrips_and_validates() {
+    // Build + flush an initial tree, then drop the handle entirely.
+    let img = build_image_with_tree(16 * 1024 * 1024);
+    let path = img.path().to_path_buf();
+
+    // --- Reopen read-handle, mutate, flush (no format) ---
+    {
+        let mut dev = FileBackend::open(&path).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        let body = b"added after reopen\n";
+        ntfs.create_file(
+            &mut dev,
+            "/added.txt",
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(body.to_vec())),
+                len: body.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        ntfs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    // --- Third open: the new file and the original are both present ---
+    {
+        let mut dev = FileBackend::open(&path).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        let names: Vec<String> = ntfs
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "added.txt"),
+            "reopened image missing the file added after reopen: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "hello.txt"),
+            "reopen-mutate clobbered the pre-existing tree: {names:?}"
+        );
+
+        let mut got = Vec::new();
+        {
+            let mut r = ntfs.open_file_reader(&mut dev, "/added.txt").unwrap();
+            std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+        }
+        assert_eq!(got, b"added after reopen\n");
+
+        // Pre-existing file content survives.
+        let mut got2 = Vec::new();
+        {
+            let mut r2 = ntfs.open_file_reader(&mut dev, "/hello.txt").unwrap();
+            std::io::Read::read_to_end(&mut r2, &mut got2).unwrap();
+        }
+        assert_eq!(got2, b"hello ntfs\n");
+    }
+
+    // --- External oracles ---
+    if which("ntfsfix").is_some() {
+        let out = Command::new("ntfsfix")
+            .arg("--no-action")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("Mounting volume... OK"),
+            "ntfsfix did not cleanly mount the reopen-mutated image:\n{combined}"
+        );
+    } else {
+        eprintln!("skipping ntfsfix oracle: not installed");
+    }
+
+    if which("ntfsls").is_some() {
+        let out = Command::new("ntfsls")
+            .arg("--force")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "ntfsls failed on reopen-mutated image:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("added.txt"),
+            "ntfsls did not list the reopen-added file:\n{stdout}"
+        );
+    } else {
+        eprintln!("skipping ntfsls oracle: not installed");
+    }
+}
+
 // ---------------------------------------------------------------------
 // Mount-via-ntfs-3g (manual only).
 //

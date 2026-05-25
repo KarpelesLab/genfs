@@ -250,11 +250,7 @@ impl super::Ntfs {
         src: FileSource,
         meta: FileMeta,
     ) -> Result<()> {
-        if self.writer.is_none() {
-            return Err(crate::Error::Unsupported(
-                "ntfs: create_file requires a writer (call Ntfs::format first)".into(),
-            ));
-        }
+        self.ensure_writer(dev)?;
         let (parent_path, base_name) = split_parent(path)?;
         let parent_rec = self.resolve_dir(dev, &parent_path)?;
         let file_size = src.len().map_err(crate::Error::from)?;
@@ -389,11 +385,7 @@ impl super::Ntfs {
         path: &str,
         meta: FileMeta,
     ) -> Result<()> {
-        if self.writer.is_none() {
-            return Err(crate::Error::Unsupported(
-                "ntfs: create_dir requires a writer (call Ntfs::format first)".into(),
-            ));
-        }
+        self.ensure_writer(dev)?;
         let (parent_path, base_name) = split_parent(path)?;
         let parent_rec = self.resolve_dir(dev, &parent_path)?;
         let writer = self.writer.as_mut().expect("writer present");
@@ -467,11 +459,7 @@ impl super::Ntfs {
         target: &str,
         meta: FileMeta,
     ) -> Result<()> {
-        if self.writer.is_none() {
-            return Err(crate::Error::Unsupported(
-                "ntfs: create_symlink requires a writer".into(),
-            ));
-        }
+        self.ensure_writer(dev)?;
         let (parent_path, base_name) = split_parent(path)?;
         let parent_rec = self.resolve_dir(dev, &parent_path)?;
         let writer = self.writer.as_mut().expect("writer present");
@@ -570,6 +558,141 @@ impl super::Ntfs {
         Err(crate::Error::Unsupported(
             "ntfs: special files (char/block/fifo/socket) are not representable".into(),
         ))
+    }
+
+    /// Reconstruct a [`WriterState`] from an already-formatted on-disk
+    /// volume so a *reopened* image (`Ntfs::open`, `writer: None`) can be
+    /// mutated — e.g. an NTFS filesystem living inside a qcow2 used as a
+    /// read/write store. Everything [`Self::flush`] consumes is recovered
+    /// from the boot sector plus the well-known system MFT records, using
+    /// the same readers the read path is already validated on:
+    ///
+    /// * geometry + `volume_serial` from `self.boot`;
+    /// * `$MFT` (rec 0) `$DATA` run list → `mft_extents` / `mft_records`;
+    /// * `$MFT` (rec 0) `$BITMAP` run list + bytes → MFT record bitmap;
+    /// * `$Bitmap` (rec 6) `$DATA` run list + bytes → cluster allocation
+    ///   bitmap (so new allocations never collide with existing data);
+    /// * recs 2/4/10 `$DATA` run lists → $LogFile/$AttrDef/$UpCase
+    ///   locations (best-effort; `flush` never rewrites these).
+    fn reconstruct_writer_state(&mut self, dev: &mut dyn BlockDevice) -> Result<WriterState> {
+        let cluster_size = self.boot.cluster_size() as u64;
+        let mft_record_size = self.boot.mft_record_size();
+        let bytes_per_sector = self.boot.bytes_per_sector;
+        let sectors_per_cluster = self.boot.sectors_per_cluster;
+        let index_record_size = self.boot.index_record_size();
+        let total_clusters = dev.total_size() / cluster_size;
+
+        // --- $MFT (record 0): $DATA extents + $BITMAP ---
+        let mft_set = self.load_record_set(dev, 0)?;
+        let mft_rec = &mft_set[0].1;
+        let mft_extents = extract_non_resident_runs(mft_rec, TYPE_DATA, "").ok_or_else(|| {
+            crate::Error::InvalidImage("ntfs: $MFT (rec 0) has no non-resident $DATA".into())
+        })?;
+        let mft_clusters_total: u64 = mft_extents.iter().map(|&(_, len)| len).sum();
+        let mft_records = mft_clusters_total * cluster_size / mft_record_size as u64;
+
+        let mft_bitmap_runs = extract_non_resident_runs(mft_rec, super::attribute::TYPE_BITMAP, "")
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "ntfs: reopen-mutate requires a non-resident $MFT $BITMAP".into(),
+                )
+            })?;
+        let (mft_bitmap_lcn, mft_bitmap_clusters) = mft_bitmap_runs[0];
+        let mft_bitmap = read_runs_prefix(
+            dev,
+            &mft_bitmap_runs,
+            cluster_size,
+            mft_records.div_ceil(8) as usize,
+        )?;
+
+        // --- $Bitmap (record 6): cluster allocation bitmap ---
+        let bm_set = self.load_record_set(dev, 6)?;
+        let bm_rec = &bm_set[0].1;
+        let bitmap_runs = extract_non_resident_runs(bm_rec, TYPE_DATA, "").ok_or_else(|| {
+            crate::Error::InvalidImage("ntfs: $Bitmap (rec 6) has no non-resident $DATA".into())
+        })?;
+        let bitmap_lcn = bitmap_runs[0].0;
+        let bitmap_clusters: u64 = bitmap_runs.iter().map(|&(_, len)| len).sum();
+        let bitmap_bytes = read_runs_prefix(
+            dev,
+            &bitmap_runs,
+            cluster_size,
+            total_clusters.div_ceil(8) as usize,
+        )?;
+        let bitmap = format::BitmapAlloc {
+            bytes: bitmap_bytes,
+            total: total_clusters,
+            next_hint: 0,
+        };
+
+        // --- best-effort system file locations (flush never rewrites them) ---
+        let (logfile_lcn, logfile_clusters) = self.first_data_run(dev, 2);
+        let (attrdef_lcn, attrdef_clusters) = self.first_data_run(dev, 4);
+        let (upcase_lcn, upcase_clusters) = self.first_data_run(dev, 10);
+
+        let layout = LayoutResult {
+            cluster_size: cluster_size as u32,
+            bytes_per_sector,
+            sectors_per_cluster,
+            total_clusters,
+            mft_record_size,
+            index_record_size,
+            mft_extents,
+            mft_records,
+            mftmirr_lcn: self.boot.mft_mirr_lcn,
+            bitmap_lcn,
+            bitmap_clusters,
+            bitmap,
+            mft_bitmap_lcn,
+            mft_bitmap_clusters,
+            volume_serial: self.boot.volume_serial,
+            upcase_lcn,
+            upcase_clusters,
+            logfile_lcn,
+            logfile_clusters,
+            attrdef_lcn,
+            attrdef_clusters,
+        };
+
+        // First free MFT slot ≥ FIRST_USER_RECORD (0..16 are system records).
+        let next_user_record = (FIRST_USER_RECORD..mft_records)
+            .find(|&r| {
+                let i = (r / 8) as usize;
+                let m = 1u8 << ((r % 8) as u8);
+                i >= mft_bitmap.len() || mft_bitmap[i] & m == 0
+            })
+            .unwrap_or(mft_records);
+
+        let mut state = WriterState::new(layout);
+        state.mft_bitmap = mft_bitmap;
+        state.next_user_record = next_user_record;
+        state.dirty = false;
+        Ok(state)
+    }
+
+    /// Make this handle writable. `Ntfs::open` returns a read-only handle
+    /// (`writer: None`); the first mutation lazily reconstructs the writer
+    /// state from disk. No-op once a writer exists (after `format` or a
+    /// prior mutation). Reads stay cheap — the cluster bitmap is only read
+    /// here, on first write.
+    pub(super) fn ensure_writer(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if self.writer.is_none() {
+            let state = self.reconstruct_writer_state(dev)?;
+            self.writer = Some(state);
+        }
+        Ok(())
+    }
+
+    /// First non-resident `$DATA` run `(lcn, clusters)` of system record
+    /// `rec_no`, or `(0, 0)` if absent. Best-effort: used only to populate
+    /// `LayoutResult` fields `flush` never rewrites.
+    fn first_data_run(&mut self, dev: &mut dyn BlockDevice, rec_no: u64) -> (u64, u64) {
+        self.load_record_set(dev, rec_no)
+            .ok()
+            .and_then(|s| {
+                extract_non_resident_runs(&s[0].1, TYPE_DATA, "").and_then(|r| r.first().copied())
+            })
+            .unwrap_or((0, 0))
     }
 
     /// Persist outstanding writer state to disk. Re-stamps $Bitmap, MFT
@@ -913,6 +1036,30 @@ fn dos_flags_from_mode(mode: u16, isdir: bool) -> u32 {
 
 /// Walk an MFT record looking for a non-resident attribute of `(type_code,
 /// name)`. Returns the list of (LCN, length) extents covered by its run list.
+/// Read `want_bytes` bytes from the start of a non-resident run list,
+/// walking runs in order. Used to recover the cluster / MFT bitmaps when
+/// reconstructing writer state for a reopened volume. The result is
+/// padded with zeros (or truncated) to exactly `want_bytes`.
+fn read_runs_prefix(
+    dev: &mut dyn BlockDevice,
+    runs: &[(u64, u64)],
+    cluster_size: u64,
+    want_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::with_capacity(want_bytes);
+    for &(lcn, clusters) in runs {
+        if out.len() >= want_bytes {
+            break;
+        }
+        let span = (clusters * cluster_size) as usize;
+        let mut buf = vec![0u8; span];
+        dev.read_at(lcn * cluster_size, &mut buf)?;
+        out.extend_from_slice(&buf);
+    }
+    out.resize(want_bytes, 0);
+    Ok(out)
+}
+
 fn extract_non_resident_runs(rec: &[u8], type_code: u32, name: &str) -> Option<Vec<(u64, u64)>> {
     let hdr = mft::RecordHeader::parse(rec).ok()?;
     let bytes_in_use = hdr.bytes_in_use as usize;

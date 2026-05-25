@@ -57,6 +57,7 @@ use std::io::Read;
 
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::fs::dir_batch::{DEFAULT_CAPACITY, DirBatch};
 
 use super::Xfs;
 use super::bmbt::Extent;
@@ -244,6 +245,12 @@ pub struct WriteState {
     inodes_used: u64,
     /// Outstanding inodes free across all chunks across all AGs.
     inodes_free: u64,
+    /// Pending directory entries `(name, child_ino, ftype)` keyed by
+    /// parent directory inode. Staged instead of rewriting the parent's
+    /// single dir block + inode on every child (O(N²) for a directory of
+    /// N children). Serialized once on eviction or at flush; path lookups
+    /// read it as an in-memory overlay so staged children stay visible.
+    dir_batch: DirBatch<u64, (String, u64, u8)>,
 }
 
 impl WriteState {
@@ -285,6 +292,7 @@ impl WriteState {
             uuid,
             inodes_used: 3,
             inodes_free: 61,
+            dir_batch: DirBatch::new(DEFAULT_CAPACITY),
         }
     }
 
@@ -488,6 +496,7 @@ impl Xfs {
             uuid,
             inodes_used,
             inodes_free,
+            dir_batch: DirBatch::new(DEFAULT_CAPACITY),
         });
         Ok(())
     }
@@ -691,6 +700,11 @@ impl Xfs {
     /// re-encode the v5 block-format directory, and write it back. The
     /// caller has already allocated `child_ino`. Returns the updated
     /// parent's directory size in bytes.
+    /// Stage a directory entry for `parent_ino` instead of rewriting the
+    /// parent's dir block + inode immediately. The batch is serialized
+    /// once — on eviction when a new directory enters a full cache, or at
+    /// flush — and [`resolve_path`](super::Xfs::resolve_path) reads it as
+    /// an overlay so staged children remain visible to path lookups.
     fn append_dir_entry(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -698,7 +712,33 @@ impl Xfs {
         name: &str,
         child_ino: u64,
         ftype: u8,
-    ) -> Result<u64> {
+    ) -> Result<()> {
+        self.ensure_write_state(dev)?;
+        let victim = self
+            .ws_mut()?
+            .dir_batch
+            .stage(parent_ino, (name.to_string(), child_ino, ftype));
+        if let Some((victim_ino, entries)) = victim {
+            self.serialize_dir(dev, victim_ino, &entries)?;
+        }
+        Ok(())
+    }
+
+    /// Apply a directory's whole pending batch to its single on-disk dir
+    /// block in one pass: decode the existing entries, append every
+    /// staged entry, re-encode the block once, and rewrite the parent
+    /// inode once (size + `nlink` bumped by the number of staged
+    /// subdirectories). Equivalent to the old per-entry append repeated,
+    /// but O(1) block rewrites instead of O(N).
+    fn serialize_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_ino: u64,
+        staged: &[(String, u64, u8)],
+    ) -> Result<()> {
+        if staged.is_empty() {
+            return Ok(());
+        }
         // Read the parent inode. Block-format only.
         let (parent_buf, parent_core) = self.read_inode(dev, parent_ino)?;
         if !parent_core.is_dir() {
@@ -728,7 +768,7 @@ impl Xfs {
             .filter(|e| e.name != "." && e.name != "..")
             .map(|e: DataEntry| (e.name, e.inumber, e.ftype))
             .collect();
-        all.push((name.to_string(), child_ino, ftype));
+        all.extend(staged.iter().cloned());
 
         // Find parent's parent. The shortform encoding kept it in the
         // first two records' inumber for ".."; we decoded them out. For
@@ -757,11 +797,12 @@ impl Xfs {
         let new_size = dir_block_size as u64;
         let (atime, mtime, ctime) = (parent_core.atime, parent_core.mtime, parent_core.ctime);
         let crtime = mtime;
-        let nlink = if ftype == XFS_DIR3_FT_DIR {
-            parent_core.nlink + 1 // new ".." backref
-        } else {
-            parent_core.nlink
-        };
+        // Each staged subdirectory adds a ".." backref to the parent.
+        let new_subdirs = staged
+            .iter()
+            .filter(|(_, _, ft)| *ft == XFS_DIR3_FT_DIR)
+            .count() as u32;
+        let nlink = parent_core.nlink + new_subdirs;
         let builder = V3DinodeBuilder {
             inodesize: XFS_INODESIZE as usize,
             mode: parent_core.mode,
@@ -788,7 +829,52 @@ impl Xfs {
         let mut lit = Vec::with_capacity(16);
         lit.extend_from_slice(&parent_self_extent.encode());
         self.write_inode(dev, parent_ino, builder, &lit)?;
-        Ok(new_size)
+        Ok(())
+    }
+
+    /// Serialize every pending directory batch (at flush, or before a
+    /// read that needs the on-disk blocks current). No-op without write
+    /// state.
+    pub(crate) fn flush_dir_batches(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        let pending = match self.write_state.as_mut() {
+            Some(ws) => ws.dir_batch.drain_all(),
+            None => return Ok(()),
+        };
+        for (dir_ino, entries) in pending {
+            self.serialize_dir(dev, dir_ino, &entries)?;
+        }
+        Ok(())
+    }
+
+    /// Serialize one directory's pending batch, if any. Used before a
+    /// read path (`list` / `remove`) consumes that directory's on-disk
+    /// block.
+    pub(crate) fn flush_one_dir_batch(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_ino: u64,
+    ) -> Result<()> {
+        let entries = match self.write_state.as_mut() {
+            Some(ws) => ws.dir_batch.take(&dir_ino),
+            None => None,
+        };
+        if let Some(entries) = entries {
+            self.serialize_dir(dev, dir_ino, &entries)?;
+        }
+        Ok(())
+    }
+
+    /// Look up a child inode staged (not yet serialized) under `dir_ino`
+    /// by name. Lets [`resolve_path`](super::Xfs::resolve_path) see
+    /// batched children as an in-memory overlay.
+    pub(crate) fn pending_child_ino(&self, dir_ino: u64, name: &str) -> Option<u64> {
+        self.write_state
+            .as_ref()?
+            .dir_batch
+            .peek(&dir_ino)?
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, ino, _)| *ino)
     }
 
     /// Convenience: return the UUID we use for new metadata blocks.
@@ -1118,6 +1204,10 @@ impl Xfs {
                 "xfs: cannot remove {name:?}"
             )));
         }
+        // The splice below operates on on-disk dir blocks; serialize any
+        // staged entries (for this parent and the target) first so they
+        // are present to be removed and not re-added at flush.
+        self.flush_one_dir_batch(dev, parent_ino)?;
         let (parent_buf, parent_core) = self.read_inode(dev, parent_ino)?;
         if !parent_core.is_dir() {
             return Err(crate::Error::InvalidArgument(format!(
@@ -1145,6 +1235,11 @@ impl Xfs {
         })?;
         let target_ino = target.inumber;
         let target_ftype = target.ftype;
+
+        // Serialize the target's own staged children (if any) so the
+        // emptiness check below sees them rather than a stale on-disk
+        // block.
+        self.flush_one_dir_batch(dev, target_ino)?;
 
         // Read the target inode; reject non-empty directories.
         let (target_buf, target_core) = self.read_inode(dev, target_ino)?;
@@ -1625,6 +1720,9 @@ impl Xfs {
     /// called once after all `add_*` / `remove` calls so the image is
     /// `xfs_repair -n` clean.
     pub fn flush_writes(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        // Serialize any pending directory batches first, so the AG
+        // free-space / inode accounting below reflects the final state.
+        self.flush_dir_batches(dev)?;
         let agblocks = self.sb.agblocks;
         let total_blocks = self.sb.dblocks as u32;
         let uuid = self.uuid_for_writes();
@@ -2846,6 +2944,57 @@ mod tests {
             .collect();
         for n in &names {
             assert!(user_names.contains(n), "file {n:?} missing after reopens");
+        }
+    }
+
+    /// Batched directory writes: create many files in one directory in a
+    /// single session (so they accumulate in the dir batch and serialize
+    /// once at flush), then reopen and confirm every file is listed and
+    /// its contents read back byte-exact.
+    #[test]
+    fn batched_many_files_one_dir_round_trip() {
+        let mut dev = MemoryBackend::new(64 * 1024 * 1024);
+        let opts = super::super::FormatOpts::default();
+        let mut xfs = super::super::format(&mut dev, &opts).unwrap();
+        xfs.add_dir_path(&mut dev, "/d", EntryMeta::default())
+            .unwrap();
+        let n_files = 40usize;
+        for i in 0..n_files {
+            let body = format!("contents-of-file-{i:03}");
+            let mut src = std::io::Cursor::new(body.clone().into_bytes());
+            xfs.add_file_path(
+                &mut dev,
+                &format!("/d/f{i:03}"),
+                EntryMeta::default(),
+                body.len() as u64,
+                &mut src,
+            )
+            .unwrap();
+        }
+        xfs.flush_writes(&mut dev).unwrap();
+
+        let ro = super::super::Xfs::open(&mut dev).unwrap();
+        let listed: std::collections::HashSet<String> = ro
+            .list_path(&mut dev, "/d")
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(
+            listed.len(),
+            n_files,
+            "expected {n_files} files, got {listed:?}"
+        );
+        for i in 0..n_files {
+            let name = format!("f{i:03}");
+            assert!(listed.contains(&name), "missing {name}");
+            let mut r = ro
+                .open_file_reader(&mut dev, &format!("/d/{name}"))
+                .unwrap();
+            let mut got = String::new();
+            std::io::Read::read_to_string(&mut r, &mut got).unwrap();
+            assert_eq!(got, format!("contents-of-file-{i:03}"));
         }
     }
 }

@@ -185,10 +185,16 @@ impl Xfs {
         let mut cur_core = core;
         for part in split_path(path) {
             let dir_entries = self.read_dir_entries(dev, &cur_buf, &cur_core)?;
-            let found = dir_entries.iter().find(|e| e.name == part).ok_or_else(|| {
-                crate::Error::InvalidArgument(format!("xfs: no such entry {part:?} under {path:?}"))
-            })?;
-            cur_ino = found.inumber;
+            // On-disk entry, or one still staged in the directory's batch
+            // (created this session but not yet serialized).
+            cur_ino = match dir_entries.iter().find(|e| e.name == part) {
+                Some(found) => found.inumber,
+                None => self.pending_child_ino(cur_ino, part).ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "xfs: no such entry {part:?} under {path:?}"
+                    ))
+                })?,
+            };
             let (b, c) = self.read_inode(dev, cur_ino)?;
             cur_buf = b;
             cur_core = c;
@@ -777,6 +783,9 @@ impl crate::fs::Filesystem for Xfs {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        // Serialize staged directory entries so the on-disk blocks the
+        // remove path reads (and splices) are current.
+        self.flush_dir_batches(dev)?;
         self.remove_path(dev, s).map(|_| ())
     }
 
@@ -788,6 +797,11 @@ impl crate::fs::Filesystem for Xfs {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 path".into()))?;
+        // Materialize any staged children of the listed directory so the
+        // listing reflects them.
+        if let Ok(ino) = self.lookup_path_ino(dev, s) {
+            self.flush_one_dir_batch(dev, ino)?;
+        }
         self.list_path(dev, s)
     }
 

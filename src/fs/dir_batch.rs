@@ -42,7 +42,7 @@ pub const DEFAULT_CAPACITY: usize = 64;
 
 /// Capacity-bounded, FIFO directory-entry batch cache. See the module
 /// docs for the contract.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirBatch<K: Eq + Hash + Clone, E> {
     map: HashMap<K, Vec<E>>,
     /// Directory keys in first-insertion order; front == oldest.
@@ -81,6 +81,14 @@ impl<K: Eq + Hash + Clone, E> DirBatch<K, E> {
         self.order.push_back(key.clone());
         self.map.insert(key, vec![entry]);
         victim
+    }
+
+    /// Borrow a directory's pending entries without removing them. Lets a
+    /// backend serve in-memory staged entries as a read overlay (so path
+    /// lookups see children that have not yet been written to disk)
+    /// without forcing a serialize.
+    pub fn peek(&self, key: &K) -> Option<&Vec<E>> {
+        self.map.get(key)
     }
 
     /// Remove and return one directory's pending batch, if any. Used to

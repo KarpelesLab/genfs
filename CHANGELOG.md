@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/KarpelesLab/fstool/compare/v0.4.2...v0.4.3) - 2026-05-25
+
+### Added
+
+- *(f2fs)* hashed multi-level directories — large dirs pass fsck.f2fs
+- *(hfs+)* grow catalog B-tree + correct clump size — 100k files clean
+- *(xfs)* 2-level INOBT — 100k+ files in one directory pass xfs_repair
+- *(xfs)* leaf + node directories and aligned inode chunks (to ~16k files)
+- *(ext4)* incremental depth-2 extent growth for large directories
+- *(ext4)* depth-N extent trees + journal/flex_bg sizing for large dirs
+- *(analyze)* generic source-analysis API + `fstool analyze` command
+- *(repack)* stream compressed-tar sources — no decompress-to-tempfile
+- *(repack)* phase markers + wire up the per-file progress counter
+- *(shell)* `info <path>` dumps per-file metadata + xattrs
+
+### Fixed
+
+- *(xfs)* escape `bestfree[0]` in doc comment to unbreak cargo doc
+- *(xfs)* clean error instead of panic on block-dir overflow
+- *(ntfs)* scale directories + $MFT to 100k files (clean ntfs-3g mount)
+- *(ext4)* one-shot build path promotes to depth-1 extent tree
+
+### Other
+
+- *(f2fs)* mark large-directory test ignored — known writer limitation
+- *(f2fs)* large-directory guard (read-back local, fsck.f2fs in CI)
+- *(ntfs)* external scale guard — 4000-file dir mounts ntfsfix-clean
+- *(exfat)* batch directory writes via DirBatch + lookup overlay
+- *(fat)* batch directory writes via DirBatch + lookup overlay
+- *(xfs)* batch directory writes via DirBatch + lookup overlay
+- *(ntfs,ext)* batch directory writes; add shared DirBatch cache
+- *(squashfs)* multithread block compression by default
+- *(repack)* gate compressed-tar stream test to Unix
+
 ## [0.4.2](https://github.com/KarpelesLab/fstool/compare/v0.4.1...v0.4.2) - 2026-05-25
 
 ### Added

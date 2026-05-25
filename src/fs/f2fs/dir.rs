@@ -174,6 +174,123 @@ fn set_bit(bitmap: &mut [u8], i: usize) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Directory hashing + multi-level bucket layout (kernel fs/f2fs/{hash,dir}.c)
+// ---------------------------------------------------------------------
+
+/// Maximum directory hash depth (`MAX_DIR_HASH_DEPTH`).
+pub const MAX_DIR_HASH_DEPTH: u32 = 63;
+/// Maximum buckets at the deepest levels (`MAX_DIR_BUCKETS`).
+pub const MAX_DIR_BUCKETS: u32 = 1 << ((MAX_DIR_HASH_DEPTH / 2) - 1);
+
+const HASH_DELTA: u32 = 0x9E37_79B9;
+
+fn tea_transform(buf: &mut [u32; 4], input: &[u32; 4]) {
+    let mut sum: u32 = 0;
+    let (mut b0, mut b1) = (buf[0], buf[1]);
+    let (a, b, c, d) = (input[0], input[1], input[2], input[3]);
+    for _ in 0..16 {
+        sum = sum.wrapping_add(HASH_DELTA);
+        b0 = b0.wrapping_add(
+            ((b1 << 4).wrapping_add(a)) ^ (b1.wrapping_add(sum)) ^ ((b1 >> 5).wrapping_add(b)),
+        );
+        b1 = b1.wrapping_add(
+            ((b0 << 4).wrapping_add(c)) ^ (b0.wrapping_add(sum)) ^ ((b0 >> 5).wrapping_add(d)),
+        );
+    }
+    buf[0] = buf[0].wrapping_add(b0);
+    buf[1] = buf[1].wrapping_add(b1);
+}
+
+/// Pack up to 16 bytes of `msg` into four 32-bit words (kernel
+/// `str2hashbuf`). `full_len` is the *remaining* name length (used for the
+/// pad value); only `min(full_len, 16)` bytes are consumed.
+fn str2hashbuf(msg: &[u8], full_len: usize, out: &mut [u32; 4]) {
+    let pad = {
+        let l = full_len as u32;
+        let mut p = l | (l << 8);
+        p |= p << 16;
+        p
+    };
+    let mut val = pad;
+    let len = full_len.min(16);
+    let mut num: i32 = 4;
+    let mut idx = 0usize;
+    for (i, &byte) in msg.iter().take(len).enumerate() {
+        if i % 4 == 0 {
+            val = pad;
+        }
+        val = (byte as u32).wrapping_add(val << 8);
+        if i % 4 == 3 {
+            out[idx] = val;
+            idx += 1;
+            val = pad;
+            num -= 1;
+        }
+    }
+    num -= 1;
+    if num >= 0 {
+        out[idx] = val;
+        idx += 1;
+    }
+    loop {
+        num -= 1;
+        if num < 0 {
+            break;
+        }
+        out[idx] = pad;
+        idx += 1;
+    }
+}
+
+/// F2FS directory-entry hash (`f2fs_dentry_hash` / `TEA_hash_name`). `.`
+/// and `..` hash to 0 (matching `name_is_dot_dotdot`). The kernel clears
+/// `F2FS_HASH_COL_BIT` (bit 63) which is a no-op on the 32-bit result.
+pub fn f2fs_dentry_hash(name: &[u8]) -> u32 {
+    if name == b"." || name == b".." {
+        return 0;
+    }
+    let mut buf = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    let mut off = 0usize;
+    loop {
+        let remaining = name.len() - off;
+        let mut input = [0u32; 4];
+        str2hashbuf(&name[off..], remaining, &mut input);
+        tea_transform(&mut buf, &input);
+        off += 16;
+        if remaining <= 16 {
+            break;
+        }
+    }
+    buf[0]
+}
+
+/// Number of hash buckets at `level` (`dir_buckets`).
+pub fn dir_buckets(level: u32, dir_level: u8) -> u32 {
+    let s = level + dir_level as u32;
+    if s < MAX_DIR_HASH_DEPTH / 2 {
+        1u32 << s
+    } else {
+        MAX_DIR_BUCKETS
+    }
+}
+
+/// Number of dentry blocks per bucket at `level` (`bucket_blocks`).
+pub fn bucket_blocks(level: u32) -> u32 {
+    if level < MAX_DIR_HASH_DEPTH / 2 { 2 } else { 4 }
+}
+
+/// Logical dentry-block index of bucket `bucket` at `level`
+/// (`dir_block_index`): the count of all blocks in levels below, plus the
+/// bucket's offset within this level.
+pub fn dir_block_index(level: u32, dir_level: u8, bucket: u32) -> u64 {
+    let mut bidx: u64 = 0;
+    for i in 0..level {
+        bidx += dir_buckets(i, dir_level) as u64 * bucket_blocks(i) as u64;
+    }
+    bidx + bucket as u64 * bucket_blocks(level) as u64
+}
+
 /// Compute the file-type byte for a POSIX mode.
 pub fn file_type_from_mode(mode: u16) -> u8 {
     use super::constants::{
@@ -246,4 +363,46 @@ fn encode_dentry_region(
         slot += name_slots;
     }
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dentry_hash_dots_are_zero() {
+        assert_eq!(f2fs_dentry_hash(b"."), 0);
+        assert_eq!(f2fs_dentry_hash(b".."), 0);
+    }
+
+    #[test]
+    fn dentry_hash_matches_kernel_tea() {
+        // Reference values from an independent replica of the kernel
+        // fs/f2fs/hash.c TEA_hash_name (and ultimately cross-checked by
+        // fsck.f2fs in CI, which recomputes the hash for every dentry).
+        assert_eq!(f2fs_dentry_hash(b"a"), 0x6d0e_a4c1);
+        assert_eq!(f2fs_dentry_hash(b"file00000"), 0x4bc4_becc);
+        assert_eq!(f2fs_dentry_hash(b"file09999"), 0xa554_9af2);
+        assert_eq!(f2fs_dentry_hash(b"abcdefghijklmnop"), 0xf4ac_8cb5);
+        assert_eq!(f2fs_dentry_hash(b"hello"), 0x6f5b_b1a8);
+    }
+
+    #[test]
+    fn bucket_layout_math() {
+        assert_eq!(dir_buckets(0, 0), 1);
+        assert_eq!(dir_buckets(1, 0), 2);
+        assert_eq!(dir_buckets(2, 0), 4);
+        assert_eq!(dir_buckets(5, 0), 32);
+        assert_eq!(bucket_blocks(0), 2);
+        assert_eq!(bucket_blocks(30), 2);
+        assert_eq!(bucket_blocks(31), 4);
+        // Level 0: bucket 0 → block 0.
+        assert_eq!(dir_block_index(0, 0, 0), 0);
+        // Level 1: 1 bucket × 2 blocks below, then bucket offset.
+        assert_eq!(dir_block_index(1, 0, 0), 2);
+        assert_eq!(dir_block_index(1, 0, 1), 4);
+        // Level 2: (1×2 + 2×2) = 6 blocks below.
+        assert_eq!(dir_block_index(2, 0, 0), 6);
+        assert_eq!(dir_block_index(2, 0, 3), 12);
+    }
 }

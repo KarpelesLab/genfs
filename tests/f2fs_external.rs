@@ -255,18 +255,14 @@ fn writer_image_dump_f2fs_clean_exit() {
     );
 }
 
-/// Large single directory. **Known-failing / ignored**: unlike the other
-/// filesystems, the f2fs writer does not yet implement f2fs's hashed
-/// multi-level directory. Dentries are emitted with `hash = 0` into
-/// sequential dentry blocks, so a directory larger than one block (~214
-/// entries) traverses fine through fstool's own reader but fails
-/// `fsck.f2fs` — it reports unreachable NAT entries (it can't find the
-/// dentries by hash) and a missing `inline_dots` flag on the grown dir.
-/// Implementing `dir_buckets` levels + `f2fs_dentry_hash` (the analogue of
-/// the XFS leaf/node and HFS+ catalog-grow work) is the fix; run this with
-/// `--ignored` to check progress once that lands.
+/// Large single directory: enough entries to drive the f2fs hashed
+/// multi-level directory through several levels (well past the inline and
+/// single-block thresholds). The writer lays dentries out in their hash
+/// buckets (`f2fs_dentry_hash` + `dir_buckets` levels), writes real
+/// `.`/`..` in block 0, and stamps `i_current_depth`. The build + read-back
+/// run unconditionally; the `fsck.f2fs` cross-check runs wherever the tool
+/// is on PATH (CI), validating the on-disk hash structure at scale.
 #[test]
-#[ignore = "f2fs writer lacks hashed multi-level directories; large dirs fail fsck.f2fs"]
 fn writer_large_directory_passes_fsck_f2fs() {
     const N: usize = 10_000;
     let tmp = NamedTempFile::new().unwrap();

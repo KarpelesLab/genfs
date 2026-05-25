@@ -1075,6 +1075,18 @@ impl Writer {
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         let bs = F2FS_BLKSIZE as u64;
 
+        // Parent of every inode (root self-parents) — needed up front for
+        // the ".." dentry of each spilled directory.
+        let mut parent_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        parent_of.insert(3, 3); // root → root
+        for (&parent, kids) in &self.children {
+            for kid in kids {
+                parent_of.insert(kid.ino, parent);
+            }
+        }
+        // Hash depth (`i_current_depth`) computed per spilled directory.
+        let mut dir_depths: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+
         // 1) Write any dentry block(s) for directories that have spilled.
         //
         // For every spilled directory we greedily pack its child list into
@@ -1084,44 +1096,106 @@ impl Writer {
         // handles direct-in-inode / direct-node / indirect-node / triple
         // indirect placement — exactly like a regular file.
         for (&dir_nid, _) in self.spilled_dirs.clone().iter() {
+            let parent_nid = *parent_of.get(&dir_nid).unwrap_or(&dir_nid);
             let kids = self.children.get(&dir_nid).cloned().unwrap_or_default();
-            let chunks = split_dentries_per_block(&kids);
-            if chunks.is_empty() {
-                continue;
+
+            // Full entry set: synthetic "." / ".." (hash 0 → block 0)
+            // first, then the children with their real f2fs hashes.
+            let mut entries: Vec<Dentry> = Vec::with_capacity(kids.len() + 2);
+            entries.push(Dentry {
+                hash: 0,
+                ino: dir_nid,
+                file_type: F2FS_FT_DIR,
+                name: b".".to_vec(),
+            });
+            entries.push(Dentry {
+                hash: 0,
+                ino: parent_nid,
+                file_type: F2FS_FT_DIR,
+                name: b"..".to_vec(),
+            });
+            for k in &kids {
+                entries.push(Dentry {
+                    hash: super::dir::f2fs_dentry_hash(&k.name),
+                    ino: k.ino,
+                    file_type: k.file_type,
+                    name: k.name.clone(),
+                });
             }
-            // Block 0 — already pre-allocated when the directory first
-            // spilled (see `attach_to_parent`). If somehow not (paranoid
-            // path) allocate now.
-            let mut block_addrs: Vec<u32> = Vec::with_capacity(chunks.len());
-            let first_phys = {
-                let ino = self
-                    .inodes
-                    .get(&dir_nid)
-                    .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost dir".into()))?;
-                ino.i_addr[0]
-            };
-            if first_phys == 0 {
-                let phys = self.alloc_data_block()?;
-                self.inodes.get_mut(&dir_nid).unwrap().i_addr[0] = phys;
-                block_addrs.push(phys);
-            } else {
-                block_addrs.push(first_phys);
+
+            // Replicate the kernel's hashed insertion (fs/f2fs/dir.c
+            // f2fs_add_regular_entry): for each entry, scan levels from 0,
+            // growing the depth as a level is first reached; within a level
+            // place into the hash bucket's blocks, spilling to the next
+            // level when the bucket is full.
+            let dir_level: u8 = 0; // DEF_DIR_LEVEL
+            let mut blocks: std::collections::BTreeMap<u64, (Vec<Dentry>, usize)> =
+                std::collections::BTreeMap::new();
+            let mut current_depth: u32 = 0;
+            for e in entries {
+                let slots = e.name.len().div_ceil(F2FS_SLOT_LEN).max(1);
+                let mut level: u32 = 0;
+                loop {
+                    if level >= super::dir::MAX_DIR_HASH_DEPTH {
+                        return Err(crate::Error::Unsupported(
+                            "f2fs: directory exceeds maximum hash depth".into(),
+                        ));
+                    }
+                    if level == current_depth {
+                        current_depth += 1;
+                    }
+                    let nbucket = super::dir::dir_buckets(level, dir_level);
+                    let nblock = super::dir::bucket_blocks(level);
+                    let bidx = super::dir::dir_block_index(level, dir_level, e.hash % nbucket);
+                    let mut placed = false;
+                    for b in bidx..bidx + nblock as u64 {
+                        let used = blocks.get(&b).map(|(_, u)| *u).unwrap_or(0);
+                        if used + slots <= NR_DENTRY_IN_BLOCK {
+                            let slot = blocks.entry(b).or_insert_with(|| (Vec::new(), 0));
+                            slot.0.push(e.clone());
+                            slot.1 += slots;
+                            placed = true;
+                            break;
+                        }
+                    }
+                    if placed {
+                        break;
+                    }
+                    level += 1;
+                }
             }
-            // Blocks 1..N — allocate + register.
-            for idx in 1..chunks.len() {
-                let phys = self.alloc_data_block()?;
-                self.place_data_block(dir_nid, idx as u64, phys)?;
-                block_addrs.push(phys);
+
+            // Allocate + stamp each non-empty logical dentry block. Logical
+            // block 0 reuses the pre-allocated `i_addr[0]`; the rest route
+            // through `place_data_block`. Gaps (empty buckets) stay holes.
+            let mut max_logical: u64 = 0;
+            for (&logical, (blk_entries, _)) in blocks.iter() {
+                max_logical = max_logical.max(logical);
+                let phys = if logical == 0 {
+                    let cur = self.inodes.get(&dir_nid).map(|i| i.i_addr[0]).unwrap_or(0);
+                    if cur != 0 {
+                        cur
+                    } else {
+                        let p = self.alloc_data_block()?;
+                        self.inodes.get_mut(&dir_nid).unwrap().i_addr[0] = p;
+                        p
+                    }
+                } else {
+                    let p = self.alloc_data_block()?;
+                    self.place_data_block(dir_nid, logical, p)?;
+                    p
+                };
+                let blk = encode_block_dentry(blk_entries);
+                dev.write_at(phys as u64 * bs, &blk)?;
             }
-            // Stamp dentry blocks to disk.
-            for (idx, chunk) in chunks.iter().enumerate() {
-                let blk = encode_block_dentry(chunk);
-                dev.write_at(block_addrs[idx] as u64 * bs, &blk)?;
+
+            // i_size spans every logical block (holes included); i_blocks is
+            // recomputed below from the mapped addresses. Record the hash
+            // depth so `encode_inode_block` stamps `i_current_depth`.
+            if let Some(ino) = self.inodes.get_mut(&dir_nid) {
+                ino.size = (max_logical + 1) * F2FS_BLKSIZE as u64;
             }
-            // Update inode size / blocks to reflect the dentry block(s).
-            let ino = self.inodes.get_mut(&dir_nid).unwrap();
-            ino.size = (chunks.len() as u64) * F2FS_BLKSIZE as u64;
-            ino.blocks = chunks.len() as u64;
+            dir_depths.insert(dir_nid, current_depth);
         }
 
         // 2) Write every direct-node block.
@@ -1136,14 +1210,7 @@ impl Writer {
             let blk = encode_indirect_node_with_crc(&ind.nids, ind.nid, ino);
             dev.write_at(ind.on_disk_block as u64 * bs, &blk)?;
         }
-        // Build parent_of: every inode's parent nid (root self-parents).
-        let mut parent_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-        parent_of.insert(3, 3); // root → root
-        for (&parent, kids) in &self.children {
-            for kid in kids {
-                parent_of.insert(kid.ino, parent);
-            }
-        }
+        // `parent_of` was built at the top of flush.
 
         // Recompute every inode's `i_blocks`. fsck.f2fs counts:
         //   inode block (1) + direct-node blocks owned + indirect-node
@@ -1184,7 +1251,8 @@ impl Writer {
             };
             let parent_nid = *parent_of.get(&ino.nid).unwrap_or(&ino.nid);
             let blocks_count = *blocks_for.get(&ino.nid).unwrap_or(&1);
-            let blk = encode_inode_block(ino, kids.as_deref(), parent_nid, blocks_count);
+            let depth = dir_depths.get(&ino.nid).copied().unwrap_or(0);
+            let blk = encode_inode_block(ino, kids.as_deref(), parent_nid, blocks_count, depth);
             dev.write_at(ino.on_disk_block as u64 * bs, &blk)?;
         }
 
@@ -1537,32 +1605,6 @@ fn find_owner_of_indirect(w: &Writer, inid: u32) -> u32 {
     inid
 }
 
-/// Greedy-pack a child list into 4 KiB dentry blocks. Each block holds at
-/// most `NR_DENTRY_IN_BLOCK` slots; a single dentry consumes
-/// `ceil(name_len / F2FS_SLOT_LEN)` slots (or 1 slot for an empty name).
-/// Returns the per-block child slices in the order they should be written.
-fn split_dentries_per_block(entries: &[Dentry]) -> Vec<Vec<Dentry>> {
-    if entries.is_empty() {
-        return Vec::new();
-    }
-    let mut out: Vec<Vec<Dentry>> = Vec::new();
-    let mut cur: Vec<Dentry> = Vec::new();
-    let mut cur_slots = 0usize;
-    for e in entries {
-        let need = e.name.len().div_ceil(F2FS_SLOT_LEN).max(1);
-        if cur_slots + need > NR_DENTRY_IN_BLOCK {
-            out.push(std::mem::take(&mut cur));
-            cur_slots = 0;
-        }
-        cur.push(e.clone());
-        cur_slots += need;
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
 /// True if a list of dentries still fits in the inline-dentry layout.
 fn fits_in_inline(entries: &[Dentry]) -> bool {
     let mut slot = 0usize;
@@ -1588,10 +1630,11 @@ fn encode_block_dentry(entries: &[Dentry]) -> Vec<u8> {
         if slot + need > NR_DENTRY_IN_BLOCK {
             break;
         }
-        set_bit(
-            &mut buf[bitmap_off..bitmap_off + SIZE_OF_DENTRY_BITMAP],
-            slot,
-        );
+        // Mark every slot the dentry occupies (head + name slots), as the
+        // kernel does — fsck.f2fs walks the bitmap and expects all of them.
+        for s in slot..slot + need {
+            set_bit(&mut buf[bitmap_off..bitmap_off + SIZE_OF_DENTRY_BITMAP], s);
+        }
         let de_off = dentries_off + slot * SIZE_OF_DIR_ENTRY;
         buf[de_off..de_off + 4].copy_from_slice(&e.hash.to_le_bytes());
         buf[de_off + 4..de_off + 8].copy_from_slice(&e.ino.to_le_bytes());
@@ -1690,6 +1733,7 @@ fn encode_inode_block(
     inline_children: Option<&[Dentry]>,
     parent_nid: u32,
     blocks: u64,
+    current_depth: u32,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; F2FS_BLKSIZE];
     buf[0x00..0x02].copy_from_slice(&ino.mode.to_le_bytes());
@@ -1705,10 +1749,11 @@ fn encode_inode_block(
     // Per kernel `struct f2fs_inode`:
     //   0x38..0x44  i_atime_nsec, i_ctime_nsec, i_mtime_nsec (left 0)
     //   0x44..0x48  i_generation (0)
-    //   0x48..0x4C  i_current_depth (0)
+    //   0x48..0x4C  i_current_depth (hash depth for multi-level dirs)
     //   0x4C..0x50  i_xattr_nid (0)
     //   0x50..0x54  i_flags
     //   0x54..0x58  i_pino — fsck verifies this matches the parent NAT entry
+    buf[0x48..0x4C].copy_from_slice(&current_depth.to_le_bytes());
     buf[0x50..0x54].copy_from_slice(&ino.flags.to_le_bytes());
     buf[0x54..0x58].copy_from_slice(&parent_nid.to_le_bytes());
 
@@ -1813,39 +1858,6 @@ mod tests {
             });
         }
         assert!(!fits_in_inline(&overflow));
-    }
-
-    /// Greedy chunker emits no chunks for an empty list, one chunk for
-    /// trivially-small lists, and exactly the right number of chunks when
-    /// the slot budget overflows.
-    #[test]
-    fn split_dentries_per_block_packs_greedily() {
-        // Empty.
-        assert!(split_dentries_per_block(&[]).is_empty());
-
-        // One entry — fits in one block.
-        let one = vec![Dentry {
-            hash: 0,
-            ino: 7,
-            file_type: F2FS_FT_REG_FILE,
-            name: b"a".to_vec(),
-        }];
-        assert_eq!(split_dentries_per_block(&one).len(), 1);
-
-        // 300 entries with 1-slot names → ceil(300 / 214) = 2 blocks.
-        let mut many: Vec<Dentry> = Vec::new();
-        for i in 0..300 {
-            many.push(Dentry {
-                hash: 0,
-                ino: i,
-                file_type: F2FS_FT_REG_FILE,
-                name: b"x".to_vec(),
-            });
-        }
-        let chunks = split_dentries_per_block(&many);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 214);
-        assert_eq!(chunks[1].len(), 86);
     }
 
     /// Synthesize a tracked file inode at a block index that falls into

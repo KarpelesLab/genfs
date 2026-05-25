@@ -373,7 +373,8 @@ pub enum MutationCapability {
     /// Full in-place edits: open an existing image, `create_*` /
     /// `remove` files, and (when a partial-write API exists) patch
     /// arbitrary byte ranges within an existing file. ext, FAT32,
-    /// F2FS today.
+    /// exFAT, XFS, HFS+, NTFS today — and a freshly-`format`ted F2FS
+    /// handle (a *reopened* F2FS handle is `Immutable`; see below).
     Mutable,
     /// `create_file` (whole-file replacement) and `remove` work, but
     /// partial in-place writes to an existing file's contents do
@@ -391,7 +392,9 @@ pub enum MutationCapability {
     /// On-disk layout is laid down at format time and the format has
     /// no in-place mutation hooks (no free-list, no journal). The
     /// writer can seek, but the image isn't re-openable as writable.
-    /// ISO 9660 and SquashFS today.
+    /// ISO 9660 and SquashFS today, plus a *reopened* F2FS handle
+    /// (build-once: its writer serializes the whole FS from in-memory
+    /// state at flush and isn't reconstructed on `open`).
     Immutable,
 }
 

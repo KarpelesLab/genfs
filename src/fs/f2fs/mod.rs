@@ -396,6 +396,24 @@ impl crate::fs::FilesystemFactory for F2fs {
 }
 
 impl crate::fs::Filesystem for F2fs {
+    /// F2FS's writer accumulates the entire filesystem in memory and
+    /// serializes it from scratch at flush (NAT both halves, fresh-image
+    /// cursegs), so it can only mutate the handle returned by
+    /// [`F2fs::format`] — where the writer is armed. A handle from
+    /// [`F2fs::open`] is read-only: the on-disk image isn't re-openable
+    /// as writable, so it reports `Immutable` and the generic
+    /// `require_mutable` guard rejects `add` / `rm` / `mkdir` cleanly
+    /// (typed `Error::Immutable`) instead of failing deep inside the
+    /// writer. Contrast NTFS / XFS / HFS+, whose writers mutate the disk
+    /// incrementally and reconstruct their state on reopen.
+    fn mutation_capability(&self) -> crate::fs::MutationCapability {
+        if self.writer.is_some() {
+            crate::fs::MutationCapability::Mutable
+        } else {
+            crate::fs::MutationCapability::Immutable
+        }
+    }
+
     fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,

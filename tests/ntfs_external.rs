@@ -848,6 +848,89 @@ fn remove_negative_cases_reject_cleanly() {
     }
 }
 
+/// Large single-directory scale test: plant several thousand files in one
+/// directory so the writer must (a) grow the `$I30` index across multiple
+/// INDX blocks into a real B-tree, and (b) extend the `$MFT` by doubling
+/// its data region — which produces multi-cluster `$DATA` runs whose
+/// lengths (128, 256, …) exercise the signed run-length encoding. A length
+/// of 128 naively encodes as a single `0x80` byte, which ntfs-3g
+/// sign-extends to -128 and rejects ("Invalid length in mapping pairs
+/// array" → "Failed to load $MFT"). This is the regression guard for that
+/// fix: the volume must mount cleanly and list every entry.
+#[test]
+fn large_directory_scales_and_mounts_clean() {
+    if which("ntfsfix").is_none() {
+        eprintln!("skipping: ntfsfix not installed");
+        return;
+    }
+    const N: usize = 4000;
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), 64 * 1024 * 1024).unwrap();
+    let opts = FormatOpts {
+        volume_label: "FSTOOL-BIG".to_string(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+    ntfs.create_dir(&mut dev, "/big", FileMeta::default())
+        .unwrap();
+    for i in 0..N {
+        let name = format!("/big/file{i:05}");
+        let body = b"x".to_vec();
+        ntfs.create_file(
+            &mut dev,
+            &name,
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(body)),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // ntfsfix mounts $MFT + $MFTMirr and walks the structure.
+    let out = Command::new("ntfsfix")
+        .arg("--no-action")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Mounting volume... OK"),
+        "ntfsfix could not mount the {N}-file volume:\n{combined}"
+    );
+    assert!(
+        !combined.contains("mapping pairs"),
+        "ntfsfix hit a mapping-pairs error (run-length regression):\n{combined}"
+    );
+
+    // ntfsls walks the promoted B-tree and lists every entry.
+    if which("ntfsls").is_some() {
+        let out = Command::new("ntfsls")
+            .arg("--force")
+            .arg("-p")
+            .arg("/big")
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "ntfsls failed on the large directory:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let listed = stdout.lines().filter(|l| l.contains("file")).count();
+        assert_eq!(listed, N, "ntfsls listed {listed} of {N} files in /big");
+    }
+}
+
 // ---------------------------------------------------------------------
 // Mount-via-ntfs-3g (manual only).
 //

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/KarpelesLab/fstool/compare/v0.4.3...v0.4.4) - 2026-05-25
+
+### Fixed
+
+- *(ntfs)* size resident $DATA by actual $SI/$FN length (fuzz panic)
+
+### Other
+
+- *(repack)* stop spilling every streamed file to a temp file
+- *(hfs+)* bump-cursor allocation — drop O(n²) from large-dir builds
+- *(f2fs)* O(1) directory lookups — drop O(n²) from large-dir builds
+
 ## [0.4.3](https://github.com/KarpelesLab/fstool/compare/v0.4.2...v0.4.3) - 2026-05-25
 
 ### Added

@@ -393,9 +393,29 @@ impl Writer {
                 "hfs+ writer: out of space (0 free blocks)".into(),
             ));
         }
-        // Find the largest free run discoverable from the start of the
-        // bitmap. Prefer one that begins at or after `next_alloc` so we
-        // keep the bump-pointer behaviour on the happy path.
+        // Fast path: take a run starting at the bump cursor. On a fresh
+        // sequential build everything below `next_alloc` is already used,
+        // so scanning the whole bitmap from bit 0 every call is O(n²) over
+        // a large build. Extend from the cursor while free, up to `max`.
+        if self.next_alloc < self.total_blocks && self.range_is_free(self.next_alloc, 1) {
+            let mut len = 1u32;
+            while len < max
+                && self.next_alloc + len < self.total_blocks
+                && self.range_is_free(self.next_alloc + len, 1)
+            {
+                len += 1;
+            }
+            let s = self.next_alloc;
+            self.set_used(s, len);
+            self.next_alloc = s + len;
+            self.free_blocks -= len;
+            return Ok(ExtentDescriptor {
+                start_block: s,
+                block_count: len,
+            });
+        }
+        // Fallback: largest free run from the start of the bitmap (handles
+        // the fragmented case where the cursor region is exhausted).
         let mut best: Option<(u32, u32)> = None;
         let mut run_start: u32 = 0;
         let mut run_len: u32 = 0;

@@ -14,7 +14,13 @@
 //!                       (DEST defaults to the basename of HOST in cwd)
 //!   rm PATH             remove a file or empty directory
 //!   mkdir PATH          create an empty directory
-//!   info                show image summary
+//!   info [PATH]         no arg → image summary; with PATH → per-file
+//!                       metadata (kind/mode/owner/size/blocks/nlink
+//!                       /inode/atime/mtime/ctime/rdev) plus any
+//!                       extended attributes (fs-specific properties
+//!                       come through here: NTFS DOS attrs, ADS,
+//!                       security descriptors; ext / squashfs xattrs;
+//!                       HFS+ Finder info; …)
 //!   help                list these commands
 //!   quit | exit         leave
 //! ```
@@ -124,7 +130,7 @@ impl Shell {
                 Ok(false)
             }
             "info" => {
-                self.cmd_info(output)?;
+                self.cmd_info(dev, rest, output)?;
                 Ok(false)
             }
             "" => Ok(false),
@@ -143,7 +149,9 @@ cat PATH            print a file's contents to stdout
 put HOST [DEST]     copy a host file or directory into the image
 rm PATH             remove a file or empty directory
 mkdir PATH          create an empty directory
-info                show image summary
+info [PATH]         no arg → image summary; with PATH → file metadata
+                    (kind/mode/owner/size/blocks/nlink/inode/atime/mtime
+                    /ctime/rdev) plus any extended attributes
 help | ?            print this help
 quit | exit         leave\n";
         output.write_all(body.as_bytes())?;
@@ -287,8 +295,88 @@ quit | exit         leave\n";
         Ok(())
     }
 
-    fn cmd_info(&self, output: &mut impl Write) -> Result<()> {
-        writeln!(output, "fs kind: {}", self.fs.kind_string())?;
+    fn cmd_info(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        arg: &str,
+        output: &mut impl Write,
+    ) -> Result<()> {
+        // No path → image-level summary, unchanged behaviour.
+        if arg.is_empty() {
+            writeln!(output, "fs kind: {}", self.fs.kind_string())?;
+            return Ok(());
+        }
+
+        // With a path → per-file metadata. `getattr` returns the
+        // POSIX-ish fields every backend can answer; `list_xattrs`
+        // surfaces fs-specific properties (NTFS DOS attrs, ADS, security
+        // descriptors; ext / squashfs xattrs; HFS+ Finder info; …).
+        let path = self.resolve(arg);
+        let attrs = self.fs.getattr(dev, Path::new(&path))?;
+
+        writeln!(output, "path:   {path}")?;
+        writeln!(output, "kind:   {}", fmt_kind(attrs.kind))?;
+        writeln!(
+            output,
+            "mode:   {:04o}  ({})",
+            attrs.mode & 0o7777,
+            fmt_mode(attrs.kind, attrs.mode)
+        )?;
+        writeln!(output, "owner:  {}:{}", attrs.uid, attrs.gid)?;
+        writeln!(output, "size:   {} bytes", attrs.size)?;
+        writeln!(output, "blocks: {}  (512-byte units)", attrs.blocks)?;
+        writeln!(output, "nlink:  {}", attrs.nlink)?;
+        writeln!(output, "inode:  {}", attrs.inode)?;
+        writeln!(
+            output,
+            "atime:  {}  ({})",
+            attrs.atime,
+            fmt_unix_utc(attrs.atime)
+        )?;
+        writeln!(
+            output,
+            "mtime:  {}  ({})",
+            attrs.mtime,
+            fmt_unix_utc(attrs.mtime)
+        )?;
+        writeln!(
+            output,
+            "ctime:  {}  ({})",
+            attrs.ctime,
+            fmt_unix_utc(attrs.ctime)
+        )?;
+        match attrs.kind {
+            fstool::fs::EntryKind::Char | fstool::fs::EntryKind::Block => {
+                let (maj, min) = fstool::fs::ext::inode::decode_devnum(attrs.rdev);
+                writeln!(
+                    output,
+                    "rdev:   {:#x}  (major {maj}, minor {min})",
+                    attrs.rdev
+                )?;
+            }
+            _ => writeln!(output, "rdev:   -")?,
+        }
+
+        // Symlinks: also surface the target. Backends that don't carry
+        // symlinks (FAT/exFAT) error here; we just skip on error so
+        // info on a non-symlink still works.
+        if matches!(attrs.kind, fstool::fs::EntryKind::Symlink)
+            && let Ok(tgt) = self.fs.read_symlink(dev, &path)
+        {
+            writeln!(output, "target: {tgt}")?;
+        }
+
+        // Extended attributes — fs-specific metadata in a generic shape.
+        // Empty xattr lists are common (most ext images, most files),
+        // so omit the section entirely when none.
+        let xattrs = self.fs.list_xattrs(dev, Path::new(&path))?;
+        if !xattrs.is_empty() {
+            writeln!(output)?;
+            writeln!(output, "xattrs ({}):", xattrs.len())?;
+            for xa in &xattrs {
+                writeln!(output, "  {:<28} = {}", xa.name, fmt_xattr_value(&xa.value))?;
+            }
+        }
         Ok(())
     }
 
@@ -340,6 +428,118 @@ pub fn normalize_path(p: &str) -> String {
     }
 }
 
+// ---------- formatting helpers for `cmd_info` ----------
+
+/// Human-readable name for a [`fstool::fs::EntryKind`].
+fn fmt_kind(kind: fstool::fs::EntryKind) -> &'static str {
+    use fstool::fs::EntryKind;
+    match kind {
+        EntryKind::Regular => "regular file",
+        EntryKind::Dir => "directory",
+        EntryKind::Symlink => "symbolic link",
+        EntryKind::Char => "character device",
+        EntryKind::Block => "block device",
+        EntryKind::Fifo => "fifo",
+        EntryKind::Socket => "socket",
+        EntryKind::Unknown => "unknown",
+    }
+}
+
+/// Render POSIX permission bits in the `ls -l` shape — leading
+/// type byte, three rwx triples, setuid/setgid/sticky overlays.
+fn fmt_mode(kind: fstool::fs::EntryKind, mode: u16) -> String {
+    use fstool::fs::EntryKind;
+    let mut s = String::with_capacity(10);
+    s.push(match kind {
+        EntryKind::Regular => '-',
+        EntryKind::Dir => 'd',
+        EntryKind::Symlink => 'l',
+        EntryKind::Char => 'c',
+        EntryKind::Block => 'b',
+        EntryKind::Fifo => 'p',
+        EntryKind::Socket => 's',
+        EntryKind::Unknown => '?',
+    });
+    for shift in [6u16, 3, 0] {
+        let bits = (mode >> shift) & 0o7;
+        s.push(if bits & 0o4 != 0 { 'r' } else { '-' });
+        s.push(if bits & 0o2 != 0 { 'w' } else { '-' });
+        s.push(if bits & 0o1 != 0 { 'x' } else { '-' });
+    }
+    // setuid/setgid/sticky overlay on the x slots.
+    let bytes: Vec<u8> = s.bytes().collect();
+    let mut bytes = bytes;
+    if mode & 0o4000 != 0 {
+        bytes[3] = if bytes[3] == b'x' { b's' } else { b'S' };
+    }
+    if mode & 0o2000 != 0 {
+        bytes[6] = if bytes[6] == b'x' { b's' } else { b'S' };
+    }
+    if mode & 0o1000 != 0 {
+        bytes[9] = if bytes[9] == b'x' { b't' } else { b'T' };
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+/// Format a Unix epoch second count as an ISO-8601 UTC string
+/// (`YYYY-MM-DDTHH:MM:SSZ`). Uses Hinnant's `civil_from_days`
+/// algorithm — no external date crate, valid for all positive `u32`
+/// timestamps (up to year 2106).
+fn fmt_unix_utc(t: u32) -> String {
+    let total = t as i64;
+    let days = total.div_euclid(86_400);
+    let sod = total.rem_euclid(86_400) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
+    let doe = z - era * 146_097; // [0, 146097)
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    let h = sod / 3600;
+    let mn = (sod / 60) % 60;
+    let s = sod % 60;
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mn:02}:{s:02}Z")
+}
+
+/// Format an xattr value for display. Pure-ASCII (printable + tab/LF)
+/// renders as a quoted string; otherwise prints the byte length plus a
+/// hex preview of the first 16 bytes. Keeps single-line so the
+/// `name = value` layout stays scannable.
+fn fmt_xattr_value(value: &[u8]) -> String {
+    let is_printable = !value.is_empty()
+        && value
+            .iter()
+            .all(|&b| matches!(b, b'\t' | b'\n' | 0x20..=0x7e));
+    if is_printable {
+        // Strip a trailing newline so the line stays tight.
+        let s = std::str::from_utf8(value).unwrap();
+        let s = s.strip_suffix('\n').unwrap_or(s);
+        return format!("{:?}", s);
+    }
+    let n = value.len();
+    let preview_len = n.min(16);
+    let mut hex = String::with_capacity(preview_len * 3);
+    for (i, b) in value[..preview_len].iter().enumerate() {
+        if i > 0 {
+            hex.push(' ');
+        }
+        hex.push_str(&format!("{b:02x}"));
+    }
+    if n > preview_len {
+        format!("<{n} bytes> {hex}…")
+    } else {
+        format!("<{n} bytes> {hex}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +563,45 @@ mod tests {
         assert_eq!(split_cmd("ls"), ("ls", ""));
         assert_eq!(split_cmd("ls /etc"), ("ls", "/etc"));
         assert_eq!(split_cmd("put a b"), ("put", "a b"));
+    }
+
+    #[test]
+    fn fmt_mode_renders_ls_l_layout() {
+        use fstool::fs::EntryKind;
+        assert_eq!(super::fmt_mode(EntryKind::Regular, 0o644), "-rw-r--r--");
+        assert_eq!(super::fmt_mode(EntryKind::Dir, 0o755), "drwxr-xr-x");
+        assert_eq!(super::fmt_mode(EntryKind::Symlink, 0o777), "lrwxrwxrwx");
+        assert_eq!(super::fmt_mode(EntryKind::Char, 0o600), "crw-------");
+        assert_eq!(super::fmt_mode(EntryKind::Block, 0o660), "brw-rw----");
+        // Setuid / setgid / sticky overlays.
+        assert_eq!(super::fmt_mode(EntryKind::Regular, 0o4755), "-rwsr-xr-x");
+        assert_eq!(super::fmt_mode(EntryKind::Regular, 0o4644), "-rwSr--r--");
+        assert_eq!(super::fmt_mode(EntryKind::Dir, 0o1755), "drwxr-xr-t");
+    }
+
+    #[test]
+    fn fmt_unix_utc_known_epochs() {
+        // The Unix epoch.
+        assert_eq!(super::fmt_unix_utc(0), "1970-01-01T00:00:00Z");
+        // 2001-09-09T01:46:40Z — the iconic 1e9 timestamp.
+        assert_eq!(super::fmt_unix_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        // 2023-11-14T22:13:20Z — the 1.7e9 mark.
+        assert_eq!(super::fmt_unix_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn fmt_xattr_value_chooses_string_or_hex() {
+        // Printable ASCII renders as a quoted string.
+        assert_eq!(super::fmt_xattr_value(b"text/plain"), r#""text/plain""#);
+        // Trailing newline gets stripped so the output stays single-line.
+        assert_eq!(super::fmt_xattr_value(b"v1\n"), r#""v1""#);
+        // Non-printable bytes fall back to <N bytes> + hex preview.
+        let mut v = b"\x01\x00\x04\x80".to_vec();
+        assert_eq!(super::fmt_xattr_value(&v), "<4 bytes> 01 00 04 80");
+        // Long values truncate after 16 bytes with a `…` marker.
+        v = (0u8..=31).collect();
+        let s = super::fmt_xattr_value(&v);
+        assert!(s.starts_with("<32 bytes> "), "{s}");
+        assert!(s.ends_with('…'), "{s}");
     }
 }

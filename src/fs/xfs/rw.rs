@@ -508,6 +508,7 @@ impl<'a> XfsFileHandle<'a> {
             generation: self.keep_generation,
             di_ino: self.ino,
             uuid: self.fs.sb.uuid,
+            flags2: 0,
         };
         let mut buf = builder.build();
         let data_end = 176 + lit.len();

@@ -460,6 +460,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Xfs> {
         generation: 1,
         di_ino: rootino,
         uuid: opts.uuid,
+        flags2: 0,
     }
     .build();
     // Write the single extent record in the literal area at offset 176.
@@ -501,6 +502,7 @@ pub fn format(dev: &mut dyn BlockDevice, opts: &FormatOpts) -> Result<Xfs> {
             generation: 1,
             di_ino: ino_num,
             uuid: opts.uuid,
+            flags2: 0,
         }
         .build();
         stamp_v3_inode_crc(&mut buf);

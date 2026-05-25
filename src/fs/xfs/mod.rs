@@ -680,6 +680,32 @@ impl crate::fs::FilesystemFactory for Xfs {
 }
 
 impl crate::fs::Filesystem for Xfs {
+    /// XFS images opt in to the REFLINK feature (`format::format`
+    /// stamps `XFS_SB_FEAT_RO_COMPAT_REFLINK` and an empty per-AG
+    /// REFCNTBT root), and `clone_file_path` shares extents through
+    /// the refcount-btree. `clone_range` for arbitrary sub-file
+    /// ranges into a pre-existing destination is stage 3 (write-on-
+    /// shared CoW) — for now we expose only whole-file cloning, where
+    /// the destination must not already exist.
+    fn clone_capability(&self) -> crate::fs::CloneCapability {
+        crate::fs::CloneCapability::WholeFile
+    }
+
+    fn clone_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+    ) -> Result<()> {
+        let s = src
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 src path".into()))?;
+        let d = dst
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("xfs: non-UTF-8 dst path".into()))?;
+        self.clone_file_path(dev, s, d).map(|_| ())
+    }
+
     fn create_file(
         &mut self,
         dev: &mut dyn BlockDevice,

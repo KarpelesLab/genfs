@@ -783,6 +783,7 @@ impl Xfs {
             generation: parent_core.generation,
             di_ino: parent_ino,
             uuid,
+            flags2: 0,
         };
         let mut lit = Vec::with_capacity(16);
         lit.extend_from_slice(&parent_self_extent.encode());
@@ -871,6 +872,7 @@ impl Xfs {
             generation: 1,
             di_ino: ino,
             uuid: self.uuid_for_writes(),
+            flags2: 0,
         };
         let lit = if nblocks > 0 {
             let ext = Extent {
@@ -929,6 +931,7 @@ impl Xfs {
             generation: 1,
             di_ino: ino,
             uuid,
+            flags2: 0,
         };
         let ext = Extent {
             offset: 0,
@@ -981,6 +984,7 @@ impl Xfs {
                 generation: 1,
                 di_ino: ino,
                 uuid,
+                flags2: 0,
             };
             self.write_inode(dev, ino, builder, target_bytes)?;
         } else if target_bytes.len() <= max_remote {
@@ -1027,6 +1031,7 @@ impl Xfs {
                 generation: 1,
                 di_ino: ino,
                 uuid,
+                flags2: 0,
             };
             let ext = Extent {
                 offset: 0,
@@ -1087,6 +1092,7 @@ impl Xfs {
             generation: 1,
             di_ino: ino,
             uuid,
+            flags2: 0,
         };
         self.write_inode(dev, ino, builder, &lit)?;
         self.append_dir_entry(dev, parent_ino, name, ino, kind.ftype())?;
@@ -1222,6 +1228,7 @@ impl Xfs {
             generation: parent_core.generation,
             di_ino: parent_ino,
             uuid,
+            flags2: 0,
         };
         let mut lit = Vec::with_capacity(16);
         lit.extend_from_slice(&parent_self_extent.encode());
@@ -1462,6 +1469,7 @@ impl Xfs {
             generation: core.generation,
             di_ino: ino,
             uuid: self.uuid_for_writes(),
+            flags2: 0,
         };
         let mut buf = builder.build();
         // Restore the data fork.
@@ -1841,6 +1849,257 @@ impl Xfs {
         self.ensure_write_state(dev)?;
         let (parent_ino, name) = self.split_path_for_create(dev, path)?;
         self.add_file(dev, parent_ino, &name, meta, size, src)
+    }
+
+    /// Clone `src_path` to a new file at `dst_path` by sharing extents:
+    /// the destination inode points at the **same** physical FSBs as
+    /// the source, and a refcount record is inserted into each
+    /// affected AG's REFCNTBT with `refcount = 2`. Both the source and
+    /// destination inodes get `XFS_DIFLAG2_REFLINK` set in `di_flags2`
+    /// so `xfs_repair` sees a consistent picture.
+    ///
+    /// Constraints (this stage):
+    /// * `src_path` must be a regular file in the EXTENTS data-fork
+    ///   format (BMBT-format files are rejected — fstool's writer
+    ///   never produces them anyway).
+    /// * `dst_path` must not already exist; its parent must.
+    /// * Sparse / unwritten / encrypted extents and `$ATTRIBUTE_LIST`-
+    ///   like multi-record inodes are rejected with `Unsupported`.
+    /// * A subsequent clone of the same range would bump the refcount
+    ///   past 2; this initial implementation rejects overlap with
+    ///   `Unsupported` rather than splitting / merging records (real
+    ///   workloads will surface that need; we add it then).
+    pub fn clone_file_path(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        src_path: &str,
+        dst_path: &str,
+    ) -> Result<u64> {
+        self.ensure_write_state(dev)?;
+
+        // 1) Resolve src, validate kind + format.
+        let (src_ino, mut src_buf, src_core) = self.resolve_path(dev, src_path)?;
+        if !src_core.is_reg() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: clone_file source {src_path:?} is not a regular file"
+            )));
+        }
+        if src_core.format != super::inode::DiFormat::Extents {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: clone_file source is in {:?} format; only Extents is supported",
+                src_core.format
+            )));
+        }
+
+        // 2) Extent list (each record is `Extent { offset, startblock, blockcount, unwritten }`).
+        let extents = self.read_extent_list(dev, &src_buf, &src_core)?;
+        for e in &extents {
+            if e.unwritten {
+                return Err(crate::Error::Unsupported(
+                    "xfs: clone_file: unwritten extents not supported".into(),
+                ));
+            }
+        }
+
+        // 3) Resolve destination parent + leaf; reject if leaf exists.
+        let (parent_ino, leaf) = self.split_path_for_create(dev, dst_path)?;
+        if self.dir_entry_exists(dev, parent_ino, &leaf)? {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: clone_file destination {dst_path:?} already exists"
+            )));
+        }
+
+        // 4) Allocate the destination inode.
+        let dst_ino = self.alloc_inode()?;
+
+        // 5) Re-read raw bytes the DinodeCore doesn't expose: extsize
+        //    (72..76), aformat (83), existing flags2 (120..128).
+        let src_extsize = u32::from_be_bytes(src_buf[72..76].try_into().unwrap());
+        let src_aformat = src_buf[83];
+
+        // 6) Build dst inode core (mirror src's, except di_ino + REFLINK flag).
+        let dst_builder = V3DinodeBuilder {
+            inodesize: XFS_INODESIZE as usize,
+            mode: src_core.mode,
+            format: 2, // EXTENTS
+            uid: src_core.uid,
+            gid: src_core.gid,
+            nlink: 1,
+            atime: src_core.atime,
+            mtime: src_core.mtime,
+            ctime: src_core.ctime,
+            // No crtime on the existing core; reuse mtime — matches the
+            // writer's other create paths.
+            crtime: src_core.mtime,
+            size: src_core.size,
+            nblocks: src_core.nblocks,
+            extsize: src_extsize,
+            nextents: src_core.nextents,
+            forkoff: src_core.forkoff,
+            aformat: src_aformat,
+            flags: src_core.flags,
+            generation: 1,
+            di_ino: dst_ino,
+            uuid: self.uuid_for_writes(),
+            flags2: super::inode::XFS_DIFLAG2_REFLINK,
+        };
+
+        // 7) Encode the extents verbatim into dst's literal area —
+        //    same physical FSBs the source points at.
+        let mut lit: Vec<u8> = Vec::with_capacity(extents.len() * 16);
+        for e in &extents {
+            lit.extend_from_slice(&e.encode());
+        }
+
+        // 8) Write dst inode + add the entry to dst's parent directory.
+        self.write_inode(dev, dst_ino, dst_builder, &lit)?;
+        self.append_dir_entry(dev, parent_ino, &leaf, dst_ino, XFS_DIR3_FT_REG_FILE)?;
+
+        // 9) For each shared extent, insert a refcount record with
+        //    refcount=2 into the AG that owns it.
+        for e in &extents {
+            self.insert_refcount_record_for_extent(dev, e.startblock, e.blockcount)?;
+        }
+
+        // 10) Set REFLINK on the source inode too — xfs_repair flags
+        //     "inode has shared extents but REFLINK flag unset" as a
+        //     corruption otherwise. OR the bit into di_flags2
+        //     (120..128) and restamp the CRC.
+        let mut src_flags2 = u64::from_be_bytes(src_buf[120..128].try_into().unwrap());
+        src_flags2 |= super::inode::XFS_DIFLAG2_REFLINK;
+        src_buf[120..128].copy_from_slice(&src_flags2.to_be_bytes());
+        super::inode::stamp_v3_inode_crc(&mut src_buf);
+        let src_off = self.ino_byte_offset(src_ino)?;
+        dev.write_at(src_off, &src_buf)?;
+
+        Ok(dst_ino)
+    }
+
+    /// Insert a refcount record `(startblock_in_ag, blockcount,
+    /// refcount=2)` into the AG that owns the given absolute FSB.
+    /// The REFCNTBT root lives at AG-block `REFCNTBT_AGBLOCK` of every
+    /// AG (see `format::format()`).
+    ///
+    /// Records are sorted by `rc_startblock` ascending — the XFS
+    /// refcount-btree's collation rule. `numrecs` is bumped and the
+    /// block's CRC re-stamped.
+    fn insert_refcount_record_for_extent(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        startblock_fsb: u64,
+        blockcount: u32,
+    ) -> Result<()> {
+        let agblklog = self.sb.agblklog as u32;
+        let ag = (startblock_fsb >> agblklog) as u32;
+        let ag_start_block = (startblock_fsb & ((1u64 << agblklog) - 1)) as u32;
+
+        // Sanity: refuse to issue refcount records that straddle an AG
+        // boundary. fstool's bump allocator (`alloc_blocks_fsb`) never
+        // emits one — every extent is allocated from a single AG — but
+        // assert anyway so a future change that breaks the invariant
+        // doesn't silently corrupt the refcount-btree.
+        let agblocks = self.sb.agblocks;
+        if (ag_start_block as u64) + (blockcount as u64) > agblocks as u64 {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: clone_file extent at FSB {startblock_fsb} (ag {ag}, agblock \
+                 {ag_start_block}, count {blockcount}) straddles AG boundary"
+            )));
+        }
+
+        let bs = self.sb.blocksize as u64;
+        let ag_byte = (ag as u64) * (agblocks as u64) * bs;
+        let refc_block_off = ag_byte + (super::format::REFCNTBT_AGBLOCK as u64) * bs;
+
+        let mut block = vec![0u8; bs as usize];
+        dev.read_at(refc_block_off, &mut block)?;
+        // Validate magic — guards against AG-layout mistakes.
+        let magic = u32::from_be_bytes(block[0..4].try_into().unwrap());
+        if magic != super::format::XFS_REFC_CRC_MAGIC {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: clone_file: REFCNTBT at ag {ag} has wrong magic {magic:#010x}"
+            )));
+        }
+        let numrecs = u16::from_be_bytes(block[6..8].try_into().unwrap()) as usize;
+
+        // Parse existing records (12 bytes each, starting at offset
+        // `XFS_BTREE_SBLOCK_V5_SIZE` = 56).
+        const REC_OFF: usize = super::format::XFS_BTREE_SBLOCK_V5_SIZE;
+        const REC_SZ: usize = 12;
+        let max_recs = (bs as usize - REC_OFF) / REC_SZ;
+        if numrecs >= max_recs {
+            return Err(crate::Error::Unsupported(format!(
+                "xfs: REFCNTBT for ag {ag} is full ({numrecs}/{max_recs}); \
+                 splitting to a multi-block tree is not implemented"
+            )));
+        }
+
+        // Detect overlap with an existing record — reject for now
+        // (stage 2 simplification). Real workloads triggering this need
+        // refcount bump-or-split logic in stage 3.
+        for i in 0..numrecs {
+            let off = REC_OFF + i * REC_SZ;
+            let rec_start = u32::from_be_bytes(block[off..off + 4].try_into().unwrap());
+            let rec_count = u32::from_be_bytes(block[off + 4..off + 8].try_into().unwrap());
+            let rec_end = rec_start.saturating_add(rec_count);
+            let new_end = ag_start_block.saturating_add(blockcount);
+            let overlaps = ag_start_block < rec_end && rec_start < new_end;
+            if overlaps {
+                return Err(crate::Error::Unsupported(format!(
+                    "xfs: clone_file: extent (ag {ag}, agblock {ag_start_block}, \
+                     count {blockcount}) overlaps existing refcount record at \
+                     [{rec_start}..{rec_end}); refcount bump beyond 2 not implemented yet"
+                )));
+            }
+        }
+
+        // Sort-insert: find the position where rc_startblock keeps
+        // ascending. The 'high bit of rc_startblock = COW staging
+        // extent' convention is left clear (we share regular data).
+        let mut insert_pos = numrecs;
+        for i in 0..numrecs {
+            let off = REC_OFF + i * REC_SZ;
+            let rec_start = u32::from_be_bytes(block[off..off + 4].try_into().unwrap());
+            if ag_start_block < rec_start {
+                insert_pos = i;
+                break;
+            }
+        }
+        // Shift records >= insert_pos right by one slot.
+        let tail_src = REC_OFF + insert_pos * REC_SZ;
+        let tail_dst = tail_src + REC_SZ;
+        let tail_len = (numrecs - insert_pos) * REC_SZ;
+        block.copy_within(tail_src..tail_src + tail_len, tail_dst);
+        // Write the new record.
+        block[tail_src..tail_src + 4].copy_from_slice(&ag_start_block.to_be_bytes());
+        block[tail_src + 4..tail_src + 8].copy_from_slice(&blockcount.to_be_bytes());
+        block[tail_src + 8..tail_src + 12].copy_from_slice(&2u32.to_be_bytes());
+        // Bump numrecs.
+        let new_numrecs = (numrecs + 1) as u16;
+        block[6..8].copy_from_slice(&new_numrecs.to_be_bytes());
+        // Re-stamp CRC.
+        stamp_v5_btree_block_crc(&mut block);
+        dev.write_at(refc_block_off, &block)?;
+        Ok(())
+    }
+
+    /// Best-effort existence check for `name` under directory `parent_ino`.
+    /// Reads the directory's entries and looks for an exact name match.
+    /// Used by `clone_file_path` to honour the trait contract ("dst
+    /// must not already exist") before allocating any inode.
+    fn dir_entry_exists(
+        &self,
+        dev: &mut dyn BlockDevice,
+        parent_ino: u64,
+        name: &str,
+    ) -> Result<bool> {
+        let (buf, core) = self.read_inode(dev, parent_ino)?;
+        if !core.is_dir() {
+            return Err(crate::Error::InvalidArgument(format!(
+                "xfs: parent inode {parent_ino} is not a directory"
+            )));
+        }
+        let entries = self.read_dir_entries(dev, &buf, &core)?;
+        Ok(entries.iter().any(|e| e.name == name))
     }
 
     /// Path-based equivalent of [`Self::add_dir`].

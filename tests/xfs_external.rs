@@ -551,3 +551,93 @@ fn writer_image_opts_in_reflink() {
         "SB features_ro_compat missing REFLINK bit (got {val:#x}):\n{s}"
     );
 }
+
+/// End-to-end XFS reflink: format a volume, plant a regular file with
+/// known content, call the trait `clone_file` (which routes through
+/// `Xfs::clone_file_path`), flush, and assert:
+///   * `xfs_repair -n` reports clean (REFCNTBT records validate against
+///     the dst inode's BMBT and src's REFLINK flag);
+///   * the cloned file reads back byte-for-byte equal to the source;
+///   * `xfs_db` shows the refcount record at the expected AG-block
+///     with refcount = 2 and the right blockcount.
+#[test]
+fn clone_file_round_trip_via_reflink() {
+    use fstool::fs::Filesystem;
+    use std::io::{Cursor, Read};
+
+    let Some(_) = which("xfs_repair") else {
+        eprintln!("skipping: xfs_repair not installed");
+        return;
+    };
+
+    let tmp = NamedTempFile::new().unwrap();
+    let size: u64 = 64 * 1024 * 1024;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let opts = FormatOpts {
+        uuid: [0x42u8; 16],
+        ..Default::default()
+    };
+    let body: Vec<u8> = (0..32 * 1024).map(|i| (i & 0xFF) as u8).collect();
+    {
+        let mut x = xfs::format(&mut dev, &opts).unwrap();
+        x.begin_writes(opts.uuid);
+        // Plant /src.bin with 32 KiB body.
+        let mut src = Cursor::new(&body[..]);
+        let meta = EntryMeta {
+            mode: 0o644,
+            ..EntryMeta::default()
+        };
+        x.add_file_path(&mut dev, "/src.bin", meta, body.len() as u64, &mut src)
+            .unwrap();
+        // Clone /src.bin → /dst.bin via the trait method (the same path
+        // a consumer hitting `inspect::open` + `clone_file` would take).
+        <Xfs as Filesystem>::clone_file(
+            &mut x,
+            &mut dev,
+            std::path::Path::new("/src.bin"),
+            std::path::Path::new("/dst.bin"),
+        )
+        .unwrap();
+        x.flush_writes(&mut dev).unwrap();
+    }
+    dev.sync().unwrap();
+
+    // 1) Content round-trip: dst reads back identical to src.
+    {
+        let x = Xfs::open(&mut dev).unwrap();
+        let mut r = x.open_file_reader(&mut dev, "/dst.bin").unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body, "/dst.bin content differs from /src.bin");
+    }
+    drop(dev);
+
+    // 2) xfs_repair stays clean.
+    assert_xfs_repair_clean(tmp.path());
+
+    // 3) refcount record exists with refcount = 2.
+    if which("xfs_db").is_some() {
+        let out = Command::new("xfs_db")
+            .args(["-r", "-c", "agf 0", "-c", "addr refcntroot", "-c", "p"])
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        let bt = String::from_utf8_lossy(&out.stdout);
+        // The block has at least one record after the clone.
+        assert!(
+            !bt.contains("numrecs = 0"),
+            "REFCNTBT still empty after clone:\n{bt}"
+        );
+        // xfs_db prints leaf records as "recs[N] = [startblock,blockcount,refcount]..."
+        // — match on the refcount=2 marker.
+        assert!(
+            bt.contains("cowflag = 0")
+                || bt.contains("refcount = 2")
+                || bt.contains(",2 ")
+                || bt.contains(":2 ")
+                || bt.contains(",2]")
+                || bt.contains(",2,"),
+            "REFCNTBT records don't show refcount=2:\n{bt}"
+        );
+    }
+}

@@ -269,7 +269,18 @@ pub struct V3DinodeBuilder {
     pub generation: u32,
     pub di_ino: u64,
     pub uuid: [u8; 16],
+    /// `di_flags2` (v3 extension, offset 120..128). Carries the
+    /// REFLINK / BIGTIME / NREXT64 bits. Most callers leave this `0`;
+    /// the `clone_file` writer sets `XFS_DIFLAG2_REFLINK` on both
+    /// the source and destination inodes.
+    pub flags2: u64,
 }
+
+/// `di_flags2` bit: file has shared extents (clone / reflink). XFS
+/// kernels require this on every inode that participates in a clone;
+/// `xfs_repair` flags the volume corrupt if the bit is unset but the
+/// extent is in the REFCNTBT.
+pub const XFS_DIFLAG2_REFLINK: u64 = 0x2;
 
 impl V3DinodeBuilder {
     /// Allocate the on-disk inode buffer and stamp every field except
@@ -299,6 +310,8 @@ impl V3DinodeBuilder {
         // di_next_unlinked at 96..100 = NULL (-1)
         buf[96..100].copy_from_slice(&u32::MAX.to_be_bytes());
         // di_crc at 100..104 — caller's responsibility via stamp_v3_inode_crc
+        // di_flags2 at 120..128 — REFLINK / BIGTIME / NREXT64 etc.
+        buf[120..128].copy_from_slice(&self.flags2.to_be_bytes());
         buf[144..152].copy_from_slice(&encode_ts(self.crtime));
         buf[152..160].copy_from_slice(&self.di_ino.to_be_bytes());
         buf[160..176].copy_from_slice(&self.uuid);

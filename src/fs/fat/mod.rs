@@ -25,6 +25,7 @@ use table::Fat;
 
 use crate::Result;
 use crate::block::BlockDevice;
+use crate::fs::dir_batch::{DEFAULT_CAPACITY, DirBatch};
 
 /// FAT32 requires at least this many data clusters; fewer makes it a
 /// FAT12/FAT16 volume, which fsck.vfat rejects as "not FAT32".
@@ -84,6 +85,10 @@ pub struct Fat32 {
     fat: Fat,
     /// Cluster to hand out next from the free pool.
     next_free: u32,
+    /// Pending child directory entries keyed by parent directory start
+    /// cluster. Staged instead of rewriting the parent's cluster chain on
+    /// every child; serialized once on eviction or at flush.
+    dir_batch: DirBatch<u32, mutate::PendingEntry>,
 }
 
 impl Fat32 {
@@ -162,10 +167,11 @@ impl Fat32 {
         // Root directory occupies cluster 2, a one-cluster chain.
         fat.set(boot.root_cluster, table::EOC);
 
-        let fs = Self {
+        let mut fs = Self {
             boot,
             fat,
             next_free: 3,
+            dir_batch: DirBatch::new(DEFAULT_CAPACITY),
         };
         // Zero the whole volume up front so unwritten clusters read clean.
         dev.zero_range(0, need)?;
@@ -247,7 +253,10 @@ impl Fat32 {
     /// Persist the boot sector (+ backup), FSInfo (+ backup) and both FAT
     /// copies. Free-cluster accounting is derived from the current FAT, so
     /// this works for both fresh-format and modify-in-place flows.
-    pub fn flush(&self, dev: &mut dyn BlockDevice) -> Result<()> {
+    pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        // Serialize pending directory batches first — they may allocate
+        // clusters, which the FAT written below must reflect.
+        self.flush_dir_batches(dev)?;
         let boot_bytes = self.boot.encode();
         dev.write_at(0, &boot_bytes)?;
         dev.write_at(
@@ -560,6 +569,7 @@ impl Fat32 {
             boot,
             fat,
             next_free,
+            dir_batch: DirBatch::new(DEFAULT_CAPACITY),
         })
     }
 
@@ -954,6 +964,9 @@ impl crate::fs::Filesystem for Fat32 {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        // Materialize staged directory entries so the listing (and any
+        // ancestor lookups along the way) reflect them.
+        self.flush_dir_batches(dev)?;
         self.list_path(dev, s)
     }
 
@@ -1006,6 +1019,9 @@ impl crate::fs::Filesystem for Fat32 {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        // This path locates directory entries on disk (and the handle
+        // updates them in place), so serialize any staged entries first.
+        self.flush_dir_batches(dev)?;
         // Resolve the parent + leaf. We do this once up front so the
         // create-then-reopen branch shares the result.
         let (parent_cluster, leaf) = self.resolve_parent(dev, s)?;
@@ -1031,8 +1047,10 @@ impl crate::fs::Filesystem for Fat32 {
                     ));
                 }
                 // Create an empty file via the existing modify-in-place
-                // path, then re-find its entry.
+                // path; serialize it so its on-disk entry exists, then
+                // re-find it (the handle updates that entry in place).
                 self.add_file_from_reader(dev, s, &mut std::io::empty(), 0)?;
+                self.flush_dir_batches(dev)?;
                 self.find_entry(dev, parent_cluster, &leaf)?
                     .ok_or_else(|| {
                         crate::Error::InvalidImage(
@@ -1335,6 +1353,46 @@ mod tests {
             Ok(_) => panic!("expected error for non-existent path with create=false"),
             Err(crate::Error::InvalidArgument(_)) => {}
             Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    /// Batched directory writes: create a directory with many files in
+    /// one session (accumulated in the dir batch, serialized once at
+    /// flush), reopen, and confirm every file lists and reads back.
+    #[test]
+    fn batched_many_files_one_dir_round_trip() {
+        let (mut dev, mut fs) = fresh_volume();
+        fs.create_dir(&mut dev, Path::new("/d"), FileMeta::default())
+            .unwrap();
+        let n = 50usize;
+        for i in 0..n {
+            let body = format!("file-body-{i:03}");
+            fs.create_file(
+                &mut dev,
+                &std::path::PathBuf::from(format!("/d/f{i:03}.txt")),
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(body.clone().into_bytes())),
+                    len: body.len() as u64,
+                },
+                FileMeta::default(),
+            )
+            .unwrap();
+        }
+        fs.flush(&mut dev).unwrap();
+
+        let mut fs2 = Fat32::open(&mut dev).unwrap();
+        let listed: std::collections::HashSet<String> =
+            crate::fs::Filesystem::list(&mut fs2, &mut dev, Path::new("/d"))
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+        assert_eq!(listed.len(), n, "expected {n} files, got {listed:?}");
+        for i in 0..n {
+            let name = format!("f{i:03}.txt");
+            assert!(listed.contains(&name), "missing {name}");
+            let got = read_all(&mut fs2, &mut dev, &format!("/d/{name}"));
+            assert_eq!(got, format!("file-body-{i:03}").into_bytes());
         }
     }
 

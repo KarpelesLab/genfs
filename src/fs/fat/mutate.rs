@@ -13,6 +13,19 @@ use super::{Fat32, SECTOR, dir, table};
 use crate::Result;
 use crate::block::BlockDevice;
 
+/// One child directory entry staged in [`Fat32`]'s directory-batch cache
+/// instead of being written to the parent's cluster chain immediately.
+/// `bytes` is the ready-to-write run of 32-byte slots (LFN + 8.3);
+/// `name` / `first_cluster` / `is_dir` let path lookups resolve the
+/// staged child as an in-memory overlay before it is serialized.
+#[derive(Debug, Clone)]
+pub(super) struct PendingEntry {
+    pub(super) bytes: Vec<u8>,
+    pub(super) name: String,
+    pub(super) first_cluster: u32,
+    pub(super) is_dir: bool,
+}
+
 /// Result of [`Fat32::find_entry`] — a directory's loaded byte buffer plus
 /// the position of the named entry (and any preceding LFN run) within it.
 pub(super) struct FoundEntry {
@@ -269,7 +282,7 @@ impl Fat32 {
         size: u64,
     ) -> Result<()> {
         let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
-        if self.find_entry(dev, parent_cluster, &leaf)?.is_some() {
+        if self.child_exists(dev, parent_cluster, &leaf)? {
             return Err(crate::Error::InvalidArgument(format!(
                 "fat32: {dest_path:?} already exists"
             )));
@@ -285,8 +298,16 @@ impl Fat32 {
         let first = chain.first().copied().unwrap_or(0);
         let mut entries: Vec<u8> = Vec::new();
         self.push_dir_entry(&mut entries, &leaf, dir::ATTR_ARCHIVE, first, size as u32);
-        self.append_dir_entries(dev, parent_cluster, &entries)?;
-        Ok(())
+        self.stage_dir_entry(
+            dev,
+            parent_cluster,
+            PendingEntry {
+                bytes: entries,
+                name: leaf,
+                first_cluster: first,
+                is_dir: false,
+            },
+        )
     }
 
     fn stream_reader_chain(
@@ -318,7 +339,7 @@ impl Fat32 {
     /// Create a directory at `dest_path`. The parent must already exist.
     pub fn add_dir(&mut self, dev: &mut dyn BlockDevice, dest_path: &str) -> Result<()> {
         let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
-        if self.find_entry(dev, parent_cluster, &leaf)?.is_some() {
+        if self.child_exists(dev, parent_cluster, &leaf)? {
             return Err(crate::Error::InvalidArgument(format!(
                 "fat32: {dest_path:?} already exists"
             )));
@@ -340,13 +361,92 @@ impl Fat32 {
 
         let mut entries: Vec<u8> = Vec::new();
         self.push_dir_entry(&mut entries, &leaf, dir::ATTR_DIRECTORY, child_cluster, 0);
-        self.append_dir_entries(dev, parent_cluster, &entries)?;
+        self.stage_dir_entry(
+            dev,
+            parent_cluster,
+            PendingEntry {
+                bytes: entries,
+                name: leaf,
+                first_cluster: child_cluster,
+                is_dir: true,
+            },
+        )
+    }
+
+    /// Stage a child entry for `parent_cluster` instead of rewriting the
+    /// parent's directory immediately. Serialized once on eviction or at
+    /// flush; [`resolve_parent`](Self::resolve_parent) reads the batch as
+    /// an overlay so staged children stay resolvable.
+    fn stage_dir_entry(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_cluster: u32,
+        entry: PendingEntry,
+    ) -> Result<()> {
+        if let Some((victim, entries)) = self.dir_batch.stage(parent_cluster, entry) {
+            self.serialize_one_dir(dev, victim, entries)?;
+        }
         Ok(())
+    }
+
+    /// Append a directory's whole pending batch to its cluster chain in
+    /// one pass (one chain read, one growth check, one write run) instead
+    /// of once per child.
+    fn serialize_one_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        entries: Vec<PendingEntry>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut combined = Vec::new();
+        for e in &entries {
+            combined.extend_from_slice(&e.bytes);
+        }
+        self.append_dir_entries(dev, dir_cluster, &combined)
+    }
+
+    /// Serialize every pending directory batch (at flush, or before a
+    /// read path that consumes on-disk directory blocks).
+    pub(super) fn flush_dir_batches(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        for (dir_cluster, entries) in self.dir_batch.drain_all() {
+            self.serialize_one_dir(dev, dir_cluster, entries)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve a child of `dir_cluster` by name from the pending batch
+    /// (staged but not yet written). Returns `(first_cluster, is_dir)`.
+    fn pending_child(&self, dir_cluster: u32, name: &str) -> Option<(u32, bool)> {
+        self.dir_batch
+            .peek(&dir_cluster)?
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(name))
+            .map(|e| (e.first_cluster, e.is_dir))
+    }
+
+    /// `true` if `name` already exists under `dir_cluster` — on disk or
+    /// staged in the pending batch.
+    fn child_exists(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        name: &str,
+    ) -> Result<bool> {
+        if self.pending_child(dir_cluster, name).is_some() {
+            return Ok(true);
+        }
+        Ok(self.find_entry(dev, dir_cluster, name)?.is_some())
     }
 
     /// Remove a file, or an empty directory, at `path`. Returns
     /// [`crate::Error::InvalidArgument`] for a non-empty directory.
     pub fn remove(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        // The splice + emptiness check below read on-disk directory
+        // blocks; serialize all staged entries first so they are present.
+        self.flush_dir_batches(dev)?;
         let (parent_cluster, leaf) = self.resolve_parent(dev, path)?;
         let Some(FoundEntry {
             chain,
@@ -405,23 +505,28 @@ impl Fat32 {
         })?;
         let mut cluster = self.boot.root_cluster;
         for part in prefix {
-            let entry = match self.find_entry(dev, cluster, part)? {
-                Some(found) => found.entry,
-                None => {
-                    return Err(crate::Error::InvalidArgument(format!(
+            // On-disk entry, or one still staged in this directory's batch
+            // (created this session, not yet serialized).
+            let (first_cluster, is_dir) = match self.find_entry(dev, cluster, part)? {
+                Some(found) => (
+                    found.entry.first_cluster,
+                    found.entry.attr & dir::ATTR_DIRECTORY != 0,
+                ),
+                None => self.pending_child(cluster, part).ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
                         "fat32: parent {part:?} of {path:?} does not exist"
-                    )));
-                }
+                    ))
+                })?,
             };
-            if entry.attr & dir::ATTR_DIRECTORY == 0 {
+            if !is_dir {
                 return Err(crate::Error::InvalidArgument(format!(
                     "fat32: {part:?} is not a directory"
                 )));
             }
-            cluster = if entry.first_cluster == 0 {
+            cluster = if first_cluster == 0 {
                 self.boot.root_cluster
             } else {
-                entry.first_cluster
+                first_cluster
             };
         }
         Ok((cluster, (*last).to_string()))

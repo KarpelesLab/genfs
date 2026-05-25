@@ -1324,3 +1324,44 @@ fn cli_tar_archive_readable_by_system_tar() {
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("hello"), "system tar didn't see /hello:\n{s}");
 }
+
+/// `analyze` on a host directory: human output carries the counts, and
+/// `--json` parses with the expected fields + a per-fs size map.
+#[test]
+fn cli_analyze_reports_counts_and_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    std::fs::write(dir.path().join("b.bin"), vec![0u8; 2000]).unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/c.txt"), b"0123456789").unwrap();
+
+    // Human output.
+    let out = Command::new(FSTOOL)
+        .arg("analyze")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "analyze failed: {out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("files:     3"), "human output:\n{text}");
+    assert!(text.contains("dirs:      1"), "human output:\n{text}");
+
+    // JSON output.
+    let out = Command::new(FSTOOL)
+        .arg("analyze")
+        .arg(dir.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "analyze --json failed: {out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(v["files"], 3);
+    assert_eq!(v["dirs"], 1);
+    assert_eq!(v["symlinks"], 0);
+    assert_eq!(v["total_file_bytes"], 2015);
+    // recommended_size carries the block-FS targets.
+    assert!(v["recommended_size"]["ext4"].is_u64());
+    assert!(v["recommended_size"]["fat32"].is_u64());
+    // streamed outputs are absent.
+    assert!(v["recommended_size"].get("tar").is_none());
+}

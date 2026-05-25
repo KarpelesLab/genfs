@@ -392,6 +392,7 @@ dependencies = [
  "minilzo-rs",
  "pbkdf2",
  "serde",
+ "serde_json",
  "sha1",
  "tempfile",
  "thiserror",

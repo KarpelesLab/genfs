@@ -11,6 +11,7 @@
 //! High-level entry points for building or inspecting an image live at the
 //! crate root once P5 lands.
 
+pub mod analyze;
 pub mod block;
 pub mod compression;
 pub mod concurrent;

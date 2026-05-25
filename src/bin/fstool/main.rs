@@ -120,6 +120,28 @@ enum Command {
         image: String,
     },
 
+    /// Analyze a source and report its contents (file / dir / symlink /
+    /// device counts, total file bytes, ext inode estimate) plus the
+    /// recommended destination image size per filesystem type — the same
+    /// metrics used to size a `--shrink` repack. The source may be a
+    /// filesystem image (optionally `:N` for a partition), a tar /
+    /// `.tar.gz` archive, or a host directory.
+    Analyze {
+        /// Source: image[:N], tar / tar.gz, or host directory.
+        #[arg(value_name = "SOURCE")]
+        source: String,
+        /// Report the recommended size only for this destination fs type
+        /// (default: every type that takes a content-fit size).
+        #[arg(long, value_name = "TYPE")]
+        fs_type: Option<String>,
+        /// ext block size used for the ext size estimate.
+        #[arg(long, default_value_t = 4096)]
+        block_size: u32,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Build an image from a TOML spec file. Bare-filesystem specs are
     /// supported today; partitioned-disk specs land in a follow-up.
     Build {
@@ -274,6 +296,12 @@ fn run(cli: Cli) -> fstool::Result<()> {
         Command::Ls { image, path } => ls(&image, &path),
         Command::Cat { image, path } => cat(&image, &path),
         Command::Info { image } => info(&image),
+        Command::Analyze {
+            source,
+            fs_type,
+            block_size,
+            json,
+        } => analyze_cmd(&source, fs_type.as_deref(), block_size, json),
         Command::Build { spec, output } => build(&spec, &output),
         Command::Add {
             image,
@@ -667,16 +695,13 @@ fn repack_cmd(
         let dst_size = match (size_arg, shrink) {
             (Some(s), _) => fstool::spec::parse_size(s)?,
             (None, true) => match lower.as_str() {
-                "ext2" | "ext3" | "ext4" => {
-                    let plan = build_ext_plan(src_dev, &mut src_fs, block_size, &lower)?;
-                    plan.blocks_count() as u64 * plan.block_size as u64
-                }
-                "fat32" | "vfat" => {
-                    let bytes = sum_source_file_bytes(src_dev, &mut src_fs)?;
-                    let needed = bytes
-                        .saturating_mul(2)
-                        .max(fstool::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024);
-                    needed.div_ceil(512) * 512
+                // Fixed-size block filesystems: the analyze API owns the
+                // content-fit sizing (ext via BuildPlan, fat32 via the
+                // byte heuristic).
+                "ext2" | "ext3" | "ext4" | "fat32" | "vfat" => {
+                    fstool::analyze::analyze_fs(&mut src_fs, src_dev, block_size)?
+                        .recommended_size(&lower)
+                        .expect("block fs has a recommended size")
                 }
                 // Tar output streams to a file; no pre-sized device, so
                 // the destination size is unused.
@@ -784,8 +809,13 @@ fn repack_cmd(
         // the over-provisioned file; `None` for fixed-size FS images.
         let archive_len: Option<u64> = match lower.as_str() {
             "ext2" | "ext3" | "ext4" => {
-                let plan = build_ext_plan(src_dev, &mut src_fs, block_size, &lower)?;
-                let mut opts = plan.to_format_opts();
+                let kind = match lower.as_str() {
+                    "ext2" => fstool::fs::ext::FsKind::Ext2,
+                    "ext3" => fstool::fs::ext::FsKind::Ext3,
+                    _ => fstool::fs::ext::FsKind::Ext4,
+                };
+                let mut opts = fstool::analyze::analyze_fs(&mut src_fs, src_dev, block_size)?
+                    .ext_format_opts(kind);
                 // Sparse: the source reader emits zeros over holes and
                 // the ext writer re-sparsifies all-zero blocks, so holes
                 // round-trip.
@@ -994,7 +1024,7 @@ fn repack_tar_stream_to_fs(
     block_size: u32,
     qcow2_cluster_size: u32,
 ) -> fstool::Result<()> {
-    use fstool::fs::ext::{BuildPlan, Ext, FsKind};
+    use fstool::fs::ext::{Ext, FsKind};
     let _ = shrink; // sizing always uses a pass when no explicit size
 
     let explicit = match size_arg {
@@ -1002,9 +1032,19 @@ fn repack_tar_stream_to_fs(
         None => None,
     };
 
-    // ext needs full FormatOpts (inode count, group layout) which only
-    // a content scan yields — run a streaming plan pass regardless of
-    // whether the size is explicit.
+    // One streaming content scan yields everything sizing needs: the ext
+    // FormatOpts (inode count, group layout) and the file-byte total for
+    // the FAT/other heuristics. (Replaces the former PlanSink/ByteSumSink
+    // passes with a single `analyze` pass.)
+    let analysis = fstool::analyze::analyze_source(
+        &fstool::repack::Source::TarArchive {
+            path: tar_path.to_path_buf(),
+            codec: Some(algo),
+        },
+        block_size,
+    )?;
+
+    // ext needs full FormatOpts regardless of whether the size is explicit.
     let mut ext_opts = match lower {
         "ext2" | "ext3" | "ext4" => {
             let kind = match lower {
@@ -1012,42 +1052,27 @@ fn repack_tar_stream_to_fs(
                 "ext3" => FsKind::Ext3,
                 _ => FsKind::Ext4,
             };
-            let mut plan = BuildPlan::new(block_size, kind);
-            {
-                let mut sink = fstool::repack::PlanSink::new(&mut plan);
-                let mut reader = fstool::repack::open_tar_stream(tar_path, Some(algo))?;
-                fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
-            }
-            let mut opts = plan.to_format_opts();
+            let mut opts = analysis.ext_format_opts(kind);
             opts.sparse = true;
             Some(opts)
         }
         _ => None,
     };
 
-    // Destination size: explicit wins; ext derives from its plan;
-    // everything else sums file bytes in a streaming pass + headroom.
+    // Destination size: explicit wins; ext derives from its plan; fat32
+    // uses the analyze recommendation; the remaining self-sizing block
+    // FSes (xfs/hfs+/ntfs/f2fs) get a generous upper bound.
     let dst_size = if let Some(sz) = explicit {
         sz
     } else if let Some(opts) = &ext_opts {
         opts.blocks_count as u64 * opts.block_size as u64
+    } else if let Some(sz) = analysis.recommended_size(lower) {
+        sz
     } else {
-        let mut sum = fstool::repack::ByteSumSink::default();
-        {
-            let mut reader = fstool::repack::open_tar_stream(tar_path, Some(algo))?;
-            fstool::repack::walk_tar_stream(&mut reader, &mut sum)?;
-        }
-        let bytes = sum.bytes;
-        match lower {
-            "fat32" | "vfat" => {
-                bytes
-                    .saturating_mul(2)
-                    .max(fstool::fs::fat::MIN_FAT32_CLUSTERS as u64 * 1024)
-                    .div_ceil(512)
-                    * 512
-            }
-            _ => bytes.saturating_mul(2).saturating_add(64 * 1024 * 1024),
-        }
+        analysis
+            .total_file_bytes
+            .saturating_mul(2)
+            .saturating_add(64 * 1024 * 1024)
     };
 
     // Grow the ext plan's image to an explicitly-requested larger size
@@ -1423,31 +1448,6 @@ fn open_decoded_stream_plain(image: &str) -> fstool::Result<Box<dyn std::io::Rea
 // ─── Tar → FAT32 ────────────────────────────────────────────────────────
 
 // ─── shrink sizing ───────────────────────────────────────────────────────
-
-/// Build a BuildPlan that reflects the source filesystem's content,
-/// without touching the host filesystem. Trait-driven via
-/// [`fstool::repack::scan_into_build_plan`] — no per-FS arms.
-fn build_ext_plan(
-    src_dev: &mut dyn fstool::block::BlockDevice,
-    src_fs: &mut fstool::inspect::AnyFs,
-    block_size: u32,
-    fs_kind_str: &str,
-) -> fstool::Result<fstool::fs::ext::BuildPlan> {
-    use fstool::fs::ext::{BuildPlan, FsKind};
-    let kind = match fs_kind_str {
-        "ext2" => FsKind::Ext2,
-        "ext3" => FsKind::Ext3,
-        "ext4" => FsKind::Ext4,
-        other => {
-            return Err(fstool::Error::InvalidArgument(format!(
-                "repack: unknown ext kind {other:?}"
-            )));
-        }
-    };
-    let mut plan = BuildPlan::new(block_size, kind);
-    fstool::repack::build_ext_plan_through_trait(src_dev, src_fs, &mut plan)?;
-    Ok(plan)
-}
 
 /// Sum the size of every regular file in the source filesystem — used
 /// by FAT32 / ISO shrink sizing. Trait-driven walk via
@@ -2099,6 +2099,53 @@ fn cat(image: &str, path: &str) -> fstool::Result<()> {
         fs.copy_file_to(dev, path, &mut out)?;
         Ok(())
     })
+}
+
+fn analyze_cmd(
+    source: &str,
+    fs_type: Option<&str>,
+    block_size: u32,
+    json: bool,
+) -> fstool::Result<()> {
+    let src = fstool::repack::Source::detect(source)?;
+    let analysis = fstool::analyze::analyze_source(&src, block_size)?;
+    let fs_types: Vec<&str> = match fs_type {
+        Some(t) => vec![t],
+        None => fstool::analyze::SIZED_FS_TYPES.to_vec(),
+    };
+    let report = analysis.report(&fs_types);
+
+    if json {
+        let s = serde_json::to_string_pretty(&report)
+            .map_err(|e| fstool::Error::Io(std::io::Error::other(e)))?;
+        println!("{s}");
+        return Ok(());
+    }
+
+    println!("source:    {source}");
+    println!("files:     {}", report.files);
+    println!("dirs:      {}", report.dirs);
+    println!("symlinks:  {}", report.symlinks);
+    println!("devices:   {}", report.devices);
+    println!("hardlinks: {}", report.hardlinks);
+    println!(
+        "file data: {} ({} bytes)",
+        human_size(report.total_file_bytes),
+        report.total_file_bytes
+    );
+    println!("inodes:    {}", report.inode_count);
+    println!(
+        "recommended image size (ext block size {}):",
+        report.block_size
+    );
+    if report.recommended_size.is_empty() {
+        println!("  (none — destination grows/truncates; no fixed size needed)");
+    } else {
+        for (t, sz) in &report.recommended_size {
+            println!("  {t:<8} {} ({sz} bytes)", human_size(*sz));
+        }
+    }
+    Ok(())
 }
 
 fn info(image: &str) -> fstool::Result<()> {

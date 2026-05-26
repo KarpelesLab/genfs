@@ -597,6 +597,11 @@ fn repack_cmd(
             .or_else(|| tar_output_codec(dst).map(|_| "tar".to_string()))
             .unwrap_or_else(|| "ext4".to_string());
         let lower = target_fs.to_ascii_lowercase();
+        // tar → tar is a pure forward re-mux: decode the source on the fly
+        // and re-emit through the tar stream sink, no tempfile.
+        if lower == "tar" {
+            return repack_tar_stream_to_tar(&tar_path, algo, dst, tar_output_codec(dst));
+        }
         if matches!(
             lower.as_str(),
             "ext2"
@@ -613,6 +618,8 @@ fn repack_cmd(
                 | "iso"
                 | "iso9660"
                 | "grf"
+                | "zip"
+                | "cpio"
         ) {
             return repack_tar_stream_to_fs(
                 &tar_path,
@@ -625,7 +632,8 @@ fn repack_cmd(
                 qcow2_cluster_size,
             );
         }
-        // else: tar→tar output — fall through.
+        // All streamable destinations are handled above; nothing falls
+        // through for a compressed-tar source.
     }
 
     // Compressed-tar source: decompress once to a tempfile and treat
@@ -1017,6 +1025,45 @@ fn repack_stream_via_trait<F: fstool::fs::FilesystemFactory>(
 /// size) runs a first streaming pass into a counting sink, then the
 /// write pass re-opens the source and decodes from byte 0 again. Only
 /// reached for the block-FS targets gated by the caller.
+/// Re-mux a compressed-tar source into a tar destination by streaming:
+/// decode the source archive on the fly and re-emit each entry through the
+/// tar stream sink, optionally re-compressing the output. No tempfile and
+/// no random access — a tar is only ever walked forward.
+fn repack_tar_stream_to_tar(
+    tar_path: &std::path::Path,
+    src_algo: fstool::compression::Algo,
+    dst: &std::path::Path,
+    dst_tar_codec: Option<fstool::compression::Algo>,
+) -> fstool::Result<()> {
+    use fstool::repack::RepackSink;
+    let file = std::fs::File::create(dst)?;
+    let buffered: Box<dyn std::io::Write> =
+        Box::new(std::io::BufWriter::with_capacity(64 * 1024, file));
+    let inner = match dst_tar_codec {
+        Some(algo) => fstool::compression::make_writer(algo, buffered)?,
+        None => buffered,
+    };
+    let mut sink = fstool::repack::TarStreamSink::new(inner);
+    let mut reader = fstool::repack::open_tar_stream(tar_path, Some(src_algo))?;
+    fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
+    sink.finish()?;
+    let written = sink.bytes_written();
+    match dst_tar_codec {
+        Some(algo) => eprintln!(
+            "repacked {} → {} (fs: tar → tar.{}, {written} bytes plain)",
+            tar_path.display(),
+            dst.display(),
+            algo.name()
+        ),
+        None => eprintln!(
+            "repacked {} → {} (fs: tar → tar, {written} bytes)",
+            tar_path.display(),
+            dst.display()
+        ),
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn repack_tar_stream_to_fs(
     tar_path: &std::path::Path,
@@ -1190,6 +1237,20 @@ fn repack_tar_stream_to_fs(
         "grf" => repack_stream_via_trait::<fstool::fs::grf::Grf>(
             dst_dev.as_mut(),
             &fstool::fs::grf::FormatOpts::default(),
+            tar_path,
+            algo,
+            false,
+        )?,
+        "zip" => repack_stream_via_trait::<fstool::fs::archive::zip::ZipFs>(
+            dst_dev.as_mut(),
+            &fstool::fs::archive::zip::ZipFormatOpts::default(),
+            tar_path,
+            algo,
+            true,
+        )?,
+        "cpio" => repack_stream_via_trait::<fstool::fs::archive::cpio::CpioFs>(
+            dst_dev.as_mut(),
+            &fstool::fs::archive::cpio::CpioFormatOpts,
             tar_path,
             algo,
             false,

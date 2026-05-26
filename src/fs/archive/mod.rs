@@ -438,6 +438,15 @@ impl crate::fs::Filesystem for ArchiveFs {
         }
     }
 
+    /// The builder writes each entry's header + body straight to the
+    /// device cursor as `create_file` is called, so the streaming repack
+    /// path can hand us a body without spooling it to a temp file first
+    /// (small bodies buffer in RAM; larger ones spill, same as every other
+    /// stream-through backend).
+    fn streams_immediately(&self) -> bool {
+        true
+    }
+
     fn create_dir(&mut self, dev: &mut dyn BlockDevice, path: &Path, meta: FileMeta) -> Result<()> {
         let s = self.path_str(path)?.to_string();
         match self.builder.as_mut() {
@@ -755,6 +764,9 @@ macro_rules! impl_archive_fs_filesystem {
             }
             fn flush(&mut self, dev: &mut dyn $crate::block::BlockDevice) -> $crate::Result<()> {
                 self.0.flush(dev)
+            }
+            fn streams_immediately(&self) -> bool {
+                self.0.streams_immediately()
             }
             fn image_len(&self) -> Option<u64> {
                 self.0.image_len()

@@ -574,13 +574,13 @@ fn repack_cmd(
         return res;
     }
 
-    // Streaming fast path: a compressed-tar source bound for a
-    // block-device filesystem never needs the decompress-to-tempfile —
-    // decode on the fly and walk forward into the destination (a second
-    // decode pass handles sizing for ext / `--shrink` / default). Only
-    // block FSes that the writer can size + format this way take the
-    // branch; tar→tar and archive/ISO/GRF destinations fall through to
-    // the random-access tempfile path below.
+    // Streaming fast path: a compressed-tar source never needs the
+    // decompress-to-tempfile — decode on the fly and walk forward into the
+    // destination (a second decode pass handles sizing for ext / `--shrink`
+    // / default). Every destination whose writer streams each file as it
+    // arrives takes this branch, including the deferred archive formats
+    // (SquashFS / ISO 9660 / GRF), which now write data incrementally. Only
+    // tar→tar output (a pure sequential re-mux) falls through.
     if let Some(algo) = tar_input_codec(srcs[0].as_str()) {
         let raw = srcs[0].as_str();
         let tar_path = std::path::PathBuf::from(raw.split(':').next().unwrap_or(raw));
@@ -609,6 +609,10 @@ fn repack_cmd(
                 | "hfs+"
                 | "ntfs"
                 | "f2fs"
+                | "squashfs"
+                | "iso"
+                | "iso9660"
+                | "grf"
         ) {
             return repack_tar_stream_to_fs(
                 &tar_path,
@@ -621,7 +625,7 @@ fn repack_cmd(
                 qcow2_cluster_size,
             );
         }
-        // else: tar→tar / iso / grf / archive output — fall through.
+        // else: tar→tar output — fall through.
     }
 
     // Compressed-tar source: decompress once to a tempfile and treat
@@ -1099,7 +1103,10 @@ fn repack_tar_stream_to_fs(
         },
     )?;
 
-    match lower {
+    // `Some(len)` for the deferred archive formats (squashfs/iso/grf) so
+    // the over-provisioned backing file is truncated to its real length;
+    // `None` for the fixed-size block filesystems.
+    let archive_len: Option<u64> = match lower {
         "ext2" | "ext3" | "ext4" => {
             let opts = ext_opts.expect("ext opts computed above");
             let mut dst_ext = Ext::format_with(dst_dev.as_mut(), &opts)?;
@@ -1109,6 +1116,7 @@ fn repack_tar_stream_to_fs(
                 fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
             }
             dst_ext.flush(dst_dev.as_mut())?;
+            None
         }
         "fat32" | "vfat" => {
             let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
@@ -1128,50 +1136,81 @@ fn repack_tar_stream_to_fs(
                 fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
             }
             dst_fat.flush(dst_dev.as_mut())?;
+            None
         }
-        "xfs" => {
-            repack_stream_via_trait::<fstool::fs::xfs::Xfs>(
+        "xfs" => repack_stream_via_trait::<fstool::fs::xfs::Xfs>(
+            dst_dev.as_mut(),
+            &fstool::fs::xfs::format::FormatOpts::default(),
+            tar_path,
+            algo,
+            false,
+        )?,
+        "hfsplus" | "hfs+" => repack_stream_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
+            dst_dev.as_mut(),
+            &fstool::fs::hfs_plus::FormatOpts::default(),
+            tar_path,
+            algo,
+            false,
+        )?,
+        "ntfs" => repack_stream_via_trait::<fstool::fs::ntfs::Ntfs>(
+            dst_dev.as_mut(),
+            &fstool::fs::ntfs::format::FormatOpts::default(),
+            tar_path,
+            algo,
+            false,
+        )?,
+        "f2fs" => repack_stream_via_trait::<fstool::fs::f2fs::F2fs>(
+            dst_dev.as_mut(),
+            &fstool::fs::f2fs::FormatOpts::default(),
+            tar_path,
+            algo,
+            false,
+        )?,
+        "squashfs" => repack_stream_via_trait::<fstool::fs::squashfs::Squashfs>(
+            dst_dev.as_mut(),
+            &fstool::fs::squashfs::FormatOpts::default(),
+            tar_path,
+            algo,
+            false,
+        )?,
+        "iso" | "iso9660" => {
+            let opts = fstool::fs::iso9660::FormatOpts {
+                volume_id: "FSTOOL".into(),
+                application_id: "fstool".into(),
+                ..fstool::fs::iso9660::FormatOpts::default()
+            };
+            repack_stream_via_trait::<fstool::fs::iso9660::Iso9660>(
                 dst_dev.as_mut(),
-                &fstool::fs::xfs::format::FormatOpts::default(),
+                &opts,
                 tar_path,
                 algo,
                 false,
-            )?;
+            )?
         }
-        "hfsplus" | "hfs+" => {
-            repack_stream_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
-                dst_dev.as_mut(),
-                &fstool::fs::hfs_plus::FormatOpts::default(),
-                tar_path,
-                algo,
-                false,
-            )?;
-        }
-        "ntfs" => {
-            repack_stream_via_trait::<fstool::fs::ntfs::Ntfs>(
-                dst_dev.as_mut(),
-                &fstool::fs::ntfs::format::FormatOpts::default(),
-                tar_path,
-                algo,
-                false,
-            )?;
-        }
-        "f2fs" => {
-            repack_stream_via_trait::<fstool::fs::f2fs::F2fs>(
-                dst_dev.as_mut(),
-                &fstool::fs::f2fs::FormatOpts::default(),
-                tar_path,
-                algo,
-                false,
-            )?;
-        }
+        "grf" => repack_stream_via_trait::<fstool::fs::grf::Grf>(
+            dst_dev.as_mut(),
+            &fstool::fs::grf::FormatOpts::default(),
+            tar_path,
+            algo,
+            false,
+        )?,
         other => unreachable!("repack_tar_stream_to_fs reached for ungated fs {other:?}"),
-    }
+    };
     dst_dev.sync()?;
-    drop(dst_dev);
+    let report_size = match archive_len {
+        Some(len) => {
+            drop(dst_dev);
+            truncate_output_file(dst, len)?;
+            len
+        }
+        None => {
+            drop(dst_dev);
+            dst_size
+        }
+    };
 
     eprintln!(
-        "repacked {} → {} (fs: tar → {lower}, {dst_size} bytes)",
+        "repacked {} → {} (fs: tar → {lower}, {report_size} bytes)",
         tar_path.display(),
         dst.display()
     );

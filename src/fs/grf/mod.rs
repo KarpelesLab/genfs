@@ -119,6 +119,10 @@ pub struct Grf {
     /// to mark the handle as a fresh writer (no existing file data
     /// to preserve).
     fresh: bool,
+    /// Byte length of the archive after the last flush (data + table).
+    /// `0` until flushed; lets a repack truncate the over-provisioned
+    /// backing file to fit.
+    image_end: u64,
 }
 
 impl Grf {
@@ -142,6 +146,7 @@ impl Grf {
             wasted_space: 0,
             dirty: true,
             fresh: true,
+            image_end: 0,
         })
     }
 
@@ -182,6 +187,7 @@ impl Grf {
             wasted_space,
             dirty: false,
             fresh: false,
+            image_end: 0,
         })
     }
 
@@ -490,6 +496,12 @@ impl crate::fs::Filesystem for Grf {
 
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         writer::flush(self, dev)
+    }
+
+    /// Exact archive length after flush (data region + file table), so a
+    /// repack can truncate the over-provisioned backing file to fit.
+    fn image_len(&self) -> Option<u64> {
+        (self.image_end > 0).then_some(self.image_end)
     }
 
     fn mutation_capability(&self) -> MutationCapability {

@@ -155,6 +155,9 @@ pub struct Iso9660Writer {
     /// Next free LBA in the data area. Initialised to the first sector
     /// past the volume descriptors and advanced as files stream in.
     data_cursor: u32,
+    /// Total image byte length, set once `flush` lays out the metadata.
+    /// Lets a repack truncate the over-provisioned backing file to fit.
+    image_len: Option<u64>,
     /// Set once `flush` has run successfully.
     flushed: bool,
 }
@@ -166,8 +169,14 @@ impl Iso9660Writer {
             opts,
             entries: BTreeMap::new(),
             data_cursor,
+            image_len: None,
             flushed: false,
         }
+    }
+
+    /// Total image byte length, available after [`flush`](Self::flush).
+    pub fn image_len(&self) -> Option<u64> {
+        self.image_len
     }
 
     /// Stream a file body to the device immediately, recording only its
@@ -312,6 +321,7 @@ impl Iso9660Writer {
         let tree = build_tree(&self.entries)?;
         // Metadata begins where the data area came to rest.
         let layout = compute_layout(&tree, &self.opts, self.data_cursor, file_lba);
+        self.image_len = Some(u64::from(layout.total_sectors) * SECTOR);
         write_image(dev, &tree, &layout, &self.opts)?;
         self.flushed = true;
         Ok(())

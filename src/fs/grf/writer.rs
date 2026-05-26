@@ -155,8 +155,9 @@ pub(super) fn flush(grf: &mut Grf, dev: &mut dyn BlockDevice) -> Result<()> {
     // bytes were there (zeros for a fresh image; possibly garbage
     // for a reopened one). libgrf truncates the OS file; the
     // fstool-level callers (image creation, repack pipeline) size
-    // the destination so the tail is benign zero.
-    let _new_end = table_abs + 8 + compressed.len() as u64;
+    // the destination so the tail is benign zero. We still record the
+    // real end so a repack can truncate the over-provisioned file.
+    grf.image_end = table_abs + 8 + compressed.len() as u64;
 
     // Rewrite the header with the new table offset + filecount.
     let table_offset = (table_abs - HEADER_SIZE as u64) as u32;

@@ -518,6 +518,10 @@ impl crate::fs::Filesystem for Iso9660 {
         )))
     }
 
+    fn image_len(&self) -> Option<u64> {
+        self.writer.as_ref().and_then(|w| w.image_len())
+    }
+
     fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
         if let Some(w) = self.writer.as_mut() {
             w.flush(dev)?;

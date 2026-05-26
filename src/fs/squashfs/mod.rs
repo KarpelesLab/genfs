@@ -867,6 +867,12 @@ impl crate::fs::Filesystem for Squashfs {
         Self::flush(self, dev)
     }
 
+    /// The superblock's `bytes_used` is the exact image length, so a
+    /// repack can truncate the over-provisioned backing file to fit.
+    fn image_len(&self) -> Option<u64> {
+        (self.sb.bytes_used > 0).then_some(self.sb.bytes_used)
+    }
+
     fn mutation_capability(&self) -> crate::fs::MutationCapability {
         crate::fs::MutationCapability::Immutable
     }

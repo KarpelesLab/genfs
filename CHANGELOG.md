@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5](https://github.com/KarpelesLab/fstool/compare/v0.4.4...v0.4.5) - 2026-05-26
+
+### Other
+
+- *(merge)* in-memory model + per-source ordered emission, no tempfile
+- *(repack)* stream tar into zip/cpio + tar→tar, drop archive temp files
+- *(repack)* stream compressed tar into squashfs/iso/grf, no tempfile
+- *(iso9660)* stream file data to the device, no temp file, bounded RAM
+- *(grf)* stream body into the archive directly, no temp file
+- *(squashfs)* stream file data to the device, no temp files
+- *(clone)* buffer small clones in memory instead of a temp file
+
 ## [0.4.4](https://github.com/KarpelesLab/fstool/compare/v0.4.3...v0.4.4) - 2026-05-25
 
 ### Fixed

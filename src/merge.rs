@@ -8,15 +8,15 @@
 //! Two passes:
 //!
 //! 1. **Pass 1 — build the model.** Walk every layer forward (tar via
-//!    [`TarStreamIndex`] / host dirs via `read_dir`) recording each
-//!    surviving entry's kind / mode / uid / gid / mtime / xattrs / symlink
-//!    target / device numbers and a [`BodyRef`] pointing at where the bytes
-//!    live (a host path, or a (layer, body_offset, size) tuple inside a
-//!    tar). Apply whiteouts (`.wh.<name>` → delete subtree) and opaque-dir
-//!    markers (`.wh..wh..opq` → drop lower-layer children at this dir).
-//!    Synthesize missing ancestor directories at the end.
+//!    [`crate::fs::tar::TarStreamIndex`] / host dirs via `read_dir`)
+//!    recording each surviving entry's kind / mode / uid / gid / mtime /
+//!    xattrs / symlink target / device numbers and a `BodyRef` pointing at
+//!    where the bytes live (a host path, or a (layer, body_offset, size)
+//!    tuple inside a tar). Apply whiteouts (`.wh.<name>` → delete subtree)
+//!    and opaque-dir markers (`.wh..wh..opq` → drop lower-layer children
+//!    at this dir). Synthesize missing ancestor directories at the end.
 //!
-//! 2. **Pass 2 — emit through a [`RepackSink`].** First every directory
+//! 2. **Pass 2 — emit through a [`crate::repack::RepackSink`].** First every directory
 //!    (sorted, so parents precede children); then, for each layer in order,
 //!    read its files **forward, in the order they appear in that source**
 //!    — tar layers stream through a `TarStreamReader`, matching the winner
@@ -187,8 +187,8 @@ impl MergeModel {
         }
     }
 
-    /// Fill an [`Analysis`] straight from model metadata — no body reads,
-    /// no tar decompression beyond pass-1 index building.
+    /// Fill an [`crate::analyze::Analysis`] straight from model metadata —
+    /// no body reads, no tar decompression beyond pass-1 index building.
     pub fn analysis(&self, block_size: u32) -> crate::analyze::Analysis {
         use crate::analyze::Analysis;
         use crate::fs::ext::{BuildPlan, FsKind};

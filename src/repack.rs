@@ -695,14 +695,10 @@ pub fn walk_source_into_sink(source: &Source, sink: &mut dyn RepackSink) -> Resu
         }
         Source::Image(target) => walk_image(target, sink),
         Source::Layered(layers) => {
-            let tmp = crate::merge::flatten_to_tempfile(layers)?;
-            let merged = Source::TarArchive {
-                path: tmp.path().to_path_buf(),
-                codec: None,
-            };
-            let res = walk_source_into_sink(&merged, sink);
-            drop(tmp);
-            res
+            // Build the merged tree in memory (metadata only) and drive
+            // the sink directly — no temp file, RAM bounded by metadata.
+            let model = crate::merge::MergeModel::build(layers)?;
+            model.walk_into_sink(layers, sink)
         }
     }
 }
@@ -1092,16 +1088,13 @@ pub fn ext_build_plan_for_source(
             })?;
         }
         Source::Layered(layers) => {
-            // Plan from the flattened tar; the tempfile lifetime
-            // brackets the scan, after which it's dropped.
-            let tmp = crate::merge::flatten_to_tempfile(layers)?;
-            let merged_path = tmp.path().to_string_lossy().into_owned();
-            let target = crate::inspect::Target::parse(&merged_path);
-            crate::inspect::with_target_device(&target, |src_dev| {
-                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
-                build_ext_plan_inner(src_dev, &mut src_fs, &mut plan)
-            })?;
-            drop(tmp);
+            // Plan from the in-memory model — no tempfile, RAM bounded
+            // by tree metadata. `analysis(block_size).plan` walks the
+            // model's nodes once and accumulates counts/byte totals
+            // identical to what scanning a flattened tar would produce.
+            let model = crate::merge::MergeModel::build(layers)?;
+            plan = model.analysis(block_size).plan;
+            plan.kind = kind;
         }
     }
     Ok(plan)
@@ -1199,19 +1192,10 @@ pub fn fat32_min_bytes_for_source(source: &Source) -> Result<u64> {
             sum
         }
         Source::Layered(layers) => {
-            // Flatten the layers to a tar, then size from the tar
-            // contents (post-whiteout). Tempfile drops at scope end.
-            let tmp = crate::merge::flatten_to_tempfile(layers)?;
-            let merged_path = tmp.path().to_string_lossy().into_owned();
-            let target = crate::inspect::Target::parse(&merged_path);
-            let mut sum = 0u64;
-            crate::inspect::with_target_device(&target, |src_dev| {
-                let mut src_fs = crate::inspect::AnyFs::open(src_dev)?;
-                sum = sum_source_file_bytes(src_dev, &mut src_fs)?;
-                Ok(())
-            })?;
-            drop(tmp);
-            sum
+            // Sum from the in-memory model — no tempfile, no body reads.
+            let model = crate::merge::MergeModel::build(layers)?;
+            // block_size doesn't affect the byte total; pass a sentinel.
+            model.analysis(1024).total_file_bytes
         }
     };
     let needed = bytes

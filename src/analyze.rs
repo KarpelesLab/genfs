@@ -46,7 +46,7 @@ pub struct Analysis {
     pub hardlinks: u64,
     /// Sum of every regular file's size in bytes.
     pub total_file_bytes: u64,
-    plan: BuildPlan,
+    pub(crate) plan: BuildPlan,
 }
 
 impl Analysis {

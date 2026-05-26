@@ -548,30 +548,25 @@ fn repack_cmd(
         ));
     }
 
-    // Multi-source: flatten all layers to a single uncompressed tar in
-    // a tempfile, then recurse with that tempfile as the sole source.
-    // The tempfile lives until the inner repack completes; the
-    // recursive call inherits the same `dst` and options, so the merged
-    // tar drives the rest of the pipeline exactly as a single tar
-    // source would.
+    // Multi-source: fold the layers into an in-memory `MergeModel`
+    // (metadata only — no file bodies in RAM) and drive the destination
+    // straight from it. Each tar layer is read **forward only**, in the
+    // order entries appear in it, so no random access (and no tempfile)
+    // is ever needed for the merged source.
     if srcs.len() > 1 {
         let layers: Vec<fstool::repack::Source> = srcs
             .iter()
             .map(|s| fstool::repack::Source::detect(s))
             .collect::<fstool::Result<_>>()?;
-        let tmp = fstool::merge::flatten_to_tempfile(&layers)?;
-        let merged = tmp.path().to_string_lossy().into_owned();
-        let res = repack_cmd(
-            std::slice::from_ref(&merged),
+        return repack_layered_to_dst(
+            layers,
             dst,
             size_arg,
             shrink,
             fs_type_override,
             block_size,
-            cluster_size,
+            qcow2_cluster_size,
         );
-        drop(tmp);
-        return res;
     }
 
     // Streaming fast path: a compressed-tar source never needs the
@@ -1062,6 +1057,266 @@ fn repack_tar_stream_to_tar(
         ),
     }
     Ok(())
+}
+
+/// Drive a multi-source repack from an in-memory [`fstool::merge::MergeModel`]
+/// straight into the destination — no flatten-to-tempfile step. The model
+/// is built once and reused for both sizing and the walk; tar layers are
+/// read forward (in the order entries appear), host layers are random-access.
+#[allow(clippy::too_many_arguments)]
+fn repack_layered_to_dst(
+    layers: Vec<fstool::repack::Source>,
+    dst: &std::path::Path,
+    size_arg: Option<&str>,
+    shrink: bool,
+    fs_type_override: Option<&str>,
+    block_size: u32,
+    qcow2_cluster_size: u32,
+) -> fstool::Result<()> {
+    use fstool::merge::MergeModel;
+    use fstool::repack::{FsSink, RepackSink, TarStreamSink};
+    let _ = shrink; // sizing always derives from the model when no explicit size
+
+    // Pass 1 — build the metadata-only model. No file body is read here.
+    let model = MergeModel::build(&layers)?;
+    let analysis = model.analysis(block_size);
+
+    // Resolve destination fs-type. With a layered source there's no source
+    // "kind" to preserve — default to ext4 unless the dst extension says
+    // tar.
+    let dst_tar_codec = tar_output_codec(dst);
+    let target_fs = fs_type_override
+        .map(|s| s.to_string())
+        .or_else(|| {
+            dst.extension()
+                .and_then(|s| s.to_str())
+                .filter(|e| e.eq_ignore_ascii_case("tar"))
+                .map(|_| "tar".to_string())
+        })
+        .or_else(|| dst_tar_codec.map(|_| "tar".to_string()))
+        .unwrap_or_else(|| "ext4".to_string());
+    let lower = target_fs.to_ascii_lowercase();
+
+    let explicit = match size_arg {
+        Some(s) => Some(fstool::spec::parse_size(s)?),
+        None => None,
+    };
+    let dst_size = if let Some(sz) = explicit {
+        sz
+    } else if lower == "tar" {
+        0
+    } else if let Some(sz) = analysis.recommended_size(&lower) {
+        sz
+    } else {
+        // Over-provision: archive writers truncate via `image_len()` after
+        // flush; block FSes fill the device.
+        analysis
+            .total_file_bytes
+            .saturating_mul(2)
+            .saturating_add(64 * 1024 * 1024)
+    };
+
+    // tar output is sequential — write straight through a `TarStreamSink`,
+    // optionally codec-wrapped. No backing device.
+    if lower == "tar" {
+        let file = std::fs::File::create(dst)?;
+        let buffered: Box<dyn std::io::Write> =
+            Box::new(std::io::BufWriter::with_capacity(64 * 1024, file));
+        let inner = match dst_tar_codec {
+            Some(algo) => fstool::compression::make_writer(algo, buffered)?,
+            None => buffered,
+        };
+        let mut sink = TarStreamSink::new(inner);
+        model.walk_into_sink(&layers, &mut sink)?;
+        sink.finish()?;
+        let written = sink.bytes_written();
+        match dst_tar_codec {
+            Some(algo) => eprintln!(
+                "repacked layered → {} (fs: layered → tar.{}, {written} bytes plain)",
+                dst.display(),
+                algo.name()
+            ),
+            None => eprintln!(
+                "repacked layered → {} (fs: layered → tar, {written} bytes)",
+                dst.display()
+            ),
+        }
+        return Ok(());
+    }
+
+    fstool::repack::phase(&format!(
+        "formatting {target_fs} destination ({}) …",
+        human_size(dst_size)
+    ));
+    let mut dst_dev = fstool::block::create_image(
+        dst,
+        dst_size,
+        &fstool::block::CreateOpts {
+            cluster_size: qcow2_cluster_size,
+        },
+    )?;
+
+    let archive_len: Option<u64> = match lower.as_str() {
+        "ext2" | "ext3" | "ext4" => {
+            use fstool::fs::ext::{Ext, FsKind};
+            let kind = match lower.as_str() {
+                "ext2" => FsKind::Ext2,
+                "ext3" => FsKind::Ext3,
+                _ => FsKind::Ext4,
+            };
+            let mut opts = analysis.ext_format_opts(kind);
+            opts.sparse = true;
+            let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
+            if dst_size > plan_size {
+                let max = (dst_size / opts.block_size as u64) as u32;
+                opts.blocks_count = (max / 8) * 8;
+                let by_density =
+                    (opts.blocks_count as u64 * opts.block_size as u64 / 16_384) as u32;
+                opts.inodes_count = opts.inodes_count.max(by_density);
+            }
+            let mut dst = Ext::format_with(dst_dev.as_mut(), &opts)?;
+            {
+                let mut sink = FsSink::new(&mut dst, dst_dev.as_mut());
+                model.walk_into_sink(&layers, &mut sink)?;
+            }
+            dst.flush(dst_dev.as_mut())?;
+            None
+        }
+        "fat32" | "vfat" => {
+            let total_sectors: u32 = (dst_size / 512).try_into().map_err(|_| {
+                fstool::Error::InvalidArgument(
+                    "repack: FAT32 size doesn't fit in a u32 sector count".into(),
+                )
+            })?;
+            let opts = fstool::fs::fat::FatFormatOpts {
+                total_sectors,
+                volume_id: 0,
+                volume_label: *b"REPACKED   ",
+            };
+            let mut dst = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
+            {
+                let mut sink = FsSink::new(&mut dst, dst_dev.as_mut()).lossy();
+                model.walk_into_sink(&layers, &mut sink)?;
+            }
+            dst.flush(dst_dev.as_mut())?;
+            None
+        }
+        "xfs" => repack_layered_via_trait::<fstool::fs::xfs::Xfs>(
+            dst_dev.as_mut(),
+            &fstool::fs::xfs::format::FormatOpts::default(),
+            &model,
+            &layers,
+            false,
+        )?,
+        "hfsplus" | "hfs+" => repack_layered_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
+            dst_dev.as_mut(),
+            &fstool::fs::hfs_plus::FormatOpts::default(),
+            &model,
+            &layers,
+            false,
+        )?,
+        "ntfs" => repack_layered_via_trait::<fstool::fs::ntfs::Ntfs>(
+            dst_dev.as_mut(),
+            &fstool::fs::ntfs::format::FormatOpts::default(),
+            &model,
+            &layers,
+            false,
+        )?,
+        "f2fs" => repack_layered_via_trait::<fstool::fs::f2fs::F2fs>(
+            dst_dev.as_mut(),
+            &fstool::fs::f2fs::FormatOpts::default(),
+            &model,
+            &layers,
+            false,
+        )?,
+        "squashfs" => repack_layered_via_trait::<fstool::fs::squashfs::Squashfs>(
+            dst_dev.as_mut(),
+            &fstool::fs::squashfs::FormatOpts::default(),
+            &model,
+            &layers,
+            false,
+        )?,
+        "iso" | "iso9660" => {
+            let opts = fstool::fs::iso9660::FormatOpts {
+                volume_id: "FSTOOL".into(),
+                application_id: "fstool".into(),
+                ..fstool::fs::iso9660::FormatOpts::default()
+            };
+            repack_layered_via_trait::<fstool::fs::iso9660::Iso9660>(
+                dst_dev.as_mut(),
+                &opts,
+                &model,
+                &layers,
+                false,
+            )?
+        }
+        "grf" => repack_layered_via_trait::<fstool::fs::grf::Grf>(
+            dst_dev.as_mut(),
+            &fstool::fs::grf::FormatOpts::default(),
+            &model,
+            &layers,
+            false,
+        )?,
+        "zip" => repack_layered_via_trait::<fstool::fs::archive::zip::ZipFs>(
+            dst_dev.as_mut(),
+            &fstool::fs::archive::zip::ZipFormatOpts::default(),
+            &model,
+            &layers,
+            true,
+        )?,
+        "cpio" => repack_layered_via_trait::<fstool::fs::archive::cpio::CpioFs>(
+            dst_dev.as_mut(),
+            &fstool::fs::archive::cpio::CpioFormatOpts,
+            &model,
+            &layers,
+            false,
+        )?,
+        other => {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "repack: unknown --fs-type {other:?}"
+            )));
+        }
+    };
+    dst_dev.sync()?;
+    let report_size = match archive_len {
+        Some(len) => {
+            drop(dst_dev);
+            truncate_output_file(dst, len)?;
+            len
+        }
+        None => {
+            drop(dst_dev);
+            dst_size
+        }
+    };
+    eprintln!(
+        "repacked layered → {} (fs: layered → {lower}, {report_size} bytes)",
+        dst.display()
+    );
+    Ok(())
+}
+
+/// Generic trait-based variant of [`repack_layered_to_dst`]'s dispatch
+/// arms: format `F` on `dst_dev`, walk the in-memory model into an
+/// `FsSink`, flush. The model is built once by the caller and reused so
+/// the per-layer tar index is scanned exactly once.
+fn repack_layered_via_trait<F: fstool::fs::FilesystemFactory>(
+    dst_dev: &mut dyn fstool::block::BlockDevice,
+    opts: &F::FormatOpts,
+    model: &fstool::merge::MergeModel,
+    layers: &[fstool::repack::Source],
+    lossy: bool,
+) -> fstool::Result<Option<u64>> {
+    let mut dst = F::format(dst_dev, opts)?;
+    {
+        let mut sink = fstool::repack::FsSink::new(&mut dst, dst_dev);
+        if lossy {
+            sink = sink.lossy();
+        }
+        model.walk_into_sink(layers, &mut sink)?;
+    }
+    dst.flush(dst_dev)?;
+    Ok(fstool::fs::Filesystem::image_len(&dst))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1414,7 +1414,16 @@ pub(crate) fn open_tar_stream_reader(
     path: &str,
     algo: Option<crate::compression::Algo>,
 ) -> crate::Result<crate::fs::tar::TarStreamReader<Box<dyn std::io::Read>>> {
-    let p = std::path::Path::new(path.split(':').next().unwrap_or(path));
+    // Strip a `:N` partition selector only when `N` is purely numeric —
+    // a Windows path like `C:\foo\src.tar` must not be split at the
+    // drive-letter colon. (Tar sources don't actually carry a partition
+    // suffix; this is defensive parity with `Source::detect`.)
+    let p = match path.rsplit_once(':') {
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+            std::path::Path::new(head)
+        }
+        _ => std::path::Path::new(path),
+    };
     let file = std::fs::File::open(p)?;
     let buffered: Box<dyn std::io::Read> =
         Box::new(std::io::BufReader::with_capacity(64 * 1024, file));

@@ -1586,7 +1586,14 @@ fn open_tar_stream_reader(
     path: &str,
     algo: Option<fstool::compression::Algo>,
 ) -> fstool::Result<fstool::fs::tar::TarStreamReader<Box<dyn std::io::Read>>> {
-    let p = std::path::Path::new(path.split(':').next().unwrap_or(path));
+    // Only strip a `:N` partition suffix where N is purely numeric — a
+    // Windows path like `C:\foo\src.tar` must keep its drive-letter colon.
+    let p = match path.rsplit_once(':') {
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+            std::path::Path::new(head)
+        }
+        _ => std::path::Path::new(path),
+    };
     let file = std::fs::File::open(p)?;
     let buffered: Box<dyn std::io::Read> =
         Box::new(std::io::BufReader::with_capacity(64 * 1024, file));

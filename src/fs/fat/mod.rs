@@ -978,6 +978,12 @@ impl crate::fs::Filesystem for Fat32 {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("fat32: non-UTF-8 path".into()))?;
+        // The lookup path reads directory entries straight from disk, so
+        // a file freshly created via `create_file_*` is invisible until
+        // its parent directory's batch is serialised. `list` / `open_file_rw`
+        // already flush for the same reason; do it here too so callers like
+        // `FsSink::materialise_copy` can read back a just-written file.
+        self.flush_dir_batches(dev)?;
         let r = self.open_file_reader(dev, s)?;
         Ok(Box::new(r))
     }

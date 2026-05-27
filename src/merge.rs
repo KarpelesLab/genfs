@@ -38,8 +38,11 @@
 //! override files of the same path and apply tombstones to the running
 //! merge. Tombstone entries themselves never reach the destination.
 //!
-//! Limitations preserved from the previous (tempfile-based) implementation:
-//! image-source layers and tar hard-links are not represented in the model.
+//! Hard links from tar and host-dir layers are preserved: the model
+//! records the first occurrence's body and emits subsequent links via
+//! `put_hardlink`, falling back to `materialise_copy` on destinations that
+//! can't represent links (FAT/exFAT). Image-source layers remain
+//! unsupported (use tar or host-dir layers).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -82,6 +85,11 @@ pub(crate) enum BodyRef {
         body_offset: u64,
         size: u64,
     },
+    /// Hard link to another file in the merged tree. Emitted in pass 2
+    /// after every regular file has been written so the target exists.
+    /// Falls back to `materialise_copy` when the destination FS can't
+    /// represent links.
+    HardLink(PathBuf),
 }
 
 /// Running state of the merge. Public surface is small: build, analyse,
@@ -211,15 +219,25 @@ impl MergeModel {
                     a.plan.add_dir();
                 }
                 EntryKind::Regular => {
-                    a.files += 1;
                     let size = match &node.body {
                         BodyRef::Tar { size, .. } => *size,
                         BodyRef::Host(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
                         BodyRef::Empty => 0,
                         BodyRef::None => 0,
+                        BodyRef::HardLink(_) => 0,
                     };
+                    // Hardlinks share the target's inode in any FS that
+                    // supports them (ext/xfs/ntfs/squashfs/iso/…), so they
+                    // count toward hardlinks rather than fresh files; lossy
+                    // sinks materialise them as copies, but the sizing path
+                    // doesn't need to charge for that twice.
+                    if matches!(node.body, BodyRef::HardLink(_)) {
+                        a.hardlinks += 1;
+                    } else {
+                        a.files += 1;
+                        a.plan.add_file(size);
+                    }
                     a.total_file_bytes = a.total_file_bytes.saturating_add(size);
-                    a.plan.add_file(size);
                 }
                 EntryKind::Symlink => {
                     a.symlinks += 1;
@@ -309,10 +327,43 @@ impl MergeModel {
                     let mut empty: &[u8] = &[];
                     sink.put_file(&p_str, &mut empty, 0, to_meta(node), &to_xattrs(node))?;
                 }
-                BodyRef::Tar { .. } | BodyRef::None => {
-                    // Tar winners were emitted in (2); BodyRef::None on a
+                BodyRef::Tar { .. } | BodyRef::HardLink(_) | BodyRef::None => {
+                    // Tar winners emitted in (2); hardlinks deferred to
+                    // (3.5) so their target exists; BodyRef::None on a
                     // Regular shouldn't happen but is a safe no-op.
                 }
+            }
+        }
+
+        // (3.5) Hard links — every regular-file body has been written by
+        // now, so the target exists on the destination. `put_hardlink`
+        // returns false on destinations that can't represent links
+        // (FAT/exFAT); fall back to materialise_copy from the destination.
+        for (path, node) in &self.nodes {
+            let target = match &node.body {
+                BodyRef::HardLink(t) => t,
+                _ => continue,
+            };
+            // Resolve through hardlink chains so the sink sees a real file.
+            let resolved = resolve_hardlink_target(&self.nodes, target, 8);
+            let Some(resolved_path) = resolved else {
+                eprintln!(
+                    "merge: hardlink {} → {} skipped (target missing from merged tree)",
+                    path.display(),
+                    target.display(),
+                );
+                continue;
+            };
+            let resolved_str = path_str(&resolved_path)?;
+            let p_str = path_str(path)?;
+            let linked =
+                sink.put_hardlink(&p_str, &resolved_str, to_meta(node), &to_xattrs(node))?;
+            if !linked {
+                // Destination FS has no hardlink concept — copy the body
+                // back out of it under the new path. Re-read from the dest
+                // is the only option here since the source body was
+                // already streamed past.
+                sink.materialise_copy(&p_str, &resolved_str, to_meta(node), &to_xattrs(node))?;
             }
         }
 
@@ -401,6 +452,12 @@ fn apply_layer(layer: &Source, model: &mut MergeModel, layer_idx: &mut usize) ->
 }
 
 fn apply_host_dir(root: &Path, model: &mut MergeModel) -> Result<()> {
+    // Track inodes seen with nlink > 1: the first occurrence emits a real
+    // file (BodyRef::Host); subsequent ones become hardlinks pointing back
+    // to the first path. Scoped per host-dir layer (inodes only collide
+    // within one filesystem).
+    #[cfg(unix)]
+    let mut link_map: std::collections::HashMap<u64, PathBuf> = std::collections::HashMap::new();
     let mut stack: Vec<(PathBuf, PathBuf)> = vec![(root.to_path_buf(), PathBuf::from("/"))];
     while let Some((host, fs)) = stack.pop() {
         for entry in std::fs::read_dir(&host)? {
@@ -450,6 +507,29 @@ fn apply_host_dir(root: &Path, model: &mut MergeModel) -> Result<()> {
                     },
                 );
             } else if ft.is_file() {
+                // On Unix, files with nlink > 1 sharing an inode are hard
+                // links; record the first path and emit subsequent ones
+                // as BodyRef::HardLink so the destination preserves the
+                // shared inode (or copies, on FAT/exFAT).
+                #[cfg(unix)]
+                let body = {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.len() == 0 {
+                        BodyRef::Empty
+                    } else if meta.nlink() > 1 {
+                        let ino = meta.ino();
+                        match link_map.get(&ino) {
+                            Some(first) => BodyRef::HardLink(first.clone()),
+                            None => {
+                                link_map.insert(ino, dest.clone());
+                                BodyRef::Host(entry.path())
+                            }
+                        }
+                    } else {
+                        BodyRef::Host(entry.path())
+                    }
+                };
+                #[cfg(not(unix))]
                 let body = if meta.len() == 0 {
                     BodyRef::Empty
                 } else {
@@ -624,13 +704,57 @@ fn apply_tar_layer(
                 );
             }
             TarKind::HardLink => {
-                // Hard links are not represented in the model (parity with
-                // the previous tempfile-based merge — they were skipped
-                // there too).
+                // `link_target` is the archive-relative path of the file
+                // this entry links to. Normalise it to a canonical absolute
+                // path so it matches the keys in `model.nodes`.
+                let target = e.link_target.clone().unwrap_or_default();
+                let target_path = normalise_tar_path(&target);
+                if target_path.is_empty() {
+                    continue;
+                }
+                model.insert(
+                    p,
+                    Node {
+                        kind: EntryKind::Regular,
+                        mode,
+                        uid,
+                        gid,
+                        mtime,
+                        dev_major: 0,
+                        dev_minor: 0,
+                        target: None,
+                        xattrs,
+                        body: BodyRef::HardLink(PathBuf::from(target_path)),
+                    },
+                );
             }
         }
     }
     Ok(())
+}
+
+/// Follow a hardlink chain in the model until reaching a real file body
+/// or running out of hops. Returns the resolved path, or `None` when the
+/// target is missing (e.g. whited out by an upper layer) or the chain
+/// dead-ends in another hardlink within the hop budget.
+fn resolve_hardlink_target(
+    nodes: &BTreeMap<PathBuf, Node>,
+    start: &Path,
+    mut hops: usize,
+) -> Option<PathBuf> {
+    let mut cur = start.to_path_buf();
+    while hops > 0 {
+        let n = nodes.get(&cur)?;
+        match &n.body {
+            BodyRef::Host(_) | BodyRef::Tar { .. } | BodyRef::Empty => return Some(cur),
+            BodyRef::HardLink(next) => {
+                cur = next.clone();
+                hops -= 1;
+            }
+            BodyRef::None => return None,
+        }
+    }
+    None
 }
 
 fn normalise_tar_path(p: &str) -> String {

@@ -252,6 +252,13 @@ struct GroupState {
     block_bitmap: Vec<u8>,
     inode_bitmap: Vec<u8>,
     desc: GroupDesc,
+    /// First bit index *possibly* free in this group's block bitmap.
+    /// Advanced by [`Ext::alloc_data_block`] so it doesn't rescan the
+    /// known-allocated prefix on every call — the original linear scan
+    /// from bit 0 was the dominant cost (35 % of total instructions) for
+    /// bulk-insert workloads, since allocations are append-only and each
+    /// call walked the full set prefix before finding the next free bit.
+    next_free_block_bit: u32,
 }
 
 /// An open / under-construction ext filesystem.
@@ -435,6 +442,7 @@ impl Ext {
                 block_bitmap,
                 inode_bitmap,
                 desc,
+                next_free_block_bit: 0,
             });
         }
 
@@ -1552,13 +1560,25 @@ impl Ext {
             let layout_g = self.layout.groups[gi];
             let start_rel = layout_g.data_start - layout_g.start_block;
             let group_blocks = layout_g.end_block - layout_g.start_block + 1;
+            // Resume from the per-group cursor (clamped to the data area)
+            // instead of rescanning from bit 0 every call — the original
+            // linear scan was O(allocated) per call and dominated the
+            // 100 k-file repack profile (~35 % of total Ir).
+            let cursor = self.groups[gi].next_free_block_bit.max(start_rel);
+            if cursor >= group_blocks {
+                continue;
+            }
             let bitmap = &mut self.groups[gi].block_bitmap;
-            for bit in start_rel..group_blocks {
+            for bit in cursor..group_blocks {
                 if !test_bit(bitmap, bit) {
                     set_bit(bitmap, bit);
+                    self.groups[gi].next_free_block_bit = bit + 1;
                     return Ok(layout_g.start_block + bit);
                 }
             }
+            // No free bit at-or-past the cursor — mark the group exhausted
+            // so the next call skips straight to the next group.
+            self.groups[gi].next_free_block_bit = group_blocks;
         }
         Err(crate::Error::Unsupported(
             "ext: filesystem has no free data blocks".into(),
@@ -3351,6 +3371,7 @@ impl Ext {
                 block_bitmap,
                 inode_bitmap,
                 desc,
+                next_free_block_bit: 0,
             });
         }
 

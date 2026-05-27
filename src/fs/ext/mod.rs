@@ -729,12 +729,14 @@ impl Ext {
         }
 
         if consumed < n {
-            let dind = self.build_indirect_l2(data, &mut consumed, bs, ptrs, &mut allocated_meta)?;
+            let dind =
+                self.build_indirect_l2(data, &mut consumed, bs, ptrs, &mut allocated_meta)?;
             inode.block[constants::IDX_DOUBLE_INDIRECT] = dind;
         }
 
         if consumed < n {
-            let tind = self.build_indirect_l3(data, &mut consumed, bs, ptrs, &mut allocated_meta)?;
+            let tind =
+                self.build_indirect_l3(data, &mut consumed, bs, ptrs, &mut allocated_meta)?;
             inode.block[constants::IDX_TRIPLE_INDIRECT] = tind;
         }
 
@@ -3638,7 +3640,12 @@ impl Ext {
         let mut n_off = n - constants::N_DIRECT as u32;
         let bs = self.layout.block_size as usize;
         let mut buf = vec![0u8; bs];
-        let read_ptr = |this: &Self, dev: &mut dyn BlockDevice, blk: u32, idx: u32, buf: &mut [u8]| -> Result<u32> {
+        let read_ptr = |this: &Self,
+                        dev: &mut dyn BlockDevice,
+                        blk: u32,
+                        idx: u32,
+                        buf: &mut [u8]|
+         -> Result<u32> {
             this.read_block(dev, blk, buf)?;
             let off = (idx as usize) * 4;
             Ok(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()))

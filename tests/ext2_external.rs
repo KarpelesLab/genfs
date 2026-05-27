@@ -902,13 +902,16 @@ fn prezeroed_skips_full_device_zero_and_stays_sparse() {
     };
     // mke2fs's flex_bg packs metadata; mirror it so untouched groups
     // really do stay zero.
-    opts.log_groups_per_flex = FormatOpts::default_log_groups_per_flex(
-        opts.blocks_count.div_ceil(8 * opts.block_size),
-    );
+    opts.log_groups_per_flex =
+        FormatOpts::default_log_groups_per_flex(opts.blocks_count.div_ceil(8 * opts.block_size));
     build_empty_ext2(tmp.path(), &opts);
 
     // Filesystem is well-formed.
-    let out = Command::new("e2fsck").arg("-fn").arg(tmp.path()).output().unwrap();
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "e2fsck failed:\nstdout:\n{}\nstderr:\n{}",
@@ -967,7 +970,14 @@ fn large_file_round_trips_through_triple_indirect() {
         f.sync_all().unwrap();
     }
     let tar = dir.path().join("big.tar");
-    let st = Command::new("tar").arg("-cf").arg(&tar).arg("-C").arg(dir.path()).arg("big.bin").status().unwrap();
+    let st = Command::new("tar")
+        .arg("-cf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(dir.path())
+        .arg("big.bin")
+        .status()
+        .unwrap();
     assert!(st.success(), "tar failed");
 
     let img = dir.path().join("out.img");
@@ -986,7 +996,11 @@ fn large_file_round_trips_through_triple_indirect() {
 
     // e2fsck must accept it — confirms triple-indirect block-pointer
     // structure + LARGE_FILE feature flag + i_size_high all line up.
-    let out = Command::new("e2fsck").arg("-fn").arg(&img).output().unwrap();
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(&img)
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "e2fsck failed on > 4 GiB file:\nstdout:\n{}\nstderr:\n{}",
@@ -1026,4 +1040,3 @@ fn large_file_round_trips_through_triple_indirect() {
     let got_hash = got.split_whitespace().next().unwrap();
     assert_eq!(got_hash, want_hash, "round-trip checksum mismatch");
 }
-

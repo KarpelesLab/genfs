@@ -386,7 +386,7 @@ impl<'a> F2fsFileHandle<'a> {
                 ino.blocks = 0;
                 // Wipe stale i_addr / i_nid pointers — they'd
                 // be reinterpreted as the inline payload area otherwise.
-                ino.i_addr = [0; super::constants::ADDRS_PER_INODE];
+                ino.i_addr.clear();
                 ino.i_nid = [0; super::constants::NIDS_PER_INODE];
             }
             ino.size = self.size;

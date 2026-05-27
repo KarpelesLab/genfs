@@ -90,8 +90,12 @@ pub(crate) struct InodeRec {
     pub mtime: u32,
     pub flags: u32,
     pub inline_flags: u8,
-    /// 923 in-inode direct pointers.
-    pub i_addr: [u32; ADDRS_PER_INODE],
+    /// In-inode direct pointers — up to [`ADDRS_PER_INODE`] (923) slots.
+    /// Stored as a `Vec<u32>` and grown on demand so an inline file (the
+    /// common case for a bulk repack) doesn't carry the full 3.7 KiB
+    /// pointer array. Serialised to the on-disk fixed-size array via
+    /// `iaddr_iter` (zero-padded to length).
+    pub i_addr: Vec<u32>,
     /// 5 node-id slots: 0,1 direct nodes; 2,3 indirect; 4 triple.
     pub i_nid: [u32; NIDS_PER_INODE],
     /// Inline payload (data or dentry) — when one of those flags is set
@@ -101,6 +105,23 @@ pub(crate) struct InodeRec {
     /// main-area address allocated when the data was streamed in. The
     /// writer never touches the device after this point.
     pub on_disk_block: u32,
+}
+
+impl InodeRec {
+    /// Read direct-pointer slot `i`. Slots past `i_addr.len()` are zero
+    /// (the inline-file case where the array was never grown).
+    pub(crate) fn iaddr_get(&self, i: usize) -> u32 {
+        self.i_addr.get(i).copied().unwrap_or(0)
+    }
+    /// Set direct-pointer slot `i`, growing `i_addr` (padded with zeros)
+    /// up to `i + 1` slots as needed. The fixed bound is enforced by the
+    /// callers' existing `ADDRS_PER_INODE` checks.
+    pub(crate) fn iaddr_set(&mut self, i: usize, v: u32) {
+        if self.i_addr.len() <= i {
+            self.i_addr.resize(i + 1, 0);
+        }
+        self.i_addr[i] = v;
+    }
 }
 
 /// Tracked direct-node block (1018 data-block pointers + a backing nid).
@@ -206,7 +227,7 @@ impl Writer {
                 mtime: 0,
                 flags: 0,
                 inline_flags: F2FS_INLINE_DENTRY,
-                i_addr: [0; ADDRS_PER_INODE],
+                i_addr: Vec::new(),
                 i_nid: [0; NIDS_PER_INODE],
                 inline_payload: Vec::new(),
                 on_disk_block: root_phys,
@@ -442,7 +463,7 @@ impl Writer {
                 .inodes
                 .get(&nid)
                 .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost nid".into()))?;
-            return Ok(ino.i_addr[idx as usize]);
+            return Ok(ino.iaddr_get(idx as usize));
         }
         let mut rel = idx - ADDRS_PER_INODE as u64;
 
@@ -541,7 +562,7 @@ impl Writer {
                 .inodes
                 .get_mut(&nid)
                 .ok_or_else(|| crate::Error::InvalidImage("f2fs: ghost nid".into()))?;
-            ino.i_addr[idx as usize] = phys;
+            ino.iaddr_set(idx as usize, phys);
             return Ok(());
         }
         let mut rel = idx - ADDRS_PER_INODE as u64;
@@ -749,7 +770,7 @@ impl Writer {
                 mtime: meta.mtime,
                 flags: 0,
                 inline_flags: 0,
-                i_addr: [0; ADDRS_PER_INODE],
+                i_addr: Vec::new(),
                 i_nid: [0; NIDS_PER_INODE],
                 inline_payload: Vec::new(),
                 on_disk_block: inode_blk,
@@ -797,7 +818,7 @@ impl Writer {
                 mtime: meta.mtime,
                 flags: 0,
                 inline_flags: F2FS_INLINE_DENTRY,
-                i_addr: [0; ADDRS_PER_INODE],
+                i_addr: Vec::new(),
                 i_nid: [0; NIDS_PER_INODE],
                 inline_payload: Vec::new(),
                 on_disk_block: inode_blk,
@@ -857,7 +878,7 @@ impl Writer {
                 mtime: meta.mtime,
                 flags: 0,
                 inline_flags: F2FS_INLINE_DATA | F2FS_DATA_EXIST,
-                i_addr: [0; ADDRS_PER_INODE],
+                i_addr: Vec::new(),
                 i_nid: [0; NIDS_PER_INODE],
                 inline_payload: target_bytes,
                 on_disk_block: inode_blk,
@@ -913,7 +934,7 @@ impl Writer {
                 mtime: meta.mtime,
                 flags: 0,
                 inline_flags: F2FS_INLINE_DATA | F2FS_DATA_EXIST,
-                i_addr: [0; ADDRS_PER_INODE],
+                i_addr: Vec::new(),
                 i_nid: [0; NIDS_PER_INODE],
                 inline_payload: payload,
                 on_disk_block: inode_blk,
@@ -1044,9 +1065,9 @@ impl Writer {
             self.spilled_dirs.insert(parent_nid, ());
             // Allocate one data block for now. Multi-block dentry growth
             // is handled at flush time.
-            if ino.i_addr[0] == 0 {
+            if ino.iaddr_get(0) == 0 {
                 let phys = self.alloc_data_block()?;
-                self.inodes.get_mut(&parent_nid).unwrap().i_addr[0] = phys;
+                self.inodes.get_mut(&parent_nid).unwrap().iaddr_set(0, phys);
                 self.inodes.get_mut(&parent_nid).unwrap().blocks = 1;
             }
         }
@@ -1192,12 +1213,16 @@ impl Writer {
             for (&logical, (blk_entries, _)) in blocks.iter() {
                 max_logical = max_logical.max(logical);
                 let phys = if logical == 0 {
-                    let cur = self.inodes.get(&dir_nid).map(|i| i.i_addr[0]).unwrap_or(0);
+                    let cur = self
+                        .inodes
+                        .get(&dir_nid)
+                        .map(|i| i.iaddr_get(0))
+                        .unwrap_or(0);
                     if cur != 0 {
                         cur
                     } else {
                         let p = self.alloc_data_block()?;
-                        self.inodes.get_mut(&dir_nid).unwrap().i_addr[0] = p;
+                        self.inodes.get_mut(&dir_nid).unwrap().iaddr_set(0, p);
                         p
                     }
                 } else {
@@ -1239,6 +1264,8 @@ impl Writer {
         // missed the inode block itself plus any node-tree overhead.
         let mut blocks_for: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
         for (&nid, ino) in self.inodes.iter() {
+            // Iterate `i_addr` directly (no padding needed — zero slots
+            // past `i_addr.len()` would not increment the count anyway).
             let mut count: u64 = 1; // the inode block
             for a in ino.i_addr.iter() {
                 if *a != 0 {
@@ -1916,7 +1943,7 @@ mod tests {
                 mtime: 0,
                 flags: 0,
                 inline_flags: 0,
-                i_addr: [0; ADDRS_PER_INODE],
+                i_addr: Vec::new(),
                 i_nid: [0; NIDS_PER_INODE],
                 inline_payload: Vec::new(),
                 on_disk_block: inode_blk,
@@ -1948,7 +1975,7 @@ mod tests {
         let dnode = writer.direct_nodes.get(&dnode_nid).unwrap();
         assert_eq!(dnode.addrs[7], phys);
         // And the inode hasn't accidentally clobbered its in-inode array.
-        assert_eq!(ino.i_addr[0], 0);
+        assert_eq!(ino.iaddr_get(0), 0);
     }
 
     /// End-to-end triple-indirect: create a real file whose final block
@@ -1996,7 +2023,7 @@ mod tests {
                     mtime: 0,
                     flags: 0,
                     inline_flags: 0,
-                    i_addr: [0; ADDRS_PER_INODE],
+                    i_addr: Vec::new(),
                     i_nid: [0; NIDS_PER_INODE],
                     inline_payload: Vec::new(),
                     on_disk_block: inode_blk,
@@ -2086,7 +2113,7 @@ mod tests {
                 mtime: 0,
                 flags: 0,
                 inline_flags: 0,
-                i_addr: [0; ADDRS_PER_INODE],
+                i_addr: Vec::new(),
                 i_nid: [0; NIDS_PER_INODE],
                 inline_payload: Vec::new(),
                 on_disk_block: inode_blk,

@@ -1555,16 +1555,16 @@ impl Apfs {
 impl crate::fs::Filesystem for Apfs {
     fn create_file(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &std::path::Path,
         src: crate::fs::FileSource,
         meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        // Pull bytes out of `src` while we still have it. APFS' writer
-        // streams from a Read, but we have to buffer here because the
-        // writer doesn't exist yet — flush() builds it. For real-world
-        // use this means create_file is bounded by available RAM. Empty
-        // files are fine.
+        // Buffer the source bytes — both code paths need to know the
+        // file size up front (PendingWrite to stage the op, Write to
+        // bump-allocate an extent). APFS' streaming write happens
+        // inside the writer; at this layer we materialise the body
+        // first.
         let (mut reader, size) = src
             .open()
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
@@ -1572,50 +1572,79 @@ impl crate::fs::Filesystem for Apfs {
         let n = std::io::Read::read_to_end(&mut reader, &mut data)
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
         if n as u64 != size {
-            // Pad with zeros so dstream.size still matches what the user
-            // asked for; mirrors the writer's truncation handling.
+            // Pad with zeros so dstream.size still matches what the
+            // user asked for; mirrors the writer's truncation handling.
             data.resize(size as usize, 0);
         }
-        let pw = pending_write_mut(&mut self.state)?;
-        let (parent_oid, name) = pw.resolve_parent(path)?;
-        pw.ops.push(PendingOp::File {
-            parent_oid,
-            name,
-            mode: meta.mode,
-            data,
-        });
-        // Consume an oid slot so future creates see the same sequence
-        // the writer will use. add_file_from_reader allocates one oid.
-        pw.next_oid = pw.next_oid.saturating_add(1);
-        Ok(())
+        drop(reader);
+        match &self.state {
+            ApfsState::Read(_) => Err(crate::Error::Unsupported(
+                "apfs: create_file on a read-only image (use Apfs::open_writable for re-opens)"
+                    .into(),
+            )),
+            ApfsState::Write(_) => {
+                let path_str = path
+                    .to_str()
+                    .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+                self.create_file_at(dev, path_str, &data, meta.mode)
+            }
+            ApfsState::PendingWrite(_) => {
+                let pw = pending_write_mut(&mut self.state)?;
+                let (parent_oid, name) = pw.resolve_parent(path)?;
+                pw.ops.push(PendingOp::File {
+                    parent_oid,
+                    name,
+                    mode: meta.mode,
+                    data,
+                });
+                // Consume an oid slot so future creates see the same
+                // sequence the writer will use. add_file_from_reader
+                // allocates one oid.
+                pw.next_oid = pw.next_oid.saturating_add(1);
+                Ok(())
+            }
+        }
     }
 
     fn create_dir(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &std::path::Path,
         meta: crate::fs::FileMeta,
     ) -> Result<()> {
-        let pw = pending_write_mut(&mut self.state)?;
-        let (parent_oid, name) = pw.resolve_parent(path)?;
-        // Assign a deterministic oid that matches what the writer will
-        // hand out for this position in the call sequence, and remember
-        // it so nested children of this directory can resolve their
-        // parent path on subsequent calls.
-        let new_oid = pw.next_oid;
-        pw.next_oid = pw.next_oid.saturating_add(1);
-        pw.dir_oid.insert(path.to_path_buf(), new_oid);
-        pw.ops.push(PendingOp::Dir {
-            parent_oid,
-            name,
-            mode: meta.mode,
-        });
-        Ok(())
+        match &self.state {
+            ApfsState::Read(_) => Err(crate::Error::Unsupported(
+                "apfs: create_dir on a read-only image".into(),
+            )),
+            ApfsState::Write(_) => {
+                let path_str = path
+                    .to_str()
+                    .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+                self.create_dir_at(dev, path_str, meta.mode)
+            }
+            ApfsState::PendingWrite(_) => {
+                let pw = pending_write_mut(&mut self.state)?;
+                let (parent_oid, name) = pw.resolve_parent(path)?;
+                // Assign a deterministic oid that matches what the
+                // writer will hand out for this position in the call
+                // sequence, and remember it so nested children of this
+                // directory can resolve their parent path later.
+                let new_oid = pw.next_oid;
+                pw.next_oid = pw.next_oid.saturating_add(1);
+                pw.dir_oid.insert(path.to_path_buf(), new_oid);
+                pw.ops.push(PendingOp::Dir {
+                    parent_oid,
+                    name,
+                    mode: meta.mode,
+                });
+                Ok(())
+            }
+        }
     }
 
     fn create_symlink(
         &mut self,
-        _dev: &mut dyn BlockDevice,
+        dev: &mut dyn BlockDevice,
         path: &std::path::Path,
         target: &std::path::Path,
         meta: crate::fs::FileMeta,
@@ -1624,16 +1653,29 @@ impl crate::fs::Filesystem for Apfs {
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 symlink target".into()))?
             .to_string();
-        let pw = pending_write_mut(&mut self.state)?;
-        let (parent_oid, name) = pw.resolve_parent(path)?;
-        pw.ops.push(PendingOp::Symlink {
-            parent_oid,
-            name,
-            mode: meta.mode,
-            target: target_str,
-        });
-        pw.next_oid = pw.next_oid.saturating_add(1);
-        Ok(())
+        match &self.state {
+            ApfsState::Read(_) => Err(crate::Error::Unsupported(
+                "apfs: create_symlink on a read-only image".into(),
+            )),
+            ApfsState::Write(_) => {
+                let path_str = path
+                    .to_str()
+                    .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+                self.create_symlink_at(dev, path_str, &target_str, meta.mode)
+            }
+            ApfsState::PendingWrite(_) => {
+                let pw = pending_write_mut(&mut self.state)?;
+                let (parent_oid, name) = pw.resolve_parent(path)?;
+                pw.ops.push(PendingOp::Symlink {
+                    parent_oid,
+                    name,
+                    mode: meta.mode,
+                    target: target_str,
+                });
+                pw.next_oid = pw.next_oid.saturating_add(1);
+                Ok(())
+            }
+        }
     }
 
     fn create_device(
@@ -1645,15 +1687,163 @@ impl crate::fs::Filesystem for Apfs {
         _minor: u32,
         _meta: crate::fs::FileMeta,
     ) -> Result<()> {
+        // APFS supports DT_CHR / DT_BLK / DT_FIFO / DT_SOCK via the
+        // rdev xfield, but neither the single-pass writer nor the
+        // Write-state mutators emit one yet. Use cases are rare; this
+        // is out of scope for the current mutation surface.
         Err(crate::Error::Unsupported(
             "apfs: device nodes are not supported by the writer".into(),
         ))
     }
 
-    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
-        Err(crate::Error::Unsupported(
-            "apfs: remove is not supported (writer is single-pass)".into(),
-        ))
+    fn remove(&mut self, dev: &mut dyn BlockDevice, path: &std::path::Path) -> Result<()> {
+        match &self.state {
+            ApfsState::Write(_) => {
+                let s = path
+                    .to_str()
+                    .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+                self.remove_path(dev, s)
+            }
+            _ => Err(crate::Error::Unsupported(
+                "apfs: remove requires Apfs::open_writable (PendingWrite is single-pass; \
+                 Read is immutable)"
+                    .into(),
+            )),
+        }
+    }
+
+    fn rename(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        old_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) -> Result<()> {
+        match &self.state {
+            ApfsState::Write(_) => {
+                let old = old_path.to_str().ok_or_else(|| {
+                    crate::Error::InvalidArgument("apfs: non-UTF-8 rename source".into())
+                })?;
+                let new = new_path.to_str().ok_or_else(|| {
+                    crate::Error::InvalidArgument("apfs: non-UTF-8 rename target".into())
+                })?;
+                Apfs::rename(self, dev, old, new)
+            }
+            _ => Err(crate::Error::Unsupported(
+                "apfs: rename requires Apfs::open_writable".into(),
+            )),
+        }
+    }
+
+    fn hardlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        target_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) -> Result<()> {
+        match &self.state {
+            ApfsState::Write(_) => {
+                let tgt = target_path.to_str().ok_or_else(|| {
+                    crate::Error::InvalidArgument("apfs: non-UTF-8 hardlink target".into())
+                })?;
+                let new = new_path.to_str().ok_or_else(|| {
+                    crate::Error::InvalidArgument("apfs: non-UTF-8 hardlink path".into())
+                })?;
+                self.link(dev, tgt, new)
+            }
+            _ => Err(crate::Error::Unsupported(
+                "apfs: hardlink requires Apfs::open_writable".into(),
+            )),
+        }
+    }
+
+    fn set_attrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        attrs: crate::fs::SetAttrs,
+    ) -> Result<()> {
+        if !matches!(&self.state, ApfsState::Write(_)) {
+            return Err(crate::Error::Unsupported(
+                "apfs: set_attrs requires Apfs::open_writable".into(),
+            ));
+        }
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+        let target_oid = self.resolve_path_to_oid(dev, s)?;
+        // Bundle every requested field into one commit_with_mutator
+        // closure so the multi-field case costs one checkpoint, not
+        // three. Layout offsets per j_inode_val_t: mode 80..82
+        // (preserve type bits), uid 72..76, gid 76..80, mtime 24..32,
+        // ctime 32..40, atime 40..48 (all u64 ns; the trait's
+        // SetAttrs gives u32 epoch seconds, so multiply by 1e9).
+        const NS_PER_SEC: u64 = 1_000_000_000;
+        rw::commit_with_mutator(self, dev, |cx| {
+            patch_inode_record(cx.records, target_oid, |v| {
+                if v.len() < jrec::J_INODE_VAL_FIXED_SIZE {
+                    return;
+                }
+                if let Some(mode) = attrs.mode {
+                    let cur = u16::from_le_bytes(v[80..82].try_into().unwrap());
+                    let new = (cur & 0xF000) | (mode & 0o7777);
+                    v[80..82].copy_from_slice(&new.to_le_bytes());
+                }
+                if let Some(uid) = attrs.uid {
+                    v[72..76].copy_from_slice(&uid.to_le_bytes());
+                }
+                if let Some(gid) = attrs.gid {
+                    v[76..80].copy_from_slice(&gid.to_le_bytes());
+                }
+                if let Some(mtime) = attrs.mtime {
+                    let ns = mtime as u64 * NS_PER_SEC;
+                    v[24..32].copy_from_slice(&ns.to_le_bytes());
+                }
+                if let Some(ctime) = attrs.ctime {
+                    let ns = ctime as u64 * NS_PER_SEC;
+                    v[32..40].copy_from_slice(&ns.to_le_bytes());
+                }
+                if let Some(atime) = attrs.atime {
+                    let ns = atime as u64 * NS_PER_SEC;
+                    v[40..48].copy_from_slice(&ns.to_le_bytes());
+                }
+            });
+            Ok(())
+        })
+    }
+
+    fn set_xattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        if !matches!(&self.state, ApfsState::Write(_)) {
+            return Err(crate::Error::Unsupported(
+                "apfs: set_xattr requires Apfs::open_writable".into(),
+            ));
+        }
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+        Apfs::set_xattr(self, dev, s, name, value)
+    }
+
+    fn remove_xattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        name: &str,
+    ) -> Result<()> {
+        if !matches!(&self.state, ApfsState::Write(_)) {
+            return Err(crate::Error::Unsupported(
+                "apfs: remove_xattr requires Apfs::open_writable".into(),
+            ));
+        }
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+        Apfs::remove_xattr(self, dev, s, name)
     }
 
     fn list(

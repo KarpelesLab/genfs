@@ -1012,3 +1012,194 @@ fn apfs_write_state_set_xattr_round_trips() {
     let xs = fs.read_xattrs(&mut dev, "/f.txt").unwrap();
     assert!(!xs.contains_key("user.tag"), "xattr lingered: {xs:?}");
 }
+
+/// Filesystem-trait wiring exercise: after open_writable, the trait
+/// methods (create_file, create_dir, set_attrs, set_xattr, rename,
+/// remove) should dispatch to the inherent Write-state methods we
+/// added in commit-4 rather than returning Unsupported. This is the
+/// surface a generic Filesystem consumer (FUSE adapter, build spec)
+/// uses, so it has to actually work in Write state.
+#[test]
+fn apfs_filesystem_trait_dispatches_to_write_state() {
+    use fstool::fs::{Filesystem, SetAttrs};
+    use std::path::Path;
+
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let bs = 4096u32;
+    let total_blocks = 4096u64;
+    let img = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(img.path(), total_blocks * bs as u64).unwrap();
+        let w = ApfsWriter::new(&mut dev, total_blocks, bs, "TRAIT").unwrap();
+        w.finish().unwrap();
+        dev.sync().unwrap();
+    }
+
+    // create_file via trait
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        let body: Vec<u8> = b"alpha\n".to_vec();
+        let body_len = body.len() as u64;
+        Filesystem::create_file(
+            &mut fs,
+            &mut dev,
+            Path::new("/a.txt"),
+            fstool::fs::FileSource::Reader {
+                reader: Box::new(Cursor::new(body)),
+                len: body_len,
+            },
+            fstool::fs::FileMeta {
+                mode: 0o644,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+    // create_dir + nested create_file
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        Filesystem::create_dir(
+            &mut fs,
+            &mut dev,
+            Path::new("/sub"),
+            fstool::fs::FileMeta {
+                mode: 0o755,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+    // set_attrs (mode + uid + gid + times in one checkpoint)
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        Filesystem::set_attrs(
+            &mut fs,
+            &mut dev,
+            Path::new("/a.txt"),
+            SetAttrs {
+                mode: Some(0o600),
+                uid: Some(501),
+                gid: Some(20),
+                mtime: Some(1_700_000_000),
+                ctime: Some(1_700_000_000),
+                atime: Some(1_700_000_000),
+            },
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+    // set_xattr via trait
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        Filesystem::set_xattr(
+            &mut fs,
+            &mut dev,
+            Path::new("/a.txt"),
+            "user.role",
+            b"trait",
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+    // rename via trait
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        Filesystem::rename(&mut fs, &mut dev, Path::new("/a.txt"), Path::new("/b.txt")).unwrap();
+        dev.sync().unwrap();
+    }
+    // remove via trait
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        Filesystem::remove(&mut fs, &mut dev, Path::new("/sub")).unwrap();
+        dev.sync().unwrap();
+    }
+
+    // Final state: /b.txt with the right xattr and mode; /sub gone.
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let fs = Apfs::open(&mut dev).unwrap();
+    let names: Vec<String> = fs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(
+        names.contains(&"b.txt".to_string()),
+        "/b.txt missing: {names:?}"
+    );
+    assert!(!names.contains(&"a.txt".to_string()), "old name lingers");
+    assert!(
+        !names.contains(&"sub".to_string()),
+        "/sub not removed: {names:?}"
+    );
+    let xs = fs.read_xattrs(&mut dev, "/b.txt").unwrap();
+    assert_eq!(
+        xs.get("user.role").map(|v| v.as_slice()),
+        Some(b"trait".as_ref()),
+        "trait set_xattr did not stick: {xs:?}"
+    );
+}
+
+/// Filesystem trait on a Read-state Apfs (post-flush, or post-Apfs::open)
+/// must keep returning Unsupported for every mutation — re-opening for
+/// writes requires Apfs::open_writable explicitly.
+#[test]
+fn apfs_filesystem_trait_refuses_mutations_on_read_state() {
+    use fstool::fs::{Filesystem, SetAttrs};
+    use std::path::Path;
+
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let bs = 4096u32;
+    let total_blocks = 4096u64;
+    let img = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(img.path(), total_blocks * bs as u64).unwrap();
+        let mut w = ApfsWriter::new(&mut dev, total_blocks, bs, "RDST").unwrap();
+        let body = b"r\n";
+        let mut r = Cursor::new(body.as_ref());
+        w.add_file_from_reader(2, "f.txt", 0o644, &mut r, body.len() as u64)
+            .unwrap();
+        w.finish().unwrap();
+        dev.sync().unwrap();
+    }
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let mut fs = Apfs::open(&mut dev).unwrap();
+    assert!(matches!(
+        Filesystem::remove(&mut fs, &mut dev, Path::new("/f.txt")),
+        Err(fstool::Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        Filesystem::rename(&mut fs, &mut dev, Path::new("/f.txt"), Path::new("/g.txt")),
+        Err(fstool::Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        Filesystem::set_attrs(
+            &mut fs,
+            &mut dev,
+            Path::new("/f.txt"),
+            SetAttrs {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+        ),
+        Err(fstool::Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        Filesystem::set_xattr(&mut fs, &mut dev, Path::new("/f.txt"), "n", b"v"),
+        Err(fstool::Error::Unsupported(_))
+    ));
+}

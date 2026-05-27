@@ -117,7 +117,11 @@ impl Progress {
             return;
         }
         self.last_emit = now;
-        let line = self.status_line();
+        // On a TTY, sample the terminal width per emit and let
+        // `status_line` budget the path-ticker variant against it. Bar
+        // mode is already fixed-width and ignores the hint.
+        let cols = if self.is_tty { term_cols() } else { None };
+        let line = self.status_line(cols);
         if self.is_tty {
             let mut err = std::io::stderr().lock();
             let _ = write!(err, "\r\x1b[Krepack: {line}");
@@ -130,8 +134,10 @@ impl Progress {
     /// Build the "progress bar" or "N files | last_path" line for the
     /// current state. With totals (set after analyze) the line reads
     /// `[████░░░░░░░░] 38%  38247/100001 files  39.2/100.0 MiB`; without,
-    /// it falls back to the historical `N files | path` ticker.
-    fn status_line(&self) -> String {
+    /// it falls back to the `N files | path` ticker — and when `cols`
+    /// is known, the path is truncated on the **left** (with an `…`
+    /// marker) so the filename suffix stays visible on narrow terminals.
+    fn status_line(&self, cols: Option<usize>) -> String {
         match (self.total_files, self.total_bytes) {
             (Some(tf), Some(tb)) if tf > 0 || tb > 0 => {
                 let file_frac = if tf > 0 {
@@ -159,7 +165,20 @@ impl Progress {
                     human_bytes(tb),
                 )
             }
-            _ => format!("{} files | {}", self.files, self.last_path),
+            _ => {
+                let prefix = format!("{} files | ", self.files);
+                // "repack: " (8) + prefix + path must fit inside `cols`.
+                // Reserve 1 column so the cursor doesn't push us into a
+                // wrap on tight terminals.
+                let path = match cols {
+                    Some(c) => {
+                        let budget = c.saturating_sub(8 + prefix.chars().count() + 1);
+                        truncate_left(&self.last_path, budget)
+                    }
+                    None => self.last_path.clone(),
+                };
+                format!("{prefix}{path}")
+            }
         }
     }
 
@@ -203,6 +222,59 @@ impl Progress {
             );
         }
     }
+}
+
+/// Sample the terminal's column count from stderr (file descriptor 2)
+/// via the `TIOCGWINSZ` ioctl. Returns `None` when stderr isn't a TTY,
+/// the ioctl fails, or the width comes back zero (which some terminals
+/// report transiently during resizes). Unix-only; on other platforms
+/// we just don't truncate.
+#[cfg(unix)]
+fn term_cols() -> Option<usize> {
+    use std::os::fd::AsRawFd;
+    let fd = std::io::stderr().as_raw_fd();
+    // SAFETY: `winsize` is a POD layout populated by the kernel; we
+    // pass a valid mutable pointer and check the return code before
+    // reading the fields.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    if rc != 0 || ws.ws_col == 0 {
+        return None;
+    }
+    Some(ws.ws_col as usize)
+}
+
+#[cfg(not(unix))]
+fn term_cols() -> Option<usize> {
+    None
+}
+
+/// Truncate `path` on the **left** so the result fits in `budget` cells,
+/// preserving the trailing characters (filename and any short tail of
+/// its parent path). When trimmed, a leading `…` marks the elision.
+/// Counts Unicode scalar values, which is a good-enough proxy for
+/// terminal cells for the ASCII path component names we typically deal
+/// with. (Wide-CJK paths may overshoot by a column or two.)
+fn truncate_left(path: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    // Fast path: already fits.
+    if path.chars().count() <= budget {
+        return path.to_string();
+    }
+    // Reserve one cell for the `…` marker.
+    let keep = budget.saturating_sub(1);
+    // Take the last `keep` chars, byte-safe.
+    let (byte_start, _) = path
+        .char_indices()
+        .rev()
+        .nth(keep.saturating_sub(1))
+        .unwrap_or((path.len(), '\0'));
+    let mut out = String::with_capacity(1 + path.len() - byte_start);
+    out.push('…');
+    out.push_str(&path[byte_start..]);
+    out
 }
 
 /// Render a `[████░░░░]` bar of width `cells`. Unicode block characters
@@ -1603,4 +1675,84 @@ pub(crate) fn sum_source_file_bytes(
     src_fs: &mut crate::inspect::AnyFs,
 ) -> crate::Result<u64> {
     src_fs.total_file_bytes(src_dev)
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::truncate_left;
+
+    #[test]
+    fn truncate_left_fits_returns_full() {
+        assert_eq!(truncate_left("short.txt", 10), "short.txt");
+        // Exactly the budget: no marker needed.
+        assert_eq!(truncate_left("9chars.tx", 9), "9chars.tx");
+    }
+
+    #[test]
+    fn truncate_left_keeps_trailing_filename() {
+        // 20-byte path, budget 10 → "…" + 9 trailing chars.
+        let p = "/var/log/path/to/deep/file.log";
+        let out = truncate_left(p, 10);
+        assert_eq!(out, "…/file.log");
+        assert!(out.chars().count() <= 10);
+    }
+
+    #[test]
+    fn truncate_left_zero_budget_empty() {
+        assert_eq!(truncate_left("x", 0), "");
+    }
+
+    #[test]
+    fn truncate_left_unicode_path() {
+        // Multi-byte chars in the path: must split at a char boundary.
+        let p = "/données/important/документ.txt";
+        let out = truncate_left(p, 15);
+        // First char should be the ellipsis, rest the trailing slice.
+        assert!(out.starts_with('…'));
+        assert!(out.chars().count() <= 15);
+        // The filename suffix must survive.
+        assert!(out.contains(".txt"));
+    }
+}
+
+#[cfg(test)]
+mod ticker_layout_tests {
+    use super::Progress;
+
+    fn make() -> Progress {
+        let mut p = Progress::auto();
+        p.is_tty = true;
+        p.files = 42;
+        p.last_path = "/very/deep/nested/dir/some-long-filename.bin".into();
+        p
+    }
+
+    #[test]
+    fn ticker_no_cols_keeps_full_path() {
+        let p = make();
+        let line = p.status_line(None);
+        assert!(line.contains("/very/deep/nested/dir/some-long-filename.bin"));
+    }
+
+    #[test]
+    fn ticker_narrow_pty_truncates_left() {
+        let p = make();
+        // 60-col terminal. "repack: " (8) + "42 files | " (11) + path budget = 60-1
+        let line = p.status_line(Some(60));
+        // Total visible (with "repack: " prefix and minus the 1-col cursor margin) must fit
+        assert!(8 + line.chars().count() <= 60);
+        // Left side trimmed → starts ".../some-long-filename.bin" suffix preserved.
+        assert!(line.contains("filename.bin"));
+        // Should contain the ellipsis marker introduced by truncate_left.
+        assert!(line.contains('…'));
+    }
+
+    #[test]
+    fn ticker_tight_pty_still_shows_basename_suffix() {
+        let p = make();
+        let line = p.status_line(Some(30));
+        assert!(8 + line.chars().count() <= 30);
+        // Even tight, the trailing characters survive (in particular `.bin`).
+        assert!(line.contains(".bin"));
+    }
 }

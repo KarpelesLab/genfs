@@ -986,7 +986,8 @@ impl Apfs {
                 )));
             }
             remove_drec(records, old_parent, &old_name);
-            push_drec(records, new_parent, &new_name, target_oid, dtype);
+            let (k, v) = write::build_drec_record(new_parent, &new_name, target_oid, dtype)?;
+            records.push((k, v));
             if old_parent != new_parent {
                 // Update both parents' nchildren.
                 patch_inode_record(records, old_parent, |v| {
@@ -1041,7 +1042,8 @@ impl Apfs {
                     "apfs: link target {new_name:?} already exists"
                 )));
             }
-            push_drec(records, new_parent, &new_name, target_oid, target_dtype);
+            let (k, v) = write::build_drec_record(new_parent, &new_name, target_oid, target_dtype)?;
+            records.push((k, v));
             patch_inode_record(records, target_oid, |v| {
                 if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
                     let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
@@ -1956,30 +1958,6 @@ pub(crate) fn remove_drec(records: &mut Vec<(Vec<u8>, Vec<u8>)>, parent_oid: u64
         let stored = &k[10..10 + nlen - 1];
         stored != name.as_bytes()
     });
-}
-
-/// Append a new drec record under `parent_oid`. Matches
-/// `ApfsWriter::add_drec` exactly so later checkpoints walk the new
-/// dirent the same way the writer would.
-pub(crate) fn push_drec(
-    records: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    parent_oid: u64,
-    name: &str,
-    target_oid: u64,
-    dtype: u16,
-) {
-    let nlen = name.len() + 1;
-    let mut key = Vec::with_capacity(10 + nlen);
-    let hdr = ((APFS_TYPE_DIR_REC as u64) << OBJ_TYPE_SHIFT) | (parent_oid & OBJ_ID_MASK);
-    key.extend_from_slice(&hdr.to_le_bytes());
-    key.extend_from_slice(&(nlen as u16).to_le_bytes());
-    key.extend_from_slice(name.as_bytes());
-    key.push(0);
-    let mut val = vec![0u8; 18];
-    val[0..8].copy_from_slice(&target_oid.to_le_bytes());
-    // date_added at 8..16 stays zero.
-    val[16..18].copy_from_slice(&dtype.to_le_bytes());
-    records.push((key, val));
 }
 
 /// Count direct children of a directory inode by scanning drec

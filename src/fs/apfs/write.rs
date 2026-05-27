@@ -266,6 +266,179 @@ pub struct ApfsWriter<'a> {
     write_label_nxsb: bool,
 }
 
+// ───────────────────────── shared record builders ─────────────────────────
+//
+// Free `pub(crate)` functions that build the on-disk (key, value) byte
+// pairs for every fs-tree record kind we emit. Both the single-pass
+// [`ApfsWriter`] (format / pending-write path) and the in-place mutators
+// in [`super::Apfs`] (Write-state checkpoint COWs via
+// [`super::rw::commit_with_mutator`]) push records through the same
+// builders, so the byte layouts only need to live in one place.
+
+/// Build the `j_drec_key_t` + `j_drec_val_t` record bytes for a
+/// directory entry. The key carries the parent directory's oid, the
+/// entry name (NUL-terminated, length in `name_len`), and the value
+/// carries the target inode oid + the directory-entry type tag.
+///
+/// Errors when the name is too long to encode in the 16-bit `name_len`
+/// field — POSIX caps at 255 bytes anyway, but the type allows more.
+pub(crate) fn build_drec_record(
+    parent_oid: u64,
+    name: &str,
+    target_oid: u64,
+    dtype: u16,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let nlen = name.len() + 1; // includes trailing NUL
+    if nlen > u16::MAX as usize {
+        return Err(crate::Error::InvalidArgument(
+            "apfs writer: directory entry name too long".into(),
+        ));
+    }
+    let mut key = Vec::with_capacity(10 + nlen);
+    let hdr = ((APFS_TYPE_DIR_REC as u64) << OBJ_TYPE_SHIFT) | (parent_oid & OBJ_ID_MASK);
+    key.extend_from_slice(&hdr.to_le_bytes());
+    key.extend_from_slice(&(nlen as u16).to_le_bytes());
+    key.extend_from_slice(name.as_bytes());
+    key.push(0);
+
+    // j_drec_val_t: file_id u64 + date_added u64 (zero) + flags u16
+    let mut val = vec![0u8; 18];
+    val[0..8].copy_from_slice(&target_oid.to_le_bytes());
+    val[16..18].copy_from_slice(&dtype.to_le_bytes());
+    Ok((key, val))
+}
+
+/// Build the `j_inode_key_t` + `j_inode_val_t` record bytes. For
+/// regular files / symlinks (`dstream_size > 0` OR mode is `S_IFREG` /
+/// `S_IFLNK`) an `INO_EXT_TYPE_DSTREAM` xfield carrying `size` and
+/// `alloced_size` (block-rounded) is appended. Directory inodes get
+/// no xfield. `nlink` is seeded as 2 for directories and 1 for
+/// everything else, matching the single-pass writer's convention.
+///
+/// `block_size` is needed to round `alloced_size` to a whole-block
+/// boundary inside the DSTREAM xfield value.
+pub(crate) fn build_inode_record(
+    oid: u64,
+    parent_oid: u64,
+    mode: u16,
+    dstream_size: u64,
+    block_size: u32,
+) -> (Vec<u8>, Vec<u8>) {
+    let has_dstream =
+        dstream_size > 0 || (mode & 0o170_000 == 0o100_000) || (mode & 0o170_000 == 0o120_000);
+    let mut val = vec![0u8; J_INODE_VAL_FIXED_SIZE];
+    val[0..8].copy_from_slice(&parent_oid.to_le_bytes());
+    let private_id = if has_dstream && DSTREAM_ID_SHARES_INODE {
+        oid
+    } else {
+        0
+    };
+    val[8..16].copy_from_slice(&private_id.to_le_bytes());
+    // Times: leave zero (timestamps are set by the caller post-build).
+    // internal_flags: 0.
+    let nlink: i32 = if mode & 0o170_000 == 0o040_000 { 2 } else { 1 };
+    val[56..60].copy_from_slice(&nlink.to_le_bytes());
+    // owner/group: 0 (root).
+    val[80..82].copy_from_slice(&mode.to_le_bytes());
+    val[84..92].copy_from_slice(&dstream_size.to_le_bytes());
+
+    if has_dstream {
+        // xfield blob: 1 entry (DSTREAM), 40 bytes value, padded to 8.
+        let mut xfields = Vec::new();
+        xfields.extend_from_slice(&1u16.to_le_bytes()); // num_exts
+        xfields.extend_from_slice(&40u16.to_le_bytes()); // used_data
+        // x_field_t = (type:u8, flags:u8, size:u16)
+        xfields.push(INO_EXT_TYPE_DSTREAM);
+        xfields.push(0);
+        xfields.extend_from_slice(&40u16.to_le_bytes());
+        // value: j_dstream_t (40 bytes)
+        let mut ds = [0u8; 40];
+        ds[0..8].copy_from_slice(&dstream_size.to_le_bytes());
+        let bs = block_size as u64;
+        let alloc = dstream_size.div_ceil(bs) * bs;
+        ds[8..16].copy_from_slice(&alloc.to_le_bytes());
+        xfields.extend_from_slice(&ds);
+        val.extend_from_slice(&xfields);
+    }
+
+    let mut key = vec![0u8; 8];
+    let hdr = ((APFS_TYPE_INODE as u64) << OBJ_TYPE_SHIFT) | (oid & OBJ_ID_MASK);
+    key.copy_from_slice(&hdr.to_le_bytes());
+    (key, val)
+}
+
+/// Build the FILE_EXTENT + DSTREAM_ID record pair for a single extent
+/// of `dstream_oid`. Always returns two records — the FILE_EXTENT
+/// carrying `(logical_addr, length, phys_block)` and the DSTREAM_ID
+/// counter the reader uses to locate the dstream's extents under this
+/// oid.
+pub(crate) fn build_file_extent_records(
+    dstream_oid: u64,
+    logical_addr: u64,
+    length: u64,
+    phys_block: u64,
+    block_size: u32,
+) -> [(Vec<u8>, Vec<u8>); 2] {
+    // FILE_EXTENT
+    let mut fe_key = vec![0u8; 16];
+    let fe_hdr = ((APFS_TYPE_FILE_EXTENT as u64) << OBJ_TYPE_SHIFT) | (dstream_oid & OBJ_ID_MASK);
+    fe_key[0..8].copy_from_slice(&fe_hdr.to_le_bytes());
+    fe_key[8..16].copy_from_slice(&logical_addr.to_le_bytes());
+    let mut fe_val = vec![0u8; 24];
+    let bs = block_size as u64;
+    let alloc = length.div_ceil(bs) * bs;
+    fe_val[0..8].copy_from_slice(&alloc.to_le_bytes()); // length (low 56 bits)
+    fe_val[8..16].copy_from_slice(&phys_block.to_le_bytes());
+    // crypto_id stays zero.
+
+    // DSTREAM_ID (just a refcnt=0 marker; reader uses presence not value)
+    let mut ds_key = vec![0u8; 8];
+    let ds_hdr = ((APFS_TYPE_DSTREAM_ID as u64) << OBJ_TYPE_SHIFT) | (dstream_oid & OBJ_ID_MASK);
+    ds_key.copy_from_slice(&ds_hdr.to_le_bytes());
+    let ds_val = vec![0u8; 4];
+    [(fe_key, fe_val), (ds_key, ds_val)]
+}
+
+/// Build an XATTR record for `(parent_oid, name, value)`. Embedded
+/// values only — values larger than [`APFS_XATTR_MAX_EMBEDDED_SIZE`]
+/// (3804 bytes) are rejected (dstream-backed xattrs are not yet
+/// supported). Errors on a name that doesn't fit in a 16-bit
+/// `name_len` field.
+pub(crate) fn build_xattr_record(
+    parent_oid: u64,
+    name: &str,
+    value: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if value.len() > APFS_XATTR_MAX_EMBEDDED_SIZE {
+        return Err(crate::Error::Unsupported(format!(
+            "apfs writer: xattr value of {} bytes exceeds embedded limit ({}); \
+             dstream xattrs are not supported",
+            value.len(),
+            APFS_XATTR_MAX_EMBEDDED_SIZE
+        )));
+    }
+    let name_bytes = name.as_bytes();
+    let nlen = name_bytes.len() + 1; // includes trailing NUL
+    if nlen > u16::MAX as usize {
+        return Err(crate::Error::InvalidArgument(
+            "apfs writer: xattr name too long".into(),
+        ));
+    }
+    // Key: j_xattr_key_t
+    let mut key = Vec::with_capacity(10 + nlen);
+    let hdr = ((APFS_TYPE_XATTR as u64) << OBJ_TYPE_SHIFT) | (parent_oid & OBJ_ID_MASK);
+    key.extend_from_slice(&hdr.to_le_bytes());
+    key.extend_from_slice(&(nlen as u16).to_le_bytes());
+    key.extend_from_slice(name_bytes);
+    key.push(0);
+    // Value: j_xattr_val_t
+    let mut val = Vec::with_capacity(4 + value.len());
+    val.extend_from_slice(&XATTR_DATA_EMBEDDED.to_le_bytes());
+    val.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    val.extend_from_slice(value);
+    Ok((key, val))
+}
+
 impl<'a> ApfsWriter<'a> {
     /// Create a writer over `dev`. `total_blocks * block_size` must fit
     /// inside `dev.total_size()`. `block_size` must be a power of two
@@ -564,33 +737,7 @@ impl<'a> ApfsWriter<'a> {
     /// `(parent_oid, APFS_TYPE_XATTR, name)` and is visible via
     /// [`super::Apfs::read_xattrs`].
     pub fn add_xattr(&mut self, parent_oid: u64, name: &str, value: &[u8]) -> Result<()> {
-        if value.len() > APFS_XATTR_MAX_EMBEDDED_SIZE {
-            return Err(crate::Error::Unsupported(format!(
-                "apfs writer: xattr value of {} bytes exceeds embedded limit ({}); \
-                 dstream xattrs are not supported",
-                value.len(),
-                APFS_XATTR_MAX_EMBEDDED_SIZE
-            )));
-        }
-        let name_bytes = name.as_bytes();
-        let nlen = name_bytes.len() + 1; // includes trailing NUL
-        if nlen > u16::MAX as usize {
-            return Err(crate::Error::InvalidArgument(
-                "apfs writer: xattr name too long".into(),
-            ));
-        }
-        // Key: j_xattr_key_t = j_key_t + u16 name_len + name[name_len]
-        let mut key = Vec::with_capacity(10 + nlen);
-        let hdr = ((APFS_TYPE_XATTR as u64) << OBJ_TYPE_SHIFT) | (parent_oid & OBJ_ID_MASK);
-        key.extend_from_slice(&hdr.to_le_bytes());
-        key.extend_from_slice(&(nlen as u16).to_le_bytes());
-        key.extend_from_slice(name_bytes);
-        key.push(0);
-        // Value: j_xattr_val_t = u16 flags + u16 xdata_len + xdata
-        let mut val = Vec::with_capacity(4 + value.len());
-        val.extend_from_slice(&XATTR_DATA_EMBEDDED.to_le_bytes());
-        val.extend_from_slice(&(value.len() as u16).to_le_bytes());
-        val.extend_from_slice(value);
+        let (key, val) = build_xattr_record(parent_oid, name, value)?;
         self.records.push(FsRecord { key, val });
         Ok(())
     }
@@ -927,25 +1074,7 @@ impl<'a> ApfsWriter<'a> {
         // Plain drec key (we ship images without
         // APFS_INCOMPAT_NORMALIZATION_INSENSITIVE so our reader picks
         // the plain layout).
-        let nlen = name.len() + 1; // includes trailing NUL
-        if nlen > u16::MAX as usize {
-            return Err(crate::Error::InvalidArgument(
-                "apfs writer: directory entry name too long".into(),
-            ));
-        }
-        let mut key = Vec::with_capacity(10 + nlen);
-        let hdr = ((APFS_TYPE_DIR_REC as u64) << OBJ_TYPE_SHIFT) | (parent_oid & OBJ_ID_MASK);
-        key.extend_from_slice(&hdr.to_le_bytes());
-        key.extend_from_slice(&(nlen as u16).to_le_bytes());
-        key.extend_from_slice(name.as_bytes());
-        key.push(0);
-
-        // j_drec_val_t (18 bytes minimum)
-        let mut val = vec![0u8; 18];
-        val[0..8].copy_from_slice(&target_oid.to_le_bytes());
-        // date_added at offset 8..16 — leave zero
-        val[16..18].copy_from_slice(&dtype.to_le_bytes());
-
+        let (key, val) = build_drec_record(parent_oid, name, target_oid, dtype)?;
         self.records.push(FsRecord { key, val });
         Ok(())
     }
@@ -957,54 +1086,7 @@ impl<'a> ApfsWriter<'a> {
         mode: u16,
         dstream_size: u64,
     ) -> Result<()> {
-        // Build j_inode_val_t with no trailing xfields for directories;
-        // for regular files / symlinks, add a DSTREAM xfield carrying
-        // the file size.
-        let has_dstream =
-            dstream_size > 0 || (mode & 0o170_000 == 0o100_000) || (mode & 0o170_000 == 0o120_000);
-        let mut val = vec![0u8; J_INODE_VAL_FIXED_SIZE];
-        val[0..8].copy_from_slice(&parent_oid.to_le_bytes());
-        // private_id = oid for files/symlinks (shared dstream id)
-        let private_id = if has_dstream && DSTREAM_ID_SHARES_INODE {
-            oid
-        } else {
-            0
-        };
-        val[8..16].copy_from_slice(&private_id.to_le_bytes());
-        // Times: leave zero.
-        // internal_flags: 0.
-        // nchildren_or_nlink: 1 (for files) or 2 (for dirs at minimum)
-        let nlink: i32 = if mode & 0o170_000 == 0o040_000 { 2 } else { 1 };
-        val[56..60].copy_from_slice(&nlink.to_le_bytes());
-        // owner/group: 0 (root).
-        val[80..82].copy_from_slice(&mode.to_le_bytes());
-        val[84..92].copy_from_slice(&dstream_size.to_le_bytes());
-
-        if has_dstream {
-            // xfield blob: 1 entry (DSTREAM), 40 bytes value, padded to 8.
-            let mut xfields = Vec::new();
-            xfields.extend_from_slice(&1u16.to_le_bytes()); // num_exts
-            // used_data covers value bytes (40)
-            xfields.extend_from_slice(&40u16.to_le_bytes());
-            // x_field_t = (type:u8, flags:u8, size:u16)
-            xfields.push(INO_EXT_TYPE_DSTREAM);
-            xfields.push(0);
-            xfields.extend_from_slice(&40u16.to_le_bytes());
-            // value: j_dstream_t (40 bytes)
-            let mut ds = [0u8; 40];
-            ds[0..8].copy_from_slice(&dstream_size.to_le_bytes());
-            // alloced_size — round up to block-size multiple
-            let bs = self.block_size as u64;
-            let alloc = dstream_size.div_ceil(bs) * bs;
-            ds[8..16].copy_from_slice(&alloc.to_le_bytes());
-            xfields.extend_from_slice(&ds);
-            val.extend_from_slice(&xfields);
-        }
-
-        let mut key = vec![0u8; 8];
-        let hdr = ((APFS_TYPE_INODE as u64) << OBJ_TYPE_SHIFT) | (oid & OBJ_ID_MASK);
-        key.copy_from_slice(&hdr.to_le_bytes());
-
+        let (key, val) = build_inode_record(oid, parent_oid, mode, dstream_size, self.block_size);
         self.records.push(FsRecord { key, val });
         Ok(())
     }
@@ -1016,30 +1098,16 @@ impl<'a> ApfsWriter<'a> {
         length: u64,
         phys_block: u64,
     ) -> Result<()> {
-        let mut key = vec![0u8; 16];
-        let hdr = ((APFS_TYPE_FILE_EXTENT as u64) << OBJ_TYPE_SHIFT) | (dstream_oid & OBJ_ID_MASK);
-        key[0..8].copy_from_slice(&hdr.to_le_bytes());
-        key[8..16].copy_from_slice(&logical_addr.to_le_bytes());
-
-        // j_file_extent_val_t (24 bytes)
-        let mut val = vec![0u8; 24];
-        let bs = self.block_size as u64;
-        let alloc = length.div_ceil(bs) * bs;
-        val[0..8].copy_from_slice(&alloc.to_le_bytes()); // length (low 56 bits)
-        val[8..16].copy_from_slice(&phys_block.to_le_bytes());
-        // crypto_id stays zero.
-        self.records.push(FsRecord { key, val });
-
-        // Also a DSTREAM_ID record (just a counter to one) so the
-        // reader can locate the dstream's extents under this oid.
-        let mut dkey = vec![0u8; 8];
-        let dhdr = ((APFS_TYPE_DSTREAM_ID as u64) << OBJ_TYPE_SHIFT) | (dstream_oid & OBJ_ID_MASK);
-        dkey.copy_from_slice(&dhdr.to_le_bytes());
-        let dval = vec![0u8; 4]; // j_dstream_id_val_t = refcnt: u32
-        self.records.push(FsRecord {
-            key: dkey,
-            val: dval,
-        });
+        let pair = build_file_extent_records(
+            dstream_oid,
+            logical_addr,
+            length,
+            phys_block,
+            self.block_size,
+        );
+        for (key, val) in pair {
+            self.records.push(FsRecord { key, val });
+        }
         Ok(())
     }
 
@@ -1637,13 +1705,13 @@ fn derive_uuid(name: &[u8], salt: &[u8]) -> [u8; 16] {
     out
 }
 
-fn mode_reg(perm: u16) -> u16 {
+pub(crate) fn mode_reg(perm: u16) -> u16 {
     0o100_000 | (perm & 0o7777)
 }
-fn mode_dir(perm: u16) -> u16 {
+pub(crate) fn mode_dir(perm: u16) -> u16 {
     0o040_000 | (perm & 0o7777)
 }
-fn mode_lnk(perm: u16) -> u16 {
+pub(crate) fn mode_lnk(perm: u16) -> u16 {
     0o120_000 | (perm & 0o7777)
 }
 

@@ -679,19 +679,13 @@ impl RepackSink for TarStreamSink {
 pub fn walk_source_into_sink(source: &Source, sink: &mut dyn RepackSink) -> Result<()> {
     match source {
         Source::HostDir(p) => walk_host_dir(p, sink),
-        Source::TarArchive {
-            path,
-            codec: Some(algo),
-        } => {
-            // Stream the compressed tar forward — decompress on the fly,
-            // no tempfile. Like the other arms, the caller owns
-            // `sink.finish()`.
-            let mut reader = open_tar_stream(path, Some(*algo))?;
+        Source::TarArchive { path, codec } => {
+            // Stream the tar forward, whether compressed or not — a tar
+            // is sequential, never seeked, so `Tar::open`'s upfront
+            // index build is wasted work (it dominated profiles before
+            // this arm was unified).
+            let mut reader = open_tar_stream(path, *codec)?;
             walk_tar_stream(&mut reader, sink)
-        }
-        Source::TarArchive { path, codec: None } => {
-            let target = crate::inspect::Target::parse(&path.to_string_lossy());
-            walk_image(&target, sink)
         }
         Source::Image(target) => walk_image(target, sink),
         Source::Layered(layers) => {

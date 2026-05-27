@@ -219,11 +219,128 @@ impl<'a> FileHandle for ApfsFileHandle<'a> {
     }
 }
 
+/// Mutation context handed to closures passed into
+/// [`commit_with_mutator`]. Carries everything a Write-state
+/// mutator might touch:
+///
+/// - the dumped fs-tree records (read/write),
+/// - the underlying device (for extent body writes),
+/// - the bump-allocator high-water (advanced when a new extent is
+///   allocated),
+/// - the per-volume counters the APSB tracks (`next_oid`,
+///   `num_files`, `num_directories`, `num_symlinks`).
+///
+/// Counters and `bump_high_water` are read back by
+/// [`commit_with_mutator`] after the closure returns and threaded
+/// through to [`write::ApfsWriter::new_checkpoint`], so the new
+/// checkpoint's APSB reflects whatever the closure did.
+pub(crate) struct MutatorCx<'a> {
+    /// In-memory dump of every existing fs-tree record. Mutators
+    /// add / remove / patch entries here; the order doesn't matter
+    /// (the writer sorts on flush).
+    pub records: &'a mut Vec<(Vec<u8>, Vec<u8>)>,
+    dev: &'a mut dyn BlockDevice,
+    block_size: u32,
+    total_blocks: u64,
+    bump_high_water: u64,
+    next_oid: u64,
+    num_files: u64,
+    num_directories: u64,
+    num_symlinks: u64,
+}
+
+impl<'a> MutatorCx<'a> {
+    /// Block size in bytes (4096 on every APFS image in the wild).
+    #[allow(dead_code)] // used by commit-3+ callers
+    pub(crate) fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// Bump-allocate a fresh extent of `len_bytes` (rounded up to a
+    /// whole block). Returns the physical block number the extent
+    /// starts at. Subsequent calls return non-overlapping ranges.
+    /// Errors when the device doesn't have enough remaining blocks.
+    #[allow(dead_code)] // used by commit-3+ callers
+    pub(crate) fn alloc_extent(&mut self, len_bytes: u64) -> Result<u64> {
+        if len_bytes == 0 {
+            return Ok(0);
+        }
+        let bs = self.block_size as u64;
+        let blocks = len_bytes.div_ceil(bs);
+        let start = self.bump_high_water;
+        let end = start.checked_add(blocks).ok_or_else(|| {
+            crate::Error::InvalidArgument("apfs: extent allocation overflow".into())
+        })?;
+        if end > self.total_blocks {
+            return Err(crate::Error::InvalidArgument(format!(
+                "apfs: not enough free blocks to allocate {len_bytes} bytes \
+                 (need {blocks}, have {})",
+                self.total_blocks - self.bump_high_water
+            )));
+        }
+        self.bump_high_water = end;
+        Ok(start)
+    }
+
+    /// Write `bytes` into the extent starting at `paddr`. Pads the
+    /// final block with zeros if `bytes.len()` isn't a multiple of
+    /// `block_size`. The caller is responsible for `paddr` having
+    /// come from a recent [`Self::alloc_extent`] call sized for
+    /// `bytes.len()`.
+    #[allow(dead_code)] // used by commit-3+ callers
+    pub(crate) fn write_extent_bytes(&mut self, paddr: u64, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let bs = self.block_size as usize;
+        let bs_u64 = bs as u64;
+        let blocks = bytes.len().div_ceil(bs);
+        let mut blk = vec![0u8; bs];
+        for i in 0..blocks {
+            let off = i * bs;
+            let end = (off + bs).min(bytes.len());
+            blk.fill(0);
+            blk[..end - off].copy_from_slice(&bytes[off..end]);
+            self.dev.write_at((paddr + i as u64) * bs_u64, &blk)?;
+        }
+        Ok(())
+    }
+
+    /// Reserve and return the next free APFS object id. Bumps the
+    /// internal counter so a second call returns a different value.
+    #[allow(dead_code)] // used by commit-4+ callers
+    pub(crate) fn alloc_oid(&mut self) -> u64 {
+        let oid = self.next_oid;
+        self.next_oid = self.next_oid.saturating_add(1);
+        oid
+    }
+
+    /// Increment the APSB's `apfs_num_files` counter. Call this once
+    /// per regular file added by the mutator.
+    #[allow(dead_code)] // used by commit-4+ callers
+    pub(crate) fn note_new_file(&mut self) {
+        self.num_files = self.num_files.saturating_add(1);
+    }
+
+    /// Increment the APSB's `apfs_num_directories` counter.
+    #[allow(dead_code)] // used by commit-4+ callers
+    pub(crate) fn note_new_dir(&mut self) {
+        self.num_directories = self.num_directories.saturating_add(1);
+    }
+
+    /// Increment the APSB's `apfs_num_symlinks` counter.
+    #[allow(dead_code)] // used by commit-4+ callers
+    pub(crate) fn note_new_symlink(&mut self) {
+        self.num_symlinks = self.num_symlinks.saturating_add(1);
+    }
+}
+
 /// Commit a checkpoint after running `mutator` against the dumped
-/// fs-tree record list. Use this for any change that lives entirely
-/// in B-tree records (inode attributes, directory entries, xattrs,
-/// hardlink bookkeeping, …) — anything that doesn't need fresh file
-/// extents allocated.
+/// fs-tree record list. Use this for any Write-state mutation:
+/// inode attribute patches, directory entry add / remove / rename,
+/// xattr edits, file creation (extent allocation via
+/// [`MutatorCx::alloc_extent`]), file body rewrites — all go through
+/// here, so the COW pathway lives in exactly one place.
 ///
 /// On return, `fs.state` is refreshed to a fresh write state that
 /// reflects the newly-written checkpoint.
@@ -233,7 +350,7 @@ pub(crate) fn commit_with_mutator<F>(
     mutator: F,
 ) -> Result<()>
 where
-    F: FnOnce(&mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<()>,
+    F: FnOnce(&mut MutatorCx<'_>) -> Result<()>,
 {
     let (
         block_size,
@@ -271,7 +388,28 @@ where
     };
 
     let mut records = dump_all_records(fs, dev)?;
-    mutator(&mut records)?;
+    // Build a context the mutator can both read records out of and
+    // append fresh extents to. `bump_high_water` / counters are
+    // copied out after the mutator returns and threaded through to
+    // the writer so the new APSB reflects the closure's work.
+    let mut cx = MutatorCx {
+        records: &mut records,
+        dev,
+        block_size,
+        total_blocks,
+        bump_high_water,
+        next_oid,
+        num_files,
+        num_directories,
+        num_symlinks,
+    };
+    mutator(&mut cx)?;
+    let new_bump_high_water = cx.bump_high_water;
+    let new_next_oid = cx.next_oid;
+    let new_num_files = cx.num_files;
+    let new_num_directories = cx.num_directories;
+    let new_num_symlinks = cx.num_symlinks;
+    drop(cx);
 
     let new_xid = cur_xid + 1;
     {
@@ -284,11 +422,11 @@ where
             volume_uuid,
             new_xid,
             next_xp_desc_slot,
-            bump_high_water,
-            next_oid,
-            num_files,
-            num_directories,
-            num_symlinks,
+            new_bump_high_water,
+            new_next_oid,
+            new_num_files,
+            new_num_directories,
+            new_num_symlinks,
         )?;
         for (k, v) in records {
             w.push_raw_record(k, v);

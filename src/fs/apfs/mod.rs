@@ -830,7 +830,8 @@ impl Apfs {
     pub fn chmod(&mut self, dev: &mut dyn BlockDevice, path: &str, mode_perms: u16) -> Result<()> {
         let target_oid = self.resolve_path_to_oid(dev, path)?;
         let new_perms = mode_perms & 0o7777;
-        rw::commit_with_mutator(self, dev, |records| {
+        rw::commit_with_mutator(self, dev, |cx| {
+            let records = &mut *cx.records;
             patch_inode_record(records, target_oid, |val| {
                 if val.len() < jrec::J_INODE_VAL_FIXED_SIZE {
                     return;
@@ -854,7 +855,8 @@ impl Apfs {
         group: u32,
     ) -> Result<()> {
         let target_oid = self.resolve_path_to_oid(dev, path)?;
-        rw::commit_with_mutator(self, dev, |records| {
+        rw::commit_with_mutator(self, dev, |cx| {
+            let records = &mut *cx.records;
             patch_inode_record(records, target_oid, |val| {
                 if val.len() < jrec::J_INODE_VAL_FIXED_SIZE {
                     return;
@@ -880,7 +882,8 @@ impl Apfs {
         atime_ns: Option<u64>,
     ) -> Result<()> {
         let target_oid = self.resolve_path_to_oid(dev, path)?;
-        rw::commit_with_mutator(self, dev, |records| {
+        rw::commit_with_mutator(self, dev, |cx| {
+            let records = &mut *cx.records;
             patch_inode_record(records, target_oid, |val| {
                 if val.len() < jrec::J_INODE_VAL_FIXED_SIZE {
                     return;
@@ -907,7 +910,8 @@ impl Apfs {
     /// Refuses non-empty directories.
     pub fn remove_path(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
         let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
-        rw::commit_with_mutator(self, dev, |records| {
+        rw::commit_with_mutator(self, dev, |cx| {
+            let records = &mut *cx.records;
             let (target_oid, dtype) = find_drec(records, parent_oid, &name).ok_or_else(|| {
                 crate::Error::InvalidArgument(format!(
                     "apfs: no such entry {name:?} under inode {parent_oid}"
@@ -973,7 +977,8 @@ impl Apfs {
     ) -> Result<()> {
         let (old_parent, old_name) = self.resolve_parent_and_name(dev, old_path)?;
         let (new_parent, new_name) = self.resolve_parent_and_name(dev, new_path)?;
-        rw::commit_with_mutator(self, dev, |records| {
+        rw::commit_with_mutator(self, dev, |cx| {
+            let records = &mut *cx.records;
             let (target_oid, dtype) =
                 find_drec(records, old_parent, &old_name).ok_or_else(|| {
                     crate::Error::InvalidArgument(format!(
@@ -1036,7 +1041,8 @@ impl Apfs {
                 "apfs: cannot hardlink to a directory".into(),
             ));
         }
-        rw::commit_with_mutator(self, dev, |records| {
+        rw::commit_with_mutator(self, dev, |cx| {
+            let records = &mut *cx.records;
             if find_drec(records, new_parent, &new_name).is_some() {
                 return Err(crate::Error::InvalidArgument(format!(
                     "apfs: link target {new_name:?} already exists"

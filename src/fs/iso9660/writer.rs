@@ -344,8 +344,12 @@ struct Node {
     name: String,
     /// File / dir / symlink / device.
     kind: NodeKind,
-    /// Children, sorted by ISO-comparison order. Empty for non-directories.
-    children: Vec<Node>,
+    /// Children keyed by name. `BTreeMap` keeps iteration in ISO-comparison
+    /// order natively (matching the previous `Vec` + sort step) and makes
+    /// `insert_node` / `find_node` O(log n) instead of the O(n) linear
+    /// scans that turned bulk-inserts of a flat directory into O(n²).
+    /// Empty for non-directories.
+    children: BTreeMap<String, Node>,
 }
 
 enum NodeKind {
@@ -363,7 +367,7 @@ fn build_tree(entries: &BTreeMap<PathBuf, PendingEntry>) -> Result<Node> {
         path: PathBuf::from("/"),
         name: "/".to_string(),
         kind: NodeKind::Dir,
-        children: Vec::new(),
+        children: BTreeMap::new(),
     };
     for (path, entry) in entries {
         let kind = match entry {
@@ -376,7 +380,8 @@ fn build_tree(entries: &BTreeMap<PathBuf, PendingEntry>) -> Result<Node> {
         };
         insert_node(&mut root, path, kind)?;
     }
-    sort_tree(&mut root);
+    // `BTreeMap` already iterates in key (= name) order, so no separate
+    // sort pass is needed.
     Ok(root)
 }
 
@@ -398,52 +403,36 @@ fn insert_node(root: &mut Node, path: &Path, kind: NodeKind) -> Result<()> {
         let is_leaf = i + 1 == components.len();
         let mut full = cur.path.clone();
         full.push(comp);
-        if let Some(idx) = cur.children.iter().position(|c| c.name == *comp) {
-            if is_leaf {
-                cur.children[idx].kind = match &kind {
-                    NodeKind::Dir => NodeKind::Dir,
-                    NodeKind::File { size } => NodeKind::File { size: *size },
-                    NodeKind::Symlink { target } => NodeKind::Symlink {
-                        target: target.clone(),
-                    },
-                    NodeKind::Device => NodeKind::Device,
-                };
+        let leaf_kind = || -> NodeKind {
+            match &kind {
+                NodeKind::Dir => NodeKind::Dir,
+                NodeKind::File { size } => NodeKind::File { size: *size },
+                NodeKind::Symlink { target } => NodeKind::Symlink {
+                    target: target.clone(),
+                },
+                NodeKind::Device => NodeKind::Device,
             }
-            cur = &mut cur.children[idx];
+        };
+        if cur.children.contains_key(*comp) {
+            if is_leaf {
+                cur.children.get_mut(*comp).unwrap().kind = leaf_kind();
+            }
+            cur = cur.children.get_mut(*comp).unwrap();
         } else {
-            let child_kind = if is_leaf {
-                match &kind {
-                    NodeKind::Dir => NodeKind::Dir,
-                    NodeKind::File { size } => NodeKind::File { size: *size },
-                    NodeKind::Symlink { target } => NodeKind::Symlink {
-                        target: target.clone(),
-                    },
-                    NodeKind::Device => NodeKind::Device,
-                }
-            } else {
-                NodeKind::Dir
-            };
-            cur.children.push(Node {
-                path: full,
-                name: (*comp).to_string(),
-                kind: child_kind,
-                children: Vec::new(),
-            });
-            let n = cur.children.len() - 1;
-            cur = &mut cur.children[n];
+            let child_kind = if is_leaf { leaf_kind() } else { NodeKind::Dir };
+            cur.children.insert(
+                (*comp).to_string(),
+                Node {
+                    path: full,
+                    name: (*comp).to_string(),
+                    kind: child_kind,
+                    children: BTreeMap::new(),
+                },
+            );
+            cur = cur.children.get_mut(*comp).unwrap();
         }
     }
     Ok(())
-}
-
-fn sort_tree(node: &mut Node) {
-    // ISO 9660 sort order: ascending byte-wise by uppercased 8.3
-    // identifier. For our purposes, lexicographic on the cooked name is
-    // good enough — both Joliet and Rock Ridge tolerate any sort.
-    node.children.sort_by(|a, b| a.name.cmp(&b.name));
-    for child in node.children.iter_mut() {
-        sort_tree(child);
-    }
 }
 
 /// Layout results. Every directory in `dir_lba` has its LBA assigned;
@@ -555,7 +544,7 @@ fn collect_directories(root: &Node) -> Vec<(PathBuf, u16)> {
     let mut out: Vec<(PathBuf, u16)> = vec![(root.path.clone(), 1)];
     let mut queue: Vec<(usize, &Node)> = vec![(0, root)];
     while let Some((parent_idx_minus1, parent)) = queue.pop() {
-        for child in &parent.children {
+        for child in parent.children.values() {
             if matches!(child.kind, NodeKind::Dir) {
                 let parent_record = (parent_idx_minus1 + 1) as u16;
                 out.push((child.path.clone(), parent_record));
@@ -579,7 +568,7 @@ fn find_node<'a>(root: &'a Node, path: &Path) -> Option<&'a Node> {
         .collect();
     let mut cur = root;
     for comp in comps {
-        cur = cur.children.iter().find(|c| c.name == comp)?;
+        cur = cur.children.get(comp)?;
     }
     Some(cur)
 }
@@ -634,7 +623,7 @@ fn dir_records_byte_size(dir: &Node, opts: &FormatOpts, joliet: bool, is_root: b
         sum += 7;
     }
     let want_rr = opts.rock_ridge && !joliet;
-    for child in &dir.children {
+    for child in dir.children.values() {
         sum += dir_record_size(child, want_rr, joliet) as u64;
     }
     // Round up to sector — ISO records don't straddle sectors. We
@@ -1048,7 +1037,7 @@ fn encode_dir_records(
     let parent_size = dir_lba.get(&parent.path).copied().unwrap().1;
     buf.extend_from_slice(&encode_dot_record(parent_lba, parent_size, 0x01));
 
-    for child in &dir.children {
+    for child in dir.children.values() {
         let rec = encode_child_record(child, dir_lba, file_lba, opts, joliet);
         // Records can't straddle a 2K boundary.
         let sector_used = buf.len() as u64 % SECTOR;

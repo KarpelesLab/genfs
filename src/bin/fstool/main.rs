@@ -2339,7 +2339,32 @@ where
     apply(&mut format_opts, &mut bag)?;
     bag.check_empty(label)?;
 
-    let bytes = resolve_size_for_dev(output, size_arg, is_device, default_min_size)?;
+    // When the user supplied a source but no `--size`, walk it once to
+    // pick a size that fits. Without this, a host-dir source always got
+    // the 1 MiB `default_min_size` and the writer overran the device on
+    // anything larger than empty. We over-provision (`total_file_bytes ×
+    // 2 + 64 MiB`) and let the deferred-archive backends (squashfs / iso
+    // / grf) truncate via `image_len` after flush; fixed-size FSes just
+    // get a comfortable image.
+    let auto_size = if !is_device
+        && size_arg.is_none()
+        && let Some(src) = source
+    {
+        let analysis = fstool::analyze::analyze_source(src, 1024)?;
+        Some(
+            analysis
+                .total_file_bytes
+                .saturating_mul(2)
+                .saturating_add(64 * 1024 * 1024)
+                .max(default_min_size),
+        )
+    } else {
+        None
+    };
+    let bytes = match auto_size {
+        Some(b) => b,
+        None => resolve_size_for_dev(output, size_arg, is_device, default_min_size)?,
+    };
     let mut dev = fstool::block::create_image(
         output,
         bytes,

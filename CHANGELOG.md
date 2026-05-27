@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7](https://github.com/KarpelesLab/fstool/compare/v0.4.6...v0.4.7) - 2026-05-27
+
+### Added
+
+- *(ext)* triple-indirect, LARGE_FILE, and prezeroed fast-path
+- *(repack)* truncate filename from the left to fit a narrow PTY
+- *(repack)* progress bar during the copy phase
+
+### Fixed
+
+- *(qcow2)* keep image sparse for zero writes to unmapped clusters
+- *(create)* auto-size from source instead of the 1 MiB default
+- *(repack)* reset file counter at each phase, not summed across passes
+
+### Other
+
+- drop private-item intra-doc link in file_block
+- cargo fmt the new tests + helper closure
+
 ## [0.4.6](https://github.com/KarpelesLab/fstool/compare/v0.4.5...v0.4.6) - 2026-05-27
 
 ### Added

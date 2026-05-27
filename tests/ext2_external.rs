@@ -874,3 +874,156 @@ fn ext2_large_directory_uses_indirect_block() {
         .count();
     assert_eq!(count as u32, n, "debugfs counted {count}, expected {n}");
 }
+
+/// `FormatOpts::prezeroed = true` skips the upfront full-device zero
+/// pass. On a freshly-`set_len`'d sparse file the device already reads
+/// as zero, so the result must still be a well-formed ext2 — and the
+/// backing file must stay genuinely sparse (du --apparent-size much
+/// larger than du), because nothing has dirtied the unused regions.
+#[test]
+fn prezeroed_skips_full_device_zero_and_stays_sparse() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    // 128 MiB image, but the only thing written is the FS metadata —
+    // a few MB. With prezeroed = true the rest must stay as a hole.
+    let bs: u32 = 4096;
+    let blocks: u32 = (128 * 1024 * 1024) / bs;
+    let mut opts = FormatOpts {
+        kind: fstool::fs::ext::FsKind::Ext4,
+        block_size: bs,
+        blocks_count: blocks,
+        inodes_count: 4096,
+        sparse_super: true,
+        prezeroed: true,
+        ..FormatOpts::default()
+    };
+    // mke2fs's flex_bg packs metadata; mirror it so untouched groups
+    // really do stay zero.
+    opts.log_groups_per_flex = FormatOpts::default_log_groups_per_flex(
+        opts.blocks_count.div_ceil(8 * opts.block_size),
+    );
+    build_empty_ext2(tmp.path(), &opts);
+
+    // Filesystem is well-formed.
+    let out = Command::new("e2fsck").arg("-fn").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Backing file is sparse: on-disk size ≪ apparent size. We don't
+    // pin the exact number — flex_bg + sparse_super shape it — but a
+    // 128 MiB ext4 with no user data should be well under 16 MiB on
+    // disk on every filesystem that supports holes.
+    let meta = std::fs::metadata(tmp.path()).unwrap();
+    let apparent = meta.len();
+    assert_eq!(apparent, 128 * 1024 * 1024);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let on_disk = meta.blocks() * 512;
+        assert!(
+            on_disk < 16 * 1024 * 1024,
+            "prezeroed image is not sparse: {on_disk} bytes on disk (apparent {apparent})",
+        );
+    }
+}
+
+/// Round-trip a regular file past the double-indirect cap (~4.004 GiB
+/// at 4 KiB blocks) — exercises both triple-indirect block pointers and
+/// the `RO_COMPAT_LARGE_FILE` size-high handling. The image must
+/// validate clean with e2fsck and our own reader must produce the same
+/// bytes back.
+#[test]
+fn large_file_round_trips_through_triple_indirect() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    // 4.1 GiB file — past u32::MAX (4 GiB - 1) and past the
+    // direct+single+double cap at 1 KiB blocks (~65 MiB). Mostly zeros
+    // (cheap on disk thanks to sparse repack), with a known-pattern
+    // chunk at the start, middle, and end so the round-trip catches a
+    // wrong block in any of the three indirection layers.
+    let src = dir.path().join("big.bin");
+    {
+        use std::io::Seek as _;
+        use std::io::SeekFrom;
+        let mut f = std::fs::File::create(&src).unwrap();
+        let len: u64 = 4_400 * 1024 * 1024;
+        f.set_len(len).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&[0xABu8; 4096]).unwrap();
+        f.seek(SeekFrom::Start(len / 2)).unwrap();
+        f.write_all(&[0xCDu8; 4096]).unwrap();
+        f.seek(SeekFrom::Start(len - 4096)).unwrap();
+        f.write_all(&[0xEFu8; 4096]).unwrap();
+        f.sync_all().unwrap();
+    }
+    let tar = dir.path().join("big.tar");
+    let st = Command::new("tar").arg("-cf").arg(&tar).arg("-C").arg(dir.path()).arg("big.bin").status().unwrap();
+    assert!(st.success(), "tar failed");
+
+    let img = dir.path().join("out.img");
+    let bin = env!("CARGO_BIN_EXE_fstool");
+    let r = Command::new(bin)
+        .args(["repack", "--size", "8G", "--fs-type", "ext2"])
+        .arg(&tar)
+        .arg(&img)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "repack failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // e2fsck must accept it — confirms triple-indirect block-pointer
+    // structure + LARGE_FILE feature flag + i_size_high all line up.
+    let out = Command::new("e2fsck").arg("-fn").arg(&img).output().unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck failed on > 4 GiB file:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Hash the source via external md5sum (avoids pulling in a dev-dep
+    // just for one test). Then stream the body back via
+    // `fstool cat … | md5sum` so we don't buffer 4.4 GiB in-process.
+    let Some(_) = which("md5sum") else {
+        eprintln!("skipping checksum check: md5sum not installed");
+        return;
+    };
+    let m = Command::new("md5sum").arg(&src).output().unwrap();
+    let want = String::from_utf8(m.stdout).unwrap();
+    let want_hash = want.split_whitespace().next().unwrap().to_string();
+
+    let mut cat = std::process::Command::new(bin)
+        .args(["cat"])
+        .arg(&img)
+        .arg("/big.bin")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let cat_out = cat.stdout.take().unwrap();
+    let md5 = std::process::Command::new("md5sum")
+        .stdin(std::process::Stdio::from(cat_out))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let md5_out = md5.wait_with_output().unwrap();
+    let cat_status = cat.wait().unwrap();
+    assert!(cat_status.success(), "fstool cat exited non-zero");
+    assert!(md5_out.status.success(), "md5sum exited non-zero");
+    let got = String::from_utf8(md5_out.stdout).unwrap();
+    let got_hash = got.split_whitespace().next().unwrap();
+    assert_eq!(got_hash, want_hash, "round-trip checksum mismatch");
+}
+

@@ -572,7 +572,14 @@ fn format_ext_into(
     opts: &crate::fs::ext::FormatOpts,
 ) -> Result<()> {
     let rootdevs = parse_rootdevs(fs.rootdevs.as_deref())?;
-    let mut ext = Ext::format_with(dev, opts)?;
+    // Spec builds always run on a device that was just created (raw
+    // file / qcow2 / sliced partition of one), which reads back as
+    // zero — skip `format_with`'s full-device zero pass.
+    let opts = crate::fs::ext::FormatOpts {
+        prezeroed: true,
+        ..opts.clone()
+    };
+    let mut ext = Ext::format_with(dev, &opts)?;
     if let Some(src) = &fs.source {
         let source = source_from_spec(src)?;
         crate::repack::populate_ext_from_source(dev, &mut ext, &source)?;

@@ -160,6 +160,25 @@ impl Inode {
         }
     }
 
+    /// Logical file size in bytes, for regular files. Reads
+    /// `size_hi_or_dir_acl` as `i_size_high` (per ext2/3's
+    /// `RO_COMPAT_LARGE_FILE` layout) and combines it with `size` for
+    /// files > 4 GiB. For non-regular inodes the upper half is
+    /// `i_dir_acl` and the caller must use `size` directly — this
+    /// helper is named accordingly to discourage that misuse.
+    pub fn file_size(&self) -> u64 {
+        ((self.size_hi_or_dir_acl as u64) << 32) | self.size as u64
+    }
+
+    /// Store a 64-bit file size across the low/high halves. The caller
+    /// is responsible for setting the `RO_COMPAT_LARGE_FILE` feature
+    /// on the superblock when any file ends up with a non-zero
+    /// `size_hi`. Only meaningful on regular-file inodes.
+    pub fn set_file_size(&mut self, len: u64) {
+        self.size = len as u32;
+        self.size_hi_or_dir_acl = (len >> 32) as u32;
+    }
+
     /// Encode into the 128-byte on-disk representation.
     pub fn encode(&self) -> [u8; INODE_BASE_SIZE] {
         let mut buf = [0u8; INODE_BASE_SIZE];

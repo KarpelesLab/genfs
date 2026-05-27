@@ -849,6 +849,11 @@ fn repack_cmd(
                 // the ext writer re-sparsifies all-zero blocks, so holes
                 // round-trip.
                 opts.sparse = true;
+                // dst_dev came from `block::create_image` above — a
+                // fresh sparse file or qcow2, already all-zero. Tell
+                // the formatter so it skips its upfront full-device
+                // zero pass.
+                opts.prezeroed = true;
                 let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
                 if dst_size > plan_size {
                     let max = (dst_size / opts.block_size as u64) as u32;
@@ -1191,6 +1196,8 @@ fn repack_layered_to_dst(
             };
             let mut opts = analysis.ext_format_opts(kind);
             opts.sparse = true;
+            // dst_dev is a fresh image from `create_image` above.
+            opts.prezeroed = true;
             let plan_size = opts.blocks_count as u64 * opts.block_size as u64;
             if dst_size > plan_size {
                 let max = (dst_size / opts.block_size as u64) as u32;
@@ -1385,6 +1392,9 @@ fn repack_tar_stream_to_fs(
             };
             let mut opts = analysis.ext_format_opts(kind);
             opts.sparse = true;
+            // dst_dev is created fresh below via `create_image`, so the
+            // formatter can skip its full-device zero pass.
+            opts.prezeroed = true;
             Some(opts)
         }
         _ => None,
@@ -2191,6 +2201,10 @@ fn create_ext(
     }
     let final_size = format_opts.blocks_count as u64 * format_opts.block_size as u64;
 
+    // `dev` was just created by `create_image` — a freshly-`set_len`'d
+    // sparse raw file or a fresh qcow2 — so it reads back as zero. Skip
+    // the formatter's full-device zero pass.
+    format_opts.prezeroed = true;
     let mut ext = Ext::format_with(dev.as_mut(), &format_opts)?;
     if let Some(src) = source {
         fstool::repack::populate_ext_from_source(dev.as_mut(), &mut ext, src)?;

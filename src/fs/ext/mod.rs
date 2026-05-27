@@ -132,6 +132,21 @@ pub struct FormatOpts {
     /// shape of the FS so kernel/e2fsck installations older than ~3.8
     /// would refuse to mount the result.
     pub inline_data: bool,
+    /// When true, the caller guarantees the device's first
+    /// `blocks_count * block_size` bytes already read back as zero
+    /// (e.g. a freshly-`set_len`'d sparse file, a fresh `Qcow2Backend`,
+    /// or a freshly-allocated `MemoryBackend`). The formatter skips its
+    /// upfront full-device `zero_range`, which on an 8 GiB raw image is
+    /// 8 GiB of writes, and on a sparse qcow2 is a no-op walk over
+    /// every cluster but still pure overhead.
+    ///
+    /// Off by default so the formatter remains correct on a device with
+    /// arbitrary prior contents — leaving stale data behind in the
+    /// inode-table tail of empty groups, or in the journal data area
+    /// past block 0, would produce a filesystem that e2fsck and the
+    /// kernel reject. Flip it on only when you know the destination is
+    /// zero.
+    pub prezeroed: bool,
 }
 
 impl Default for FormatOpts {
@@ -153,6 +168,7 @@ impl Default for FormatOpts {
             use_64bit: false,
             sparse_super2: false,
             inline_data: false,
+            prezeroed: false,
         }
     }
 }
@@ -379,8 +395,18 @@ impl Ext {
             )));
         }
 
-        // Zero the FS region. Backends may treat this as a sparse hole.
-        dev.zero_range(0, total_bytes)?;
+        // Zero the FS region so anything we don't explicitly write back
+        // — the tail of every inode-table block in a group with no
+        // staged inodes, journal data blocks past the JBD2 superblock,
+        // bitmap-tracked-but-untouched regions — reads back as zero.
+        // Backends may treat this as a sparse hole. Callers that just
+        // created the device (`block::create_image`, `MemoryBackend`)
+        // set `prezeroed` to skip the pass: those devices already read
+        // as zero, and an 8 GiB `zero_range` on a freshly-`set_len`'d
+        // raw file is 8 GiB of pointless writes.
+        if !opts.prezeroed {
+            dev.zero_range(0, total_bytes)?;
+        }
 
         // Build superblock.
         let mut sb = Superblock::ext2_default();
@@ -679,16 +705,18 @@ impl Ext {
         Ok(meta as u32)
     }
 
-    /// Ext2 / Ext3 path: direct + single + double indirection. v1 cap.
-    /// At 1 KiB blocks that's up to 12 + 256 + 256² ≈ 65 MiB; at 4 KiB
-    /// it's ~4 GiB.
+    /// Ext2 / Ext3 path: direct + single + double + triple indirection.
+    /// At 4 KiB blocks that's up to 12 + 1024 + 1024² + 1024³ ≈ 4 TiB —
+    /// the actual ext2 single-file cap on most setups (the `LARGE_FILE`
+    /// RO-compat feature must be set when any file uses i_size_high,
+    /// which the caller does in [`Self::add_file_to_streaming`]).
     ///
     /// A `0` in `data` is a hole (sparse file): the corresponding block
-    /// pointer stays 0, and an indirect block whose entire range is holes
-    /// is not allocated at all.
+    /// pointer stays 0, and any indirect block whose entire range is
+    /// holes is not allocated at all.
     fn fill_block_pointers_indirect(&mut self, inode: &mut Inode, data: &[u32]) -> Result<u32> {
         let bs = self.layout.block_size;
-        let ptrs_per_block = (bs / 4) as usize;
+        let ptrs = (bs / 4) as usize;
         let n = data.len();
         let n_direct = constants::N_DIRECT.min(n);
         inode.block[..n_direct].copy_from_slice(&data[..n_direct]);
@@ -696,61 +724,122 @@ impl Ext {
         let mut consumed = n_direct;
 
         if consumed < n {
-            // Single-indirect — only allocate the indirect block if at least
-            // one block in its range is actually present.
-            let take = (n - consumed).min(ptrs_per_block);
-            let range = &data[consumed..consumed + take];
-            if range.iter().any(|&b| b != 0) {
-                let ind = self.alloc_data_block()?;
-                allocated_meta += 1;
-                inode.block[constants::IDX_INDIRECT] = ind;
-                let mut buf = vec![0u8; bs as usize];
-                for (i, &b) in range.iter().enumerate() {
-                    buf[i * 4..i * 4 + 4].copy_from_slice(&b.to_le_bytes());
-                }
-                self.push_data_block(ind, buf);
-            }
-            consumed += take;
+            let ind = self.build_indirect_l1(data, &mut consumed, bs, ptrs, &mut allocated_meta)?;
+            inode.block[constants::IDX_INDIRECT] = ind;
         }
 
         if consumed < n {
-            // Double-indirect. Each sub-indirect block is allocated only if
-            // its range has a non-hole block; the double-indirect block
-            // itself is allocated only if at least one sub-indirect is.
-            let mut dind_buf = vec![0u8; bs as usize];
-            let mut dind_slot = 0;
-            let mut any_sub = false;
-            while consumed < n {
-                if dind_slot >= ptrs_per_block {
-                    return Err(crate::Error::Unsupported(
-                        "ext: file exceeds direct+single+double indirection capacity".into(),
-                    ));
-                }
-                let take = (n - consumed).min(ptrs_per_block);
-                let range = &data[consumed..consumed + take];
-                if range.iter().any(|&b| b != 0) {
-                    let ind = self.alloc_data_block()?;
-                    allocated_meta += 1;
-                    any_sub = true;
-                    dind_buf[dind_slot * 4..dind_slot * 4 + 4].copy_from_slice(&ind.to_le_bytes());
-                    let mut ind_buf = vec![0u8; bs as usize];
-                    for (i, &b) in range.iter().enumerate() {
-                        ind_buf[i * 4..i * 4 + 4].copy_from_slice(&b.to_le_bytes());
-                    }
-                    self.push_data_block(ind, ind_buf);
-                }
-                consumed += take;
-                dind_slot += 1;
-            }
-            if any_sub {
-                let dind = self.alloc_data_block()?;
-                allocated_meta += 1;
-                inode.block[constants::IDX_DOUBLE_INDIRECT] = dind;
-                self.push_data_block(dind, dind_buf);
-            }
+            let dind = self.build_indirect_l2(data, &mut consumed, bs, ptrs, &mut allocated_meta)?;
+            inode.block[constants::IDX_DOUBLE_INDIRECT] = dind;
+        }
+
+        if consumed < n {
+            let tind = self.build_indirect_l3(data, &mut consumed, bs, ptrs, &mut allocated_meta)?;
+            inode.block[constants::IDX_TRIPLE_INDIRECT] = tind;
+        }
+
+        if consumed < n {
+            return Err(crate::Error::Unsupported(
+                "ext: file exceeds direct+single+double+triple indirection capacity".into(),
+            ));
         }
 
         Ok(allocated_meta)
+    }
+
+    /// Build a single-indirect (level-1) block: up to `ptrs` data-block
+    /// pointers laid out in a freshly-allocated block. Returns the
+    /// block number, or `0` when every pointer in the range is a hole
+    /// (in which case nothing is allocated). Increments `meta` by the
+    /// indirect block this call allocated.
+    fn build_indirect_l1(
+        &mut self,
+        data: &[u32],
+        consumed: &mut usize,
+        bs: u32,
+        ptrs: usize,
+        meta: &mut u32,
+    ) -> Result<u32> {
+        let take = (data.len() - *consumed).min(ptrs);
+        let range = &data[*consumed..*consumed + take];
+        *consumed += take;
+        if range.iter().all(|&b| b == 0) {
+            return Ok(0);
+        }
+        let ind = self.alloc_data_block()?;
+        *meta += 1;
+        let mut buf = vec![0u8; bs as usize];
+        for (i, &b) in range.iter().enumerate() {
+            buf[i * 4..i * 4 + 4].copy_from_slice(&b.to_le_bytes());
+        }
+        self.push_data_block(ind, buf);
+        Ok(ind)
+    }
+
+    /// Build a double-indirect (level-2) block: up to `ptrs` slots, each
+    /// pointing at a single-indirect block built by `build_indirect_l1`.
+    /// Allocates the double-indirect block only when at least one
+    /// sub-block is non-empty. Returns `0` when the entire double-
+    /// indirect range is holes.
+    fn build_indirect_l2(
+        &mut self,
+        data: &[u32],
+        consumed: &mut usize,
+        bs: u32,
+        ptrs: usize,
+        meta: &mut u32,
+    ) -> Result<u32> {
+        let mut dind_buf = vec![0u8; bs as usize];
+        let mut any_sub = false;
+        for slot in 0..ptrs {
+            if *consumed >= data.len() {
+                break;
+            }
+            let ind = self.build_indirect_l1(data, consumed, bs, ptrs, meta)?;
+            if ind != 0 {
+                dind_buf[slot * 4..slot * 4 + 4].copy_from_slice(&ind.to_le_bytes());
+                any_sub = true;
+            }
+        }
+        if !any_sub {
+            return Ok(0);
+        }
+        let dind = self.alloc_data_block()?;
+        *meta += 1;
+        self.push_data_block(dind, dind_buf);
+        Ok(dind)
+    }
+
+    /// Build a triple-indirect (level-3) block: up to `ptrs` slots, each
+    /// pointing at a double-indirect block built by `build_indirect_l2`.
+    /// Same all-holes elision rule as the lower levels.
+    fn build_indirect_l3(
+        &mut self,
+        data: &[u32],
+        consumed: &mut usize,
+        bs: u32,
+        ptrs: usize,
+        meta: &mut u32,
+    ) -> Result<u32> {
+        let mut tind_buf = vec![0u8; bs as usize];
+        let mut any_dind = false;
+        for slot in 0..ptrs {
+            if *consumed >= data.len() {
+                break;
+            }
+            let dind = self.build_indirect_l2(data, consumed, bs, ptrs, meta)?;
+            if dind != 0 {
+                tind_buf[slot * 4..slot * 4 + 4].copy_from_slice(&dind.to_le_bytes());
+                any_dind = true;
+            }
+        }
+        if !any_dind {
+            return Ok(0);
+        }
+        let tind = self.alloc_data_block()?;
+        *meta += 1;
+        self.push_data_block(tind, tind_buf);
+        Ok(tind)
     }
 
     /// Allocate the journal inode (inode 8) and its data blocks. The first
@@ -2099,10 +2188,24 @@ impl Ext {
         meta: FileMeta,
     ) -> Result<u32> {
         let bs = self.layout.block_size;
+        // Cap at u32 logical blocks — this is well beyond the
+        // triple-indirect addressing range at every block size we
+        // emit (≈ 4 TiB at 4 KiB blocks), so a request past this is
+        // already going to fail at `fill_block_pointers` anyway.
+        // Catch it early with a clearer message.
+        let n_data_blocks_u64 = len.div_ceil(bs as u64);
+        if n_data_blocks_u64 > u32::MAX as u64 {
+            return Err(crate::Error::Unsupported(format!(
+                "ext: file of {len} bytes needs {n_data_blocks_u64} blocks (> u32::MAX)"
+            )));
+        }
+        // Files > 4 GiB ride the RO_COMPAT_LARGE_FILE layout: the
+        // upper 32 bits of size live in i_size_high (the
+        // `size_hi_or_dir_acl` field for regular files), and the
+        // feature bit must be set so older readers refuse the FS
+        // instead of silently truncating to the low 32 bits.
         if len > u32::MAX as u64 {
-            return Err(crate::Error::Unsupported(
-                "ext: file > 4 GiB requires LARGE_FILE (deferred to ext4)".into(),
-            ));
+            self.sb.feature_ro_compat |= constants::feature::RO_COMPAT_LARGE_FILE;
         }
 
         // Inline-data fast path: files that fit in the inode's
@@ -2145,16 +2248,18 @@ impl Ext {
             return Ok(ino);
         }
 
-        let n_data_blocks = len.div_ceil(bs as u64) as u32;
+        let n_data_blocks = n_data_blocks_u64 as u32;
 
         let ino = self.alloc_inode()?;
         let mut inode = Inode::regular(
+            // Low 32 bits; size_hi is stamped below for > 4 GiB files.
             len as u32,
             meta.mode & 0o7777,
             meta.uid,
             meta.gid,
             meta.mtime,
         );
+        inode.set_file_size(len);
 
         // Stream one block at a time. Each block is read into a fixed
         // buffer (the file is never fully resident in memory). In sparse
@@ -2832,12 +2937,18 @@ impl Ext {
     /// Only operates on regular files; returns `InvalidArgument` for
     /// dirs, symlinks, devices.
     pub fn truncate(&mut self, dev: &mut dyn BlockDevice, ino: u32, new_size: u64) -> Result<()> {
-        if new_size > u32::MAX as u64 {
-            return Err(crate::Error::Unsupported(
-                "ext: file > 4 GiB requires LARGE_FILE handling (deferred)".into(),
-            ));
+        let bs = self.layout.block_size;
+        let new_blocks_u64 = new_size.div_ceil(bs as u64);
+        if new_blocks_u64 > u32::MAX as u64 {
+            return Err(crate::Error::Unsupported(format!(
+                "ext: truncate target {new_size} bytes needs {new_blocks_u64} blocks (> u32::MAX)"
+            )));
         }
-        let new_size = new_size as u32;
+        if new_size > u32::MAX as u64 {
+            // Truncating an inode past 4 GiB requires LARGE_FILE; stamp
+            // the feature on the SB so the result is well-formed.
+            self.sb.feature_ro_compat |= constants::feature::RO_COMPAT_LARGE_FILE;
+        }
         self.ensure_inode_staged(dev, ino)?;
         let inode = self
             .inodes
@@ -2852,9 +2963,8 @@ impl Ext {
                 inode.mode
             )));
         }
-        let bs = self.layout.block_size;
-        let old_blocks = (inode.size as u64).div_ceil(bs as u64) as u32;
-        let new_blocks = (new_size as u64).div_ceil(bs as u64) as u32;
+        let old_blocks = inode.file_size().div_ceil(bs as u64) as u32;
+        let new_blocks = new_blocks_u64 as u32;
         // Shrink path: free everything past the new end.
         if new_blocks < old_blocks {
             for n in new_blocks..old_blocks {
@@ -2894,14 +3004,14 @@ impl Ext {
             self.patch_inode(dev, ino, |i| {
                 i.block = staged.block;
                 i.flags = staged.flags;
-                i.size = new_size;
+                i.set_file_size(new_size);
                 i.blocks_512 = (real_blocks + allocated_meta) * sectors_per_block;
             })?;
         } else {
             // Grow path (or no-op): leave block list alone, just bump
             // size. Subsequent writes will allocate as needed.
             self.patch_inode(dev, ino, |i| {
-                i.size = new_size;
+                i.set_file_size(new_size);
             })?;
         }
         Ok(())
@@ -3514,7 +3624,9 @@ impl Ext {
     /// Return the absolute block number for the `n`-th block (0-indexed) of
     /// the file at inode `ino`. Picks the representation based on the
     /// inode flags: `EXT4_EXTENTS_FL` → walk the extent tree;
-    /// otherwise → direct + single-indirect (double/triple deferred).
+    /// otherwise → direct + single + double + triple indirect, matching
+    /// the writer's [`Self::fill_block_pointers_indirect`]. Returns `0`
+    /// for a hole at any level (`mke2fs`-style sparse files).
     pub fn file_block(&self, dev: &mut dyn BlockDevice, ino: &Inode, n: u32) -> Result<u32> {
         if ino.flags & constants::EXT4_EXTENTS_FL != 0 {
             return self.file_block_extent(dev, ino, n);
@@ -3522,23 +3634,57 @@ impl Ext {
         if (n as usize) < constants::N_DIRECT {
             return Ok(ino.block[n as usize]);
         }
-        let ptrs_per_block = self.layout.block_size / 4;
-        let n_off = n - constants::N_DIRECT as u32;
-        if n_off < ptrs_per_block {
+        let ptrs = self.layout.block_size / 4;
+        let mut n_off = n - constants::N_DIRECT as u32;
+        let bs = self.layout.block_size as usize;
+        let mut buf = vec![0u8; bs];
+        let read_ptr = |this: &Self, dev: &mut dyn BlockDevice, blk: u32, idx: u32, buf: &mut [u8]| -> Result<u32> {
+            this.read_block(dev, blk, buf)?;
+            let off = (idx as usize) * 4;
+            Ok(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()))
+        };
+        // Single-indirect.
+        if n_off < ptrs {
             let ind = ino.block[constants::IDX_INDIRECT];
             if ind == 0 {
-                return Err(crate::Error::InvalidImage(
-                    "ext: indirect block index unset".into(),
-                ));
+                return Ok(0);
             }
-            let mut buf = vec![0u8; self.layout.block_size as usize];
-            self.read_block(dev, ind, &mut buf)?;
-            let off = (n_off as usize) * 4;
-            return Ok(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()));
+            return read_ptr(self, dev, ind, n_off, &mut buf);
         }
-        Err(crate::Error::Unsupported(
-            "ext: double/triple indirection not yet supported in reader".into(),
-        ))
+        n_off -= ptrs;
+        // Double-indirect.
+        if n_off < ptrs * ptrs {
+            let dind = ino.block[constants::IDX_DOUBLE_INDIRECT];
+            if dind == 0 {
+                return Ok(0);
+            }
+            let sub = read_ptr(self, dev, dind, n_off / ptrs, &mut buf)?;
+            if sub == 0 {
+                return Ok(0);
+            }
+            return read_ptr(self, dev, sub, n_off % ptrs, &mut buf);
+        }
+        n_off -= ptrs * ptrs;
+        // Triple-indirect.
+        if n_off < ptrs * ptrs * ptrs {
+            let tind = ino.block[constants::IDX_TRIPLE_INDIRECT];
+            if tind == 0 {
+                return Ok(0);
+            }
+            let dind = read_ptr(self, dev, tind, n_off / (ptrs * ptrs), &mut buf)?;
+            if dind == 0 {
+                return Ok(0);
+            }
+            let rem = n_off % (ptrs * ptrs);
+            let sub = read_ptr(self, dev, dind, rem / ptrs, &mut buf)?;
+            if sub == 0 {
+                return Ok(0);
+            }
+            return read_ptr(self, dev, sub, rem % ptrs, &mut buf);
+        }
+        Err(crate::Error::InvalidImage(format!(
+            "ext: logical block {n} exceeds triple-indirect range"
+        )))
     }
 
     /// Resolve logical block `n` against an inode that uses an ext4
@@ -3836,7 +3982,7 @@ pub struct FileReader<'a> {
 
 impl<'a> Read for FileReader<'a> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let total = self.inode.size as u64;
+        let total = self.inode.file_size();
         if self.pos >= total {
             return Ok(0);
         }
@@ -3878,7 +4024,7 @@ impl<'a> Read for FileReader<'a> {
 
 impl<'a> std::io::Seek for FileReader<'a> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        let total = self.inode.size as i128;
+        let total = self.inode.file_size() as i128;
         let new = match pos {
             std::io::SeekFrom::Start(n) => n as i128,
             std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
@@ -4139,12 +4285,21 @@ impl crate::fs::Filesystem for Ext {
         } else {
             0
         };
+        // For regular files past 4 GiB the upper 32 bits of size live
+        // in i_size_high (`size_hi_or_dir_acl` for regular files);
+        // `file_size()` is a no-op for the others (their size_hi is 0
+        // or unused as `i_dir_acl`).
+        let size = if matches!(kind, crate::fs::EntryKind::Regular) {
+            inode.file_size()
+        } else {
+            inode.size as u64
+        };
         Ok(crate::fs::FileAttrs {
             kind,
             mode: inode.mode & 0o7777,
             uid: inode.uid as u32,
             gid: inode.gid as u32,
-            size: inode.size as u64,
+            size,
             blocks: inode.blocks_512 as u64,
             nlink: inode.links_count as u32,
             atime: inode.atime,

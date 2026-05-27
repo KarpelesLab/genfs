@@ -99,16 +99,25 @@ impl<'a> Ext2FileHandle<'a> {
     }
 
     /// Move the local file length and patch the staged inode's
-    /// `i_size`. `blocks_512` stays in sync via [`Self::recompute_blocks_512`].
+    /// `i_size` / `i_size_high`. `blocks_512` stays in sync via
+    /// [`Self::recompute_blocks_512`]. For files > 4 GiB the
+    /// `RO_COMPAT_LARGE_FILE` feature is stamped on the superblock so
+    /// the high half of the size is honoured by readers.
     fn set_inode_size(&mut self, new_len: u64) -> Result<()> {
+        let bs = self.ext.layout.block_size;
+        let blocks_needed = new_len.div_ceil(bs as u64);
+        if blocks_needed > u32::MAX as u64 {
+            return Err(crate::Error::Unsupported(format!(
+                "ext: file of {new_len} bytes needs {blocks_needed} blocks (> u32::MAX)"
+            )));
+        }
         if new_len > u32::MAX as u64 {
-            return Err(crate::Error::Unsupported(
-                "ext2: file > 4 GiB requires LARGE_FILE — not yet implemented".into(),
-            ));
+            self.ext.sb.feature_ro_compat |=
+                crate::fs::ext::constants::feature::RO_COMPAT_LARGE_FILE;
         }
         self.len = new_len;
         let inode = self.staged_inode_mut();
-        inode.size = new_len as u32;
+        inode.set_file_size(new_len);
         Ok(())
     }
 
@@ -1205,7 +1214,7 @@ pub(crate) fn open_file_rw_ext<'a>(
     };
 
     let inode = ext.read_inode(dev, ino)?;
-    let mut len = inode.size as u64;
+    let mut len = inode.file_size();
 
     let mut handle = Ext2FileHandle::new(ext, dev, ino, len)?;
     if flags.truncate && len > 0 {
@@ -1258,7 +1267,7 @@ pub fn open_file_rw_ext_by_inode<'a>(
             )));
         }
     }
-    let len = inode.size as u64;
+    let len = inode.file_size();
     Ext2FileHandle::new(ext, dev, ino, len)
 }
 

@@ -277,6 +277,14 @@ struct ContainerCtx {
     omap_root: Vec<u8>,
     block_size: u32,
     total_bytes: u64,
+    /// Offset within the xp_desc area (0-based, relative to
+    /// `live_sb.xp_desc_base`) where the live NXSB was found. Used by
+    /// [`Apfs::open_writable`] to pick the next slot via ring math:
+    /// the new checkpoint writes one slot past the live one, wrapping
+    /// at `xp_desc_blocks` and skipping slot 0 (the chkmap). `None`
+    /// when no valid NXSB was found in the xp_desc area (fresh image
+    /// with only the label NXSB at block 0).
+    live_xp_desc_offset: Option<u64>,
 }
 
 /// Public summary of one populated `nx_fs_oid[]` slot, returned by
@@ -395,14 +403,14 @@ impl Apfs {
     /// xp_desc slot, leaving the previous valid checkpoint intact for
     /// crash safety).
     ///
-    /// Current scope: works on a freshly-formatted-then-flushed image
-    /// and supports up to `XP_DESC_BLOCKS - 2` subsequent checkpoint
-    /// commits before the xp_desc area fills up; create / remove are
-    /// still refused. See the `rw` module for the per-feature limits.
+    /// Each successful `sync` on a returned handle consumes one
+    /// xp_desc slot; slots are reused in ring-buffer order so the
+    /// number of consecutive checkpoint commits is unbounded. The
+    /// chkmap at slot 0 is preserved (we never overwrite it).
     pub fn open_writable(dev: &mut dyn BlockDevice) -> Result<Self> {
         let read_only = Apfs::open(dev)?;
         // Re-decode the container so we can pull the checkpoint
-        // metadata we need (xid, xp_desc_index, container UUID).
+        // metadata we need (xid, container UUID, live slot offset).
         let ctx = load_container(dev)?;
         let block_size = ctx.block_size;
         let total_blocks = ctx.live_sb.block_count;
@@ -410,19 +418,26 @@ impl Apfs {
         let container_uuid = ctx.live_sb.uuid;
         let cur_xid = ctx.live_sb.obj.xid;
 
-        // The reader picks the highest-xid NXSB inside xp_desc, so we
-        // know which slot that lives at — that's `xp_desc_index +
-        // xp_desc_len - 1` modulo the ring. Because our writer keeps
-        // xp_desc_index = 0 and xp_desc_len strictly forward, the next
-        // free slot is `xp_desc_base + xp_desc_len`.
-        let next_xp_desc_slot = ctx.live_sb.xp_desc_base + ctx.live_sb.xp_desc_len as u64;
-        if next_xp_desc_slot >= ctx.live_sb.xp_desc_base + ctx.live_sb.xp_desc_blocks as u64 {
-            return Err(crate::Error::Unsupported(
-                "apfs: xp_desc area is full — checkpoint rotation isn't \
-                 implemented yet"
-                    .into(),
-            ));
-        }
+        // Pick the next xp_desc slot via ring math: the new NXSB
+        // writes one offset past the live one, wrapping at
+        // `xp_desc_blocks`. Slot 0 holds the chkmap and is reserved —
+        // valid NXSB slots are [1, xp_desc_blocks), so we skip slot 0
+        // when wrapping. The reader's `find_live_nxsb` walks every
+        // slot and picks the highest-xid valid NXSB, so ring rotation
+        // round-trips through the read side without further work.
+        //
+        // For a fresh image with no live NXSB in the xp_desc area
+        // (label NXSB at block 0 only), start at slot 1 (the
+        // canonical first NXSB slot = `NXSB_LIVE_PADDR`).
+        let blocks = ctx.live_sb.xp_desc_blocks as u64;
+        let nxsb_slots = blocks.saturating_sub(1).max(1); // skip slot 0
+        let next_offset = match ctx.live_xp_desc_offset {
+            Some(off) if off >= 1 => ((off - 1 + 1) % nxsb_slots) + 1,
+            // Live NXSB came from slot 0 somehow, or no live NXSB at
+            // all — start at the first NXSB slot.
+            _ => 1,
+        };
+        let next_xp_desc_slot = ctx.live_sb.xp_desc_base + next_offset;
 
         // Read the APSB to capture volume_uuid + counters + next_oid.
         let (vol_index, apsb_paddr) = find_volume_paddr(dev, &ctx)?;
@@ -2430,7 +2445,10 @@ fn load_container(dev: &mut dyn BlockDevice) -> Result<ContainerCtx> {
     let label_sb = NxSuperblock::decode(&block0)?;
 
     // ---- Walk the checkpoint descriptor area for the live NXSB ----
-    let live_sb = find_live_nxsb(dev, &label_sb, block_size)?.unwrap_or(label_sb.clone());
+    let (live_sb, live_xp_desc_offset) = match find_live_nxsb(dev, &label_sb, block_size)? {
+        Some((sb, off)) => (sb, Some(off)),
+        None => (label_sb.clone(), None),
+    };
 
     let total_bytes = live_sb.block_count.saturating_mul(block_size as u64);
 
@@ -2447,6 +2465,7 @@ fn load_container(dev: &mut dyn BlockDevice) -> Result<ContainerCtx> {
         omap_root: omap_root_block,
         block_size,
         total_bytes,
+        live_xp_desc_offset,
     })
 }
 
@@ -2500,15 +2519,18 @@ fn read_spaceman_high_water(dev: &mut dyn BlockDevice, ctx: &ContainerCtx) -> Op
 
 /// Walk the checkpoint descriptor area looking for an NXSB whose xid is
 /// strictly larger than the label NXSB's xid. Returns the chosen super-
-/// block (or `None` if the label is already the best).
+/// block along with the slot offset (0-based, relative to
+/// `xp_desc_base`) it lived at — or `None` if the label is already the
+/// best. The slot offset is used by [`Apfs::open_writable`] to ring-
+/// advance to the next free slot.
 fn find_live_nxsb(
     dev: &mut dyn BlockDevice,
     label: &NxSuperblock,
     block_size: u32,
-) -> Result<Option<NxSuperblock>> {
+) -> Result<Option<(NxSuperblock, u64)>> {
     let n = label.xp_desc_blocks as u64;
     let base = label.xp_desc_base;
-    let mut best: Option<NxSuperblock> = None;
+    let mut best: Option<(NxSuperblock, u64)> = None;
     let mut buf = vec![0u8; block_size as usize];
     for i in 0..n {
         let paddr = base.saturating_add(i);
@@ -2532,10 +2554,10 @@ fn find_live_nxsb(
         };
         let better = match &best {
             None => sb.obj.xid >= label.obj.xid,
-            Some(b) => sb.obj.xid > b.obj.xid,
+            Some((b, _)) => sb.obj.xid > b.obj.xid,
         };
         if better {
-            best = Some(sb);
+            best = Some((sb, i));
         }
     }
     Ok(best)

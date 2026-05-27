@@ -1203,3 +1203,65 @@ fn apfs_filesystem_trait_refuses_mutations_on_read_state() {
         Err(fstool::Error::Unsupported(_))
     ));
 }
+
+/// xp_desc ring buffer: drive more than XP_DESC_BLOCKS (16) successive
+/// open_writable + sync cycles. Pre-fix, slot exhaustion errored at
+/// the 15th cycle with `Unsupported: xp_desc area is full`. With the
+/// ring buffer in place, the writer wraps around and overwrites stale
+/// slots, and every cycle's checkpoint is openable by the next one.
+///
+/// Asserts after 25 cycles: every created file is visible. This
+/// indirectly confirms that find_live_nxsb's "highest xid wins" logic
+/// keeps picking the newest checkpoint as we ring past the original
+/// slots.
+#[test]
+fn apfs_xp_desc_ring_buffer_survives_many_checkpoints() {
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let bs = 4096u32;
+    let total_blocks = 8192u64; // 32 MiB — room for many small extents
+    let img = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(img.path(), total_blocks * bs as u64).unwrap();
+        let w = ApfsWriter::new(&mut dev, total_blocks, bs, "RING").unwrap();
+        w.finish().unwrap();
+        dev.sync().unwrap();
+    }
+    // 25 cycles > XP_DESC_BLOCKS (16) → guaranteed to wrap.
+    let n_cycles = 25usize;
+    for i in 0..n_cycles {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        let path = format!("/file-{i:03}");
+        let body = format!("body-{i}\n");
+        fs.create_file_at(&mut dev, &path, body.as_bytes(), 0o644)
+            .expect("create_file_at past slot 15 (ring should wrap)");
+        dev.sync().unwrap();
+    }
+
+    // Verify every file is visible from a fresh read open.
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let fs = Apfs::open(&mut dev).unwrap();
+    let names: std::collections::HashSet<String> = fs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    for i in 0..n_cycles {
+        let want = format!("file-{i:03}");
+        assert!(
+            names.contains(&want),
+            "cycle {i}: {want} missing after ring rotation; saw {names:?}"
+        );
+    }
+    // Spot-check the last file's body to confirm the latest checkpoint
+    // is the one find_live_nxsb returned.
+    let last = format!("/file-{:03}", n_cycles - 1);
+    let mut r = fs.open_file_reader(&mut dev, &last).unwrap();
+    let mut body = String::new();
+    std::io::Read::read_to_string(&mut r, &mut body).unwrap();
+    assert_eq!(body, format!("body-{}\n", n_cycles - 1));
+}

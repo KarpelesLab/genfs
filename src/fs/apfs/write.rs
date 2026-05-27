@@ -542,11 +542,17 @@ impl<'a> ApfsWriter<'a> {
                  [{BUMP_BLOCK_START}, {total_blocks})"
             )));
         }
-        if nxsb_paddr < (NXSB_LIVE_PADDR + 1) || nxsb_paddr >= (XP_DESC_BLOCKS as u64 + 1) {
+        // Valid NXSB slot range: [NXSB_LIVE_PADDR, XP_DESC_BLOCKS+1).
+        // NXSB_LIVE_PADDR (= 2) is the format-time slot, reusable
+        // once the xp_desc ring wraps around. Slot 0 (block 1 =
+        // CHKMAP_PADDR) is reserved for the chkmap and out of the
+        // range. XP_DESC_BLOCKS = 16, base = 1, so the last valid
+        // paddr is 16.
+        if nxsb_paddr < NXSB_LIVE_PADDR || nxsb_paddr >= (XP_DESC_BLOCKS as u64 + 1) {
             return Err(crate::Error::InvalidArgument(format!(
-                "apfs writer: nxsb_paddr {nxsb_paddr} not a spare xp_desc slot \
+                "apfs writer: nxsb_paddr {nxsb_paddr} not a valid xp_desc slot \
                  (expected {} ≤ slot < {})",
-                NXSB_LIVE_PADDR + 1,
+                NXSB_LIVE_PADDR,
                 XP_DESC_BLOCKS as u64 + 1
             )));
         }

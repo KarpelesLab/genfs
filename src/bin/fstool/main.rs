@@ -576,7 +576,29 @@ fn repack_cmd(
     // arrives takes this branch, including the deferred archive formats
     // (SquashFS / ISO 9660 / GRF), which now write data incrementally. Only
     // tar→tar output (a pure sequential re-mux) falls through.
-    if let Some(algo) = tar_input_codec(srcs[0].as_str()) {
+    // The source is taken as a tar stream when it has a recognised
+    // compressed-tar extension (codec = `Some(algo)`) OR a plain `.tar`
+    // extension (codec = `None`). The streaming path handles both, so a
+    // plain tar no longer falls through to the random-access `Tar::open`
+    // — which was eating ~17 % of the W1s ext4 profile parsing entry
+    // headers up front.
+    let raw_src = srcs[0].as_str();
+    let codec_opt: Option<Option<fstool::compression::Algo>> =
+        if let Some(algo) = tar_input_codec(raw_src) {
+            Some(Some(algo))
+        } else {
+            let bare = raw_src.split(':').next().unwrap_or(raw_src);
+            let p = std::path::Path::new(bare);
+            if p.extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("tar"))
+            {
+                Some(None)
+            } else {
+                None
+            }
+        };
+    if let Some(codec) = codec_opt {
         let raw = srcs[0].as_str();
         let tar_path = std::path::PathBuf::from(raw.split(':').next().unwrap_or(raw));
         // Resolve the destination FS the same way the main path does;
@@ -595,7 +617,7 @@ fn repack_cmd(
         // tar → tar is a pure forward re-mux: decode the source on the fly
         // and re-emit through the tar stream sink, no tempfile.
         if lower == "tar" {
-            return repack_tar_stream_to_tar(&tar_path, algo, dst, tar_output_codec(dst));
+            return repack_tar_stream_to_tar(&tar_path, codec, dst, tar_output_codec(dst));
         }
         if matches!(
             lower.as_str(),
@@ -618,7 +640,7 @@ fn repack_cmd(
         ) {
             return repack_tar_stream_to_fs(
                 &tar_path,
-                algo,
+                codec,
                 dst,
                 &lower,
                 size_arg,
@@ -998,7 +1020,7 @@ fn repack_stream_via_trait<F: fstool::fs::FilesystemFactory>(
     dst_dev: &mut dyn fstool::block::BlockDevice,
     opts: &F::FormatOpts,
     tar_path: &std::path::Path,
-    algo: fstool::compression::Algo,
+    codec: Option<fstool::compression::Algo>,
     lossy: bool,
 ) -> fstool::Result<Option<u64>> {
     let mut dst = F::format(dst_dev, opts)?;
@@ -1007,7 +1029,7 @@ fn repack_stream_via_trait<F: fstool::fs::FilesystemFactory>(
         if lossy {
             sink = sink.lossy();
         }
-        let mut reader = fstool::repack::open_tar_stream(tar_path, Some(algo))?;
+        let mut reader = fstool::repack::open_tar_stream(tar_path, codec)?;
         fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
     }
     dst.flush(dst_dev)?;
@@ -1026,7 +1048,7 @@ fn repack_stream_via_trait<F: fstool::fs::FilesystemFactory>(
 /// no random access — a tar is only ever walked forward.
 fn repack_tar_stream_to_tar(
     tar_path: &std::path::Path,
-    src_algo: fstool::compression::Algo,
+    src_codec: Option<fstool::compression::Algo>,
     dst: &std::path::Path,
     dst_tar_codec: Option<fstool::compression::Algo>,
 ) -> fstool::Result<()> {
@@ -1039,7 +1061,7 @@ fn repack_tar_stream_to_tar(
         None => buffered,
     };
     let mut sink = fstool::repack::TarStreamSink::new(inner);
-    let mut reader = fstool::repack::open_tar_stream(tar_path, Some(src_algo))?;
+    let mut reader = fstool::repack::open_tar_stream(tar_path, src_codec)?;
     fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
     sink.finish()?;
     let written = sink.bytes_written();
@@ -1322,7 +1344,7 @@ fn repack_layered_via_trait<F: fstool::fs::FilesystemFactory>(
 #[allow(clippy::too_many_arguments)]
 fn repack_tar_stream_to_fs(
     tar_path: &std::path::Path,
-    algo: fstool::compression::Algo,
+    codec: Option<fstool::compression::Algo>,
     dst: &std::path::Path,
     lower: &str,
     size_arg: Option<&str>,
@@ -1345,7 +1367,7 @@ fn repack_tar_stream_to_fs(
     let analysis = fstool::analyze::analyze_source(
         &fstool::repack::Source::TarArchive {
             path: tar_path.to_path_buf(),
-            codec: Some(algo),
+            codec,
         },
         block_size,
     )?;
@@ -1414,7 +1436,7 @@ fn repack_tar_stream_to_fs(
             let mut dst_ext = Ext::format_with(dst_dev.as_mut(), &opts)?;
             {
                 let mut sink = fstool::repack::FsSink::new(&mut dst_ext, dst_dev.as_mut());
-                let mut reader = fstool::repack::open_tar_stream(tar_path, Some(algo))?;
+                let mut reader = fstool::repack::open_tar_stream(tar_path, codec)?;
                 fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
             }
             dst_ext.flush(dst_dev.as_mut())?;
@@ -1434,7 +1456,7 @@ fn repack_tar_stream_to_fs(
             let mut dst_fat = fstool::fs::fat::Fat32::format(dst_dev.as_mut(), &opts)?;
             {
                 let mut sink = fstool::repack::FsSink::new(&mut dst_fat, dst_dev.as_mut()).lossy();
-                let mut reader = fstool::repack::open_tar_stream(tar_path, Some(algo))?;
+                let mut reader = fstool::repack::open_tar_stream(tar_path, codec)?;
                 fstool::repack::walk_tar_stream(&mut reader, &mut sink)?;
             }
             dst_fat.flush(dst_dev.as_mut())?;
@@ -1444,35 +1466,35 @@ fn repack_tar_stream_to_fs(
             dst_dev.as_mut(),
             &fstool::fs::xfs::format::FormatOpts::default(),
             tar_path,
-            algo,
+            codec,
             false,
         )?,
         "hfsplus" | "hfs+" => repack_stream_via_trait::<fstool::fs::hfs_plus::HfsPlus>(
             dst_dev.as_mut(),
             &fstool::fs::hfs_plus::FormatOpts::default(),
             tar_path,
-            algo,
+            codec,
             false,
         )?,
         "ntfs" => repack_stream_via_trait::<fstool::fs::ntfs::Ntfs>(
             dst_dev.as_mut(),
             &fstool::fs::ntfs::format::FormatOpts::default(),
             tar_path,
-            algo,
+            codec,
             false,
         )?,
         "f2fs" => repack_stream_via_trait::<fstool::fs::f2fs::F2fs>(
             dst_dev.as_mut(),
             &fstool::fs::f2fs::FormatOpts::default(),
             tar_path,
-            algo,
+            codec,
             false,
         )?,
         "squashfs" => repack_stream_via_trait::<fstool::fs::squashfs::Squashfs>(
             dst_dev.as_mut(),
             &fstool::fs::squashfs::FormatOpts::default(),
             tar_path,
-            algo,
+            codec,
             false,
         )?,
         "iso" | "iso9660" => {
@@ -1485,7 +1507,7 @@ fn repack_tar_stream_to_fs(
                 dst_dev.as_mut(),
                 &opts,
                 tar_path,
-                algo,
+                codec,
                 false,
             )?
         }
@@ -1493,21 +1515,21 @@ fn repack_tar_stream_to_fs(
             dst_dev.as_mut(),
             &fstool::fs::grf::FormatOpts::default(),
             tar_path,
-            algo,
+            codec,
             false,
         )?,
         "zip" => repack_stream_via_trait::<fstool::fs::archive::zip::ZipFs>(
             dst_dev.as_mut(),
             &fstool::fs::archive::zip::ZipFormatOpts::default(),
             tar_path,
-            algo,
+            codec,
             true,
         )?,
         "cpio" => repack_stream_via_trait::<fstool::fs::archive::cpio::CpioFs>(
             dst_dev.as_mut(),
             &fstool::fs::archive::cpio::CpioFormatOpts,
             tar_path,
-            algo,
+            codec,
             false,
         )?,
         other => unreachable!("repack_tar_stream_to_fs reached for ungated fs {other:?}"),

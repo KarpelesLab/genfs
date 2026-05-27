@@ -3061,7 +3061,16 @@ impl Ext {
     pub(crate) fn free_block(&mut self, blk: u32) {
         for (gi, g) in self.layout.groups.iter().enumerate() {
             if blk >= g.start_block && blk <= g.end_block {
-                group::clear_bit(&mut self.groups[gi].block_bitmap, blk - g.start_block);
+                let bit = blk - g.start_block;
+                group::clear_bit(&mut self.groups[gi].block_bitmap, bit);
+                // Rewind the per-group allocation cursor so the next
+                // `alloc_data_block` can reuse this freed bit. Without
+                // this, append-only workloads stay O(1) but anything
+                // that frees and re-allocates (the fragmentation tests,
+                // mutate paths) skips the holes entirely.
+                if bit < self.groups[gi].next_free_block_bit {
+                    self.groups[gi].next_free_block_bit = bit;
+                }
                 return;
             }
         }

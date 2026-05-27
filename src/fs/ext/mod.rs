@@ -3627,8 +3627,8 @@ impl Ext {
     /// the file at inode `ino`. Picks the representation based on the
     /// inode flags: `EXT4_EXTENTS_FL` → walk the extent tree;
     /// otherwise → direct + single + double + triple indirect, matching
-    /// the writer's [`Self::fill_block_pointers_indirect`]. Returns `0`
-    /// for a hole at any level (`mke2fs`-style sparse files).
+    /// the writer's `fill_block_pointers_indirect`. Returns `0` for a
+    /// hole at any level (`mke2fs`-style sparse files).
     pub fn file_block(&self, dev: &mut dyn BlockDevice, ino: &Inode, n: u32) -> Result<u32> {
         if ino.flags & constants::EXT4_EXTENTS_FL != 0 {
             return self.file_block_extent(dev, ino, n);

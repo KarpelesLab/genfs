@@ -89,6 +89,14 @@ pub struct Fat32 {
     /// cluster. Staged instead of rewriting the parent's cluster chain on
     /// every child; serialized once on eviction or at flush.
     dir_batch: DirBatch<u32, mutate::PendingEntry>,
+    /// Per-directory set of names ever staged (ASCII-lowercased so the
+    /// lookup matches FAT's case-insensitive comparison). Lets
+    /// `child_exists` answer in O(1) instead of linearly scanning the
+    /// pending batch — without it, bulk-inserting N files into one
+    /// directory is O(N²). Keeping evicted-but-flushed names here too is
+    /// harmless: they really do exist (on disk), so the answer is still
+    /// correct.
+    pending_names: std::collections::HashMap<u32, std::collections::HashSet<String>>,
 }
 
 impl Fat32 {
@@ -172,6 +180,7 @@ impl Fat32 {
             fat,
             next_free: 3,
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
+            pending_names: std::collections::HashMap::new(),
         };
         // Zero the whole volume up front so unwritten clusters read clean.
         dev.zero_range(0, need)?;
@@ -570,6 +579,7 @@ impl Fat32 {
             fat,
             next_free,
             dir_batch: DirBatch::new(DEFAULT_CAPACITY),
+            pending_names: std::collections::HashMap::new(),
         })
     }
 

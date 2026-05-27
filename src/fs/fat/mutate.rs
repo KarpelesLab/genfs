@@ -383,6 +383,12 @@ impl Fat32 {
         parent_cluster: u32,
         entry: PendingEntry,
     ) -> Result<()> {
+        // Record the leaf name (ASCII-lowercased) in the per-parent index
+        // so `child_exists` is O(1) instead of scanning the growing batch.
+        self.pending_names
+            .entry(parent_cluster)
+            .or_default()
+            .insert(entry.name.to_ascii_lowercase());
         if let Some((victim, entries)) = self.dir_batch.stage(parent_cluster, entry) {
             self.serialize_one_dir(dev, victim, entries)?;
         }
@@ -435,7 +441,12 @@ impl Fat32 {
         dir_cluster: u32,
         name: &str,
     ) -> Result<bool> {
-        if self.pending_child(dir_cluster, name).is_some() {
+        // O(1) check against the per-parent name index — covers both
+        // currently-pending entries and any already serialised in this
+        // session (we never remove from `pending_names` on eviction).
+        if let Some(set) = self.pending_names.get(&dir_cluster)
+            && set.contains(&name.to_ascii_lowercase())
+        {
             return Ok(true);
         }
         Ok(self.find_entry(dev, dir_cluster, name)?.is_some())

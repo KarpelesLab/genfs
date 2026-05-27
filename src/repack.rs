@@ -55,6 +55,16 @@ pub struct Progress {
     is_tty: bool,
     verbose: bool,
     started: Instant,
+    /// Total entry count for the current phase, when known. Set by
+    /// [`set_total`] after the analyze pass; until then or on phases
+    /// without a totals signal, falls back to the filename ticker.
+    total_files: Option<u64>,
+    /// Total file-body bytes for the current phase. Same lifecycle as
+    /// `total_files`.
+    total_bytes: Option<u64>,
+    /// File-body bytes written so far in the current phase. Reset at
+    /// every [`phase`] boundary.
+    bytes_done: u64,
 }
 
 impl Progress {
@@ -69,6 +79,9 @@ impl Progress {
             is_tty: std::io::stderr().is_terminal(),
             verbose: false,
             started: now,
+            total_files: None,
+            total_bytes: None,
+            bytes_done: 0,
         }
     }
 
@@ -84,21 +97,69 @@ impl Progress {
         self.files += 1;
         self.last_path.clear();
         self.last_path.push_str(path);
+        self.emit_status();
+    }
+
+    /// Add `n` bytes to the running body-bytes counter so a phase with
+    /// known totals can render a byte-accurate progress bar. Triggers
+    /// the same throttled display refresh as [`note_inner`] — useful for
+    /// large files whose body is streamed between `note` calls.
+    fn note_bytes_inner(&mut self, n: u64) {
+        self.bytes_done = self.bytes_done.saturating_add(n);
+        self.emit_status();
+    }
+
+    /// Render a status line (or progress bar) to stderr, throttled to ≤
+    /// 5 Hz so a tight per-file loop doesn't spam.
+    fn emit_status(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_emit) < Duration::from_millis(200) {
             return;
         }
         self.last_emit = now;
+        let line = self.status_line();
         if self.is_tty {
             let mut err = std::io::stderr().lock();
-            let _ = write!(
-                err,
-                "\r\x1b[Krepack: {} files | {}",
-                self.files, self.last_path
-            );
+            let _ = write!(err, "\r\x1b[Krepack: {line}");
             let _ = err.flush();
         } else if self.verbose && self.files % 500 == 0 {
-            eprintln!("repack: {} files | {}", self.files, self.last_path);
+            eprintln!("repack: {line}");
+        }
+    }
+
+    /// Build the "progress bar" or "N files | last_path" line for the
+    /// current state. With totals (set after analyze) the line reads
+    /// `[████░░░░░░░░] 38%  38247/100001 files  39.2/100.0 MiB`; without,
+    /// it falls back to the historical `N files | path` ticker.
+    fn status_line(&self) -> String {
+        match (self.total_files, self.total_bytes) {
+            (Some(tf), Some(tb)) if tf > 0 || tb > 0 => {
+                let file_frac = if tf > 0 {
+                    (self.files as f64 / tf as f64).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let byte_frac = if tb > 0 {
+                    (self.bytes_done as f64 / tb as f64).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                // Weighted blend: bytes dominate when there's real data,
+                // file count dominates for tiny/empty files. (Most repack
+                // workloads are one or the other, so this is mostly
+                // cosmetic.)
+                let frac = if tb > 0 { byte_frac } else { file_frac };
+                let bar = render_bar(24, frac);
+                format!(
+                    "{bar} {:3.0}%  {}/{} files  {}/{}",
+                    frac * 100.0,
+                    self.files,
+                    tf,
+                    human_bytes(self.bytes_done),
+                    human_bytes(tb),
+                )
+            }
+            _ => format!("{} files | {}", self.files, self.last_path),
         }
     }
 
@@ -142,6 +203,39 @@ impl Progress {
             );
         }
     }
+}
+
+/// Render a `[████░░░░]` bar of width `cells`. Unicode block characters
+/// for the filled portion, light shade for the empty.
+fn render_bar(cells: usize, frac: f64) -> String {
+    let filled = (cells as f64 * frac).round() as usize;
+    let filled = filled.min(cells);
+    let mut s = String::with_capacity(cells + 2);
+    s.push('[');
+    for i in 0..cells {
+        s.push(if i < filled { '█' } else { '░' });
+    }
+    s.push(']');
+    s
+}
+
+/// Format `n` bytes as e.g. `47.5 MiB` / `1.2 GiB`. Compact and unitless
+/// past 4 GiB to keep the progress line short.
+fn human_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let f = n as f64;
+    if f < KIB {
+        return format!("{n} B");
+    }
+    let mib = f / KIB / KIB;
+    if mib < 1.0 {
+        return format!("{:.1} KiB", f / KIB);
+    }
+    let gib = mib / KIB;
+    if gib < 1.0 {
+        return format!("{mib:.1} MiB");
+    }
+    format!("{gib:.2} GiB")
 }
 
 thread_local! {
@@ -190,7 +284,38 @@ pub fn phase(msg: &str) {
         if let Some(p) = cell.borrow_mut().as_mut() {
             p.files = 0;
             p.last_path.clear();
+            p.bytes_done = 0;
+            // Totals are per-phase too; callers wanting a progress bar
+            // on the next phase call `set_total` after `phase`.
+            p.total_files = None;
+            p.total_bytes = None;
             p.phase_inner(msg);
+        }
+    });
+}
+
+/// Record `n` bytes of file body written. Used by the streaming walkers
+/// to drive the progress bar's byte fraction. No-op when no sink is
+/// active.
+pub fn note_bytes(n: u64) {
+    ACTIVE_PROGRESS.with(|cell| {
+        if let Some(p) = cell.borrow_mut().as_mut() {
+            p.note_bytes_inner(n);
+        }
+    });
+}
+
+/// Tell the active progress sink the totals for the current phase so it
+/// can render a percentage / bar. Call this **after** `phase("…")` (which
+/// clears any previous totals) and **before** the copy walk starts. The
+/// numbers come from the analyze pass: `files` = directory entries to
+/// emit (regular + dir + symlink + device), `bytes` = total regular-file
+/// body bytes. No-op when no sink is active.
+pub fn set_total(files: u64, bytes: u64) {
+    ACTIVE_PROGRESS.with(|cell| {
+        if let Some(p) = cell.borrow_mut().as_mut() {
+            p.total_files = Some(files);
+            p.total_bytes = Some(bytes);
         }
     });
 }
@@ -777,6 +902,7 @@ pub fn walk_anyfs(
                     }
                     let mut body = src_fs.open_body_reader(src_dev, &child)?;
                     sink.put_file(&child, &mut *body, attrs.size, meta, &xattrs)?;
+                    note_bytes(attrs.size);
                 }
                 EntryKind::Symlink => {
                     let target = src_fs.read_symlink(src_dev, &child)?;
@@ -915,6 +1041,7 @@ pub fn walk_tar_stream(reader: &mut dyn Read, sink: &mut dyn RepackSink) -> Resu
             }
             TarKind::Regular => {
                 sink.put_file(&path, &mut se, size, meta, &xattrs)?;
+                note_bytes(size);
             }
             TarKind::Symlink => {
                 let target = link.as_deref().unwrap_or("");
@@ -989,6 +1116,7 @@ fn walk_host_dir(root: &Path, sink: &mut dyn RepackSink) -> Result<()> {
                 }
                 let mut f = std::fs::File::open(entry.path())?;
                 sink.put_file(&dest, &mut f, meta.len(), rmeta, &[])?;
+                note_bytes(meta.len());
             } else {
                 #[cfg(unix)]
                 {

@@ -1170,6 +1170,9 @@ fn repack_layered_to_dst(
         "formatting {target_fs} destination ({}) …",
         human_size(dst_size)
     ));
+    // Totals from the merge model power the copy-phase progress bar.
+    let total_entries = analysis.files + analysis.dirs + analysis.symlinks + analysis.devices;
+    fstool::repack::set_total(total_entries, analysis.total_file_bytes);
     let mut dst_dev = fstool::block::create_image(
         dst,
         dst_size,
@@ -1419,6 +1422,10 @@ fn repack_tar_stream_to_fs(
         "formatting {lower} destination ({}) …",
         human_size(dst_size)
     ));
+    // Hand the totals from the analyze pass to the progress sink so the
+    // copy phase renders a bar instead of a filename ticker.
+    let total_entries = analysis.files + analysis.dirs + analysis.symlinks + analysis.devices;
+    fstool::repack::set_total(total_entries, analysis.total_file_bytes);
     let mut dst_dev = fstool::block::create_image(
         dst,
         dst_size,

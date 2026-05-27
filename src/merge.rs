@@ -300,7 +300,9 @@ impl MergeModel {
         //     sorted; just filter to dirs.
         for (path, node) in &self.nodes {
             if matches!(node.kind, EntryKind::Dir) && path != &PathBuf::from("/") {
-                sink.put_dir(&path_str(path)?, to_meta(node), &to_xattrs(node))?;
+                let p = path_str(path)?;
+                sink.put_dir(&p, to_meta(node), &to_xattrs(node))?;
+                crate::repack::note(&p);
             }
         }
 
@@ -322,10 +324,13 @@ impl MergeModel {
                     let mut f = std::fs::File::open(host)?;
                     let len = std::fs::metadata(host)?.len();
                     sink.put_file(&p_str, &mut f, len, to_meta(node), &to_xattrs(node))?;
+                    crate::repack::note(&p_str);
+                    crate::repack::note_bytes(len);
                 }
                 BodyRef::Empty => {
                     let mut empty: &[u8] = &[];
                     sink.put_file(&p_str, &mut empty, 0, to_meta(node), &to_xattrs(node))?;
+                    crate::repack::note(&p_str);
                 }
                 BodyRef::Tar { .. } | BodyRef::HardLink(_) | BodyRef::None => {
                     // Tar winners emitted in (2); hardlinks deferred to
@@ -378,6 +383,7 @@ impl MergeModel {
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     sink.put_symlink(&p_str, &t, to_meta(node), &to_xattrs(node))?;
+                    crate::repack::note(&p_str);
                 }
                 EntryKind::Char => {
                     sink.put_device(
@@ -420,6 +426,19 @@ impl MergeModel {
                     )?;
                 }
                 _ => {}
+            }
+            if matches!(
+                node.kind,
+                EntryKind::Symlink
+                    | EntryKind::Char
+                    | EntryKind::Block
+                    | EntryKind::Fifo
+                    | EntryKind::Socket
+            ) {
+                // Symlink already noted above; this covers the device kinds.
+                if !matches!(node.kind, EntryKind::Symlink) {
+                    crate::repack::note(&p_str);
+                }
             }
         }
 
@@ -816,6 +835,8 @@ where
         }
         let size = se.entry.size;
         sink.put_file(&canon, &mut se, size, to_meta(node), &to_xattrs(node))?;
+        crate::repack::note(&canon);
+        crate::repack::note_bytes(size);
     }
     Ok(())
 }

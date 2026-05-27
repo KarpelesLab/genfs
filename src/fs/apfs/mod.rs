@@ -1066,6 +1066,185 @@ impl Apfs {
         })
     }
 
+    /// Create a new regular file at `path` containing `data` with the
+    /// given permission bits. Writes a fresh APFS checkpoint via the
+    /// same COW pathway every other Write-state mutation uses
+    /// (`rw::commit_with_mutator`). Allocates a single fresh extent
+    /// for the body — empty files emit only the inode + drec records.
+    ///
+    /// Errors when the parent directory doesn't exist, the leaf name
+    /// already exists in that directory, or the device doesn't have
+    /// enough free blocks for the new extent.
+    pub fn create_file_at(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        data: &[u8],
+        mode: u16,
+    ) -> Result<()> {
+        let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
+        rw::commit_with_mutator(self, dev, |cx| {
+            if find_drec(cx.records, parent_oid, &name).is_some() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "apfs: create_file: {name:?} already exists under inode {parent_oid}"
+                )));
+            }
+            let oid = cx.alloc_oid();
+            let bs = cx.block_size();
+            let size = data.len() as u64;
+            // Allocate one extent + write the body. Empty files skip
+            // the extent and the matching FILE_EXTENT / DSTREAM_ID
+            // records — mirrors the single-pass writer's convention.
+            if size > 0 {
+                let paddr = cx.alloc_extent(size)?;
+                cx.write_extent_bytes(paddr, data)?;
+                for (k, v) in write::build_file_extent_records(oid, 0, size, paddr, bs) {
+                    cx.records.push((k, v));
+                }
+            }
+            // INODE for the new file, then the DREC under the parent.
+            let (ik, iv) =
+                write::build_inode_record(oid, parent_oid, write::mode_reg(mode), size, bs);
+            cx.records.push((ik, iv));
+            let (dk, dv) = write::build_drec_record(parent_oid, &name, oid, DT_REG)?;
+            cx.records.push((dk, dv));
+            // Bump the parent dir's nchildren counter.
+            patch_inode_record(cx.records, parent_oid, |v| {
+                if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
+                    let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
+                    v[56..60].copy_from_slice(&(cur + 1).to_le_bytes());
+                }
+            });
+            cx.note_new_file();
+            Ok(())
+        })
+    }
+
+    /// Create an empty directory at `path` with the given permission
+    /// bits. Writes a fresh checkpoint via `rw::commit_with_mutator`.
+    /// Errors when the parent doesn't exist or the leaf name is
+    /// already taken.
+    pub fn create_dir_at(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        mode: u16,
+    ) -> Result<()> {
+        let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
+        rw::commit_with_mutator(self, dev, |cx| {
+            if find_drec(cx.records, parent_oid, &name).is_some() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "apfs: create_dir: {name:?} already exists under inode {parent_oid}"
+                )));
+            }
+            let oid = cx.alloc_oid();
+            let bs = cx.block_size();
+            // Directories carry no DSTREAM xfield (dstream_size = 0
+            // + mode is S_IFDIR → has_dstream is false in
+            // build_inode_record).
+            let (ik, iv) = write::build_inode_record(oid, parent_oid, write::mode_dir(mode), 0, bs);
+            cx.records.push((ik, iv));
+            let (dk, dv) = write::build_drec_record(parent_oid, &name, oid, DT_DIR)?;
+            cx.records.push((dk, dv));
+            patch_inode_record(cx.records, parent_oid, |v| {
+                if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
+                    let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
+                    v[56..60].copy_from_slice(&(cur + 1).to_le_bytes());
+                }
+            });
+            cx.note_new_dir();
+            Ok(())
+        })
+    }
+
+    /// Create a symbolic link at `path` pointing at `target` (the
+    /// raw string is stored verbatim — APFS doesn't normalise it).
+    /// Symlink targets are stored as a single-extent file body, the
+    /// same way `Apfs::read_symlink` reads them back.
+    pub fn create_symlink_at(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        target: &str,
+        mode: u16,
+    ) -> Result<()> {
+        let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
+        let target_bytes = target.as_bytes();
+        let size = target_bytes.len() as u64;
+        if size == 0 {
+            return Err(crate::Error::InvalidArgument(
+                "apfs: symlink target must be non-empty".into(),
+            ));
+        }
+        rw::commit_with_mutator(self, dev, |cx| {
+            if find_drec(cx.records, parent_oid, &name).is_some() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "apfs: create_symlink: {name:?} already exists under inode {parent_oid}"
+                )));
+            }
+            let oid = cx.alloc_oid();
+            let bs = cx.block_size();
+            let paddr = cx.alloc_extent(size)?;
+            cx.write_extent_bytes(paddr, target_bytes)?;
+            for (k, v) in write::build_file_extent_records(oid, 0, size, paddr, bs) {
+                cx.records.push((k, v));
+            }
+            let (ik, iv) =
+                write::build_inode_record(oid, parent_oid, write::mode_lnk(mode), size, bs);
+            cx.records.push((ik, iv));
+            let (dk, dv) = write::build_drec_record(parent_oid, &name, oid, DT_LNK)?;
+            cx.records.push((dk, dv));
+            patch_inode_record(cx.records, parent_oid, |v| {
+                if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
+                    let cur = i32::from_le_bytes(v[56..60].try_into().unwrap());
+                    v[56..60].copy_from_slice(&(cur + 1).to_le_bytes());
+                }
+            });
+            cx.note_new_symlink();
+            Ok(())
+        })
+    }
+
+    /// Set an embedded extended attribute on the inode at `path`. If
+    /// the xattr already exists it's replaced; otherwise it's
+    /// inserted. Refuses values larger than 3804 bytes
+    /// (`APFS_XATTR_MAX_EMBEDDED_SIZE`) — dstream-backed xattrs are
+    /// not yet implemented.
+    pub fn set_xattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        let target_oid = self.resolve_path_to_oid(dev, path)?;
+        rw::commit_with_mutator(self, dev, |cx| {
+            // Drop any pre-existing record for the same (target_oid,
+            // XATTR, name) so the replace is idempotent.
+            remove_xattr_record(cx.records, target_oid, name);
+            let (k, v) = write::build_xattr_record(target_oid, name, value)?;
+            cx.records.push((k, v));
+            Ok(())
+        })
+    }
+
+    /// Remove an embedded extended attribute from the inode at
+    /// `path`. No-op when the named xattr doesn't exist (mirrors
+    /// `removexattr(2)` semantics on most platforms — we don't
+    /// distinguish "no such attribute" from success here).
+    pub fn remove_xattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        name: &str,
+    ) -> Result<()> {
+        let target_oid = self.resolve_path_to_oid(dev, path)?;
+        rw::commit_with_mutator(self, dev, |cx| {
+            remove_xattr_record(cx.records, target_oid, name);
+            Ok(())
+        })
+    }
+
     /// Total container capacity in bytes (`nx_block_count * nx_block_size`).
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
@@ -1166,7 +1345,7 @@ impl Apfs {
 
     /// Walk path components, resolving each name through its parent's
     /// directory records. Returns the target's object id.
-    fn resolve_path_to_oid(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
+    pub fn resolve_path_to_oid(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
         let mut cur = ROOT_DIR_INO;
         for part in split_path(path) {
             cur = self.find_drec_child(dev, cur, part)?.ok_or_else(|| {
@@ -1983,6 +2162,32 @@ pub(crate) fn drec_count_for(records: &[(Vec<u8>, Vec<u8>)], parent_oid: u64) ->
         }
     }
     n
+}
+
+/// Remove an XATTR record with key `(target_oid, XATTR, name)` if it
+/// exists. The xattr's key shape (per `build_xattr_record`) is:
+/// `j_key_t[0..8] | name_len:u16[8..10] | name_bytes | NUL` — so the
+/// 10..(10+name.len()) range is the UTF-8 name. Used by both
+/// `Apfs::set_xattr` (drop-then-replace) and `Apfs::remove_xattr`.
+pub(crate) fn remove_xattr_record(
+    records: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    target_oid: u64,
+    name: &str,
+) {
+    let name_bytes = name.as_bytes();
+    records.retain(|(k, _)| {
+        if k.len() < 10 + name_bytes.len() + 1 {
+            return true;
+        }
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        let oid = hdr & OBJ_ID_MASK;
+        let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
+        if oid != target_oid || kind != APFS_TYPE_XATTR {
+            return true;
+        }
+        // Key carries a trailing NUL; ensure the name + NUL matches.
+        &k[10..10 + name_bytes.len()] != name_bytes || k[10 + name_bytes.len()] != 0
+    });
 }
 
 /// Drop every record keyed on `target_oid` — inode + dstream_id +

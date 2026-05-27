@@ -452,7 +452,10 @@ where
     let new_num_files = cx.num_files;
     let new_num_directories = cx.num_directories;
     let new_num_symlinks = cx.num_symlinks;
-    drop(cx);
+    // `cx`'s last use is the line above; NLL releases its borrows of
+    // `records` and `dev` here, so the writer block below can
+    // reborrow `dev`. An explicit drop(cx) would be a no-op (no Drop
+    // impl on MutatorCx) — clippy flags it under drop_non_drop.
 
     let new_xid = cur_xid + 1;
     {

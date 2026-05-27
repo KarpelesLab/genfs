@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6](https://github.com/KarpelesLab/fstool/compare/v0.4.5...v0.4.6) - 2026-05-27
+
+### Added
+
+- *(merge)* hard links + fix(fat): flush dir batches before read
+
+### Fixed
+
+- *(doc)* resolve merge.rs intra-doc links for `cargo doc -D warnings`
+- *(repack)* don't strip Windows drive letters from tar paths
+
+### Other
+
+- *(repack)* unify plain + compressed tar arms in walk_source_into_sink
+- *(cli)* stream plain tar sources too — kill the random-access Tar::open
+- *(ext)* O(1) data-block allocator via per-group cursor
+- *(fat32)* O(1) child_exists via per-parent name index
+- *(iso9660)* tree children → BTreeMap, kills O(n²) insert + lookup
+- *(f2fs)* lazy `i_addr` Vec — 8× RAM cut on bulk-insert workloads
+
 ## [0.4.5](https://github.com/KarpelesLab/fstool/compare/v0.4.4...v0.4.5) - 2026-05-26
 
 ### Other

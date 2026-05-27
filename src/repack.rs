@@ -179,10 +179,17 @@ pub fn note(path: &str) {
 
 /// Announce a coarse phase boundary (e.g. "decompressing …",
 /// "scanning source …", "formatting … destination"). Prints on its own
-/// line in both TTY and pipe/log modes. No-op when no sink is active.
+/// line in both TTY and pipe/log modes and **resets** the running file
+/// counter — every emitted phase is the start of a new pass, so the
+/// user-visible "repack: N files" reflects the current phase rather
+/// than summing across passes (without this a two-pass build double-
+/// counts every entry, since both the analyze pass and the copy pass
+/// walk the source). No-op when no sink is active.
 pub fn phase(msg: &str) {
     ACTIVE_PROGRESS.with(|cell| {
         if let Some(p) = cell.borrow_mut().as_mut() {
+            p.files = 0;
+            p.last_path.clear();
             p.phase_inner(msg);
         }
     });

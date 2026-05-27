@@ -213,7 +213,53 @@ impl<'a> FileHandle for ApfsFileHandle<'a> {
         if !self.dirty {
             return Ok(());
         }
-        commit_checkpoint(self.fs, self.dev, self.target_oid, &self.contents)?;
+        let target_oid = self.target_oid;
+        let new_bytes = std::mem::take(&mut self.contents);
+        let new_size = new_bytes.len() as u64;
+        commit_with_mutator(self.fs, self.dev, |cx| {
+            let bs = cx.block_size() as u64;
+            // Drop the target's existing FILE_EXTENT / DSTREAM_ID records;
+            // a fresh single extent is allocated and written below.
+            cx.records.retain(|(k, _)| {
+                if k.len() < 8 {
+                    return true;
+                }
+                let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+                let oid = hdr & OBJ_ID_MASK;
+                let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
+                !(oid == target_oid
+                    && (kind == APFS_TYPE_FILE_EXTENT || kind == APFS_TYPE_DSTREAM_ID))
+            });
+            // Patch the inode's DSTREAM xfield to advertise the new size.
+            for (k, v) in cx.records.iter_mut() {
+                if k.len() < 8 {
+                    continue;
+                }
+                let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+                let oid = hdr & OBJ_ID_MASK;
+                let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
+                if oid == target_oid && kind == APFS_TYPE_INODE {
+                    patch_inode_dstream_size(v, new_size, bs);
+                }
+            }
+            // Allocate a fresh extent for the new bytes (skipped for an
+            // empty file — no FILE_EXTENT / DSTREAM_ID then either).
+            if new_size > 0 {
+                let extent_paddr = cx.alloc_extent(new_size)?;
+                cx.write_extent_bytes(extent_paddr, &new_bytes)?;
+                let block_size_u32 = cx.block_size();
+                for (k, v) in super::write::build_file_extent_records(
+                    target_oid,
+                    0,
+                    new_size,
+                    extent_paddr,
+                    block_size_u32,
+                ) {
+                    cx.records.push((k, v));
+                }
+            }
+            Ok(())
+        })?;
         self.dirty = false;
         Ok(())
     }
@@ -251,7 +297,6 @@ pub(crate) struct MutatorCx<'a> {
 
 impl<'a> MutatorCx<'a> {
     /// Block size in bytes (4096 on every APFS image in the wild).
-    #[allow(dead_code)] // used by commit-3+ callers
     pub(crate) fn block_size(&self) -> u32 {
         self.block_size
     }
@@ -260,7 +305,6 @@ impl<'a> MutatorCx<'a> {
     /// whole block). Returns the physical block number the extent
     /// starts at. Subsequent calls return non-overlapping ranges.
     /// Errors when the device doesn't have enough remaining blocks.
-    #[allow(dead_code)] // used by commit-3+ callers
     pub(crate) fn alloc_extent(&mut self, len_bytes: u64) -> Result<u64> {
         if len_bytes == 0 {
             return Ok(0);
@@ -287,7 +331,6 @@ impl<'a> MutatorCx<'a> {
     /// `block_size`. The caller is responsible for `paddr` having
     /// come from a recent [`Self::alloc_extent`] call sized for
     /// `bytes.len()`.
-    #[allow(dead_code)] // used by commit-3+ callers
     pub(crate) fn write_extent_bytes(&mut self, paddr: u64, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
@@ -434,171 +477,6 @@ where
         w.finish()?;
     }
 
-    let refreshed = Apfs::open_writable(dev)?;
-    debug_assert!(matches!(refreshed.state, ApfsState::Write(_)));
-    fs.state = refreshed.state;
-    fs.volume_name = refreshed.volume_name;
-    Ok(())
-}
-
-/// Commit a checkpoint that replaces the file at `target_oid` with the
-/// given `new_bytes`. All other inodes / directories / xattrs are
-/// preserved exactly.
-///
-/// On return, `fs.state` is refreshed to a fresh write state that
-/// reflects the newly-written checkpoint.
-fn commit_checkpoint(
-    fs: &mut Apfs,
-    dev: &mut dyn BlockDevice,
-    target_oid: u64,
-    new_bytes: &[u8],
-) -> Result<()> {
-    // Snapshot the writer-facing checkpoint metadata.
-    let (
-        block_size,
-        total_blocks,
-        volume_name,
-        container_uuid,
-        volume_uuid,
-        cur_xid,
-        next_xp_desc_slot,
-        bump_high_water,
-        next_oid,
-        num_files,
-        num_directories,
-        num_symlinks,
-    ) = match &fs.state {
-        ApfsState::Write(w) => (
-            fs.block_size,
-            w.total_blocks,
-            w.volume_name.clone(),
-            w.container_uuid,
-            w.volume_uuid,
-            w.cur_xid,
-            w.next_xp_desc_slot,
-            w.bump_high_water,
-            w.next_oid,
-            w.num_files,
-            w.num_directories,
-            w.num_symlinks,
-        ),
-        _ => {
-            return Err(crate::Error::Unsupported(
-                "apfs: sync called outside write state".into(),
-            ));
-        }
-    };
-
-    // ---- 1. Dump every existing fs-tree record into RAM ----
-    let mut records = dump_all_records(fs, dev)?;
-
-    // ---- 2. Mutate records: replace the target file's extents +
-    //         inode dstream size; drop dstream_id refcnt; we'll
-    //         rebuild them.
-    records.retain(|(k, _)| {
-        if k.len() < 8 {
-            return true;
-        }
-        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
-        let oid = hdr & OBJ_ID_MASK;
-        let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
-        // Drop the target's existing FILE_EXTENT / DSTREAM_ID records;
-        // we'll re-insert below.
-        !(oid == target_oid && (kind == APFS_TYPE_FILE_EXTENT || kind == APFS_TYPE_DSTREAM_ID))
-    });
-
-    // Patch the inode record (which is keyed by (target_oid, INODE)).
-    let new_size = new_bytes.len() as u64;
-    for (k, v) in records.iter_mut() {
-        if k.len() < 8 {
-            continue;
-        }
-        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
-        let oid = hdr & OBJ_ID_MASK;
-        let kind = (hdr >> OBJ_TYPE_SHIFT) as u8;
-        if oid == target_oid && kind == APFS_TYPE_INODE {
-            patch_inode_dstream_size(v, new_size, block_size as u64);
-        }
-    }
-
-    // ---- 3. Bump-allocate a fresh extent for the new file bytes ----
-    let bs_u64 = block_size as u64;
-    let (extent_paddr, extent_blocks) = if new_size == 0 {
-        (0u64, 0u64)
-    } else {
-        let blocks = new_size.div_ceil(bs_u64);
-        let start = bump_high_water;
-        let end = start.checked_add(blocks).ok_or_else(|| {
-            crate::Error::InvalidArgument("apfs: extent allocation overflow".into())
-        })?;
-        if end > total_blocks {
-            return Err(crate::Error::InvalidArgument(format!(
-                "apfs: not enough free blocks to write {new_size} bytes \
-                 (need {blocks}, have {})",
-                total_blocks - bump_high_water
-            )));
-        }
-        (start, blocks)
-    };
-
-    // Write the bytes into the new extent.
-    if new_size > 0 {
-        let mut blk = vec![0u8; block_size as usize];
-        for i in 0..extent_blocks {
-            let off = (i as usize) * block_size as usize;
-            let end = (off + block_size as usize).min(new_size as usize);
-            blk.fill(0);
-            blk[..end - off].copy_from_slice(&new_bytes[off..end]);
-            dev.write_at((extent_paddr + i) * bs_u64, &blk)?;
-        }
-    }
-
-    // ---- 4. Re-insert FILE_EXTENT + DSTREAM_ID records for the target.
-    if new_size > 0 {
-        let mut key = vec![0u8; 16];
-        let hdr = ((APFS_TYPE_FILE_EXTENT as u64) << OBJ_TYPE_SHIFT) | (target_oid & OBJ_ID_MASK);
-        key[0..8].copy_from_slice(&hdr.to_le_bytes());
-        key[8..16].copy_from_slice(&0u64.to_le_bytes()); // logical_addr
-        let mut val = vec![0u8; 24];
-        let alloc = extent_blocks * bs_u64;
-        val[0..8].copy_from_slice(&alloc.to_le_bytes());
-        val[8..16].copy_from_slice(&extent_paddr.to_le_bytes());
-        records.push((key, val));
-
-        let mut dkey = vec![0u8; 8];
-        let dhdr = ((APFS_TYPE_DSTREAM_ID as u64) << OBJ_TYPE_SHIFT) | (target_oid & OBJ_ID_MASK);
-        dkey.copy_from_slice(&dhdr.to_le_bytes());
-        let dval = vec![0u8; 4];
-        records.push((dkey, dval));
-    }
-
-    // ---- 5. Construct a checkpoint-mode writer and emit. ----
-    let new_bump_start = bump_high_water + extent_blocks;
-    let new_xid = cur_xid + 1;
-    {
-        let mut w = write::ApfsWriter::new_checkpoint(
-            dev,
-            total_blocks,
-            block_size,
-            &volume_name,
-            container_uuid,
-            volume_uuid,
-            new_xid,
-            next_xp_desc_slot,
-            new_bump_start,
-            next_oid,
-            num_files,
-            num_directories,
-            num_symlinks,
-        )?;
-        for (k, v) in records {
-            w.push_raw_record(k, v);
-        }
-        w.finish()?;
-    }
-
-    // ---- 6. Refresh `fs.state` by reopening the (now-newer)
-    //         checkpoint as a fresh write state.
     let refreshed = Apfs::open_writable(dev)?;
     debug_assert!(matches!(refreshed.state, ApfsState::Write(_)));
     fs.state = refreshed.state;

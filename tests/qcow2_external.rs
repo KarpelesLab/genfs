@@ -360,6 +360,60 @@ fn build_partitioned_qcow2() {
     assert!(s.contains("hello"));
 }
 
+/// Writing zeros to an unallocated cluster (whether via `write_at` or
+/// `zero_range`) must NOT allocate the cluster on disk — the qcow2
+/// allocator already treats unmapped clusters as zero, so the backing
+/// file should stay small. Regression: previously the ext formatter's
+/// `dev.zero_range(0, total_bytes)` upfront in `format_with` allocated
+/// every cluster of the virtual image, turning an 8 GiB repacked
+/// qcow2 into an 8 GiB file on disk.
+#[test]
+fn zero_writes_stay_sparse() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut back = Qcow2Backend::create(tmp.path(), 1024 * 1024 * 1024, 65536).unwrap();
+    // Zero the entire 1 GiB virtual region.
+    back.zero_range(0, 1024 * 1024 * 1024).unwrap();
+    // A write of all-zero bytes through write_at is the same situation.
+    back.write_at(512 * 1024 * 1024, &[0u8; 4096]).unwrap();
+    back.sync().unwrap();
+    drop(back);
+    let on_disk = std::fs::metadata(tmp.path()).unwrap().len();
+    // A fresh 1 GiB qcow2 with cluster_size=64 KiB only needs the
+    // header + refcount + L1; well under 1 MiB. Allow a generous bound.
+    assert!(
+        on_disk < 8 * 1024 * 1024,
+        "zero writes bloated the file: {on_disk} bytes on disk",
+    );
+    // The virtual contents must still read back as zero.
+    let mut buf = [0xffu8; 4096];
+    let mut back = Qcow2Backend::open(tmp.path()).unwrap();
+    back.read_at(0, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0));
+    back.read_at(512 * 1024 * 1024, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0));
+}
+
+/// Writing zeros to an *already allocated* cluster must overwrite the
+/// existing data (not silently skip), so a later read returns zero.
+#[test]
+fn zero_writes_clear_allocated_clusters() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut back = Qcow2Backend::create(tmp.path(), 4 * 1024 * 1024, 65536).unwrap();
+    // Allocate a cluster by writing a non-zero pattern.
+    back.write_at(0, &[0xABu8; 4096]).unwrap();
+    // Now write zeros to the same range; the read-back must be zero.
+    back.write_at(0, &[0u8; 4096]).unwrap();
+    let mut buf = [0xffu8; 4096];
+    back.read_at(0, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0), "stale data persisted");
+
+    // Same via zero_range.
+    back.write_at(1024 * 1024, &[0xCDu8; 4096]).unwrap();
+    back.zero_range(1024 * 1024, 4096).unwrap();
+    back.read_at(1024 * 1024, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0), "zero_range left stale data");
+}
+
 /// fstool::block::open_image dispatches to Qcow2Backend on qcow2 magic.
 #[test]
 fn open_image_dispatches_to_qcow2() {

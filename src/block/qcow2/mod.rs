@@ -254,6 +254,20 @@ impl Qcow2Backend {
             let take = ((cs - in_cluster) as usize).min(buf.len());
             let (chunk, rest) = buf.split_at(take);
             let cluster_start = offset - in_cluster;
+            // Sparse fast path: writing zeros to a cluster that has no
+            // physical mapping is a no-op — an unallocated qcow2 cluster
+            // already reads back as zero, so allocating one just to fill
+            // it with zeros bloats the file on disk for no semantic gain.
+            // This is what made an 8 GiB ext2 repacked into qcow2 take
+            // 8 GiB on disk: `Ext::format_with` calls `dev.zero_range`
+            // across the whole image before formatting.
+            if chunk.iter().all(|&b| b == 0)
+                && self.l1l2.lookup(&mut self.file, cluster_start)?.is_none()
+            {
+                offset += take as u64;
+                buf = rest;
+                continue;
+            }
             let phys = self.ensure_mapping(cluster_start)?;
             self.file.seek(SeekFrom::Start(phys + in_cluster))?;
             self.file.write_all(chunk)?;
@@ -437,19 +451,40 @@ impl BlockDevice for Qcow2Backend {
     }
 
     fn zero_range(&mut self, offset: u64, len: u64) -> Result<()> {
-        // We don't implement discard/punch here — just write zeros
-        // through the allocator. That's allocation-heavy for big ranges
-        // but produces a correct image and matches the BlockDevice
-        // trait's default behaviour.
         if len == 0 {
             return Ok(());
         }
-        let zero = vec![0u8; 4096];
-        let mut written = 0u64;
-        while written < len {
-            let n = (len - written).min(zero.len() as u64) as usize;
-            self.write_virtual(offset + written, &zero[..n])?;
-            written += n as u64;
+        let size = self.header.size;
+        let end = offset
+            .checked_add(len)
+            .ok_or(crate::Error::OutOfBounds { offset, len, size })?;
+        if end > size {
+            return Err(crate::Error::OutOfBounds { offset, len, size });
+        }
+        // Sparse-aware: an unallocated qcow2 cluster already reads as
+        // zero, so a zero_range over unallocated clusters is a no-op.
+        // Only clusters that already carry a physical mapping need to
+        // be overwritten with zeros (we don't punch/discard yet — that
+        // would require touching the refcount table). This is what
+        // keeps an 8 GiB virtual image at a few megabytes on disk when
+        // the FS formatter prefaces format with a full-device zero.
+        let cs = self.cluster_size;
+        let zero = [0u8; 4096];
+        let mut cur = offset;
+        while cur < end {
+            let in_cluster = cur & (cs - 1);
+            let take = (cs - in_cluster).min(end - cur);
+            let cluster_start = cur - in_cluster;
+            if let Some(phys) = self.l1l2.lookup(&mut self.file, cluster_start)? {
+                self.file.seek(SeekFrom::Start(phys + in_cluster))?;
+                let mut remaining = take;
+                while remaining > 0 {
+                    let n = remaining.min(zero.len() as u64) as usize;
+                    self.file.write_all(&zero[..n])?;
+                    remaining -= n as u64;
+                }
+            }
+            cur += take;
         }
         Ok(())
     }

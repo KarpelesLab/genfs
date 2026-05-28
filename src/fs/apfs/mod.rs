@@ -418,6 +418,15 @@ impl Apfs {
     /// xp_desc slot; slots are reused in ring-buffer order so the
     /// number of consecutive checkpoint commits is unbounded. The
     /// chkmap at slot 0 is preserved (we never overwrite it).
+    ///
+    /// Refuses volumes formatted with
+    /// `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE` (the default for
+    /// macOS-created APFS volumes): the on-disk drec key carries a
+    /// 22-bit hash of the Unicode-normalized + case-folded leaf
+    /// name, and we don't implement that hash. Writing a drec with
+    /// a wrong-sorted key would leave the B-tree in an order the
+    /// kernel can't traverse on lookup. Read-only access to such a
+    /// volume keeps working via [`Apfs::open`].
     pub fn open_writable(dev: &mut dyn BlockDevice) -> Result<Self> {
         let read_only = Apfs::open(dev)?;
         // Re-decode the container so we can pull the checkpoint
@@ -428,6 +437,34 @@ impl Apfs {
         let total_bytes = ctx.total_bytes;
         let container_uuid = ctx.live_sb.uuid;
         let cur_xid = ctx.live_sb.obj.xid;
+
+        // Refuse hashed-key (case-insensitive) volumes up front. We
+        // could attach in Write state, but every subsequent drec we
+        // add would sort wrong in the B-tree: the key carries a
+        // 22-bit hash of the normalized name, and our writer has
+        // no normalization hash. Silently corrupting the catalog
+        // is far worse than refusing — Apfs::open on the same image
+        // keeps working for read-only access.
+        match find_volume_paddr(dev, &ctx) {
+            Ok((_, paddr)) => {
+                let mut apsb_block = vec![0u8; block_size as usize];
+                dev.read_at(paddr * block_size as u64, &mut apsb_block)?;
+                let apsb = ApfsSuperblock::decode(&apsb_block)?;
+                if apsb.incompatible_features & APFS_INCOMPAT_NORMALIZATION_INSENSITIVE != 0 {
+                    return Err(crate::Error::Unsupported(
+                        "apfs: volume is APFS_INCOMPAT_NORMALIZATION_INSENSITIVE \
+                         (case-insensitive); the writer doesn't implement the \
+                         APFS normalization hash so writes would corrupt the \
+                         drec B-tree. Use Apfs::open for read-only access."
+                            .into(),
+                    ));
+                }
+            }
+            Err(_) => {
+                // No volumes / unreadable APSB — defer to the rest
+                // of open_writable to surface a precise error.
+            }
+        }
 
         // Pick the next xp_desc slot via ring math: the new NXSB
         // writes one offset past the live one, wrapping at

@@ -1512,3 +1512,74 @@ fn apfs_filesystem_list_xattrs_sorted() {
         "got {names:?}"
     );
 }
+
+/// `Apfs::open_writable` must refuse a volume formatted with
+/// `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE` (the macOS default).
+/// Our writer doesn't implement the APFS normalization hash, so a
+/// drec we add would sort wrong in the B-tree — silently
+/// corrupting the catalog. Read-only access via `Apfs::open` must
+/// keep working on the same image.
+#[test]
+fn apfs_open_writable_refuses_hashed_key_volume() {
+    use std::os::unix::fs::FileExt;
+
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let bs = 4096u64;
+    let total = 4096u64;
+    let img = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(img.path(), total * bs).unwrap();
+        let w = ApfsWriter::new(&mut dev, total, bs as u32, "NRMI").unwrap();
+        w.finish().unwrap();
+        dev.sync().unwrap();
+    }
+    // Flip APFS_INCOMPAT_NORMALIZATION_INSENSITIVE (bit 0x0000_0008)
+    // in the APSB's incompatible_features field (byte offset 56..64
+    // of the APSB block). APSB_PADDR lives just past the container
+    // omap — block index 19 by our writer's layout
+    // (CHKMAP=1, NXSB=2, [spare 3..15], SPACEMAN=17, CONT_OMAP=18,
+    // APSB=19). Look it up by scanning blocks for the 'APSB' magic
+    // (u32 = 0x42535041 LE) at offset +32 of each block; that's
+    // robust against future layout changes.
+    {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(img.path())
+            .unwrap();
+        let mut apsb_paddr: Option<u64> = None;
+        let mut buf = [0u8; 4];
+        for paddr in 0..total {
+            f.read_exact_at(&mut buf, paddr * bs + 32).unwrap();
+            if &buf == b"APSB" {
+                apsb_paddr = Some(paddr);
+                break;
+            }
+        }
+        let paddr = apsb_paddr.expect("no APSB found in image");
+        // Read the incompat field, set bit 0x8, write it back.
+        let mut incompat = [0u8; 8];
+        f.read_exact_at(&mut incompat, paddr * bs + 56).unwrap();
+        let mut v = u64::from_le_bytes(incompat);
+        v |= 0x0000_0008;
+        f.write_at(&v.to_le_bytes(), paddr * bs + 56).unwrap();
+        f.sync_all().unwrap();
+    }
+    // Read still works.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let _ = Apfs::open(&mut dev).expect("read of hashed-key volume should work");
+    }
+    // open_writable must refuse.
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let err =
+        Apfs::open_writable(&mut dev).expect_err("open_writable should refuse hashed-key volume");
+    let s = format!("{err}");
+    assert!(
+        s.contains("NORMALIZATION_INSENSITIVE") || s.contains("case-insensitive"),
+        "unexpected error: {s}",
+    );
+}

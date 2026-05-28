@@ -354,7 +354,7 @@ pub(crate) fn build_drec_record(
 /// from the kernel's, the new drec sorts into the wrong B-tree
 /// bucket and the kernel won't find it on the next mount — same
 /// failure mode as an off-by-one in our impl.
-pub(crate) fn apfs_drec_name_len_and_hash(name: &str, case_fold: bool) -> u32 {
+pub fn apfs_drec_name_len_and_hash(name: &str, case_fold: bool) -> u32 {
     use caseless::Caseless;
     use unicode_normalization::UnicodeNormalization;
     let chars: Vec<u32> = if case_fold {

@@ -180,6 +180,18 @@ pub(crate) struct WriteState {
     /// the spaceman's used-block count and grown by every new metadata
     /// or extent block.
     pub(crate) bump_high_water: u64,
+    /// Drec key layout for this volume, picked at open time from
+    /// `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE` in the APSB. Plain
+    /// for the volumes our own writer formats (and most case-sensitive
+    /// images); Hashed for macOS-default user data volumes. Threaded
+    /// into every `build_drec_record` call so writes land in the same
+    /// B-tree bucket the reader's comparator expects.
+    pub(crate) drec_layout: DrecKeyLayout,
+    /// Whether the volume sets `APFS_INCOMPAT_CASE_INSENSITIVE`. When
+    /// true, the writer applies Unicode default case folding before
+    /// hashing — so "Foo.txt" and "foo.txt" sort to the same hash
+    /// bucket and the kernel treats them as the same name.
+    pub(crate) drec_case_fold: bool,
 }
 
 /// Read-mode caches: everything needed to walk the fs-tree.
@@ -275,6 +287,10 @@ impl std::fmt::Debug for Apfs {
     }
 }
 
+/// `APFS_INCOMPAT_CASE_INSENSITIVE` — when set, name comparisons are
+/// case-insensitive and the writer applies Unicode default case
+/// folding before hashing the drec name.
+const APFS_INCOMPAT_CASE_INSENSITIVE: u64 = 0x0000_0001;
 /// `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE` — when set, drec keys use
 /// the hashed layout (`j_drec_hashed_key_t`); otherwise the plain
 /// layout (`j_drec_key_t`) is in use.
@@ -438,34 +454,6 @@ impl Apfs {
         let container_uuid = ctx.live_sb.uuid;
         let cur_xid = ctx.live_sb.obj.xid;
 
-        // Refuse hashed-key (case-insensitive) volumes up front. We
-        // could attach in Write state, but every subsequent drec we
-        // add would sort wrong in the B-tree: the key carries a
-        // 22-bit hash of the normalized name, and our writer has
-        // no normalization hash. Silently corrupting the catalog
-        // is far worse than refusing — Apfs::open on the same image
-        // keeps working for read-only access.
-        match find_volume_paddr(dev, &ctx) {
-            Ok((_, paddr)) => {
-                let mut apsb_block = vec![0u8; block_size as usize];
-                dev.read_at(paddr * block_size as u64, &mut apsb_block)?;
-                let apsb = ApfsSuperblock::decode(&apsb_block)?;
-                if apsb.incompatible_features & APFS_INCOMPAT_NORMALIZATION_INSENSITIVE != 0 {
-                    return Err(crate::Error::Unsupported(
-                        "apfs: volume is APFS_INCOMPAT_NORMALIZATION_INSENSITIVE \
-                         (case-insensitive); the writer doesn't implement the \
-                         APFS normalization hash so writes would corrupt the \
-                         drec B-tree. Use Apfs::open for read-only access."
-                            .into(),
-                    ));
-                }
-            }
-            Err(_) => {
-                // No volumes / unreadable APSB — defer to the rest
-                // of open_writable to surface a precise error.
-            }
-        }
-
         // Pick the next xp_desc slot via ring math: the new NXSB
         // writes one offset past the live one, wrapping at
         // `xp_desc_blocks`. Slot 0 holds the chkmap and is reserved —
@@ -497,6 +485,19 @@ impl Apfs {
         // pub struct, so peek directly.
         let next_oid = u64::from_le_bytes(apsb_block[176..184].try_into().unwrap());
 
+        // Resolve the drec key layout + case-fold policy from the APSB's
+        // incompatible_features. Hashed-key volumes (the macOS user-data
+        // default) need the 22-bit CRC32C hash threaded through every
+        // drec we emit — see write::apfs_drec_name_len_and_hash for the
+        // best-effort caveats around Apple's Unicode tables.
+        let drec_layout =
+            if apsb.incompatible_features & APFS_INCOMPAT_NORMALIZATION_INSENSITIVE != 0 {
+                DrecKeyLayout::Hashed
+            } else {
+                DrecKeyLayout::Plain
+            };
+        let drec_case_fold = apsb.incompatible_features & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
+
         // Use the spaceman's used-block accounting as the bump-allocator
         // high-water mark. Falling back to a conservative guess if the
         // spaceman can't be parsed: assume the whole front half of the
@@ -527,6 +528,8 @@ impl Apfs {
                 num_symlinks: apsb.num_symlinks,
                 cur_xid,
                 next_xp_desc_slot,
+                drec_layout,
+                drec_case_fold,
                 bump_high_water,
             }),
         })
@@ -887,6 +890,21 @@ impl Apfs {
     /// inode at `path`. Preserves the file-type bits.
     ///
     /// Writes a fresh APFS checkpoint — same COW pathway
+    /// Return the drec key layout + case-fold flag for the active
+    /// Write state. Used by every method that emits a fresh drec
+    /// (create_*_at, rename, link) so the on-disk key matches the
+    /// volume's `apfs_incompatible_features`. Panics if called
+    /// outside Write state — callers always go through `commit_with_mutator`
+    /// which already returns `Unsupported` for non-Write states.
+    fn drec_layout_for_writes(&self) -> (DrecKeyLayout, bool) {
+        match &self.state {
+            ApfsState::Write(w) => (w.drec_layout, w.drec_case_fold),
+            // commit_with_mutator handles the non-Write states; if we
+            // got here without Write state something is very wrong.
+            _ => (DrecKeyLayout::Plain, false),
+        }
+    }
+
     /// `rw::commit_with_mutator` uses for every other in-place
     /// mutation. The on-disk byte affected lives at offset 80..82
     /// of `j_inode_val_t`.
@@ -1040,6 +1058,7 @@ impl Apfs {
     ) -> Result<()> {
         let (old_parent, old_name) = self.resolve_parent_and_name(dev, old_path)?;
         let (new_parent, new_name) = self.resolve_parent_and_name(dev, new_path)?;
+        let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
             let records = &mut *cx.records;
             let (target_oid, dtype) =
@@ -1054,15 +1073,8 @@ impl Apfs {
                 )));
             }
             remove_drec(records, old_parent, &old_name);
-            // Commit-1 stub: pass Plain/false. Commit-2 threads the
-            // volume's real DrecKeyLayout + case_fold from WriteState.
             let (k, v) = write::build_drec_record(
-                new_parent,
-                &new_name,
-                target_oid,
-                dtype,
-                DrecKeyLayout::Plain,
-                false,
+                new_parent, &new_name, target_oid, dtype, layout, case_fold,
             )?;
             records.push((k, v));
             if old_parent != new_parent {
@@ -1113,6 +1125,7 @@ impl Apfs {
                 "apfs: cannot hardlink to a directory".into(),
             ));
         }
+        let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
             let records = &mut *cx.records;
             if find_drec(records, new_parent, &new_name).is_some() {
@@ -1120,14 +1133,13 @@ impl Apfs {
                     "apfs: link target {new_name:?} already exists"
                 )));
             }
-            // Commit-1 stub: Plain/false. Commit-2 swaps in real values.
             let (k, v) = write::build_drec_record(
                 new_parent,
                 &new_name,
                 target_oid,
                 target_dtype,
-                DrecKeyLayout::Plain,
-                false,
+                layout,
+                case_fold,
             )?;
             records.push((k, v));
             patch_inode_record(records, target_oid, |v| {
@@ -1164,6 +1176,7 @@ impl Apfs {
         mtime_ns: u64,
     ) -> Result<()> {
         let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
+        let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
             if find_drec(cx.records, parent_oid, &name).is_some() {
                 return Err(crate::Error::InvalidArgument(format!(
@@ -1193,15 +1206,8 @@ impl Apfs {
                 mtime_ns,
             );
             cx.records.push((ik, iv));
-            // Commit-1 stub: Plain/false. Commit-2 swaps in real values.
-            let (dk, dv) = write::build_drec_record(
-                parent_oid,
-                &name,
-                oid,
-                DT_REG,
-                DrecKeyLayout::Plain,
-                false,
-            )?;
+            let (dk, dv) =
+                write::build_drec_record(parent_oid, &name, oid, DT_REG, layout, case_fold)?;
             cx.records.push((dk, dv));
             // Bump the parent dir's nchildren counter.
             patch_inode_record(cx.records, parent_oid, |v| {
@@ -1227,6 +1233,7 @@ impl Apfs {
         mtime_ns: u64,
     ) -> Result<()> {
         let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
+        let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
             if find_drec(cx.records, parent_oid, &name).is_some() {
                 return Err(crate::Error::InvalidArgument(format!(
@@ -1241,15 +1248,8 @@ impl Apfs {
             let (ik, iv) =
                 write::build_inode_record(oid, parent_oid, write::mode_dir(mode), 0, bs, mtime_ns);
             cx.records.push((ik, iv));
-            // Commit-1 stub: Plain/false. Commit-2 swaps in real values.
-            let (dk, dv) = write::build_drec_record(
-                parent_oid,
-                &name,
-                oid,
-                DT_DIR,
-                DrecKeyLayout::Plain,
-                false,
-            )?;
+            let (dk, dv) =
+                write::build_drec_record(parent_oid, &name, oid, DT_DIR, layout, case_fold)?;
             cx.records.push((dk, dv));
             patch_inode_record(cx.records, parent_oid, |v| {
                 if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
@@ -1282,6 +1282,7 @@ impl Apfs {
                 "apfs: symlink target must be non-empty".into(),
             ));
         }
+        let (layout, case_fold) = self.drec_layout_for_writes();
         rw::commit_with_mutator(self, dev, |cx| {
             if find_drec(cx.records, parent_oid, &name).is_some() {
                 return Err(crate::Error::InvalidArgument(format!(
@@ -1304,15 +1305,8 @@ impl Apfs {
                 mtime_ns,
             );
             cx.records.push((ik, iv));
-            // Commit-1 stub: Plain/false. Commit-2 swaps in real values.
-            let (dk, dv) = write::build_drec_record(
-                parent_oid,
-                &name,
-                oid,
-                DT_LNK,
-                DrecKeyLayout::Plain,
-                false,
-            )?;
+            let (dk, dv) =
+                write::build_drec_record(parent_oid, &name, oid, DT_LNK, layout, case_fold)?;
             cx.records.push((dk, dv));
             patch_inode_record(cx.records, parent_oid, |v| {
                 if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {

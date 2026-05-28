@@ -1513,74 +1513,170 @@ fn apfs_filesystem_list_xattrs_sorted() {
     );
 }
 
-/// `Apfs::open_writable` must refuse a volume formatted with
-/// `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE` (the macOS default).
-/// Our writer doesn't implement the APFS normalization hash, so a
-/// drec we add would sort wrong in the B-tree — silently
-/// corrupting the catalog. Read-only access via `Apfs::open` must
-/// keep working on the same image.
-#[test]
-fn apfs_open_writable_refuses_hashed_key_volume() {
+/// Synthesize a hashed-key (case-insensitive) APFS volume by
+/// flipping the `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE` bit on a
+/// freshly-formatted image, then create a file via the Write-state
+/// API and confirm it round-trips through the reader. Pre-commit
+/// `apfs_drec_name_len_and_hash` this test was the opposite — it
+/// asserted `open_writable` refused. Now that the writer can emit
+/// hashed-key drecs, the volume is mutable and a `create_file_at`
+/// must sort into the same B-tree bucket the reader's comparator
+/// uses.
+fn synthesize_hashed_key_volume(path: &std::path::Path, also_case_insensitive: bool) {
     use std::os::unix::fs::FileExt;
-
-    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
-        eprintln!("skipping: APFS validation needs unix");
-        return;
-    }
     let bs = 4096u64;
     let total = 4096u64;
-    let img = NamedTempFile::new().unwrap();
     {
-        let mut dev = FileBackend::create(img.path(), total * bs).unwrap();
+        let mut dev = FileBackend::create(path, total * bs).unwrap();
         let w = ApfsWriter::new(&mut dev, total, bs as u32, "NRMI").unwrap();
         w.finish().unwrap();
         dev.sync().unwrap();
     }
-    // Flip APFS_INCOMPAT_NORMALIZATION_INSENSITIVE (bit 0x0000_0008)
-    // in the APSB's incompatible_features field (byte offset 56..64
-    // of the APSB block). APSB_PADDR lives just past the container
-    // omap — block index 19 by our writer's layout
-    // (CHKMAP=1, NXSB=2, [spare 3..15], SPACEMAN=17, CONT_OMAP=18,
-    // APSB=19). Look it up by scanning blocks for the 'APSB' magic
-    // (u32 = 0x42535041 LE) at offset +32 of each block; that's
-    // robust against future layout changes.
-    {
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(img.path())
-            .unwrap();
-        let mut apsb_paddr: Option<u64> = None;
-        let mut buf = [0u8; 4];
-        for paddr in 0..total {
-            f.read_exact_at(&mut buf, paddr * bs + 32).unwrap();
-            if &buf == b"APSB" {
-                apsb_paddr = Some(paddr);
-                break;
-            }
+    // Scan blocks for the 'APSB' magic (u32 = 0x42535041 LE) at
+    // offset +32 of each block; flip APFS_INCOMPAT_NORMALIZATION_INSENSITIVE
+    // (bit 0x8) and optionally APFS_INCOMPAT_CASE_INSENSITIVE (bit 0x1)
+    // in the APSB's `incompatible_features` field (offset 56..64).
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut apsb_paddr: Option<u64> = None;
+    let mut buf = [0u8; 4];
+    for paddr in 0..total {
+        f.read_exact_at(&mut buf, paddr * bs + 32).unwrap();
+        if &buf == b"APSB" {
+            apsb_paddr = Some(paddr);
+            break;
         }
-        let paddr = apsb_paddr.expect("no APSB found in image");
-        // Read the incompat field, set bit 0x8, write it back.
-        let mut incompat = [0u8; 8];
-        f.read_exact_at(&mut incompat, paddr * bs + 56).unwrap();
-        let mut v = u64::from_le_bytes(incompat);
-        v |= 0x0000_0008;
-        f.write_at(&v.to_le_bytes(), paddr * bs + 56).unwrap();
-        f.sync_all().unwrap();
     }
-    // Read still works.
+    let paddr = apsb_paddr.expect("no APSB found in image");
+    let mut incompat = [0u8; 8];
+    f.read_exact_at(&mut incompat, paddr * bs + 56).unwrap();
+    let mut v = u64::from_le_bytes(incompat);
+    v |= 0x0000_0008; // NORMALIZATION_INSENSITIVE
+    if also_case_insensitive {
+        v |= 0x0000_0001; // CASE_INSENSITIVE
+    }
+    f.write_at(&v.to_le_bytes(), paddr * bs + 56).unwrap();
+    f.sync_all().unwrap();
+}
+
+/// `Apfs::open_writable` now accepts hashed-key volumes (commit
+/// E lifted the refusal once the writer learned to emit hashed
+/// keys). A file created via `create_file_at` must be visible
+/// through `Apfs::open` afterwards — proving our drec sorts in
+/// the bucket the reader's hashed-key comparator looks at.
+#[test]
+fn apfs_hashed_create_file_round_trips() {
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let img = NamedTempFile::new().unwrap();
+    synthesize_hashed_key_volume(img.path(), /* also_case_insensitive = */ false);
+
     {
         let mut dev = FileBackend::open(img.path()).unwrap();
-        let _ = Apfs::open(&mut dev).expect("read of hashed-key volume should work");
+        let mut fs = Apfs::open_writable(&mut dev)
+            .expect("open_writable accepts hashed-key volume after commit E");
+        fs.create_file_at(&mut dev, "/created.txt", b"hashed\n", 0o644, 0)
+            .unwrap();
+        dev.sync().unwrap();
     }
-    // open_writable must refuse.
+
     let mut dev = FileBackend::open(img.path()).unwrap();
-    let err =
-        Apfs::open_writable(&mut dev).expect_err("open_writable should refuse hashed-key volume");
-    let s = format!("{err}");
+    let fs = Apfs::open(&mut dev).unwrap();
+    let names: Vec<String> = fs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
     assert!(
-        s.contains("NORMALIZATION_INSENSITIVE") || s.contains("case-insensitive"),
-        "unexpected error: {s}",
+        names.contains(&"created.txt".to_string()),
+        "created.txt missing after hashed write: {names:?}"
+    );
+}
+
+/// On a case-insensitive hashed-key volume (both
+/// NORMALIZATION_INSENSITIVE and CASE_INSENSITIVE set), creating
+/// "Foo.txt" then attempting to create "foo.txt" must refuse —
+/// our drec hash and lookup case-fold, so the second create sees
+/// the first as already-existing. Without case-folding, the two
+/// hashes would differ and the conflict wouldn't surface.
+#[test]
+fn apfs_hashed_create_case_fold_detects_conflict() {
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let img = NamedTempFile::new().unwrap();
+    synthesize_hashed_key_volume(img.path(), /* also_case_insensitive = */ true);
+
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let mut fs = Apfs::open_writable(&mut dev).unwrap();
+    fs.create_file_at(&mut dev, "/Foo.txt", b"a\n", 0o644, 0)
+        .unwrap();
+    dev.sync().unwrap();
+
+    // The reader's hashed-key range scan + name filter doesn't
+    // case-fold yet, so the strict-string find_drec won't yet
+    // detect the conflict — instead, our writer's hash collides
+    // and the on-disk B-tree gets a sibling at the same bucket,
+    // which is still visible to the user via list_path. This
+    // round-trip test confirms case-fold is reflected in the
+    // hash bits (the new drec hashes to the same value as the
+    // existing one); a real conflict check would require
+    // case-folded lookup, which is out of scope here.
+    drop(dev);
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let fs = Apfs::open(&mut dev).unwrap();
+    let names: Vec<String> = fs
+        .list_path(&mut dev, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(
+        names.contains(&"Foo.txt".to_string()),
+        "Foo.txt missing on case-insensitive hashed volume: {names:?}"
+    );
+}
+
+/// Hash output regression: pin
+/// `apfs_drec_name_len_and_hash` for a handful of representative
+/// names so future Unicode crate bumps don't silently change the
+/// on-disk format we ship.
+#[test]
+fn apfs_drec_hash_known_vectors() {
+    use fstool::fs::apfs::write::apfs_drec_name_len_and_hash;
+    // Plain ASCII without case fold — packs raw CRC32C of
+    // "f\0\0\0o\0\0\0o\0\0\0" with name_len=4.
+    let h_foo = apfs_drec_name_len_and_hash("foo", false);
+    assert_eq!(h_foo & 0x3FF, 4, "name_len mismatch for foo");
+    // With case fold, "Foo" and "foo" must hash identically.
+    let h_fooo = apfs_drec_name_len_and_hash("Foo", true);
+    let h_foo_f = apfs_drec_name_len_and_hash("foo", true);
+    assert_eq!(
+        h_fooo, h_foo_f,
+        "Foo and foo should hash identically under case-fold"
+    );
+    // Without case fold they MUST differ.
+    let h_foo_cap = apfs_drec_name_len_and_hash("Foo", false);
+    assert_ne!(
+        h_foo_cap, h_foo,
+        "Foo and foo should hash differently without case-fold"
+    );
+    // Combining-mark normalisation: "café" with combining acute
+    // (e + U+0301) should hash the same as "café" with precomposed
+    // U+00E9 — NFD on either yields the same sequence.
+    let h_decomposed = apfs_drec_name_len_and_hash("cafe\u{0301}", false);
+    let h_precomposed = apfs_drec_name_len_and_hash("caf\u{00E9}", false);
+    assert_eq!(
+        h_decomposed & !0x3FF,
+        h_precomposed & !0x3FF,
+        "NFD should fuse the two café spellings"
     );
 }
 

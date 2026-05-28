@@ -1867,7 +1867,7 @@ fn shell_cmd(image: &str) -> fstool::Result<()> {
     // shell would land on that tempfile, silently lost on exit.
     fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
-        let fs = fstool::inspect::AnyFs::open(dev)?;
+        let fs = fstool::inspect::AnyFs::open_writable(dev)?;
         // Shell exists for in-place mutation (`put` / `rm`). A
         // filesystem that can't support those — tar, ISO 9660,
         // SquashFS, etc. — has nothing useful to offer here; point
@@ -1900,7 +1900,7 @@ fn rm(image: &str, fs_path: &str) -> fstool::Result<()> {
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
-        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut fs = fstool::inspect::AnyFs::open_writable(dev)?;
         fs.remove(dev, fs_path)?;
         fs.flush(dev)?;
         dev.sync()?;
@@ -1914,7 +1914,7 @@ fn add(image: &str, host_src: &std::path::Path, fs_dest: &str) -> fstool::Result
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
-        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let mut fs = fstool::inspect::AnyFs::open_writable(dev)?;
         if meta.is_dir() {
             fs.add_dir_tree(dev, fs_dest, host_src)?;
         } else if meta.is_file() {

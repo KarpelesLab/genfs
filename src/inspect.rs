@@ -345,6 +345,26 @@ impl AnyFs {
         }
     }
 
+    /// Like [`Self::open`], but for callers that intend to mutate
+    /// the filesystem in place (`add` / `rm` / `shell`). APFS routes
+    /// to [`Apfs::open_writable`] so the new checkpoint COW pathway
+    /// is reachable; every other backend's writer is already alive
+    /// after a plain `open`, so they share the same dispatch table.
+    ///
+    /// Read-only callers (`ls`, `cat`, `info`, `analyze`) should keep
+    /// using [`Self::open`] — it's cheaper for APFS (no spaceman
+    /// re-parse, no Write-state scaffolding) and uniform across
+    /// backends.
+    pub fn open_writable(dev: &mut dyn BlockDevice) -> Result<Self> {
+        match detect_fs(dev)? {
+            FsKind::Apfs => Ok(Self::Apfs(Box::new(Apfs::open_writable(dev)?))),
+            // Every other backend's open() already returns a mutable
+            // handle (ext journals, FAT/exFAT/NTFS rewrite, …), so
+            // just defer to the existing dispatch.
+            _ => Self::open(dev),
+        }
+    }
+
     /// Which filesystem this handle is talking to.
     pub fn kind(&self) -> FsKind {
         match self {

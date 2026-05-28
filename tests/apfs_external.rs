@@ -1265,3 +1265,85 @@ fn apfs_xp_desc_ring_buffer_survives_many_checkpoints() {
     std::io::Read::read_to_string(&mut r, &mut body).unwrap();
     assert_eq!(body, format!("body-{}\n", n_cycles - 1));
 }
+
+/// CLI round-trip: `fstool add` against an APFS image must reach
+/// the Write-state mutators (commit-A wiring). Before that change
+/// AnyFs::open returned a Read-state Apfs handle and the trait
+/// methods all returned Unsupported, so `fstool add disk.apfs …`
+/// erred with "apfs is a write-once format" even though the
+/// inherent Write-state API worked fine.
+#[test]
+fn cli_add_rm_reach_apfs_write_state() {
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_fstool");
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("v.apfs");
+    {
+        let bs = 4096u32;
+        let total = 4096u64;
+        let mut dev = FileBackend::create(&img, total * bs as u64).unwrap();
+        let mut w = ApfsWriter::new(&mut dev, total, bs, "CLI").unwrap();
+        // Seed one file so /seed is present for the rm step.
+        let body = b"seed\n";
+        let mut r = Cursor::new(body.as_ref());
+        w.add_file_from_reader(2, "seed.txt", 0o644, &mut r, body.len() as u64)
+            .unwrap();
+        w.finish().unwrap();
+        dev.sync().unwrap();
+    }
+
+    // fstool add via CLI — must succeed (commit-A wiring).
+    let host = dir.path().join("host.txt");
+    std::fs::write(&host, b"cli-added\n").unwrap();
+    let r = Command::new(bin)
+        .arg("add")
+        .arg(&img)
+        .arg(&host)
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "fstool add on apfs failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // Verify via ls that /added.txt is present.
+    let ls = Command::new(bin)
+        .arg("ls")
+        .arg(&img)
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        listing.contains("added.txt"),
+        "/added.txt missing: {listing}"
+    );
+
+    // fstool rm via CLI — must succeed.
+    let r = Command::new(bin)
+        .arg("rm")
+        .arg(&img)
+        .arg("/seed.txt")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "fstool rm on apfs failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let ls = Command::new(bin)
+        .arg("ls")
+        .arg(&img)
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(!listing.contains("seed.txt"), "rm did not stick: {listing}");
+}

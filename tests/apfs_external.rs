@@ -1817,3 +1817,135 @@ fn apfs_open_writable_create_passes_fsck_apfs() {
         "fsck_apfs was never executed (no usable device nodes found in {devs:?})"
     );
 }
+
+/// Sibling of `apfs_open_writable_create_passes_fsck_apfs` for the
+/// hashed-key (case-insensitive) volume code path. Synthesize a
+/// hashed-key volume the same way the Linux round-trip test does,
+/// then run create_file/dir/symlink + set_xattr through the
+/// Write-state API, attach via hdiutil, run fsck_apfs -n.
+///
+/// macOS-only — Linux skips cleanly. Signal-exit fail policy
+/// matches the existing fsck siblings; stub-spaceman warnings
+/// from fsck are not a regression.
+#[test]
+fn apfs_hashed_open_writable_create_passes_fsck_apfs() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipping: APFS validation requires macOS (hdiutil + fsck_apfs)");
+        return;
+    }
+    if which("hdiutil").is_none() {
+        eprintln!("skipping: hdiutil not found on PATH");
+        return;
+    }
+    if which("fsck_apfs").is_none() {
+        eprintln!("skipping: fsck_apfs not found on PATH");
+        return;
+    }
+    if !hdiutil_usable() {
+        eprintln!("skipping: hdiutil refused to run `hdiutil help`");
+        return;
+    }
+
+    let img = NamedTempFile::new().unwrap();
+    synthesize_hashed_key_volume(img.path(), /* also_case_insensitive = */ true);
+
+    // Re-open in Write state on the hashed-key volume and emit
+    // the same tree shape the plain-key sibling test emits — but
+    // every drec now flows through `apfs_drec_name_len_and_hash`
+    // and `build_drec_record(Hashed, case_fold=true)`.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.create_file_at(&mut dev, "/readme", b"hashed open_writable\n", 0o644, 0)
+            .unwrap();
+        dev.sync().unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.create_dir_at(&mut dev, "/etc", 0o755, 0).unwrap();
+        dev.sync().unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.create_file_at(&mut dev, "/etc/conf", b"x=1\ny=2\n", 0o644, 0)
+            .unwrap();
+        dev.sync().unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.create_symlink_at(&mut dev, "/lnk", "/readme", 0o777, 0)
+            .unwrap();
+        dev.sync().unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        fs.set_xattr(&mut dev, "/readme", "user.note", b"hashed-xattr")
+            .unwrap();
+        dev.sync().unwrap();
+    }
+
+    let attach = Command::new("hdiutil")
+        .args([
+            "attach",
+            "-nomount",
+            "-readonly",
+            "-imagekey",
+            "diskimage-class=CRawDiskImage",
+            "-plist",
+        ])
+        .arg(img.path())
+        .output()
+        .expect("hdiutil attach failed to spawn");
+    if !attach.status.success() {
+        eprintln!(
+            "skipping: hdiutil attach refused our hashed-key image:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&attach.stdout),
+            String::from_utf8_lossy(&attach.stderr),
+        );
+        return;
+    }
+    let plist = String::from_utf8_lossy(&attach.stdout);
+    let (devs, whole) = parse_hdiutil_devices(&plist);
+    let whole = match whole {
+        Some(w) => w,
+        None => {
+            eprintln!("skipping: could not parse device node out of hdiutil plist:\n{plist}");
+            return;
+        }
+    };
+
+    let mut any_ran = false;
+    for dev in &devs {
+        let out = Command::new("fsck_apfs").arg("-n").arg(dev).output();
+        match out {
+            Ok(o) => {
+                any_ran = true;
+                let so = String::from_utf8_lossy(&o.stdout);
+                let se = String::from_utf8_lossy(&o.stderr);
+                eprintln!(
+                    "fsck_apfs (hashed) {dev} → exit={:?}, signal={:?}\nstdout:\n{so}\nstderr:\n{se}",
+                    o.status.code(),
+                    {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::process::ExitStatusExt;
+                            o.status.signal()
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            None::<i32>
+                        }
+                    },
+                );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    assert!(
+                        o.status.signal().is_none(),
+                        "fsck_apfs killed by signal {:?} on {dev}",
+                        o.status.signal()
+                    );
+                }
+            }
+            Err(e) => eprintln!("fsck_apfs (hashed) {dev} could not run: {e}"),
+        }
+    }
+    hdiutil_detach(&whole);
+
+    assert!(
+        any_ran,
+        "fsck_apfs (hashed) was never executed (no usable device nodes found in {devs:?})"
+    );
+}

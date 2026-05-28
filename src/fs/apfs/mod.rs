@@ -1856,6 +1856,50 @@ impl crate::fs::Filesystem for Apfs {
         })
     }
 
+    fn truncate(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+        new_size: u64,
+    ) -> Result<()> {
+        if !matches!(&self.state, ApfsState::Write(_)) {
+            return Err(crate::Error::Unsupported(
+                "apfs: truncate requires Apfs::open_writable".into(),
+            ));
+        }
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+        // Route through the rw handle's set_len + sync — that
+        // pathway already handles the COW checkpoint, dstream
+        // resize, and extent rewrite. Shrinking truncates the file
+        // body; growing extends with zeros.
+        let mut h = rw::ApfsFileHandle::open(self, dev, s, crate::fs::OpenFlags::default())?;
+        crate::fs::FileHandle::set_len(&mut h, new_size)?;
+        crate::fs::FileHandle::sync(&mut h)?;
+        Ok(())
+    }
+
+    fn list_xattrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::XattrPair>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
+        // Apfs::read_xattrs returns a HashMap; flatten into the
+        // trait's Vec<XattrPair> in lexicographic name order for
+        // a stable listing.
+        let map = self.read_xattrs(dev, s)?;
+        let mut pairs: Vec<_> = map
+            .into_iter()
+            .map(|(name, value)| crate::fs::XattrPair { name, value })
+            .collect();
+        pairs.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(pairs)
+    }
+
     fn set_xattr(
         &mut self,
         dev: &mut dyn BlockDevice,

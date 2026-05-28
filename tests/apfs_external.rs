@@ -1404,3 +1404,111 @@ fn apfs_create_file_preserves_mtime() {
         attrs.mtime
     );
 }
+
+/// `Filesystem::truncate` on APFS routes through the open_file_rw
+/// then set_len pathway. Shrink first, then grow back with zeros,
+/// then verify the file body matches.
+#[test]
+fn apfs_filesystem_truncate_round_trips() {
+    use fstool::fs::Filesystem;
+    use std::path::Path;
+
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let bs = 4096u32;
+    let total = 4096u64;
+    let img = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(img.path(), total * bs as u64).unwrap();
+        let mut w = ApfsWriter::new(&mut dev, total, bs, "TRUN").unwrap();
+        let body = b"hello world\n";
+        let mut r = Cursor::new(body.as_ref());
+        w.add_file_from_reader(2, "t.txt", 0o644, &mut r, body.len() as u64)
+            .unwrap();
+        w.finish().unwrap();
+        dev.sync().unwrap();
+    }
+    // Shrink to 5 bytes.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        Filesystem::truncate(&mut fs, &mut dev, Path::new("/t.txt"), 5).unwrap();
+        dev.sync().unwrap();
+    }
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let fs = Apfs::open(&mut dev).unwrap();
+        let mut r = fs.open_file_reader(&mut dev, "/t.txt").unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+        assert_eq!(buf.as_slice(), b"hello", "shrink failed: {buf:?}");
+    }
+    // Grow back to 8 bytes — tail is zero-filled.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        Filesystem::truncate(&mut fs, &mut dev, Path::new("/t.txt"), 8).unwrap();
+        dev.sync().unwrap();
+    }
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let fs = Apfs::open(&mut dev).unwrap();
+    let mut r = fs.open_file_reader(&mut dev, "/t.txt").unwrap();
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+    assert_eq!(
+        buf.as_slice(),
+        b"hello\0\0\0",
+        "grow zero-fill wrong: {buf:?}"
+    );
+}
+
+/// `Filesystem::list_xattrs` surfaces every xattr on the inode,
+/// sorted by name. Default in the trait returns empty — APFS
+/// overrides to wrap Apfs::read_xattrs.
+#[test]
+fn apfs_filesystem_list_xattrs_sorted() {
+    use fstool::fs::Filesystem;
+    use std::path::Path;
+
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let bs = 4096u32;
+    let total = 4096u64;
+    let img = NamedTempFile::new().unwrap();
+    {
+        let mut dev = FileBackend::create(img.path(), total * bs as u64).unwrap();
+        let mut w = ApfsWriter::new(&mut dev, total, bs, "XATT").unwrap();
+        let body = b"x\n";
+        let mut r = Cursor::new(body.as_ref());
+        w.add_file_from_reader(2, "f.txt", 0o644, &mut r, body.len() as u64)
+            .unwrap();
+        w.finish().unwrap();
+        dev.sync().unwrap();
+    }
+    // Set three xattrs out-of-order.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        Filesystem::set_xattr(&mut fs, &mut dev, Path::new("/f.txt"), "user.zeta", b"z").unwrap();
+        dev.sync().unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        Filesystem::set_xattr(&mut fs, &mut dev, Path::new("/f.txt"), "user.alpha", b"a").unwrap();
+        dev.sync().unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        Filesystem::set_xattr(&mut fs, &mut dev, Path::new("/f.txt"), "user.mid", b"m").unwrap();
+        dev.sync().unwrap();
+    }
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let mut fs = Apfs::open(&mut dev).unwrap();
+    let xs = Filesystem::list_xattrs(&mut fs, &mut dev, Path::new("/f.txt")).unwrap();
+    let names: Vec<&str> = xs.iter().map(|x| x.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["user.alpha", "user.mid", "user.zeta"],
+        "got {names:?}"
+    );
+}

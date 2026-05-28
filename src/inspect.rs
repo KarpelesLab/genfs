@@ -1072,6 +1072,28 @@ pub fn detect_partition_table(dev: &mut dyn BlockDevice) -> Result<Option<Detect
     Ok(None)
 }
 
+/// Refuse a target path whose extension marks it as a compressed image
+/// (`.gz` / `.zst` / `.xz` / etc.). Mutating commands like `add` / `rm`
+/// / `shell` go through [`with_target_device`], which transparently
+/// decompresses to a tempfile — any mutation lands on that tempfile
+/// and is silently lost when it drops. Call this from every mutating
+/// CLI handler before opening the device.
+///
+/// Read-only commands (`ls`, `cat`, `info`, `analyze`) are fine with
+/// the decompress-to-tempfile fast path and should NOT call this.
+pub fn reject_compressed_for_mutation(target: &Target) -> Result<()> {
+    if let Some(algo) = crate::compression::detect_path(&target.path)? {
+        return Err(crate::Error::InvalidArgument(format!(
+            "{}: cannot mutate a {} archive in place — decompress it first \
+             (e.g. `gunzip {}`) or use `fstool repack` to rebuild a fresh image",
+            target.path.display(),
+            algo.name(),
+            target.path.display(),
+        )));
+    }
+    Ok(())
+}
+
 /// Run `op` with a [`BlockDevice`] that points at whatever `target`
 /// resolves to: the whole disk for `disk.img`, or a partition slice for
 /// `disk.img:N`. The closure opens its own [`AnyFs`] (or doesn't, e.g.

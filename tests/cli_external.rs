@@ -1365,3 +1365,139 @@ fn cli_analyze_reports_counts_and_sizes() {
     // streamed outputs are absent.
     assert!(v["recommended_size"].get("tar").is_none());
 }
+
+/// `fstool shell` / `add` / `rm` against a compressed image must
+/// refuse up front: with_target_device decompresses to a tempfile,
+/// any mutation lands on that tempfile, and it's silently lost when
+/// the tempfile drops — a data-loss footgun. The guard
+/// (`inspect::reject_compressed_for_mutation`) catches this before
+/// the tempfile is even created.
+#[test]
+fn cli_mutators_refuse_compressed_inputs() {
+    let bin = env!("CARGO_BIN_EXE_fstool");
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build a tiny ext2 image, then gzip a copy.
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"a\n").unwrap();
+    let img = dir.path().join("e.img");
+    let r = Command::new(bin)
+        .args(["create", "-t", "ext2", "-o"])
+        .arg(&img)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    // gzip via the host tool — the test only needs *some* `.gz` file
+    // alongside the real one. Skip if gzip isn't present.
+    if !Command::new("sh")
+        .arg("-c")
+        .arg("command -v gzip")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("skipping: gzip not installed");
+        return;
+    }
+    let st = Command::new("gzip").arg("-k").arg(&img).status().unwrap();
+    assert!(st.success(), "gzip failed");
+    let img_gz = dir.path().join("e.img.gz");
+    let host = dir.path().join("host.txt");
+    std::fs::write(&host, b"h\n").unwrap();
+
+    // add against .gz must refuse.
+    let r = Command::new(bin)
+        .arg("add")
+        .arg(&img_gz)
+        .arg(&host)
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "add on .gz should have failed");
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(err.contains("cannot mutate a gzip"), "wrong error: {err}");
+
+    // rm against .gz must refuse.
+    let r = Command::new(bin)
+        .arg("rm")
+        .arg(&img_gz)
+        .arg("/a.txt")
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "rm on .gz should have failed");
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("cannot mutate a gzip"),
+        "wrong error: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // shell against .gz must refuse.
+    let r = Command::new(bin)
+        .arg("shell")
+        .arg(&img_gz)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "shell on .gz should have failed");
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("cannot mutate a gzip"),
+        "wrong error: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // The original ext.img is untouched (sanity — no tempfile spew
+    // landed back on disk by mistake).
+    let ls = Command::new(bin)
+        .arg("ls")
+        .arg(&img)
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        !listing.contains("added.txt"),
+        "added.txt leaked into original: {listing}"
+    );
+}
+
+/// `fstool shell` on a filesystem whose mutation_capability isn't
+/// add/remove-capable (tar, ISO 9660, SquashFS, …) must refuse up
+/// front. The shell's whole point is in-place mutation via put/rm —
+/// opening a streaming FS in shell mode is misleading. The user is
+/// pointed at `fstool ls` / `fstool cat` for read-only browsing.
+#[test]
+fn cli_shell_refuses_streaming_filesystem() {
+    let bin = env!("CARGO_BIN_EXE_fstool");
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"a\n").unwrap();
+    let tar = dir.path().join("t.tar");
+    let st = Command::new("tar")
+        .arg("-cf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(dir.path())
+        .arg("src")
+        .status()
+        .unwrap();
+    assert!(st.success(), "tar failed");
+
+    let r = Command::new(bin)
+        .arg("shell")
+        .arg(&tar)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "shell on tar should have failed");
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(err.contains("streaming"), "wrong error: {err}");
+    assert!(err.contains("fstool ls"), "missing browse hint: {err}");
+}

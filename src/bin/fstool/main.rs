@@ -1862,8 +1862,31 @@ fn sum_source_file_bytes(
 
 fn shell_cmd(image: &str) -> fstool::Result<()> {
     let target = fstool::inspect::Target::parse(image);
+    // Refuse a compressed source up-front: with_target_device would
+    // happily decompress to a tempfile and any put/rm against the
+    // shell would land on that tempfile, silently lost on exit.
+    fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
         let fs = fstool::inspect::AnyFs::open(dev)?;
+        // Shell exists for in-place mutation (`put` / `rm`). A
+        // filesystem that can't support those — tar, ISO 9660,
+        // SquashFS, etc. — has nothing useful to offer here; point
+        // the user at `fstool ls` / `fstool cat` for read-only
+        // browsing of those formats.
+        let cap = fs.mutation_capability();
+        if !cap.supports_add_remove() {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "shell: {} is {} ({}) — shell requires an in-place mutable filesystem; \
+                 use `fstool ls` / `fstool cat` to browse it read-only",
+                target.path.display(),
+                fs.kind_string(),
+                match cap {
+                    fstool::fs::MutationCapability::Streaming => "streaming",
+                    fstool::fs::MutationCapability::Immutable => "immutable",
+                    _ => unreachable!("supports_add_remove() was false"),
+                },
+            )));
+        }
         let mut sh = shell::Shell::new(fs);
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
@@ -1875,6 +1898,7 @@ fn shell_cmd(image: &str) -> fstool::Result<()> {
 
 fn rm(image: &str, fs_path: &str) -> fstool::Result<()> {
     let target = fstool::inspect::Target::parse(image);
+    fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
         fs.remove(dev, fs_path)?;
@@ -1888,6 +1912,7 @@ fn rm(image: &str, fs_path: &str) -> fstool::Result<()> {
 fn add(image: &str, host_src: &std::path::Path, fs_dest: &str) -> fstool::Result<()> {
     let meta = std::fs::symlink_metadata(host_src)?;
     let target = fstool::inspect::Target::parse(image);
+    fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
         if meta.is_dir() {

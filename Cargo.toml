@@ -69,6 +69,14 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.2"
 crc32c = "0.6.8"
+# Unicode NFD + default case folding for the APFS drec hash function.
+# Volumes formatted with APFS_INCOMPAT_NORMALIZATION_INSENSITIVE
+# (the macOS default for user data volumes) store drec keys with a
+# 22-bit CRC32C of the NFD-normalised (optionally case-folded) name;
+# our writer computes it via these crates. Both unicode-normalization
+# and caseless are maintained under unicode-rs and MIT/Apache.
+unicode-normalization = "0.1"
+caseless = "0.2"
 # CP949 (Korean) ↔ UTF-8 for the GRF backend (Gravity Ragnarok archives
 # store filenames in CP949). encoding_rs's `EUC_KR` label is the WHATWG
 # alias that covers CP949 — the spec mapping is identical in practice.

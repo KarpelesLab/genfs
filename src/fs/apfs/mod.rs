@@ -1054,7 +1054,16 @@ impl Apfs {
                 )));
             }
             remove_drec(records, old_parent, &old_name);
-            let (k, v) = write::build_drec_record(new_parent, &new_name, target_oid, dtype)?;
+            // Commit-1 stub: pass Plain/false. Commit-2 threads the
+            // volume's real DrecKeyLayout + case_fold from WriteState.
+            let (k, v) = write::build_drec_record(
+                new_parent,
+                &new_name,
+                target_oid,
+                dtype,
+                DrecKeyLayout::Plain,
+                false,
+            )?;
             records.push((k, v));
             if old_parent != new_parent {
                 // Update both parents' nchildren.
@@ -1111,7 +1120,15 @@ impl Apfs {
                     "apfs: link target {new_name:?} already exists"
                 )));
             }
-            let (k, v) = write::build_drec_record(new_parent, &new_name, target_oid, target_dtype)?;
+            // Commit-1 stub: Plain/false. Commit-2 swaps in real values.
+            let (k, v) = write::build_drec_record(
+                new_parent,
+                &new_name,
+                target_oid,
+                target_dtype,
+                DrecKeyLayout::Plain,
+                false,
+            )?;
             records.push((k, v));
             patch_inode_record(records, target_oid, |v| {
                 if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
@@ -1176,7 +1193,15 @@ impl Apfs {
                 mtime_ns,
             );
             cx.records.push((ik, iv));
-            let (dk, dv) = write::build_drec_record(parent_oid, &name, oid, DT_REG)?;
+            // Commit-1 stub: Plain/false. Commit-2 swaps in real values.
+            let (dk, dv) = write::build_drec_record(
+                parent_oid,
+                &name,
+                oid,
+                DT_REG,
+                DrecKeyLayout::Plain,
+                false,
+            )?;
             cx.records.push((dk, dv));
             // Bump the parent dir's nchildren counter.
             patch_inode_record(cx.records, parent_oid, |v| {
@@ -1216,7 +1241,15 @@ impl Apfs {
             let (ik, iv) =
                 write::build_inode_record(oid, parent_oid, write::mode_dir(mode), 0, bs, mtime_ns);
             cx.records.push((ik, iv));
-            let (dk, dv) = write::build_drec_record(parent_oid, &name, oid, DT_DIR)?;
+            // Commit-1 stub: Plain/false. Commit-2 swaps in real values.
+            let (dk, dv) = write::build_drec_record(
+                parent_oid,
+                &name,
+                oid,
+                DT_DIR,
+                DrecKeyLayout::Plain,
+                false,
+            )?;
             cx.records.push((dk, dv));
             patch_inode_record(cx.records, parent_oid, |v| {
                 if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {
@@ -1271,7 +1304,15 @@ impl Apfs {
                 mtime_ns,
             );
             cx.records.push((ik, iv));
-            let (dk, dv) = write::build_drec_record(parent_oid, &name, oid, DT_LNK)?;
+            // Commit-1 stub: Plain/false. Commit-2 swaps in real values.
+            let (dk, dv) = write::build_drec_record(
+                parent_oid,
+                &name,
+                oid,
+                DT_LNK,
+                DrecKeyLayout::Plain,
+                false,
+            )?;
             cx.records.push((dk, dv));
             patch_inode_record(cx.records, parent_oid, |v| {
                 if v.len() >= jrec::J_INODE_VAL_FIXED_SIZE {

@@ -275,29 +275,60 @@ pub struct ApfsWriter<'a> {
 // [`super::rw::commit_with_mutator`]) push records through the same
 // builders, so the byte layouts only need to live in one place.
 
-/// Build the `j_drec_key_t` + `j_drec_val_t` record bytes for a
-/// directory entry. The key carries the parent directory's oid, the
-/// entry name (NUL-terminated, length in `name_len`), and the value
-/// carries the target inode oid + the directory-entry type tag.
+/// Build the `j_drec_key_t` (plain) or `j_drec_hashed_key_t` (hashed)
+/// key + `j_drec_val_t` value bytes for a directory entry. The
+/// layout follows the volume's `apfs_incompatible_features` flags:
 ///
-/// Errors when the name is too long to encode in the 16-bit `name_len`
-/// field — POSIX caps at 255 bytes anyway, but the type allows more.
+/// - `Plain` (the default for volumes our own writer formats):
+///   `(hdr:u64, name_len:u16, name + NUL)`. Sort order in the
+///   fs-tree is by (oid, kind, name).
+/// - `Hashed` (set by `APFS_INCOMPAT_NORMALIZATION_INSENSITIVE`,
+///   the macOS default for user data volumes):
+///   `(hdr:u64, name_len_and_hash:u32 LE, name + NUL)`. Sort order
+///   is by (oid, kind, hash, name). The hash is computed by
+///   [`apfs_drec_name_len_and_hash`] from the NFD-normalised
+///   (optionally case-folded per `case_fold`) name.
+///
+/// Value bytes are layout-independent.
+///
+/// Errors when the name is too long to encode in the 16-bit or
+/// 10-bit `name_len` field, depending on layout — POSIX caps at
+/// 255 bytes anyway, but the type allows more.
 pub(crate) fn build_drec_record(
     parent_oid: u64,
     name: &str,
     target_oid: u64,
     dtype: u16,
+    layout: super::fstree::DrecKeyLayout,
+    case_fold: bool,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let nlen = name.len() + 1; // includes trailing NUL
-    if nlen > u16::MAX as usize {
-        return Err(crate::Error::InvalidArgument(
-            "apfs writer: directory entry name too long".into(),
-        ));
-    }
-    let mut key = Vec::with_capacity(10 + nlen);
+    let mut key;
     let hdr = ((APFS_TYPE_DIR_REC as u64) << OBJ_TYPE_SHIFT) | (parent_oid & OBJ_ID_MASK);
-    key.extend_from_slice(&hdr.to_le_bytes());
-    key.extend_from_slice(&(nlen as u16).to_le_bytes());
+    match layout {
+        super::fstree::DrecKeyLayout::Plain => {
+            if nlen > u16::MAX as usize {
+                return Err(crate::Error::InvalidArgument(
+                    "apfs writer: directory entry name too long".into(),
+                ));
+            }
+            key = Vec::with_capacity(10 + nlen);
+            key.extend_from_slice(&hdr.to_le_bytes());
+            key.extend_from_slice(&(nlen as u16).to_le_bytes());
+        }
+        super::fstree::DrecKeyLayout::Hashed => {
+            // Hashed layout packs (hash:22, name_len:10) into a u32.
+            if nlen > 0x3FF {
+                return Err(crate::Error::InvalidArgument(
+                    "apfs writer: hashed-key directory entry name too long".into(),
+                ));
+            }
+            key = Vec::with_capacity(12 + nlen);
+            key.extend_from_slice(&hdr.to_le_bytes());
+            let packed = apfs_drec_name_len_and_hash(name, case_fold);
+            key.extend_from_slice(&packed.to_le_bytes());
+        }
+    }
     key.extend_from_slice(name.as_bytes());
     key.push(0);
 
@@ -306,6 +337,35 @@ pub(crate) fn build_drec_record(
     val[0..8].copy_from_slice(&target_oid.to_le_bytes());
     val[16..18].copy_from_slice(&dtype.to_le_bytes());
     Ok((key, val))
+}
+
+/// Pack a drec's name length and 22-bit hash into the `u32 LE` that
+/// lives in `j_drec_hashed_key_t.name_len_and_hash`. The hash is
+/// CRC32C over the NFD-decomposed (and optionally case-folded) name
+/// encoded as UTF-32 LE; low 10 bits of the result are the raw name
+/// length **including** the trailing NUL.
+///
+/// Best-effort match for Apple's kernel hash: ASCII and common BMP
+/// names match byte-for-byte. Uncommon combining sequences and
+/// supplementary-plane characters may differ because Apple's
+/// `UnicodeTables_v10.h` carries documented deviations (4-char
+/// decomposition cap, iota-subscript CCC override, restricted
+/// codepoint domain) we don't reproduce. If a name's hash diverges
+/// from the kernel's, the new drec sorts into the wrong B-tree
+/// bucket and the kernel won't find it on the next mount — same
+/// failure mode as an off-by-one in our impl.
+pub(crate) fn apfs_drec_name_len_and_hash(name: &str, case_fold: bool) -> u32 {
+    use caseless::Caseless;
+    use unicode_normalization::UnicodeNormalization;
+    let chars: Vec<u32> = if case_fold {
+        name.nfd().default_case_fold().map(|c| c as u32).collect()
+    } else {
+        name.nfd().map(|c| c as u32).collect()
+    };
+    let bytes: Vec<u8> = chars.iter().flat_map(|c| c.to_le_bytes()).collect();
+    let crc = crc32c::crc32c(&bytes);
+    let name_len = (name.len() + 1) as u32; // include trailing NUL
+    ((crc & 0x003F_FFFF) << 10) | (name_len & 0x0000_03FF)
 }
 
 /// Build the `j_inode_key_t` + `j_inode_val_t` record bytes. For
@@ -1135,10 +1195,19 @@ impl<'a> ApfsWriter<'a> {
     }
 
     fn add_drec(&mut self, parent_oid: u64, name: &str, target_oid: u64, dtype: u16) -> Result<()> {
-        // Plain drec key (we ship images without
-        // APFS_INCOMPAT_NORMALIZATION_INSENSITIVE so our reader picks
-        // the plain layout).
-        let (key, val) = build_drec_record(parent_oid, name, target_oid, dtype)?;
+        // Plain drec key — `ApfsWriter::new` always formats without
+        // APFS_INCOMPAT_NORMALIZATION_INSENSITIVE, so the single-pass
+        // writer's drecs stay plain-key. The Write-state mutators
+        // (Apfs::create_*_at, rename, link) pass the volume's actual
+        // layout instead.
+        let (key, val) = build_drec_record(
+            parent_oid,
+            name,
+            target_oid,
+            dtype,
+            super::fstree::DrecKeyLayout::Plain,
+            false,
+        )?;
         self.records.push(FsRecord { key, val });
         Ok(())
     }

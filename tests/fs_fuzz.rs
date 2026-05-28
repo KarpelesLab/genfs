@@ -6,7 +6,7 @@
 //! The core (`fuzz_filesystem`) drives a deterministic xorshift PRNG
 //! through randomised `create_file` / `open_file_rw` / `truncate` /
 //! `remove` sequences against a single root directory, mirroring
-//! everything in a shadow `HashMap<String, Vec<u8>>`. After each
+//! everything in a shadow `BTreeMap<String, Vec<u8>>`. After each
 //! mutation we verify the shadow against the live FS via `list` +
 //! `read_file`. A periodic `flush` exercises the persist path.
 //!
@@ -22,7 +22,7 @@
 
 #![cfg(unix)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -195,7 +195,7 @@ fn fuzz_filesystem(
     let shares_extents = fs.clone_capability().shares_extents();
 
     let mut rng = Rng::new(seed);
-    let mut shadow: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut shadow: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut frozen: HashSet<String> = HashSet::new();
 
     for step in 0..iters {
@@ -243,7 +243,7 @@ fn fuzz_filesystem(
 
 fn pick_op(
     rng: &mut Rng,
-    shadow: &HashMap<String, Vec<u8>>,
+    shadow: &BTreeMap<String, Vec<u8>>,
     frozen: &HashSet<String>,
     caps: &Caps,
     supports_partial: bool,
@@ -294,7 +294,7 @@ fn apply_op(
     fs: &mut dyn Filesystem,
     dev: &mut dyn BlockDevice,
     rng: &mut Rng,
-    shadow: &mut HashMap<String, Vec<u8>>,
+    shadow: &mut BTreeMap<String, Vec<u8>>,
     frozen: &mut HashSet<String>,
     op: Op,
     caps: &Caps,
@@ -514,7 +514,7 @@ fn set_len_via_rw(
 fn verify_against_shadow(
     fs: &mut dyn Filesystem,
     dev: &mut dyn BlockDevice,
-    shadow: &HashMap<String, Vec<u8>>,
+    shadow: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), String> {
     let entries = fs
         .list(dev, Path::new("/"))
@@ -568,7 +568,7 @@ fn probe_random_seek(
     fs: &mut dyn Filesystem,
     dev: &mut dyn BlockDevice,
     rng: &mut Rng,
-    shadow: &HashMap<String, Vec<u8>>,
+    shadow: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), String> {
     let Some(name) = pick_present(rng, shadow) else {
         return Ok(());
@@ -605,7 +605,7 @@ fn probe_random_seek(
     Ok(())
 }
 
-fn pick_fresh_name(rng: &mut Rng, shadow: &HashMap<String, Vec<u8>>) -> String {
+fn pick_fresh_name(rng: &mut Rng, shadow: &BTreeMap<String, Vec<u8>>) -> String {
     // Short ASCII-only names — backends differ on charset support and
     // we're testing the data path, not codepoint handling.
     for _ in 0..32 {
@@ -621,7 +621,7 @@ fn pick_fresh_name(rng: &mut Rng, shadow: &HashMap<String, Vec<u8>>) -> String {
     format!("file_{:x}", rng.next_u64())
 }
 
-fn pick_present(rng: &mut Rng, shadow: &HashMap<String, Vec<u8>>) -> Option<String> {
+fn pick_present(rng: &mut Rng, shadow: &BTreeMap<String, Vec<u8>>) -> Option<String> {
     if shadow.is_empty() {
         return None;
     }
@@ -634,7 +634,7 @@ fn pick_present(rng: &mut Rng, shadow: &HashMap<String, Vec<u8>>) -> Option<Stri
 /// existing file is frozen, which the caller treats as "skip this op".
 fn pick_present_unfrozen(
     rng: &mut Rng,
-    shadow: &HashMap<String, Vec<u8>>,
+    shadow: &BTreeMap<String, Vec<u8>>,
     frozen: &HashSet<String>,
 ) -> Option<String> {
     let live: Vec<&String> = shadow.keys().filter(|n| !frozen.contains(*n)).collect();

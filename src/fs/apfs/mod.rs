@@ -229,6 +229,7 @@ enum PendingOp {
         parent_oid: u64,
         name: String,
         mode: u16,
+        mtime_ns: u64,
     },
     /// `create_file` — same shape as `Dir`. The file's bytes are
     /// captured into `data` at buffer time because [`crate::fs::FileSource`]
@@ -237,6 +238,7 @@ enum PendingOp {
         parent_oid: u64,
         name: String,
         mode: u16,
+        mtime_ns: u64,
         data: Vec<u8>,
     },
     /// `create_symlink` — same shape as `Dir`, plus the link target.
@@ -244,8 +246,17 @@ enum PendingOp {
         parent_oid: u64,
         name: String,
         mode: u16,
+        mtime_ns: u64,
         target: String,
     },
+}
+
+/// Convert a [`crate::fs::FileMeta`]'s u32 epoch-second `mtime` into
+/// the u64 nanosecond timestamp APFS stores in its inode time fields.
+/// Returns 0 (1970-01-01) when `meta.mtime` is 0, matching POSIX
+/// "unset" semantics.
+fn meta_mtime_ns(meta: &crate::fs::FileMeta) -> u64 {
+    (meta.mtime as u64).saturating_mul(1_000_000_000)
 }
 
 impl std::fmt::Debug for Apfs {
@@ -1096,6 +1107,7 @@ impl Apfs {
         path: &str,
         data: &[u8],
         mode: u16,
+        mtime_ns: u64,
     ) -> Result<()> {
         let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
         rw::commit_with_mutator(self, dev, |cx| {
@@ -1118,8 +1130,14 @@ impl Apfs {
                 }
             }
             // INODE for the new file, then the DREC under the parent.
-            let (ik, iv) =
-                write::build_inode_record(oid, parent_oid, write::mode_reg(mode), size, bs);
+            let (ik, iv) = write::build_inode_record(
+                oid,
+                parent_oid,
+                write::mode_reg(mode),
+                size,
+                bs,
+                mtime_ns,
+            );
             cx.records.push((ik, iv));
             let (dk, dv) = write::build_drec_record(parent_oid, &name, oid, DT_REG)?;
             cx.records.push((dk, dv));
@@ -1144,6 +1162,7 @@ impl Apfs {
         dev: &mut dyn BlockDevice,
         path: &str,
         mode: u16,
+        mtime_ns: u64,
     ) -> Result<()> {
         let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
         rw::commit_with_mutator(self, dev, |cx| {
@@ -1157,7 +1176,8 @@ impl Apfs {
             // Directories carry no DSTREAM xfield (dstream_size = 0
             // + mode is S_IFDIR → has_dstream is false in
             // build_inode_record).
-            let (ik, iv) = write::build_inode_record(oid, parent_oid, write::mode_dir(mode), 0, bs);
+            let (ik, iv) =
+                write::build_inode_record(oid, parent_oid, write::mode_dir(mode), 0, bs, mtime_ns);
             cx.records.push((ik, iv));
             let (dk, dv) = write::build_drec_record(parent_oid, &name, oid, DT_DIR)?;
             cx.records.push((dk, dv));
@@ -1182,6 +1202,7 @@ impl Apfs {
         path: &str,
         target: &str,
         mode: u16,
+        mtime_ns: u64,
     ) -> Result<()> {
         let (parent_oid, name) = self.resolve_parent_and_name(dev, path)?;
         let target_bytes = target.as_bytes();
@@ -1204,8 +1225,14 @@ impl Apfs {
             for (k, v) in write::build_file_extent_records(oid, 0, size, paddr, bs) {
                 cx.records.push((k, v));
             }
-            let (ik, iv) =
-                write::build_inode_record(oid, parent_oid, write::mode_lnk(mode), size, bs);
+            let (ik, iv) = write::build_inode_record(
+                oid,
+                parent_oid,
+                write::mode_lnk(mode),
+                size,
+                bs,
+                mtime_ns,
+            );
             cx.records.push((ik, iv));
             let (dk, dv) = write::build_drec_record(parent_oid, &name, oid, DT_LNK)?;
             cx.records.push((dk, dv));
@@ -1601,7 +1628,7 @@ impl crate::fs::Filesystem for Apfs {
                 let path_str = path
                     .to_str()
                     .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
-                self.create_file_at(dev, path_str, &data, meta.mode)
+                self.create_file_at(dev, path_str, &data, meta.mode, meta_mtime_ns(&meta))
             }
             ApfsState::PendingWrite(_) => {
                 let pw = pending_write_mut(&mut self.state)?;
@@ -1610,6 +1637,7 @@ impl crate::fs::Filesystem for Apfs {
                     parent_oid,
                     name,
                     mode: meta.mode,
+                    mtime_ns: meta_mtime_ns(&meta),
                     data,
                 });
                 // Consume an oid slot so future creates see the same
@@ -1635,7 +1663,7 @@ impl crate::fs::Filesystem for Apfs {
                 let path_str = path
                     .to_str()
                     .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
-                self.create_dir_at(dev, path_str, meta.mode)
+                self.create_dir_at(dev, path_str, meta.mode, meta_mtime_ns(&meta))
             }
             ApfsState::PendingWrite(_) => {
                 let pw = pending_write_mut(&mut self.state)?;
@@ -1651,6 +1679,7 @@ impl crate::fs::Filesystem for Apfs {
                     parent_oid,
                     name,
                     mode: meta.mode,
+                    mtime_ns: meta_mtime_ns(&meta),
                 });
                 Ok(())
             }
@@ -1676,7 +1705,7 @@ impl crate::fs::Filesystem for Apfs {
                 let path_str = path
                     .to_str()
                     .ok_or_else(|| crate::Error::InvalidArgument("apfs: non-UTF-8 path".into()))?;
-                self.create_symlink_at(dev, path_str, &target_str, meta.mode)
+                self.create_symlink_at(dev, path_str, &target_str, meta.mode, meta_mtime_ns(&meta))
             }
             ApfsState::PendingWrite(_) => {
                 let pw = pending_write_mut(&mut self.state)?;
@@ -1685,6 +1714,7 @@ impl crate::fs::Filesystem for Apfs {
                     parent_oid,
                     name,
                     mode: meta.mode,
+                    mtime_ns: meta_mtime_ns(&meta),
                     target: target_str,
                 });
                 pw.next_oid = pw.next_oid.saturating_add(1);
@@ -1983,26 +2013,31 @@ impl crate::fs::Filesystem for Apfs {
                         parent_oid,
                         name,
                         mode,
+                        mtime_ns,
                     } => {
-                        w.add_dir(parent_oid, &name, mode)?;
+                        w.add_dir_at_time(parent_oid, &name, mode, mtime_ns)?;
                     }
                     PendingOp::File {
                         parent_oid,
                         name,
                         mode,
+                        mtime_ns,
                         data,
                     } => {
                         let len = data.len() as u64;
                         let mut r = std::io::Cursor::new(data);
-                        w.add_file_from_reader(parent_oid, &name, mode, &mut r, len)?;
+                        w.add_file_from_reader_at_time(
+                            parent_oid, &name, mode, &mut r, len, mtime_ns,
+                        )?;
                     }
                     PendingOp::Symlink {
                         parent_oid,
                         name,
                         mode,
+                        mtime_ns,
                         target,
                     } => {
-                        w.add_symlink(parent_oid, &name, mode, &target)?;
+                        w.add_symlink_at_time(parent_oid, &name, mode, &target, mtime_ns)?;
                     }
                 }
             }

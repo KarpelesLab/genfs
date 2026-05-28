@@ -830,7 +830,7 @@ fn apfs_write_state_create_file_round_trips() {
     {
         let mut dev = FileBackend::open(img.path()).unwrap();
         let mut fs = Apfs::open_writable(&mut dev).unwrap();
-        fs.create_file_at(&mut dev, "/created.txt", new_payload, 0o644)
+        fs.create_file_at(&mut dev, "/created.txt", new_payload, 0o644, 0)
             .unwrap();
         dev.sync().unwrap();
     }
@@ -875,13 +875,13 @@ fn apfs_write_state_create_dir_then_nested_file() {
     {
         let mut dev = FileBackend::open(img.path()).unwrap();
         let mut fs = Apfs::open_writable(&mut dev).unwrap();
-        fs.create_dir_at(&mut dev, "/etc", 0o755).unwrap();
+        fs.create_dir_at(&mut dev, "/etc", 0o755, 0).unwrap();
         dev.sync().unwrap();
     }
     {
         let mut dev = FileBackend::open(img.path()).unwrap();
         let mut fs = Apfs::open_writable(&mut dev).unwrap();
-        fs.create_file_at(&mut dev, "/etc/conf", b"k=v\n", 0o644)
+        fs.create_file_at(&mut dev, "/etc/conf", b"k=v\n", 0o644, 0)
             .unwrap();
         dev.sync().unwrap();
     }
@@ -931,7 +931,7 @@ fn apfs_write_state_create_symlink_round_trips() {
     {
         let mut dev = FileBackend::open(img.path()).unwrap();
         let mut fs = Apfs::open_writable(&mut dev).unwrap();
-        fs.create_symlink_at(&mut dev, "/link", "/usr/bin/sh", 0o777)
+        fs.create_symlink_at(&mut dev, "/link", "/usr/bin/sh", 0o777, 0)
             .unwrap();
         dev.sync().unwrap();
     }
@@ -1236,7 +1236,7 @@ fn apfs_xp_desc_ring_buffer_survives_many_checkpoints() {
         let mut fs = Apfs::open_writable(&mut dev).unwrap();
         let path = format!("/file-{i:03}");
         let body = format!("body-{i}\n");
-        fs.create_file_at(&mut dev, &path, body.as_bytes(), 0o644)
+        fs.create_file_at(&mut dev, &path, body.as_bytes(), 0o644, 0)
             .expect("create_file_at past slot 15 (ring should wrap)");
         dev.sync().unwrap();
     }
@@ -1346,4 +1346,61 @@ fn cli_add_rm_reach_apfs_write_state() {
     assert!(ls.status.success());
     let listing = String::from_utf8_lossy(&ls.stdout);
     assert!(!listing.contains("seed.txt"), "rm did not stick: {listing}");
+}
+
+/// `Filesystem::create_file` (via the trait) carries FileMeta.mtime
+/// through to the APFS inode's time fields. Before commit-B the
+/// PendingWrite single-pass writer dropped every timestamp and the
+/// inode was stamped epoch (1970-01-01); now the user-supplied
+/// mtime survives the round-trip.
+#[test]
+fn apfs_create_file_preserves_mtime() {
+    use fstool::fs::{FileMeta, FileSource, Filesystem};
+    use std::path::Path;
+
+    if !cfg!(target_os = "macos") && !cfg!(target_os = "linux") {
+        eprintln!("skipping: APFS validation needs unix");
+        return;
+    }
+    let bs = 4096u32;
+    let total_blocks = 4096u64;
+    let img = NamedTempFile::new().unwrap();
+    let mtime: u32 = 1_700_000_000; // ~2023-11-14
+    {
+        let mut dev = FileBackend::create(img.path(), total_blocks * bs as u64).unwrap();
+        let w = ApfsWriter::new(&mut dev, total_blocks, bs, "MTIME").unwrap();
+        w.finish().unwrap();
+        dev.sync().unwrap();
+        drop(dev);
+    }
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut fs = Apfs::open_writable(&mut dev).unwrap();
+        let body = b"t\n".to_vec();
+        let body_len = body.len() as u64;
+        Filesystem::create_file(
+            &mut fs,
+            &mut dev,
+            Path::new("/t.txt"),
+            FileSource::Reader {
+                reader: Box::new(Cursor::new(body)),
+                len: body_len,
+            },
+            FileMeta {
+                mode: 0o644,
+                mtime,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let mut fs = Apfs::open(&mut dev).unwrap();
+    let attrs = Filesystem::getattr(&mut fs, &mut dev, Path::new("/t.txt")).unwrap();
+    assert_eq!(
+        attrs.mtime, mtime,
+        "mtime did not round-trip; got {} expected {mtime}",
+        attrs.mtime
+    );
 }

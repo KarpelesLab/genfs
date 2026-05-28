@@ -323,6 +323,7 @@ pub(crate) fn build_inode_record(
     mode: u16,
     dstream_size: u64,
     block_size: u32,
+    mtime_ns: u64,
 ) -> (Vec<u8>, Vec<u8>) {
     let has_dstream =
         dstream_size > 0 || (mode & 0o170_000 == 0o100_000) || (mode & 0o170_000 == 0o120_000);
@@ -334,7 +335,15 @@ pub(crate) fn build_inode_record(
         0
     };
     val[8..16].copy_from_slice(&private_id.to_le_bytes());
-    // Times: leave zero (timestamps are set by the caller post-build).
+    // Stamp all four time fields with `mtime_ns`. APFS records
+    // create_time/mod_time/change_time/access_time as four separate
+    // u64-ns slots; we collapse them to a single value because most
+    // callers only have an mtime to give. Per-field timestamps can
+    // be refined later via Apfs::set_times / Filesystem::set_attrs.
+    val[16..24].copy_from_slice(&mtime_ns.to_le_bytes()); // create_time
+    val[24..32].copy_from_slice(&mtime_ns.to_le_bytes()); // mod_time
+    val[32..40].copy_from_slice(&mtime_ns.to_le_bytes()); // change_time
+    val[40..48].copy_from_slice(&mtime_ns.to_le_bytes()); // access_time
     // internal_flags: 0.
     let nlink: i32 = if mode & 0o170_000 == 0o040_000 { 2 } else { 1 };
     val[56..60].copy_from_slice(&nlink.to_le_bytes());
@@ -497,8 +506,10 @@ impl<'a> ApfsWriter<'a> {
             nxsb_paddr: NXSB_LIVE_PADDR,
             write_label_nxsb: true,
         };
-        // Seed the root inode record (oid = 2).
-        w.add_inode_record(2, 0, mode_dir(0o755), 0)?;
+        // Seed the root inode record (oid = 2). Times stay at 0
+        // (epoch 1970) at format — callers refine via set_times /
+        // set_attrs.
+        w.add_inode_record(2, 0, mode_dir(0o755), 0, 0)?;
         Ok(w)
     }
 
@@ -588,9 +599,23 @@ impl<'a> ApfsWriter<'a> {
     /// directory's object id (use it as `parent_oid` for nested
     /// children).
     pub fn add_dir(&mut self, parent_oid: u64, name: &str, mode: u16) -> Result<u64> {
+        self.add_dir_at_time(parent_oid, name, mode, 0)
+    }
+
+    /// Like [`Self::add_dir`] but stamps `mtime_ns` (UNIX ns since
+    /// epoch) into the inode's four time fields. Used by callers
+    /// that carry user-supplied timestamps through to the writer
+    /// (the [`crate::fs::Filesystem`] adapter, mainly).
+    pub fn add_dir_at_time(
+        &mut self,
+        parent_oid: u64,
+        name: &str,
+        mode: u16,
+        mtime_ns: u64,
+    ) -> Result<u64> {
         let oid = self.alloc_oid();
         self.add_drec(parent_oid, name, oid, DT_DIR)?;
-        self.add_inode_record(oid, parent_oid, mode_dir(mode), 0)?;
+        self.add_inode_record(oid, parent_oid, mode_dir(mode), 0, mtime_ns)?;
         self.num_directories += 1;
         Ok(oid)
     }
@@ -611,6 +636,19 @@ impl<'a> ApfsWriter<'a> {
         mode: u16,
         target: &str,
     ) -> Result<u64> {
+        self.add_symlink_at_time(parent_oid, name, mode, target, 0)
+    }
+
+    /// Like [`Self::add_symlink`] but stamps `mtime_ns` into the
+    /// inode's time fields.
+    pub fn add_symlink_at_time(
+        &mut self,
+        parent_oid: u64,
+        name: &str,
+        mode: u16,
+        target: &str,
+        mtime_ns: u64,
+    ) -> Result<u64> {
         let oid = self.alloc_oid();
         self.add_drec(parent_oid, name, oid, DT_LNK)?;
         let target_bytes = target.as_bytes();
@@ -630,7 +668,13 @@ impl<'a> ApfsWriter<'a> {
             }
         }
         self.add_file_extent(oid, 0, target_bytes.len() as u64, extent_paddr)?;
-        self.add_inode_record(oid, parent_oid, mode_lnk(mode), target_bytes.len() as u64)?;
+        self.add_inode_record(
+            oid,
+            parent_oid,
+            mode_lnk(mode),
+            target_bytes.len() as u64,
+            mtime_ns,
+        )?;
         self.num_symlinks += 1;
         Ok(oid)
     }
@@ -650,12 +694,26 @@ impl<'a> ApfsWriter<'a> {
         reader: &mut R,
         size: u64,
     ) -> Result<u64> {
+        self.add_file_from_reader_at_time(parent_oid, name, mode, reader, size, 0)
+    }
+
+    /// Like [`Self::add_file_from_reader`] but stamps `mtime_ns`
+    /// into the inode's time fields.
+    pub fn add_file_from_reader_at_time<R: Read>(
+        &mut self,
+        parent_oid: u64,
+        name: &str,
+        mode: u16,
+        reader: &mut R,
+        size: u64,
+        mtime_ns: u64,
+    ) -> Result<u64> {
         let oid = self.alloc_oid();
         self.add_drec(parent_oid, name, oid, DT_REG)?;
 
         if size == 0 {
             // No extent records — empty file.
-            self.add_inode_record(oid, parent_oid, mode_reg(mode), 0)?;
+            self.add_inode_record(oid, parent_oid, mode_reg(mode), 0, mtime_ns)?;
             self.num_files += 1;
             return Ok(oid);
         }
@@ -725,7 +783,7 @@ impl<'a> ApfsWriter<'a> {
         }
 
         self.add_file_extent(oid, 0, size, extent_paddr)?;
-        self.add_inode_record(oid, parent_oid, mode_reg(mode), size)?;
+        self.add_inode_record(oid, parent_oid, mode_reg(mode), size, mtime_ns)?;
         self.num_files += 1;
         Ok(oid)
     }
@@ -1091,8 +1149,16 @@ impl<'a> ApfsWriter<'a> {
         parent_oid: u64,
         mode: u16,
         dstream_size: u64,
+        mtime_ns: u64,
     ) -> Result<()> {
-        let (key, val) = build_inode_record(oid, parent_oid, mode, dstream_size, self.block_size);
+        let (key, val) = build_inode_record(
+            oid,
+            parent_oid,
+            mode,
+            dstream_size,
+            self.block_size,
+            mtime_ns,
+        );
         self.records.push(FsRecord { key, val });
         Ok(())
     }

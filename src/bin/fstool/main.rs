@@ -185,6 +185,13 @@ enum Command {
         /// Image path, optionally with `:N` to select partition N.
         #[arg(value_name = "IMAGE[:N]")]
         image: String,
+        /// Open the image strictly read-only. The underlying file is
+        /// opened `O_RDONLY` (any write fails at the syscall), the
+        /// shell skips its in-place-mutable check (lets you browse
+        /// tar / tar.gz / ISO / SquashFS too), and `put` / `rm` /
+        /// `mkdir` refuse with a clear error.
+        #[arg(long)]
+        ro: bool,
     },
 
     /// Convert an image between container formats (raw ↔ qcow2). Streams
@@ -309,7 +316,7 @@ fn run(cli: Cli) -> fstool::Result<()> {
             fs_dest,
         } => add(&image, &host_src, &fs_dest),
         Command::Rm { image, fs_path } => rm(&image, &fs_path),
-        Command::Shell { image } => shell_cmd(&image),
+        Command::Shell { image, ro } => shell_cmd(&image, ro),
         Command::Convert {
             src,
             dst,
@@ -1860,11 +1867,32 @@ fn sum_source_file_bytes(
     src_fs.total_file_bytes(src_dev)
 }
 
-fn shell_cmd(image: &str) -> fstool::Result<()> {
+fn shell_cmd(image: &str, ro: bool) -> fstool::Result<()> {
     let target = fstool::inspect::Target::parse(image);
-    // Refuse a compressed source up-front: with_target_device would
-    // happily decompress to a tempfile and any put/rm against the
-    // shell would land on that tempfile, silently lost on exit.
+    if ro {
+        // Read-only shell: open the underlying file O_RDONLY (any
+        // write through the BlockDevice fails with PermissionDenied),
+        // use AnyFs::open instead of open_writable (so APFS doesn't
+        // pay the Write-state spaceman re-parse + journaled FSes
+        // don't even consider a replay write), and skip both the
+        // compressed-source rejection and the mutability capability
+        // gate — compressed and streaming/immutable sources are all
+        // legal browse targets. Shell::dispatch will refuse put /
+        // rm / mkdir itself.
+        return fstool::inspect::with_target_device_read_only(&target, |dev| {
+            let fs = fstool::inspect::AnyFs::open(dev)?;
+            let mut sh = shell::Shell::new_read_only(fs);
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            sh.run(dev, stdin.lock(), stdout.lock())?;
+            // No dev.sync() — read-only.
+            Ok(())
+        });
+    }
+    // Mutating shell: refuse a compressed source up-front (with_target_device
+    // would happily decompress to a tempfile and any put/rm against the
+    // shell would land on that tempfile, silently lost on exit) and
+    // refuse non-mutable filesystems.
     fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
         let fs = fstool::inspect::AnyFs::open_writable(dev)?;
@@ -1872,12 +1900,14 @@ fn shell_cmd(image: &str) -> fstool::Result<()> {
         // filesystem that can't support those — tar, ISO 9660,
         // SquashFS, etc. — has nothing useful to offer here; point
         // the user at `fstool ls` / `fstool cat` for read-only
-        // browsing of those formats.
+        // browsing of those formats, or pass `--ro` to allow shell
+        // browsing without any write capability.
         let cap = fs.mutation_capability();
         if !cap.supports_add_remove() {
             return Err(fstool::Error::InvalidArgument(format!(
                 "shell: {} is {} ({}) — shell requires an in-place mutable filesystem; \
-                 use `fstool ls` / `fstool cat` to browse it read-only",
+                 use `fstool shell --ro` for read-only browsing, or `fstool ls` / \
+                 `fstool cat` for one-shot reads",
                 target.path.display(),
                 fs.kind_string(),
                 match cap {

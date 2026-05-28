@@ -87,6 +87,44 @@ pub fn open_image_maybe_compressed(
     }
 }
 
+/// Read-only counterpart of [`open_image`]. Picks the same backend
+/// (qcow2 / dmg / raw) but opens the underlying file `O_RDONLY` so
+/// writes through any layer fail with `PermissionDenied`. Use for
+/// strictly read-only callers (`fstool shell --ro`, etc.).
+pub fn open_image_read_only(path: &Path) -> crate::Result<Box<dyn BlockDevice>> {
+    if Qcow2Backend::probe(path)? {
+        Ok(Box::new(Qcow2Backend::open_read_only(path)?))
+    } else if dmg::probe(path)? {
+        // DmgBackend has no write surface to gate — it's already
+        // read-only by construction.
+        Ok(Box::new(DmgBackend::open(path)?))
+    } else {
+        Ok(Box::new(FileBackend::open_read_only(path)?))
+    }
+}
+
+/// Read-only counterpart of [`open_image_maybe_compressed`]. The
+/// decompressed tempfile is still opened read-write at the FS layer
+/// (it's a throwaway), but the returned [`BlockDevice`] is wrapped
+/// in a read-only `FileBackend` so the caller can't accidentally
+/// mutate it either.
+pub fn open_image_maybe_compressed_read_only(
+    path: &Path,
+) -> crate::Result<(Box<dyn BlockDevice>, Option<tempfile::NamedTempFile>)> {
+    match crate::compression::detect_path(path)? {
+        Some(algo) => {
+            let tmp = crate::compression::decompress_to_tempfile(path, algo)?;
+            // The tempfile itself isn't the artifact under
+            // protection — the user's original .gz / .zst is. We
+            // still wrap the FileBackend read-only so any FS-side
+            // write attempt errors cleanly inside the shell session.
+            let dev = FileBackend::open_read_only(tmp.path())?;
+            Ok((Box::new(dev), Some(tmp)))
+        }
+        None => Ok((open_image_read_only(path)?, None)),
+    }
+}
+
 /// Options for [`create_image`].
 #[derive(Debug, Clone, Copy)]
 pub struct CreateOpts {

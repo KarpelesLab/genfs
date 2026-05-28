@@ -96,12 +96,19 @@ fn block_device_size(_file: &File) -> io::Result<u64> {
 /// Default advisory sector size for new file-backed images.
 pub const DEFAULT_SECTOR: u32 = 512;
 
-/// A [`BlockDevice`] backed by `std::fs::File` opened read/write.
+/// A [`BlockDevice`] backed by `std::fs::File`. Opened read+write by
+/// [`Self::create`] / [`Self::open`]; opened read-only (and refusing
+/// writes early at the API surface) by [`Self::open_read_only`].
 #[derive(Debug)]
 pub struct FileBackend {
     file: File,
     size: u64,
     block_size: u32,
+    /// True when the underlying file was opened `O_RDONLY`. Writes
+    /// would fail at the syscall level anyway, but we surface the
+    /// refusal at the BlockDevice API so callers get a clean
+    /// `PermissionDenied` instead of a syscall-level errno.
+    read_only: bool,
 }
 
 impl FileBackend {
@@ -143,6 +150,7 @@ impl FileBackend {
                 file,
                 size: actual,
                 block_size,
+                read_only: false,
             });
         }
         let file = OpenOptions::new()
@@ -156,6 +164,7 @@ impl FileBackend {
             file,
             size,
             block_size,
+            read_only: false,
         })
     }
 
@@ -184,7 +193,48 @@ impl FileBackend {
             file,
             size,
             block_size,
+            read_only: false,
         })
+    }
+
+    /// Open an existing image file (or block device) read-only. The
+    /// underlying `File` is opened `O_RDONLY` — any write that slips
+    /// past the BlockDevice API would fail at the syscall. Use this
+    /// when the caller is doing strictly read-only work (`fstool
+    /// shell --ro`, the read-side of `fstool ls` / `cat`, …) and
+    /// wants belt-and-braces protection against accidental writes.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_read_only_with_block_size(path, DEFAULT_SECTOR)
+    }
+
+    /// Read-only open with an explicit advisory sector size.
+    pub fn open_read_only_with_block_size<P: AsRef<Path>>(
+        path: P,
+        block_size: u32,
+    ) -> Result<Self> {
+        assert!(
+            block_size.is_power_of_two(),
+            "block_size must be a power of two"
+        );
+        let p = path.as_ref();
+        let is_block = is_block_device(p);
+        let file = OpenOptions::new().read(true).open(p)?;
+        let size = if is_block {
+            block_device_size(&file).map_err(crate::Error::from)?
+        } else {
+            file.metadata()?.len()
+        };
+        Ok(Self {
+            file,
+            size,
+            block_size,
+            read_only: true,
+        })
+    }
+
+    /// Whether this backend was opened read-only.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 }
 
@@ -215,6 +265,12 @@ impl Read for FileBackend {
 
 impl Write for FileBackend {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "FileBackend opened read-only — write refused",
+            ));
+        }
         let pos = self.file.stream_position()?;
         let remaining = self.size.saturating_sub(pos);
         if remaining == 0 {
@@ -228,6 +284,10 @@ impl Write for FileBackend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if self.read_only {
+            // No writes happened — flush is a no-op.
+            return Ok(());
+        }
         self.file.flush()
     }
 }

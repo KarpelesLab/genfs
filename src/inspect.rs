@@ -1145,6 +1145,37 @@ where
     }
 }
 
+/// Read-only counterpart of [`with_target_device`]. Opens the
+/// backing image `O_RDONLY` (via
+/// [`crate::block::open_image_maybe_compressed_read_only`]) so any
+/// write attempt that slips through fails with `PermissionDenied`
+/// — belt-and-braces protection for callers like `fstool shell
+/// --ro` that promise not to mutate the source image.
+///
+/// Compressed sources keep working: the decompressed tempfile is
+/// still opened RO at the BlockDevice layer; on session exit the
+/// tempfile drops, taking its decompressed bytes with it.
+pub fn with_target_device_read_only<F, R>(target: &Target, op: F) -> Result<R>
+where
+    F: FnOnce(&mut dyn BlockDevice) -> Result<R>,
+{
+    let (mut disk, _tmp) = crate::block::open_image_maybe_compressed_read_only(&target.path)?;
+    match target.partition {
+        None => op(disk.as_mut()),
+        Some(idx) => {
+            let table = detect_partition_table(disk.as_mut())?.ok_or_else(|| {
+                crate::Error::InvalidArgument(format!(
+                    "{}: no partition table found, can't target partition {}",
+                    target.path.display(),
+                    idx + 1
+                ))
+            })?;
+            let mut slice = slice_partition(table.as_table(), disk.as_mut(), idx)?;
+            op(&mut slice)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

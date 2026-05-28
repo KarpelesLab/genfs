@@ -1501,3 +1501,118 @@ fn cli_shell_refuses_streaming_filesystem() {
     assert!(err.contains("streaming"), "wrong error: {err}");
     assert!(err.contains("fstool ls"), "missing browse hint: {err}");
 }
+
+/// `fstool shell --ro` opens the image read-only:
+/// - tar / tar.gz (streaming + compressed) are legal browse targets;
+/// - put / rm / mkdir refuse with a "shell is read-only" message;
+/// - the original on-disk image's bytes are unchanged after a session.
+#[test]
+fn cli_shell_ro_browses_immutable_and_keeps_image_bytes() {
+    let bin = env!("CARGO_BIN_EXE_fstool");
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build inputs: a tiny dir, an ext.img, and a tar.gz of the dir.
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"a\n").unwrap();
+
+    let ext_img = dir.path().join("e.img");
+    let r = Command::new(bin)
+        .args(["create", "-t", "ext2", "-o"])
+        .arg(&ext_img)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let tar_gz = dir.path().join("t.tar.gz");
+    let st = Command::new("tar")
+        .arg("-czf")
+        .arg(&tar_gz)
+        .arg("-C")
+        .arg(dir.path())
+        .arg("src")
+        .status()
+        .unwrap();
+    assert!(st.success(), "tar failed");
+
+    let host = dir.path().join("host.txt");
+    std::fs::write(&host, b"x\n").unwrap();
+
+    // --- shell --ro on tar.gz: ls works (streaming source now allowed)
+    let r = Command::new(bin)
+        .arg("shell")
+        .arg("--ro")
+        .arg(&tar_gz)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = r;
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"ls\nquit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "shell --ro on tar.gz failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("src"),
+        "no src/ in listing"
+    );
+
+    // --- shell --ro on ext.img: put is refused, image untouched
+    let bytes_before = std::fs::read(&ext_img).unwrap();
+    let mut child = Command::new(bin)
+        .arg("shell")
+        .arg("--ro")
+        .arg(&ext_img)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "ls").unwrap();
+        writeln!(stdin, "put {} /attempted.txt", host.display()).unwrap();
+        writeln!(stdin, "rm /a.txt").unwrap();
+        writeln!(stdin, "mkdir /newdir").unwrap();
+        writeln!(stdin, "quit").unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "shell --ro on ext.img failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Each of put/rm/mkdir surfaces the read-only refusal.
+    for cmd in ["put", "rm", "mkdir"] {
+        assert!(
+            stdout.contains(&format!("{cmd}: shell is read-only")),
+            "{cmd} not refused: {stdout}"
+        );
+    }
+    let bytes_after = std::fs::read(&ext_img).unwrap();
+    assert_eq!(bytes_before, bytes_after, "shell --ro mutated the image");
+
+    // --- shell (no --ro) on tar still refused (commit-A capability gate)
+    let r = Command::new(bin)
+        .arg("shell")
+        .arg(&tar_gz)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !r.status.success(),
+        "shell w/o --ro on tar.gz should still fail"
+    );
+}

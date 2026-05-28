@@ -41,14 +41,33 @@ pub struct Shell {
     /// Current working directory inside the image. Always absolute and
     /// normalised (no `.`/`..`/empty segments).
     cwd: String,
+    /// True when the shell is in read-only mode (`fstool shell --ro`).
+    /// `put` / `rm` / `mkdir` are refused at dispatch time and the
+    /// underlying device is opened `O_RDONLY` by the caller.
+    read_only: bool,
 }
 
 impl Shell {
-    /// A new shell rooted at `/` over `fs`.
+    /// A new shell rooted at `/` over `fs`. The shell is mutating —
+    /// `put` / `rm` / `mkdir` go through to the FS writer.
     pub fn new(fs: AnyFs) -> Self {
         Self {
             fs,
             cwd: "/".into(),
+            read_only: false,
+        }
+    }
+
+    /// A read-only shell over `fs`. `put` / `rm` / `mkdir` refuse
+    /// with a clear error; only `ls` / `cat` / `cd` / `pwd` / `info`
+    /// / `help` work. Intended for `fstool shell --ro` where the
+    /// caller has opened the BlockDevice read-only (so even a
+    /// missed gate fails at the syscall).
+    pub fn new_read_only(fs: AnyFs) -> Self {
+        Self {
+            fs,
+            cwd: "/".into(),
+            read_only: true,
         }
     }
 
@@ -118,14 +137,17 @@ impl Shell {
                 Ok(false)
             }
             "put" => {
+                self.require_writable("put")?;
                 self.cmd_put(dev, rest, output)?;
                 Ok(false)
             }
             "rm" => {
+                self.require_writable("rm")?;
                 self.cmd_rm(dev, rest, output)?;
                 Ok(false)
             }
             "mkdir" => {
+                self.require_writable("mkdir")?;
                 self.cmd_mkdir(dev, rest, output)?;
                 Ok(false)
             }
@@ -140,9 +162,28 @@ impl Shell {
         }
     }
 
+    /// Refuse a mutating command when the shell is in `--ro` mode.
+    /// The underlying BlockDevice is also opened `O_RDONLY` so a
+    /// missed gate would still fail at the syscall, but this gives
+    /// the user a clean error rather than `PermissionDenied`.
+    fn require_writable(&self, cmd: &str) -> Result<()> {
+        if self.read_only {
+            return Err(fstool::Error::InvalidArgument(format!(
+                "{cmd}: shell is read-only (started with --ro); restart \
+                 without --ro to mutate the image",
+            )));
+        }
+        Ok(())
+    }
+
     fn cmd_help(&self, output: &mut impl Write) -> Result<()> {
-        let body = "\
-ls [PATH]           list a directory (default: cwd)
+        let ro_note = if self.read_only {
+            "\n(shell is read-only: put / rm / mkdir refuse — restart without --ro to mutate)\n"
+        } else {
+            ""
+        };
+        let body = format!(
+            "ls [PATH]           list a directory (default: cwd)
 pwd                 print the current directory
 cd [PATH]           change directory (no arg → /)
 cat PATH            print a file's contents to stdout
@@ -153,7 +194,8 @@ info [PATH]         no arg → image summary; with PATH → file metadata
                     (kind/mode/owner/size/blocks/nlink/inode/atime/mtime
                     /ctime/rdev) plus any extended attributes
 help | ?            print this help
-quit | exit         leave\n";
+quit | exit         leave{ro_note}\n"
+        );
         output.write_all(body.as_bytes())?;
         Ok(())
     }

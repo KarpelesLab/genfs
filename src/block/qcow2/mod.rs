@@ -56,6 +56,11 @@ pub struct Qcow2Backend {
     file_len: u64,
     /// Virtual cursor for the `Read`/`Write`/`Seek` impls.
     cursor: u64,
+    /// True when the backing `File` was opened `O_RDONLY` by
+    /// [`Self::open_read_only`]. Writes return `PermissionDenied`
+    /// early so callers get a clean refusal rather than a deep
+    /// syscall-level error.
+    read_only: bool,
 }
 
 impl std::fmt::Debug for Qcow2Backend {
@@ -73,10 +78,24 @@ impl Qcow2Backend {
     /// Open an existing qcow2 file read+write. Errors with `Unsupported`
     /// if the image uses features fstool doesn't implement.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path.as_ref())?;
+        Self::open_inner(path.as_ref(), false)
+    }
+
+    /// Open an existing qcow2 file read-only. The backing `File` is
+    /// opened `O_RDONLY` — any write that slips past the BlockDevice
+    /// API would fail at the syscall. The qcow2 read paths
+    /// (L1/L2/refcount load, cluster reads) work unchanged.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_inner(path.as_ref(), true)
+    }
+
+    fn open_inner(path: &Path, read_only: bool) -> Result<Self> {
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        if !read_only {
+            opts.write(true);
+        }
+        let mut file = opts.open(path)?;
         let mut buf = [0u8; header::V3_HEADER_LEN];
         file.read_exact(&mut buf)?;
         let header = Header::decode(&buf)?;
@@ -92,6 +111,7 @@ impl Qcow2Backend {
             refcount,
             file_len,
             cursor: 0,
+            read_only,
         })
     }
 
@@ -210,6 +230,7 @@ impl Qcow2Backend {
             refcount,
             file_len,
             cursor: 0,
+            read_only: false,
         })
     }
 
@@ -233,6 +254,12 @@ impl Qcow2Backend {
     fn write_virtual(&mut self, mut offset: u64, mut buf: &[u8]) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
+        }
+        if self.read_only {
+            return Err(crate::Error::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Qcow2Backend opened read-only — write refused",
+            )));
         }
         let end = offset
             .checked_add(buf.len() as u64)
@@ -436,6 +463,13 @@ impl BlockDevice for Qcow2Backend {
     }
 
     fn sync(&mut self) -> Result<()> {
+        if self.read_only {
+            // No writes happened; nothing to flush. Calling
+            // l1l2.flush / refcount.flush on a RO-opened file would
+            // try to write back potentially clean caches and fail at
+            // the syscall — skip them entirely.
+            return Ok(());
+        }
         self.l1l2.flush(&mut self.file)?;
         self.refcount.flush(&mut self.file)?;
         self.file.sync_data()?;

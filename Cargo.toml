@@ -30,11 +30,18 @@ path = "src/bin/fstool/main.rs"
 # one, it gains its own optional dependency behind a per-format feature
 # here, matching the codec pattern above.
 default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
-gzip = ["dep:flate2"]
-xz = ["dep:lzma-rs"]
+# gzip/zlib/xz/zstd are served by `compcol` (uniform codec crate).
+# `flate2` is still pulled by `gzip` because the zip, DMG, and HFS+
+# decmpfs paths use it directly (migrated to compcol in a follow-up).
+# `lzma` stays on `lzma-rs`: compcol 0.4.0's `.lzma` (alone) codec isn't
+# liblzma-interoperable yet (compcol#14). lz4/lzo stay on their own crates
+# until compcol exposes raw single-block + canonical-frame codecs
+# (compcol #9 / #10).
+gzip = ["dep:flate2", "dep:compcol", "compcol/gzip", "compcol/zlib"]
+xz = ["dep:compcol", "compcol/xz"]
 lzma = ["dep:lzma-rs"]
 lz4 = ["dep:lz4_flex"]
-zstd = ["dep:zstd"]
+zstd = ["dep:compcol", "compcol/zstd"]
 lzo = ["dep:minilzo-rs"]
 # DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set.
 # bzip2-rs is a pure-Rust decoder, lzfse_rust is a pure-Rust LZFSE
@@ -89,10 +96,13 @@ tempfile = "3"
 # Compression codecs — all optional and feature-gated. Pure-rust where
 # possible (flate2 via miniz_oxide, lz4_flex, lzma-rs); zstd and lzo
 # pull in bundled C source.
+# compcol: uniform no_std codec collection. Serves gzip/zlib/xz/lzma/zstd;
+# `std` is always on (for the `io` Read/Write adapters), per-algorithm
+# features are added by fstool's own `gzip`/`xz`/`lzma`/`zstd` features.
+compcol = { version = "0.4", optional = true, default-features = false, features = ["std"] }
 flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
 lzma-rs = { version = "0.3", optional = true }
 lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["std", "safe-encode", "safe-decode", "frame"] }
-zstd = { version = "0.13", optional = true }
 "minilzo-rs" = { version = "0.6", optional = true }
 
 # DMG codec deps. bzip2-rs is decode-only pure Rust; lzfse_rust is a

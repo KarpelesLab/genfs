@@ -105,3 +105,69 @@ fn repack_into_tar_gz_then_inspect() {
     assert!(out.status.success());
     assert_eq!(out.stdout, b"hello compressed\n");
 }
+
+/// Pipe `input` through `xz <args>` (stdin → stdout) and return stdout.
+fn xz_pipe(args: &[&str], input: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("xz")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn xz");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input)
+        .expect("write to xz stdin");
+    let out = child.wait_with_output().expect("wait xz");
+    assert!(
+        out.status.success(),
+        "xz {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// Cross-tool interop: fstool's compcol-backed `.lzma` (alone) and `.xz`
+/// codecs must interoperate with the system `xz` CLI in both directions.
+/// This is the lzma/xz compatibility check called out during the compcol
+/// migration — SquashFS's legacy LZMA compressor and `.tar.lzma` rely on
+/// byte-compatible alone-format framing.
+#[test]
+fn lzma_and_xz_interoperate_with_xz_cli() {
+    use fstool::compression::{Algo, compress, decompress};
+
+    if !which("xz") {
+        eprintln!("skipping: xz not installed");
+        return;
+    }
+
+    // A payload with both repetition (so LZMA actually matches) and
+    // variation (so it isn't a degenerate all-same block).
+    let mut payload = Vec::new();
+    for i in 0..4000u32 {
+        payload.extend_from_slice(format!("line {i:05} the quick brown fox жжж\n").as_bytes());
+    }
+
+    for (algo, fmt) in [(Algo::Lzma, "lzma"), (Algo::Xz, "xz")] {
+        // fstool encode → xz CLI decode.
+        let enc = compress(algo, &payload).expect("fstool compress");
+        let via_cli = xz_pipe(&["--format", fmt, "-dc"], &enc);
+        assert_eq!(
+            via_cli, payload,
+            "{fmt}: system xz could not decode fstool output"
+        );
+
+        // xz CLI encode → fstool decode.
+        let cli_enc = xz_pipe(&["--format", fmt, "-c"], &payload);
+        let via_fstool = decompress(algo, &cli_enc, payload.len()).expect("fstool decompress");
+        assert_eq!(
+            via_fstool, payload,
+            "{fmt}: fstool could not decode system xz output"
+        );
+    }
+}

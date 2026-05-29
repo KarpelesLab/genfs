@@ -13,149 +13,80 @@
 //! compressed tar archives the gzip / zstd / lz4 adapters (which DO
 //! stream natively in their crates) are the right pick anyway.
 
+#[cfg(any(feature = "lzma", feature = "lzo"))]
 use std::io::{self, Read, Write};
 
-// ============================ xz / lzma ============================
+// =============================== lzma ==============================
+//
+// `lzma-rs` exposes only slice-based `lzma_decompress` / `lzma_compress`
+// (the legacy `.lzma` alone format), so we buffer the whole payload to
+// give the streaming API its shape. lzma stays on `lzma-rs` because
+// compcol 0.4.0's alone codec isn't liblzma-interoperable yet
+// (KarpelesLab/compcol#14); xz/gzip/zlib/zstd are on compcol.
 
-/// Codec selector for [`DecoderAdapter`] / [`EncoderAdapter`].
-#[cfg(any(feature = "xz", feature = "lzma"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LzmaFlavour {
-    /// `.xz` container.
-    Xz,
-    /// Raw LZMA1 stream (the legacy `.lzma` format).
-    Lzma,
-}
-
-/// Buffering decoder shared by xz and lzma.
-#[cfg(any(feature = "xz", feature = "lzma"))]
-pub struct DecoderAdapter<R: Read> {
+/// Buffering `.lzma` decoder: reads all compressed input on first
+/// `read`, decodes it once, then hands out the plaintext via a cursor.
+#[cfg(feature = "lzma")]
+pub struct LzmaDecoderAdapter<R: Read> {
     inner: R,
-    flavour: LzmaFlavour,
     decoded: Option<io::Cursor<Vec<u8>>>,
 }
 
-#[cfg(feature = "xz")]
-impl<R: Read> DecoderAdapter<R> {
-    pub fn new_xz(r: R) -> Self {
+#[cfg(feature = "lzma")]
+impl<R: Read> LzmaDecoderAdapter<R> {
+    pub fn new(r: R) -> Self {
         Self {
             inner: r,
-            flavour: LzmaFlavour::Xz,
             decoded: None,
         }
     }
 }
 
 #[cfg(feature = "lzma")]
-impl<R: Read> DecoderAdapter<R> {
-    pub fn new_lzma(r: R) -> Self {
-        Self {
-            inner: r,
-            flavour: LzmaFlavour::Lzma,
-            decoded: None,
-        }
-    }
-}
-
-#[cfg(any(feature = "xz", feature = "lzma"))]
-impl<R: Read> Read for DecoderAdapter<R> {
+impl<R: Read> Read for LzmaDecoderAdapter<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.decoded.is_none() {
             let mut compressed = Vec::new();
             self.inner.read_to_end(&mut compressed)?;
             let mut out = Vec::new();
             let mut input = std::io::BufReader::new(&compressed[..]);
-            match self.flavour {
-                LzmaFlavour::Xz => {
-                    #[cfg(feature = "xz")]
-                    {
-                        lzma_rs::xz_decompress(&mut input, &mut out).map_err(|e| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("xz decode failed: {e}"),
-                            )
-                        })?;
-                    }
-                    #[cfg(not(feature = "xz"))]
-                    unreachable!("xz flavour built without `xz` feature");
-                }
-                LzmaFlavour::Lzma => {
-                    #[cfg(feature = "lzma")]
-                    {
-                        lzma_rs::lzma_decompress(&mut input, &mut out).map_err(|e| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("lzma decode failed: {e}"),
-                            )
-                        })?;
-                    }
-                    #[cfg(not(feature = "lzma"))]
-                    unreachable!("lzma flavour built without `lzma` feature");
-                }
-            }
+            lzma_rs::lzma_decompress(&mut input, &mut out).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("lzma decode failed: {e}"),
+                )
+            })?;
             self.decoded = Some(io::Cursor::new(out));
         }
         self.decoded.as_mut().unwrap().read(buf)
     }
 }
 
-/// Buffering encoder shared by xz and lzma.
-#[cfg(any(feature = "xz", feature = "lzma"))]
-pub struct EncoderAdapter<W: Write> {
+/// Buffering `.lzma` encoder: stages every write, then encodes the whole
+/// buffer to the inner writer once on `flush` / `Drop`.
+#[cfg(feature = "lzma")]
+pub struct LzmaEncoderAdapter<W: Write> {
     inner: Option<W>,
-    flavour: LzmaFlavour,
     buf: Vec<u8>,
 }
 
-#[cfg(feature = "xz")]
-impl<W: Write> EncoderAdapter<W> {
-    pub fn new_xz(w: W) -> Self {
-        Self {
-            inner: Some(w),
-            flavour: LzmaFlavour::Xz,
-            buf: Vec::new(),
-        }
-    }
-}
-
 #[cfg(feature = "lzma")]
-impl<W: Write> EncoderAdapter<W> {
-    pub fn new_lzma(w: W) -> Self {
+impl<W: Write> LzmaEncoderAdapter<W> {
+    pub fn new(w: W) -> Self {
         Self {
             inner: Some(w),
-            flavour: LzmaFlavour::Lzma,
             buf: Vec::new(),
         }
     }
-}
 
-#[cfg(any(feature = "xz", feature = "lzma"))]
-impl<W: Write> EncoderAdapter<W> {
-    /// Encode the staged buffer and write it to the inner writer once.
-    /// Used by both `flush` and the `Drop` finaliser.
     fn finish_inner(&mut self) -> io::Result<()> {
-        if self.inner.is_none() {
+        let Some(mut w) = self.inner.take() else {
             return Ok(());
-        }
+        };
         let mut input = std::io::BufReader::new(&self.buf[..]);
         let mut out = Vec::new();
-        match self.flavour {
-            LzmaFlavour::Xz => {
-                #[cfg(feature = "xz")]
-                lzma_rs::xz_compress(&mut input, &mut out)
-                    .map_err(|e| io::Error::other(format!("xz encode failed: {e}")))?;
-                #[cfg(not(feature = "xz"))]
-                unreachable!("xz encoder built without `xz` feature");
-            }
-            LzmaFlavour::Lzma => {
-                #[cfg(feature = "lzma")]
-                lzma_rs::lzma_compress(&mut input, &mut out)
-                    .map_err(|e| io::Error::other(format!("lzma encode failed: {e}")))?;
-                #[cfg(not(feature = "lzma"))]
-                unreachable!("lzma encoder built without `lzma` feature");
-            }
-        }
-        let mut w = self.inner.take().unwrap();
+        lzma_rs::lzma_compress(&mut input, &mut out)
+            .map_err(|e| io::Error::other(format!("lzma encode failed: {e}")))?;
         w.write_all(&out)?;
         w.flush()?;
         self.buf.clear();
@@ -163,8 +94,8 @@ impl<W: Write> EncoderAdapter<W> {
     }
 }
 
-#[cfg(any(feature = "xz", feature = "lzma"))]
-impl<W: Write> Write for EncoderAdapter<W> {
+#[cfg(feature = "lzma")]
+impl<W: Write> Write for LzmaEncoderAdapter<W> {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         self.buf.extend_from_slice(b);
         Ok(b.len())
@@ -175,8 +106,8 @@ impl<W: Write> Write for EncoderAdapter<W> {
     }
 }
 
-#[cfg(any(feature = "xz", feature = "lzma"))]
-impl<W: Write> Drop for EncoderAdapter<W> {
+#[cfg(feature = "lzma")]
+impl<W: Write> Drop for LzmaEncoderAdapter<W> {
     fn drop(&mut self) {
         let _ = self.finish_inner();
     }

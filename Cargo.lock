@@ -202,9 +202,9 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "compcol"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc37c2968574da9dbb9529ccc1be06b3244ae6a9a2df3f2ea40c952f46467630"
+checksum = "13ffacda0c391582ad5f38d08e89f098cf2a069354b77e4fe19100fea4bf0f84"
 
 [[package]]
 name = "cpufeatures"

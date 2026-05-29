@@ -1,17 +1,14 @@
-//! Streaming adapters for codecs whose underlying crate exposes only a
-//! "decompress all" / "compress all" function.
+//! Streaming adapters for the two codecs without a native streaming form:
 //!
-//! `lzma-rs` and `minilzo-rs` both work on slices, not streams. We wrap
-//! them by buffering the whole input on the read side (then handing out
-//! the decoded payload through a `Cursor`) and by buffering all writes
-//! until `flush` (then emitting one compressed payload).
+//! - **lzma** (`lzma-rs`, slice-based `.lzma` alone) — buffer the whole
+//!   payload and en/decode in one shot.
+//! - **lzo** — LZO1X has no native frame, so we invent a tiny multi-block
+//!   frame and en/decode each block as a one-shot raw LZO1X block via
+//!   `compcol::lzo::block`.
 //!
-//! That's a streaming API in shape but a buffer-the-whole-thing
-//! implementation under the hood. For SquashFS metablocks and tar
-//! frames this is fine — the upper-layer caller chunks input below 1
-//! MiB so the working set stays small. For multi-GiB single-stream
-//! compressed tar archives the gzip / zstd / lz4 adapters (which DO
-//! stream natively in their crates) are the right pick anyway.
+//! Both buffer rather than truly stream, which is fine for SquashFS
+//! metablocks and tar's ≤ 1 MiB chunks. gzip / zstd / xz / lz4 stream
+//! natively through `compcol::io` (see [`super`]).
 
 #[cfg(any(feature = "lzma", feature = "lzo"))]
 use std::io::{self, Read, Write};
@@ -115,13 +112,13 @@ impl<W: Write> Drop for LzmaEncoderAdapter<W> {
 
 // =============================== lzo ===============================
 //
-// LZO1X has no native frame format and the `minilzo-rs` API takes
-// whole slices. We invent a tiny frame: a stream of `(u32 LE
-// compressed-len, u32 LE uncompressed-len, payload)` records terminated
-// by a `(0, 0)` sentinel. Records are emitted in 1 MiB chunks. Files
-// produced with this framing are NOT interchangeable with any other
-// LZO toolchain — they exist only so `make_reader_lzo`'s `Read` impl
-// can produce predictable streaming output.
+// LZO1X has no native frame format, so we invent a tiny frame: a stream of
+// `(u32 LE compressed-len, u32 LE uncompressed-len, payload)` records
+// terminated by a `(0, 0)` sentinel, each payload a one-shot raw LZO1X
+// block (`compcol::lzo::block`). Records are emitted in 1 MiB chunks. Files
+// produced with this framing are NOT interchangeable with any other LZO
+// toolchain — they exist only so `make_reader_lzo`'s `Read` impl can
+// produce predictable streaming output.
 
 #[cfg(feature = "lzo")]
 const LZO_FRAME_CHUNK: usize = 1 << 20;
@@ -146,11 +143,8 @@ impl<W: Write> LzoFrameWriter<W> {
         if self.pending.is_empty() || self.inner.is_none() {
             return Ok(());
         }
-        let mut lzo =
-            minilzo_rs::LZO::init().map_err(|e| io::Error::other(format!("lzo init: {e:?}")))?;
-        let compressed = lzo
-            .compress(&self.pending)
-            .map_err(|e| io::Error::other(format!("lzo encode failed: {e:?}")))?;
+        let mut compressed = Vec::new();
+        compcol::lzo::block::encode_block(&self.pending, &mut compressed);
         let w = self.inner.as_mut().unwrap();
         w.write_all(&(compressed.len() as u32).to_le_bytes())?;
         w.write_all(&(self.pending.len() as u32).to_le_bytes())?;
@@ -222,12 +216,12 @@ impl<R: Read> LzoFrameReader<R> {
         }
         let mut compressed = vec![0u8; clen];
         self.inner.read_exact(&mut compressed)?;
-        let lzo =
-            minilzo_rs::LZO::init().map_err(|e| io::Error::other(format!("lzo init: {e:?}")))?;
-        let out = lzo.decompress(&compressed, ulen).map_err(|e| {
+        let _ = ulen; // uncompressed length is implied by the block itself
+        let mut out = Vec::new();
+        compcol::lzo::block::decode_block(&compressed, &mut out).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("lzo decode failed: {e:?}"),
+                format!("lzo decode failed: {e}"),
             )
         })?;
         self.pending = io::Cursor::new(out);

@@ -109,8 +109,7 @@ impl<'a> FileReader<'a> {
                 } else {
                     // Non-tail blocks decompress to exactly `full_block_size`;
                     // the tail block decompresses to whatever's left of the
-                    // file. minilzo treats this as an exact size, so the
-                    // remaining-vs-full distinction matters for LZO.
+                    // file. Used as the output cap passed to `decompress`.
                     let expected = self.remaining.min(self.full_block_size as u64) as usize;
                     let algo = compression_to_algo(self.compression).ok_or_else(|| {
                         crate::Error::InvalidImage(format!(

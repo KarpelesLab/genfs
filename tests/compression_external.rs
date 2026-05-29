@@ -106,6 +106,64 @@ fn repack_into_tar_gz_then_inspect() {
     assert_eq!(out.stdout, b"hello compressed\n");
 }
 
+/// Repack an ext2 image into a `.tar.lz4` and confirm the canonical LZ4
+/// Frame (compcol) is both readable by the system `lz4` CLI and round-trips
+/// back through fstool — exercising the `compcol::lz4::frame` path.
+#[test]
+fn repack_into_tar_lz4_interops_with_lz4_cli() {
+    if !which("mke2fs") {
+        eprintln!("skipping: mke2fs not installed");
+        return;
+    }
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hello.txt"), b"hello lz4 frame\n").unwrap();
+
+    let src_img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args([
+            "create", "-t", "ext2",
+            srcdir.path().to_str().unwrap(),
+            "-o", src_img.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "create: {}", String::from_utf8_lossy(&out.stderr));
+
+    let tarball = tempfile::Builder::new().suffix(".tar.lz4").tempfile().unwrap();
+    let out = Command::new(FSTOOL)
+        .args([
+            "repack",
+            src_img.path().to_str().unwrap(),
+            tarball.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "repack →.tar.lz4: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Canonical LZ4 Frame magic 0x184D2204 (little-endian).
+    let bytes = std::fs::read(tarball.path()).unwrap();
+    assert_eq!(&bytes[0..4], &[0x04, 0x22, 0x4d, 0x18], "expected LZ4 frame magic");
+
+    // The system `lz4` CLI must accept the frame (integrity check).
+    if which("lz4") {
+        let t = Command::new("lz4").arg("-t").arg(tarball.path()).output().unwrap();
+        assert!(
+            t.status.success(),
+            "lz4 -t rejected fstool's frame: {}",
+            String::from_utf8_lossy(&t.stderr)
+        );
+    }
+
+    // And fstool reads its own .tar.lz4 back.
+    let out = Command::new(FSTOOL)
+        .args(["cat", tarball.path().to_str().unwrap(), "/hello.txt"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "cat .tar.lz4: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"hello lz4 frame\n");
+}
+
 /// Pipe `input` through `xz <args>` (stdin → stdout) and return stdout.
 fn xz_pipe(args: &[&str], input: &[u8]) -> Vec<u8> {
     use std::io::Write;

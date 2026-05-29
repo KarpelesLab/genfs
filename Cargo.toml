@@ -30,21 +30,21 @@ path = "src/bin/fstool/main.rs"
 # for one, it gains its own optional dependency behind a per-format feature
 # here, matching the codec pattern above. `cab` is the first such reader.
 default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
-# gzip/zlib/deflate/xz/zstd are served by `compcol` (uniform codec crate);
-# the `gzip` feature also covers zip DEFLATE, DMG zlib, and HFS+ decmpfs.
-# `lzma` stays on `lzma-rs`: compcol 0.4.0's `.lzma` (alone) codec isn't
-# liblzma-interoperable yet (compcol#14). lz4/lzo stay on their own crates
-# until compcol exposes raw single-block + canonical-frame codecs
-# (compcol #9 / #10).
+# gzip/zlib/deflate/xz/zstd/lz4/lzo are served by `compcol` (uniform codec
+# crate); the `gzip` feature also covers zip DEFLATE, DMG zlib, and HFS+
+# decmpfs. lz4 uses compcol's raw block (SquashFS) + canonical frame (tar);
+# lzo uses compcol's raw LZO1X block. `lzma` stays on `lzma-rs`: compcol's
+# `.lzma` (alone) *encoder* isn't liblzma-interoperable yet (compcol#14) and
+# fstool writes `.tar.lzma` / SquashFS-lzma that external tools must read.
 gzip = ["dep:compcol", "compcol/gzip", "compcol/zlib", "compcol/deflate"]
 xz = ["dep:compcol", "compcol/xz"]
 lzma = ["dep:lzma-rs"]
-lz4 = ["dep:lz4_flex"]
+lz4 = ["dep:compcol", "compcol/lz4"]
 # Microsoft Cabinet (.cab) reader: Store/MSZIP/LZX/Quantum folders decode
 # via compcol. Read-only.
 cab = ["dep:compcol", "compcol/deflate", "compcol/lzx", "compcol/quantum"]
 zstd = ["dep:compcol", "compcol/zstd"]
-lzo = ["dep:minilzo-rs"]
+lzo = ["dep:compcol", "compcol/lzo"]
 # DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set.
 # bzip2-rs is a pure-Rust decoder, lzfse_rust is a pure-Rust LZFSE
 # decoder; both gated so a slim build can drop them.
@@ -98,13 +98,11 @@ tempfile = "3"
 # Compression codecs — all optional and feature-gated. Pure-rust where
 # possible (flate2 via miniz_oxide, lz4_flex, lzma-rs); zstd and lzo
 # pull in bundled C source.
-# compcol: uniform no_std codec collection. Serves gzip/zlib/xz/lzma/zstd;
-# `std` is always on (for the `io` Read/Write adapters), per-algorithm
-# features are added by fstool's own `gzip`/`xz`/`lzma`/`zstd` features.
+# compcol: uniform no_std codec collection serving gzip/zlib/deflate/xz/zstd
+# /lz4/lzo plus the CAB codecs. `std` is always on (for the `io` Read/Write
+# adapters); per-algorithm features are added by fstool's feature flags.
 compcol = { version = "0.4", optional = true, default-features = false, features = ["std"] }
 lzma-rs = { version = "0.3", optional = true }
-lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["std", "safe-encode", "safe-decode", "frame"] }
-"minilzo-rs" = { version = "0.6", optional = true }
 
 # DMG codec deps. bzip2-rs is decode-only pure Rust; lzfse_rust is a
 # pure-Rust LZFSE encoder + decoder. Both opt-in via dmg-bzip2 /

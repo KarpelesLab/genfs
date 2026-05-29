@@ -26,14 +26,12 @@
 //!   collection behind one `Encoder`/`Decoder` trait. The block API rides
 //!   `compcol::vec`, the stream API `compcol::io`, and the output cap
 //!   `compcol::limit::LimitedDecoder`.
+//! - **lz4 / lzo**: compcol too — the raw block codec (`compcol::lz4::block`
+//!   / `compcol::lzo::block`) for SquashFS, and `compcol::lz4::frame`
+//!   (canonical LZ4 Frame) for `.tar.lz4` streaming.
 //! - **lzma**: `lzma-rs` (legacy `.lzma` alone format). Not yet on compcol
-//!   because compcol 0.4.0's alone codec isn't liblzma-interoperable
+//!   because compcol's alone *encoder* isn't liblzma-interoperable
 //!   (KarpelesLab/compcol#14); the `.xz` container is on compcol.
-//! - **lz4**: `lz4_flex`, pure-Rust. We use the LZ4 frame format for
-//!   tar streaming and the LZ4 block format for SquashFS. (compcol can't
-//!   yet emit raw blocks / a canonical frame — compcol #9 / #10.)
-//! - **lzo**: `minilzo-rs`, wraps the upstream `minilzo` C library
-//!   (LZO1X-1 / LZO1X-999). SquashFS encodes raw LZO1X blocks.
 
 use crate::Result;
 
@@ -138,10 +136,6 @@ pub fn detect_magic(prefix: &[u8]) -> Option<Algo> {
 /// `max_out` is the largest output we're willing to allocate (so a
 /// corrupt header can't pin gigabytes of RAM). On success returns the
 /// decoded bytes.
-///
-/// Caveat for LZO: minilzo's underlying API treats this argument as the
-/// *exact* expected output size, not a soft maximum — pass the size you
-/// read from the source's metadata, not a generous cap.
 pub fn decompress(algo: Algo, compressed: &[u8], max_out: usize) -> Result<Vec<u8>> {
     match algo {
         Algo::Gzip => decompress_gzip(compressed, max_out),
@@ -240,7 +234,7 @@ fn cap_check(buf: &[u8], max_out: usize) -> Result<()> {
 /// `src` slice — the same shape as `compcol::vec::decompress_to_vec` —
 /// rather than `compcol::io::DecoderReader`, which mishandles end-of-input
 /// on some complete streams (e.g. small zlib; KarpelesLab/compcol#17).
-#[cfg(any(feature = "gzip", feature = "xz", feature = "lzma", feature = "zstd"))]
+#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd"))]
 fn cc_decompress<A: compcol::Algorithm>(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
     use compcol::{Decoder, Status};
     let mut dec = compcol::limit::LimitedDecoder::new(A::decoder(), max_out as u64);
@@ -278,7 +272,7 @@ fn cc_decompress<A: compcol::Algorithm>(src: &[u8], max_out: usize) -> Result<Ve
 }
 
 /// One-shot compress with `A`'s default encoder config.
-#[cfg(any(feature = "gzip", feature = "xz", feature = "lzma", feature = "zstd"))]
+#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd"))]
 fn cc_compress<A: compcol::Algorithm>(plain: &[u8]) -> Result<Vec<u8>> {
     compcol::vec::compress_to_vec::<A>(plain).map_err(|e| {
         crate::Error::Io(std::io::Error::other(format!(
@@ -289,7 +283,7 @@ fn cc_compress<A: compcol::Algorithm>(plain: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Wrap a `Read` in a streaming decompressor for `A`.
-#[cfg(any(feature = "gzip", feature = "xz", feature = "lzma", feature = "zstd"))]
+#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd", feature = "lz4"))]
 fn cc_reader<'a, A: compcol::Algorithm, R: std::io::Read + 'a>(r: R) -> Box<dyn std::io::Read + 'a>
 where
     A::Decoder: 'a,
@@ -299,7 +293,7 @@ where
 
 /// Wrap a `Write` in a streaming compressor for `A`. The encoder flushes
 /// its trailer when the returned writer is dropped.
-#[cfg(any(feature = "gzip", feature = "xz", feature = "lzma", feature = "zstd"))]
+#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd", feature = "lz4"))]
 fn cc_writer<'a, A: compcol::Algorithm, W: std::io::Write + 'a>(
     w: W,
 ) -> Box<dyn std::io::Write + 'a>
@@ -494,11 +488,14 @@ fn make_writer_lzma<'a, W: std::io::Write + 'a>(_w: W) -> Result<Box<dyn std::io
 
 // =========================== lz4 ============================
 
+// SquashFS uses the raw LZ4 *block* format (no framing); tar streaming uses
+// the canonical LZ4 *frame*. Both via compcol (raw block exposed by #9,
+// canonical frame added by #10).
+
 #[cfg(feature = "lz4")]
 fn decompress_lz4(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
-    // SquashFS uses raw LZ4 block format (no frame). For tar (frame
-    // format), use `make_reader_lz4` instead.
-    let out = lz4_flex::block::decompress(src, max_out)
+    let mut out = Vec::new();
+    compcol::lz4::block::decode_block(src, &mut out)
         .map_err(|e| crate::Error::InvalidImage(format!("lz4 decode failed: {e}")))?;
     cap_check(&out, max_out)?;
     Ok(out)
@@ -511,7 +508,9 @@ fn decompress_lz4(_src: &[u8], _max_out: usize) -> Result<Vec<u8>> {
 
 #[cfg(feature = "lz4")]
 fn compress_lz4(plain: &[u8]) -> Result<Vec<u8>> {
-    Ok(lz4_flex::block::compress(plain))
+    let mut out = Vec::new();
+    compcol::lz4::block::encode_block(plain, &mut out);
+    Ok(out)
 }
 
 #[cfg(not(feature = "lz4"))]
@@ -521,7 +520,7 @@ fn compress_lz4(_plain: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(feature = "lz4")]
 fn make_reader_lz4<'a, R: std::io::Read + 'a>(r: R) -> Result<Box<dyn std::io::Read + 'a>> {
-    Ok(Box::new(lz4_flex::frame::FrameDecoder::new(r)))
+    Ok(cc_reader::<compcol::lz4::frame::LZ4Frame, _>(r))
 }
 
 #[cfg(not(feature = "lz4"))]
@@ -531,7 +530,7 @@ fn make_reader_lz4<'a, R: std::io::Read + 'a>(_r: R) -> Result<Box<dyn std::io::
 
 #[cfg(feature = "lz4")]
 fn make_writer_lz4<'a, W: std::io::Write + 'a>(w: W) -> Result<Box<dyn std::io::Write + 'a>> {
-    Ok(Box::new(lz4_flex::frame::FrameEncoder::new(w)))
+    Ok(cc_writer::<compcol::lz4::frame::LZ4Frame, _>(w))
 }
 
 #[cfg(not(feature = "lz4"))]
@@ -583,19 +582,15 @@ fn make_writer_zstd<'a, W: std::io::Write + 'a>(_w: W) -> Result<Box<dyn std::io
 
 // =========================== lzo ============================
 //
-// `minilzo-rs` doesn't have a streaming API — LZO1X is a one-shot codec
-// by design. We synthesise streaming as "buffer the whole payload, then
-// encode/decode in one go on flush." Fine for SquashFS (≤ 1 MiB blocks);
-// the tar streaming path uses a 1 MiB internal frame and emits one LZO
-// blob per chunk.
+// SquashFS uses raw LZO1X blocks (via `compcol::lzo::block`). LZO1X has no
+// native frame, so the tar streaming path wraps it in fstool's own tiny
+// multi-block frame (see `stream::LzoFrame{Reader,Writer}`).
 
 #[cfg(feature = "lzo")]
 fn decompress_lzo(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
-    let lzo = minilzo_rs::LZO::init()
-        .map_err(|e| crate::Error::InvalidImage(format!("lzo init: {e:?}")))?;
-    let out = lzo
-        .decompress(src, max_out)
-        .map_err(|e| crate::Error::InvalidImage(format!("lzo decode failed: {e:?}")))?;
+    let mut out = Vec::new();
+    compcol::lzo::block::decode_block(src, &mut out)
+        .map_err(|e| crate::Error::InvalidImage(format!("lzo decode failed: {e}")))?;
     cap_check(&out, max_out)?;
     Ok(out)
 }
@@ -607,10 +602,9 @@ fn decompress_lzo(_src: &[u8], _max_out: usize) -> Result<Vec<u8>> {
 
 #[cfg(feature = "lzo")]
 fn compress_lzo(plain: &[u8]) -> Result<Vec<u8>> {
-    let mut lzo = minilzo_rs::LZO::init()
-        .map_err(|e| crate::Error::Io(std::io::Error::other(format!("lzo init: {e:?}"))))?;
-    lzo.compress(plain)
-        .map_err(|e| crate::Error::Io(std::io::Error::other(format!("lzo encode failed: {e:?}"))))
+    let mut out = Vec::new();
+    compcol::lzo::block::encode_block(plain, &mut out);
+    Ok(out)
 }
 
 #[cfg(not(feature = "lzo"))]
@@ -804,10 +798,7 @@ mod tests {
     #[cfg(feature = "lzo")]
     #[test]
     fn lzo_block_round_trip() {
-        // minilzo-rs's decompress sizes the output buffer to the caller's
-        // hint exactly, not a soft maximum — so callers must know the
-        // uncompressed size up front (SquashFS does, from the inode's
-        // block-size table). We pass `plain.len()` here.
+        // Raw LZO1X block round-trip via compcol; `max_out` is a soft cap.
         let plain: Vec<u8> = (0u8..=255).cycle().take(8192).collect();
         let enc = compress(Algo::Lzo, &plain).unwrap();
         let dec = decompress(Algo::Lzo, &enc, plain.len()).unwrap();

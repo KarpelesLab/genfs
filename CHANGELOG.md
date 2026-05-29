@@ -21,13 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- *(compression)* gzip/zlib/deflate/xz/zstd now route through the `compcol`
-  codec crate — dropping `flate2` and `zstd` entirely. Covers the shared
-  codec layer plus the zip DEFLATE, DMG zlib, and HFS+ decmpfs paths.
-  Cross-validated against `xz`, `mksquashfs`/`unsquashfs`, and real DMG
-  fixtures. lzma stays on `lzma-rs` and lz4/lzo on their crates pending
-  compcol #9/#10/#14; the block decoder uses a manual `decode`/`finish`
-  loop to dodge a `compcol::io::DecoderReader` end-of-input bug (#17).
+- *(compression)* gzip/zlib/deflate/xz/zstd/lz4/lzo now route through the
+  `compcol` codec crate — dropping `flate2`, `zstd`, `lz4_flex`, and
+  `minilzo-rs` entirely. lz4 uses compcol's raw block (SquashFS) + canonical
+  LZ4 frame (`.tar.lz4`, cross-checked with the `lz4` CLI); lzo uses
+  compcol's raw LZO1X block. Covers the shared codec layer plus zip DEFLATE,
+  DMG zlib, and HFS+ decmpfs. Cross-validated against `xz`, `lz4`,
+  `mksquashfs`/`unsquashfs`, and real DMG fixtures. `lzma` stays on `lzma-rs`:
+  compcol's `.lzma` (alone) *encoder* isn't liblzma-interoperable yet
+  (compcol#14), and fstool writes `.tar.lzma` / SquashFS-lzma.
 
 ## [0.4.7](https://github.com/KarpelesLab/fstool/compare/v0.4.6...v0.4.7) - 2026-05-27
 

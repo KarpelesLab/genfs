@@ -418,7 +418,7 @@ pure-Rust decoders will land behind per-format Cargo features. (`rar` and `sit` 
 proprietary.)
 
 zip's Deflate support rides the existing `gzip` Cargo feature (raw DEFLATE via
-`flate2`); a build without it falls back to Stored. `cpio` and `ar` need no
+`compcol`); a build without it falls back to Stored. `cpio` and `ar` need no
 codec. Archive-to-`ext`/`fat`/`tar` repack uses the specialised FS-to-FS
 copiers and isn't wired yet (same limitation as XFS/HFS+ sources) — convert
 between archives, or to `iso`/`grf`, via the generic trait path.

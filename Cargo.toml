@@ -31,15 +31,14 @@ path = "src/bin/fstool/main.rs"
 # here, matching the codec pattern above. `cab` and `amiga-lzx` are such
 # readers.
 default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
-# gzip/zlib/deflate/xz/zstd/lz4/lzo are served by `compcol` (uniform codec
-# crate); the `gzip` feature also covers zip DEFLATE, DMG zlib, and HFS+
-# decmpfs. lz4 uses compcol's raw block (SquashFS) + canonical frame (tar);
-# lzo uses compcol's raw LZO1X block. `lzma` stays on `lzma-rs`: compcol's
-# `.lzma` (alone) *encoder* isn't liblzma-interoperable yet (compcol#14) and
-# fstool writes `.tar.lzma` / SquashFS-lzma that external tools must read.
+# Every codec is served by `compcol` (one uniform crate): gzip/zlib/deflate/
+# xz/lzma/zstd/lz4/lzo, plus the CAB + Amiga-LZX archive codecs and the DMG
+# bzip2/lzfse decoders. The `gzip` feature also covers zip DEFLATE, DMG zlib,
+# and HFS+ decmpfs; lz4 uses compcol's raw block (SquashFS) + canonical frame
+# (tar); lzo uses compcol's raw LZO1X block; lzma is the `.lzma` alone codec.
 gzip = ["dep:compcol", "compcol/gzip", "compcol/zlib", "compcol/deflate"]
 xz = ["dep:compcol", "compcol/xz"]
-lzma = ["dep:lzma-rs"]
+lzma = ["dep:compcol", "compcol/lzma"]
 lz4 = ["dep:compcol", "compcol/lz4"]
 # Microsoft Cabinet (.cab) reader: Store/MSZIP/LZX/Quantum folders decode
 # via compcol. Read-only.
@@ -106,7 +105,6 @@ tempfile = "3"
 # /lz4/lzo plus the CAB codecs. `std` is always on (for the `io` Read/Write
 # adapters); per-algorithm features are added by fstool's feature flags.
 compcol = { version = "0.4", optional = true, default-features = false, features = ["std"] }
-lzma-rs = { version = "0.3", optional = true }
 
 # Encrypted DMG (encrcdsa v2) deps — all pure-Rust from the RustCrypto
 # organization. Opt-in via the `dmg-encrypted` feature.

@@ -865,7 +865,7 @@ mod tests {
         assert_eq!(out, plain);
     }
 
-    /// LZMA chunk end-to-end: compress on the fly with lzma-rs, embed
+    /// LZMA chunk end-to-end: compress on the fly via compcol, embed
     /// the raw-LZMA1 frame as a single chunk, decode through `read_at`.
     #[cfg(feature = "lzma")]
     #[test]
@@ -875,11 +875,8 @@ mod tests {
         for (i, b) in plain.iter_mut().enumerate() {
             *b = ((i ^ (i >> 3)) & 0xFF) as u8;
         }
-        let mut compressed = Vec::new();
-        {
-            let mut input = std::io::Cursor::new(&plain);
-            lzma_rs::lzma_compress(&mut input, &mut compressed).unwrap();
-        }
+        let compressed =
+            crate::compression::compress(crate::compression::Algo::Lzma, &plain).unwrap();
         let chunks = vec![Chunk {
             kind: ChunkType::Lzma,
             virtual_sector_start: 0,

@@ -28,18 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- *(compression)* gzip/zlib/deflate/xz/zstd/lz4/lzo now route through the
-  `compcol` codec crate — dropping `flate2`, `zstd`, `lz4_flex`, and
-  `minilzo-rs` entirely. lz4 uses compcol's raw block (SquashFS) + canonical
-  LZ4 frame (`.tar.lz4`, cross-checked with the `lz4` CLI); lzo uses
-  compcol's raw LZO1X block. Covers the shared codec layer plus zip DEFLATE,
-  DMG zlib, and HFS+ decmpfs. Cross-validated against `xz`, `lz4`,
-  `mksquashfs`/`unsquashfs`, and real DMG fixtures. `lzma` stays on `lzma-rs`:
-  compcol's `.lzma` (alone) *encoder* isn't liblzma-interoperable yet
-  (compcol#14), and fstool writes `.tar.lzma` / SquashFS-lzma.
-- *(dmg)* bzip2 and LZFSE chunk decoders now use `compcol` too — dropping
-  `bzip2-rs` (`lzfse_rust` is now a test-only dev-dep, since compcol's LZFSE
-  is decode-only). Per-chunk decode is bounded by the chunk's plain length.
+- *(compression)* every codec now routes through the single `compcol` crate
+  — gzip/zlib/deflate/xz/lzma/zstd/lz4/lzo, plus the CAB + Amiga-LZX archive
+  codecs and the DMG bzip2/lzfse/zlib decoders. Dropped `flate2`, `zstd`,
+  `lz4_flex`, `minilzo-rs`, and `lzma-rs`. lz4 uses compcol's raw block
+  (SquashFS) + canonical LZ4 frame (`.tar.lz4`); lzo uses compcol's raw
+  LZO1X block; lzma is the `.lzma` alone codec (compcol 0.4.5,
+  KarpelesLab/compcol#14). Cross-validated against `xz`, `lz4`,
+  `mksquashfs`/`unsquashfs`, `cabextract`, `unlzx`, and real DMG fixtures.
+- *(dmg)* bzip2 and LZFSE chunk decoders use `compcol` (`lzfse_rust` is now a
+  test-only dev-dep — compcol's LZFSE is decode-only). Per-chunk decode is
+  bounded by the chunk's plain length.
 
 ## [0.4.7](https://github.com/KarpelesLab/fstool/compare/v0.4.6...v0.4.7) - 2026-05-27
 

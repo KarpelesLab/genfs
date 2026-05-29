@@ -29,9 +29,8 @@
 //! - **lz4 / lzo**: compcol too — the raw block codec (`compcol::lz4::block`
 //!   / `compcol::lzo::block`) for SquashFS, and `compcol::lz4::frame`
 //!   (canonical LZ4 Frame) for `.tar.lz4` streaming.
-//! - **lzma**: `lzma-rs` (legacy `.lzma` alone format). Not yet on compcol
-//!   because compcol's alone *encoder* isn't liblzma-interoperable
-//!   (KarpelesLab/compcol#14); the `.xz` container is on compcol.
+//! - **lzma**: compcol's `.lzma` (alone) codec, interoperable with
+//!   liblzma/`xz` both ways since compcol 0.4.5 (KarpelesLab/compcol#14).
 
 use crate::Result;
 
@@ -206,9 +205,9 @@ fn disabled(algo: Algo) -> crate::Error {
     ))
 }
 
-// Used by the still-slice-based codecs (lzma / lz4 / lzo); the
-// compcol-backed arms cap via `LimitedDecoder` instead.
-#[cfg(any(feature = "lzma", feature = "lz4", feature = "lzo"))]
+// Used by the lz4 / lzo block arms (which decode into a `Vec` and then
+// check the size); the streaming compcol arms cap via `LimitedDecoder`.
+#[cfg(any(feature = "lz4", feature = "lzo"))]
 fn cap_check(buf: &[u8], max_out: usize) -> Result<()> {
     if buf.len() > max_out {
         return Err(crate::Error::InvalidImage(format!(
@@ -234,7 +233,7 @@ fn cap_check(buf: &[u8], max_out: usize) -> Result<()> {
 /// `src` slice — the same shape as `compcol::vec::decompress_to_vec` —
 /// rather than `compcol::io::DecoderReader`, which mishandles end-of-input
 /// on some complete streams (e.g. small zlib; KarpelesLab/compcol#17).
-#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd"))]
+#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd", feature = "lzma"))]
 fn cc_decompress<A: compcol::Algorithm>(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
     use compcol::{Decoder, Status};
     let mut dec = compcol::limit::LimitedDecoder::new(A::decoder(), max_out as u64);
@@ -272,7 +271,7 @@ fn cc_decompress<A: compcol::Algorithm>(src: &[u8], max_out: usize) -> Result<Ve
 }
 
 /// One-shot compress with `A`'s default encoder config.
-#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd"))]
+#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd", feature = "lzma"))]
 fn cc_compress<A: compcol::Algorithm>(plain: &[u8]) -> Result<Vec<u8>> {
     compcol::vec::compress_to_vec::<A>(plain).map_err(|e| {
         crate::Error::Io(std::io::Error::other(format!(
@@ -283,7 +282,13 @@ fn cc_compress<A: compcol::Algorithm>(plain: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Wrap a `Read` in a streaming decompressor for `A`.
-#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd", feature = "lz4"))]
+#[cfg(any(
+    feature = "gzip",
+    feature = "xz",
+    feature = "zstd",
+    feature = "lz4",
+    feature = "lzma"
+))]
 fn cc_reader<'a, A: compcol::Algorithm, R: std::io::Read + 'a>(r: R) -> Box<dyn std::io::Read + 'a>
 where
     A::Decoder: 'a,
@@ -293,7 +298,13 @@ where
 
 /// Wrap a `Write` in a streaming compressor for `A`. The encoder flushes
 /// its trailer when the returned writer is dropped.
-#[cfg(any(feature = "gzip", feature = "xz", feature = "zstd", feature = "lz4"))]
+#[cfg(any(
+    feature = "gzip",
+    feature = "xz",
+    feature = "zstd",
+    feature = "lz4",
+    feature = "lzma"
+))]
 fn cc_writer<'a, A: compcol::Algorithm, W: std::io::Write + 'a>(
     w: W,
 ) -> Box<dyn std::io::Write + 'a>
@@ -432,19 +443,12 @@ fn make_writer_xz<'a, W: std::io::Write + 'a>(_w: W) -> Result<Box<dyn std::io::
 }
 
 // =========================== lzma ===========================
-
-// lzma stays on `lzma-rs`: compcol 0.4.0's `.lzma` (alone) codec isn't
-// liblzma-interoperable in either direction (KarpelesLab/compcol#14).
-// The `.xz` container is on compcol; revisit lzma once #14 lands.
+// `.lzma` (alone) format via compcol; interoperable with liblzma/`xz` in
+// both directions since compcol 0.4.5 (KarpelesLab/compcol#14).
 
 #[cfg(feature = "lzma")]
 fn decompress_lzma(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
-    let mut input = std::io::BufReader::new(src);
-    let mut out = Vec::new();
-    lzma_rs::lzma_decompress(&mut input, &mut out)
-        .map_err(|e| crate::Error::InvalidImage(format!("lzma decode failed: {e}")))?;
-    cap_check(&out, max_out)?;
-    Ok(out)
+    cc_decompress::<compcol::lzma::Lzma>(src, max_out)
 }
 
 #[cfg(not(feature = "lzma"))]
@@ -454,11 +458,7 @@ fn decompress_lzma(_src: &[u8], _max_out: usize) -> Result<Vec<u8>> {
 
 #[cfg(feature = "lzma")]
 fn compress_lzma(plain: &[u8]) -> Result<Vec<u8>> {
-    let mut input = std::io::BufReader::new(plain);
-    let mut out = Vec::new();
-    lzma_rs::lzma_compress(&mut input, &mut out)
-        .map_err(|e| crate::Error::Io(std::io::Error::other(format!("lzma encode failed: {e}"))))?;
-    Ok(out)
+    cc_compress::<compcol::lzma::Lzma>(plain)
 }
 
 #[cfg(not(feature = "lzma"))]
@@ -468,7 +468,7 @@ fn compress_lzma(_plain: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(feature = "lzma")]
 fn make_reader_lzma<'a, R: std::io::Read + 'a>(r: R) -> Result<Box<dyn std::io::Read + 'a>> {
-    Ok(Box::new(stream::LzmaDecoderAdapter::new(r)))
+    Ok(cc_reader::<compcol::lzma::Lzma, _>(r))
 }
 
 #[cfg(not(feature = "lzma"))]
@@ -478,7 +478,7 @@ fn make_reader_lzma<'a, R: std::io::Read + 'a>(_r: R) -> Result<Box<dyn std::io:
 
 #[cfg(feature = "lzma")]
 fn make_writer_lzma<'a, W: std::io::Write + 'a>(w: W) -> Result<Box<dyn std::io::Write + 'a>> {
-    Ok(Box::new(stream::LzmaEncoderAdapter::new(w)))
+    Ok(cc_writer::<compcol::lzma::Lzma, _>(w))
 }
 
 #[cfg(not(feature = "lzma"))]

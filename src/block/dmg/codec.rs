@@ -9,10 +9,10 @@
 //!
 //! ## Codec choices
 //!
-//! - **bzip2**: `bzip2-rs`, pure-Rust decoder.
-//! - **LZFSE**: `lzfse_rust`, pure-Rust en/decoder.
-//! - **LZMA**: `lzma-rs::lzma_decompress` over the raw LZMA1 frame
-//!   (DMG never uses the XZ container).
+//! - **bzip2**: `compcol` bzip2 decoder.
+//! - **LZFSE**: `compcol` LZFSE decoder.
+//! - **LZMA**: `compcol` `.lzma` (alone) decoder over the raw LZMA1
+//!   frame (DMG never uses the XZ container).
 //! - **ADC**: implemented in this file from the public spec described
 //!   in Apple's `imageformat.h`; no external dep.
 //!
@@ -232,10 +232,7 @@ pub fn decode_lzfse(_src: &[u8], _plain_len: usize) -> Result<Vec<u8>> {
 /// uncompressed length), not the XZ container.
 #[cfg(feature = "lzma")]
 pub fn decode_lzma(src: &[u8], plain_len: usize) -> Result<Vec<u8>> {
-    let mut input = std::io::BufReader::new(src);
-    let mut out = Vec::with_capacity(plain_len);
-    lzma_rs::lzma_decompress(&mut input, &mut out)
-        .map_err(|e| crate::Error::InvalidImage(format!("dmg: lzma chunk decode failed: {e}")))?;
+    let out = crate::compression::decompress(crate::compression::Algo::Lzma, src, plain_len)?;
     if out.len() != plain_len {
         return Err(crate::Error::InvalidImage(format!(
             "dmg: lzma chunk inflated to {} bytes but sector_count*512 = {}",
@@ -419,16 +416,12 @@ mod tests {
 
     #[cfg(feature = "lzma")]
     #[test]
-    fn lzma_roundtrip_via_lzma_rs() {
-        // Build a raw-LZMA1 stream on the fly with lzma-rs (the same
-        // crate the decoder uses) and check we round-trip through
-        // decode_lzma.
+    fn lzma_roundtrip() {
+        // Build a raw-LZMA1 (.lzma alone) stream and round-trip it through
+        // decode_lzma (both via compcol).
         let plain = b"the quick brown fox jumps over the lazy dog".repeat(8);
-        let mut compressed = Vec::new();
-        {
-            let mut input = std::io::Cursor::new(&plain);
-            lzma_rs::lzma_compress(&mut input, &mut compressed).unwrap();
-        }
+        let compressed =
+            crate::compression::compress(crate::compression::Algo::Lzma, &plain).unwrap();
         let out = decode_lzma(&compressed, plain.len()).unwrap();
         assert_eq!(out, plain);
     }

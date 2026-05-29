@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mksquashfs`/`unsquashfs`, and real DMG fixtures. `lzma` stays on `lzma-rs`:
   compcol's `.lzma` (alone) *encoder* isn't liblzma-interoperable yet
   (compcol#14), and fstool writes `.tar.lzma` / SquashFS-lzma.
+- *(dmg)* bzip2 and LZFSE chunk decoders now use `compcol` too — dropping
+  `bzip2-rs` (`lzfse_rust` is now a test-only dev-dep, since compcol's LZFSE
+  is decode-only). Per-chunk decode is bounded by the chunk's plain length.
 
 ## [0.4.7](https://github.com/KarpelesLab/fstool/compare/v0.4.6...v0.4.7) - 2026-05-27
 

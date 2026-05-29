@@ -122,15 +122,25 @@ fn repack_into_tar_lz4_interops_with_lz4_cli() {
     let src_img = NamedTempFile::new().unwrap();
     let out = Command::new(FSTOOL)
         .args([
-            "create", "-t", "ext2",
+            "create",
+            "-t",
+            "ext2",
             srcdir.path().to_str().unwrap(),
-            "-o", src_img.path().to_str().unwrap(),
+            "-o",
+            src_img.path().to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "create: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let tarball = tempfile::Builder::new().suffix(".tar.lz4").tempfile().unwrap();
+    let tarball = tempfile::Builder::new()
+        .suffix(".tar.lz4")
+        .tempfile()
+        .unwrap();
     let out = Command::new(FSTOOL)
         .args([
             "repack",
@@ -139,15 +149,27 @@ fn repack_into_tar_lz4_interops_with_lz4_cli() {
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "repack →.tar.lz4: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "repack →.tar.lz4: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Canonical LZ4 Frame magic 0x184D2204 (little-endian).
     let bytes = std::fs::read(tarball.path()).unwrap();
-    assert_eq!(&bytes[0..4], &[0x04, 0x22, 0x4d, 0x18], "expected LZ4 frame magic");
+    assert_eq!(
+        &bytes[0..4],
+        &[0x04, 0x22, 0x4d, 0x18],
+        "expected LZ4 frame magic"
+    );
 
     // The system `lz4` CLI must accept the frame (integrity check).
     if which("lz4") {
-        let t = Command::new("lz4").arg("-t").arg(tarball.path()).output().unwrap();
+        let t = Command::new("lz4")
+            .arg("-t")
+            .arg(tarball.path())
+            .output()
+            .unwrap();
         assert!(
             t.status.success(),
             "lz4 -t rejected fstool's frame: {}",
@@ -160,7 +182,11 @@ fn repack_into_tar_lz4_interops_with_lz4_cli() {
         .args(["cat", tarball.path().to_str().unwrap(), "/hello.txt"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "cat .tar.lz4: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "cat .tar.lz4: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(out.stdout, b"hello lz4 frame\n");
 }
 

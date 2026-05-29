@@ -45,11 +45,12 @@ lz4 = ["dep:compcol", "compcol/lz4"]
 cab = ["dep:compcol", "compcol/deflate", "compcol/lzx", "compcol/quantum"]
 zstd = ["dep:compcol", "compcol/zstd"]
 lzo = ["dep:compcol", "compcol/lzo"]
-# DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set.
-# bzip2-rs is a pure-Rust decoder, lzfse_rust is a pure-Rust LZFSE
-# decoder; both gated so a slim build can drop them.
-dmg-bzip2 = ["dep:bzip2-rs"]
-dmg-lzfse = ["dep:lzfse_rust"]
+# DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set,
+# decoded via compcol (bzip2 + lzfse decoders). Gated so a slim build can
+# drop them. (`lzfse_rust` is a dev-dependency used only to generate the
+# lzfse test vector — compcol's LZFSE is decode-only.)
+dmg-bzip2 = ["dep:compcol", "compcol/bzip2"]
+dmg-lzfse = ["dep:compcol", "compcol/lzfse"]
 # Password-protected DMG read support (`encrcdsa` v2). Pulls in the
 # RustCrypto AES/DES/CBC/HMAC/SHA1/PBKDF2 crates — all pure Rust. Gated
 # so a slim build can drop them.
@@ -104,12 +105,6 @@ tempfile = "3"
 compcol = { version = "0.4", optional = true, default-features = false, features = ["std"] }
 lzma-rs = { version = "0.3", optional = true }
 
-# DMG codec deps. bzip2-rs is decode-only pure Rust; lzfse_rust is a
-# pure-Rust LZFSE encoder + decoder. Both opt-in via dmg-bzip2 /
-# dmg-lzfse features so a build without DMG support can drop them.
-bzip2-rs = { version = "0.1", optional = true }
-lzfse_rust = { version = "0.2", optional = true }
-
 # Encrypted DMG (encrcdsa v2) deps — all pure-Rust from the RustCrypto
 # organization. Opt-in via the `dmg-encrypted` feature.
 aes = { version = "0.8", optional = true }
@@ -137,3 +132,7 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 env_logger = "0.11"
+# Test-only: an independent LZFSE *encoder* to generate fixtures that the
+# production `compcol` LZFSE decoder must round-trip (compcol's LZFSE is
+# decode-only). Not linked into the shipped binary.
+lzfse_rust = "0.2"

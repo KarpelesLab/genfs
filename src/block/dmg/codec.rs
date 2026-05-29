@@ -130,16 +130,60 @@ fn adc_copy(out: &mut [u8], dp: &mut usize, dist: usize, len: usize) -> Result<(
     Ok(())
 }
 
+/// Decode an in-memory compcol-codec chunk into a `Vec`, refusing to expand
+/// past `plain_len` (a decompression-bomb guard for the bounded per-chunk
+/// case). A manual `decode`/`finish` loop with an explicit size check —
+/// rather than `LimitedDecoder`, which stalls codecs (e.g. bzip2) that need
+/// a post-output call to consume their trailer when the cap is exact.
+#[cfg(any(feature = "dmg-bzip2", feature = "dmg-lzfse"))]
+fn decode_chunk<A: compcol::Algorithm>(
+    src: &[u8],
+    plain_len: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    use compcol::{Decoder, Status};
+    let mut dec = A::decoder();
+    let mut out = Vec::with_capacity(plain_len);
+    let mut scratch = vec![0u8; 64 * 1024];
+    let mut consumed = 0usize;
+    let err = |e| crate::Error::InvalidImage(format!("dmg: {label} chunk decode failed: {e}"));
+    let overflow = || {
+        crate::Error::InvalidImage(format!(
+            "dmg: {label} chunk expanded past {plain_len} bytes"
+        ))
+    };
+    loop {
+        let (p, status) = dec.decode(&src[consumed..], &mut scratch).map_err(err)?;
+        out.extend_from_slice(&scratch[..p.written]);
+        consumed += p.consumed;
+        if out.len() > plain_len {
+            return Err(overflow());
+        }
+        match status {
+            Status::StreamEnd => return Ok(out),
+            Status::OutputFull => continue,
+            Status::InputEmpty => break,
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut scratch).map_err(err)?;
+        out.extend_from_slice(&scratch[..p.written]);
+        if out.len() > plain_len {
+            return Err(overflow());
+        }
+        if matches!(status, Status::StreamEnd) || p.written == 0 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 /// Decode a bzip2 chunk payload into a vector of exactly `plain_len`
 /// bytes. DMG bz2 chunks are standalone bzip2 streams (BZh magic,
 /// no additional framing).
 #[cfg(feature = "dmg-bzip2")]
 pub fn decode_bzip2(src: &[u8], plain_len: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut rdr = bzip2_rs::DecoderReader::new(src);
-    let mut out = Vec::with_capacity(plain_len);
-    rdr.read_to_end(&mut out)
-        .map_err(|e| crate::Error::InvalidImage(format!("dmg: bzip2 chunk decode failed: {e}")))?;
+    let out = decode_chunk::<compcol::bzip2::Bzip2>(src, plain_len, "bzip2")?;
     if out.len() != plain_len {
         return Err(crate::Error::InvalidImage(format!(
             "dmg: bzip2 chunk inflated to {} bytes but sector_count*512 = {}",
@@ -160,12 +204,10 @@ pub fn decode_bzip2(_src: &[u8], _plain_len: usize) -> Result<Vec<u8>> {
 
 /// Decode an LZFSE chunk payload into a vector of exactly `plain_len`
 /// bytes. DMG LZFSE chunks are standalone bvxN/bvx2/bvx1/bvx- framed
-/// blocks the `lzfse_rust` crate's `decode_bytes` understands.
+/// blocks; decoded via `compcol::lzfse` (decode-only).
 #[cfg(feature = "dmg-lzfse")]
 pub fn decode_lzfse(src: &[u8], plain_len: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(plain_len);
-    lzfse_rust::decode_bytes(src, &mut out)
-        .map_err(|e| crate::Error::InvalidImage(format!("dmg: lzfse chunk decode failed: {e}")))?;
+    let out = decode_chunk::<compcol::lzfse::Lzfse>(src, plain_len, "lzfse")?;
     if out.len() != plain_len {
         return Err(crate::Error::InvalidImage(format!(
             "dmg: lzfse chunk inflated to {} bytes but sector_count*512 = {}",

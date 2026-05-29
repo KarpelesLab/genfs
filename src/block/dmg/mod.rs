@@ -894,8 +894,9 @@ mod tests {
         assert_eq!(out, plain);
     }
 
-    /// LZFSE chunk end-to-end: compress with `lzfse_rust`, embed,
-    /// read back. Pins the codec dispatch + the lzfse_rust decoder.
+    /// LZFSE chunk end-to-end: compress with the `lzfse_rust` dev-dep (an
+    /// independent encoder; compcol's LZFSE is decode-only), embed, and read
+    /// back through the production `compcol` LZFSE decoder.
     #[cfg(feature = "dmg-lzfse")]
     #[test]
     fn round_trip_lzfse_chunk() {

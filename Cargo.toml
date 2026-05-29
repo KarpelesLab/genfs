@@ -25,12 +25,12 @@ path = "src/bin/fstool/main.rs"
 #
 # Archive backends (zip / cpio / ar) are always compiled — they add no new
 # dependencies (zip's DEFLATE rides the `gzip` feature; cpio/ar need no
-# codec). The remaining detection-only scaffolds (7z / rar / arc / lha /
-# sit) are likewise always present; when a pure-Rust decoder is wired for
-# one, it gains its own optional dependency behind a per-format feature
-# here, matching the codec pattern above. `cab` and `amiga-lzx` are such
+# codec). The remaining detection-only scaffolds (7z / arc / lha / sit) are
+# likewise always present; when a pure-Rust decoder is wired for one, it
+# gains its own optional dependency behind a per-format feature here,
+# matching the codec pattern above. `cab`, `amiga-lzx`, and `rar` are such
 # readers.
-default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
+default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
 # Every codec is served by `compcol` (one uniform crate): gzip/zlib/deflate/
 # xz/lzma/zstd/lz4/lzo, plus the CAB + Amiga-LZX archive codecs and the DMG
 # bzip2/lzfse decoders. The `gzip` feature also covers zip DEFLATE, DMG zlib,
@@ -45,6 +45,9 @@ lz4 = ["dep:compcol", "compcol/lz4"]
 cab = ["dep:compcol", "compcol/deflate", "compcol/lzx", "compcol/quantum"]
 # Amiga LZX (.lzx) reader: Store + LZX (compcol amiga_lzx) groups. Read-only.
 amiga-lzx = ["dep:compcol", "compcol/amiga_lzx"]
+# RAR reader (read-only): RAR5 store + compressed via compcol's rar5 decoder.
+# (RAR4 would add compcol/rar1+rar2+rar3 later.)
+rar = ["dep:compcol", "compcol/rar5"]
 zstd = ["dep:compcol", "compcol/zstd"]
 lzo = ["dep:compcol", "compcol/lzo"]
 # DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set,

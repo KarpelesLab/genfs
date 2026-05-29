@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(rar)* RAR5 (`Rar!\x1A\x07\x01`) read-only reader behind the `rar` feature
+  — walks the block chain (vint headers, file headers, compression info) and
+  streams each member out of its packed run: **Store** raw, and compressed
+  (no-filter / x86 E8E9) via `compcol::rar5`. Cross-checked against the
+  reference `unrar` extractor (committed `rar -ma5` fixtures). RAR4, solid
+  archives, encryption, and the delta/ARM/other RAR5 filters surface as a
+  clean `Unsupported`; creation is unsupported (proprietary).
+
 ## [0.4.8](https://github.com/KarpelesLab/fstool/compare/v0.4.7...v0.4.8) - 2026-05-29
 
 ### Added
@@ -46,39 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(apfs)* fold commit_checkpoint into commit_with_mutator
 - *(apfs)* introduce MutatorCx, generalise commit_with_mutator closure
 - *(apfs)* extract record builders to pub(crate) free functions
-
-### Added
-
-- *(lzx)* Amiga LZX (`.lzx`) read-only reader behind the `amiga-lzx` feature
-  — parses the `LZX` info header + 31-byte entry headers + merged file groups
-  and streams files out of their group (Store, and LZX mode 2 via
-  `compcol::amiga_lzx`). Container validated against the reference `unlzx`
-  extractor (committed fixture); creation unsupported.
-- *(cab)* Microsoft Cabinet (`.cab`) read-only reader behind the `cab`
-  feature — parses CFHEADER/CFFOLDER/CFFILE/CFDATA and extracts Store / MSZIP
-  (incl. multi-block via `reset_keep_window`) / LZX / Quantum folders via
-  `compcol`; cross-checked against `cabextract`. Files are **streamed** out
-  of the folder (skip-to-offset + length cap), so memory stays bounded
-  regardless of folder/file size. Spanned cabinets and creation are
-  unsupported.
-- *(ext4)* arbitrary-depth extent tree writes — the in-place `open_file_rw`
-  path re-packs through `pack_extent_tree`, and the streaming append path
-  grows the rightmost spine and promotes the root past depth-2 (previously
-  capped at depth-1 / depth-2 respectively); validated against `e2fsck`
-
-### Changed
-
-- *(compression)* every codec now routes through the single `compcol` crate
-  — gzip/zlib/deflate/xz/lzma/zstd/lz4/lzo, plus the CAB + Amiga-LZX archive
-  codecs and the DMG bzip2/lzfse/zlib decoders. Dropped `flate2`, `zstd`,
-  `lz4_flex`, `minilzo-rs`, and `lzma-rs`. lz4 uses compcol's raw block
-  (SquashFS) + canonical LZ4 frame (`.tar.lz4`); lzo uses compcol's raw
-  LZO1X block; lzma is the `.lzma` alone codec (compcol 0.4.5,
-  KarpelesLab/compcol#14). Cross-validated against `xz`, `lz4`,
-  `mksquashfs`/`unsquashfs`, `cabextract`, `unlzx`, and real DMG fixtures.
-- *(dmg)* bzip2 and LZFSE chunk decoders use `compcol` (`lzfse_rust` is now a
-  test-only dev-dep — compcol's LZFSE is decode-only). Per-chunk decode is
-  bounded by the chunk's plain length.
 
 ## [0.4.7](https://github.com/KarpelesLab/fstool/compare/v0.4.6...v0.4.7) - 2026-05-27
 

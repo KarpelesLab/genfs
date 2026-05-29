@@ -4,10 +4,8 @@
 //! feature this is a real **read-only** reader: it parses the cabinet (see
 //! [`scan`]) and extracts files by decompressing the owning CFFOLDER via
 //! `compcol` and slicing out the file's range (see [`folder`]). Supported
-//! folder methods: None (Store), LZX, Quantum, and single-block MSZIP;
-//! multi-block MSZIP awaits compcol preset-dictionary support
-//! (KarpelesLab/compcol#22). Spanned/multi-cabinet sets and archive creation
-//! are not supported.
+//! folder methods: None (Store), MSZIP, LZX, and Quantum.
+//! Spanned/multi-cabinet sets and archive creation are not supported.
 //!
 //! Without the `cab` feature this stays a detection-only scaffold (reads
 //! return a clean `Unsupported`).
@@ -411,16 +409,20 @@ mod tests {
     }
 
     #[test]
-    fn mszip_multi_block_is_unsupported() {
-        // Two MSZIP blocks → cross-block history needed (compcol#22).
-        let b1 = mszip_block(b"first block");
-        let b2 = mszip_block(b"second block");
-        let cab = build_cab(1, &[(b1, 11), (b2, 12)], 23, "big.txt");
-        let err = read_file(&cab, "/big.txt").unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
+    fn mszip_multi_block_round_trip() {
+        // Two CFDATA blocks exercise the per-block decode + 32 KiB preset-
+        // dictionary seeding path (compcol 0.4.3 / #22). cabextract
+        // cross-checks the multi-block container framing.
+        let chunk1 = b"first MSZIP block contents, repeated. ".repeat(30);
+        let chunk2 = b"second MSZIP block contents, also repeated. ".repeat(30);
+        let mut content = chunk1.clone();
+        content.extend_from_slice(&chunk2);
+        let blocks = vec![
+            (mszip_block(&chunk1), chunk1.len() as u16),
+            (mszip_block(&chunk2), chunk2.len() as u16),
+        ];
+        let cab = build_cab(1, &blocks, content.len() as u32, "m2.txt");
+        assert_extracts(&cab, "/m2.txt", &content);
     }
 
     #[test]

@@ -10,9 +10,10 @@
 //!   total uncompressed length).
 //! - **Quantum** — concatenate payloads and decode via `compcol::quantum`
 //!   with the folder's window size.
-//! - **MSZIP** — single-CFDATA folders only (`CK` + raw DEFLATE). Multi-block
-//!   MSZIP needs cross-block deflate history, which compcol doesn't expose
-//!   yet (KarpelesLab/compcol#22), so it returns a clean `Unsupported`.
+//! - **MSZIP** — each CFDATA block is its own `CK` + raw-DEFLATE stream;
+//!   decoded block-by-block, seeding each with the previous block's last
+//!   32 KiB as the deflate preset dictionary (compcol 0.4.3) so cross-block
+//!   back-references resolve.
 
 use compcol::{Decoder, Status};
 
@@ -58,22 +59,31 @@ pub fn decode_folder(dev: &mut dyn BlockDevice, folder: &Folder) -> Result<Vec<u
         }
 
         CabMethod::MsZip => {
-            if folder.blocks.len() != 1 {
-                return Err(Error::Unsupported(
-                    "cab: multi-block MSZIP needs cross-block deflate history \
-                     (KarpelesLab/compcol#22); only single-block MSZIP folders \
-                     are supported"
-                        .into(),
-                ));
+            // Each CFDATA block is its own `CK` + raw-DEFLATE stream, but
+            // back-references may reach into the previous block's output, so
+            // each block is decoded with the prior block's last 32 KiB as the
+            // deflate preset dictionary (compcol 0.4.3, #22).
+            const MSZIP_WINDOW: usize = 32 * 1024;
+            let mut out: Vec<u8> = Vec::with_capacity(total as usize);
+            for blk in &folder.blocks {
+                let mut payload = vec![0u8; blk.comp_len as usize];
+                dev.read_at(blk.offset, &mut payload)?;
+                if payload.len() < 2 || &payload[0..2] != b"CK" {
+                    return Err(Error::InvalidImage(
+                        "cab: MSZIP block missing 'CK' signature".into(),
+                    ));
+                }
+                let dict_start = out.len().saturating_sub(MSZIP_WINDOW);
+                let dictionary = out[dict_start..].to_vec();
+                let mut dec =
+                    compcol::deflate::Decoder::with_config(compcol::deflate::DecoderConfig {
+                        dictionary,
+                    });
+                let block_out =
+                    decode_stream(&mut dec, &payload[2..], MSZIP_WINDOW as u64, "MSZIP")?;
+                out.extend_from_slice(&block_out);
             }
-            let payload = read_payloads(dev, folder)?;
-            if payload.len() < 2 || &payload[0..2] != b"CK" {
-                return Err(Error::InvalidImage(
-                    "cab: MSZIP block missing 'CK' signature".into(),
-                ));
-            }
-            compcol::vec::decompress_to_vec::<compcol::deflate::Deflate>(&payload[2..])
-                .map_err(|e| Error::InvalidImage(format!("cab: MSZIP decode failed: {e}")))
+            Ok(out)
         }
 
         CabMethod::Unsupported(id) => Err(Error::Unsupported(format!(

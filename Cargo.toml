@@ -40,9 +40,8 @@ gzip = ["dep:compcol", "compcol/gzip", "compcol/zlib", "compcol/deflate"]
 xz = ["dep:compcol", "compcol/xz"]
 lzma = ["dep:lzma-rs"]
 lz4 = ["dep:lz4_flex"]
-# Microsoft Cabinet (.cab) reader: Store/LZX/Quantum (and single-block
-# MSZIP) folders decode via compcol. Read-only; multi-block MSZIP awaits
-# compcol preset-dictionary support (compcol#22).
+# Microsoft Cabinet (.cab) reader: Store/MSZIP/LZX/Quantum folders decode
+# via compcol. Read-only.
 cab = ["dep:compcol", "compcol/deflate", "compcol/lzx", "compcol/quantum"]
 zstd = ["dep:compcol", "compcol/zstd"]
 lzo = ["dep:minilzo-rs"]

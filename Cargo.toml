@@ -25,11 +25,11 @@ path = "src/bin/fstool/main.rs"
 #
 # Archive backends (zip / cpio / ar) are always compiled — they add no new
 # dependencies (zip's DEFLATE rides the `gzip` feature; cpio/ar need no
-# codec). The detection-only scaffolds (7z / rar / arc / lha / lzx / cab /
-# sit) are likewise always present; when a pure-Rust decoder is wired for
-# one, it gains its own optional dependency behind a per-format feature
-# here, matching the codec pattern above.
-default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
+# codec). The remaining detection-only scaffolds (7z / rar / arc / lha /
+# lzx / sit) are likewise always present; when a pure-Rust decoder is wired
+# for one, it gains its own optional dependency behind a per-format feature
+# here, matching the codec pattern above. `cab` is the first such reader.
+default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
 # gzip/zlib/deflate/xz/zstd are served by `compcol` (uniform codec crate);
 # the `gzip` feature also covers zip DEFLATE, DMG zlib, and HFS+ decmpfs.
 # `lzma` stays on `lzma-rs`: compcol 0.4.0's `.lzma` (alone) codec isn't
@@ -40,6 +40,10 @@ gzip = ["dep:compcol", "compcol/gzip", "compcol/zlib", "compcol/deflate"]
 xz = ["dep:compcol", "compcol/xz"]
 lzma = ["dep:lzma-rs"]
 lz4 = ["dep:lz4_flex"]
+# Microsoft Cabinet (.cab) reader: Store/LZX/Quantum (and single-block
+# MSZIP) folders decode via compcol. Read-only; multi-block MSZIP awaits
+# compcol preset-dictionary support (compcol#22).
+cab = ["dep:compcol", "compcol/deflate", "compcol/lzx", "compcol/quantum"]
 zstd = ["dep:compcol", "compcol/zstd"]
 lzo = ["dep:minilzo-rs"]
 # DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set.

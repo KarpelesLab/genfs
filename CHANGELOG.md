@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(cab)* Microsoft Cabinet (`.cab`) read-only reader behind the `cab`
   feature — parses CFHEADER/CFFOLDER/CFFILE/CFDATA and extracts Store / MSZIP
-  (incl. multi-block via compcol's deflate preset dictionary) / LZX / Quantum
-  folders via `compcol`; cross-checked against `cabextract`. Spanned cabinets
-  and creation are unsupported.
+  (incl. multi-block via `reset_keep_window`) / LZX / Quantum folders via
+  `compcol`; cross-checked against `cabextract`. Files are **streamed** out
+  of the folder (skip-to-offset + length cap), so memory stays bounded
+  regardless of folder/file size. Spanned cabinets and creation are
+  unsupported.
 - *(ext4)* arbitrary-depth extent tree writes — the in-place `open_file_rw`
   path re-packs through `pack_extent_tree`, and the streaming append path
   grows the rightmost spine and promotes the root past depth-2 (previously

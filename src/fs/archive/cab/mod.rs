@@ -2,10 +2,12 @@
 //!
 //! Recognised by `detect_fs` via the `MSCF` signature. With the `cab` Cargo
 //! feature this is a real **read-only** reader: it parses the cabinet (see
-//! [`scan`]) and extracts files by decompressing the owning CFFOLDER via
-//! `compcol` and slicing out the file's range (see [`folder`]). Supported
-//! folder methods: None (Store), MSZIP, LZX, and Quantum.
-//! Spanned/multi-cabinet sets and archive creation are not supported.
+//! [`scan`]) and extracts a file by *streaming* its owning CFFOLDER through
+//! `compcol`, skipping to the file's offset and capping at its length (see
+//! [`folder`]) — so memory stays bounded even for folders that decompress to
+//! many gigabytes. Supported folder methods: None (Store), MSZIP, LZX, and
+//! Quantum. Spanned/multi-cabinet sets and archive creation are not
+//! supported.
 //!
 //! Without the `cab` feature this stays a detection-only scaffold (reads
 //! return a clean `Unsupported`).
@@ -60,37 +62,31 @@ impl CabFs {
     /// Decode and slice out a file's bytes. `None` from the slice table
     /// means a known regular file we can't extract (spanned / missing
     /// folder); a missing key means it isn't a regular file (let the inner
-    /// `ArchiveFs` produce the proper error).
+    /// `ArchiveFs` produce the proper error). The slice carries an owned
+    /// `Folder` clone so the caller can build a reader borrowing only `dev`.
     #[cfg(feature = "cab")]
-    fn file_bytes(&mut self, dev: &mut dyn BlockDevice, path: &Path) -> Result<Option<Vec<u8>>> {
+    fn lookup(&self, path: &Path) -> Result<CabLookup> {
         let s = path
             .to_str()
             .ok_or_else(|| crate::Error::InvalidArgument("cab: non-UTF-8 path".to_string()))?;
         let key = crate::fs::archive::tree::normalise_path(s);
-        let slice = match self.files.get(&key) {
-            Some(Some(slice)) => *slice,
-            Some(None) => {
-                return Err(crate::Error::Unsupported(format!(
-                    "cab: {key:?} cannot be extracted (spans cabinets or uses an \
-                     unsupported method)"
-                )));
-            }
-            None => return Ok(None), // not a regular file
-        };
-        let folder = self.folders[slice.folder].clone();
-        let bytes = folder::decode_folder(dev, &folder)?;
-        let start = slice.uncomp_offset as usize;
-        let end = start
-            .checked_add(slice.len as usize)
-            .ok_or_else(|| crate::Error::InvalidImage("cab: file slice overflow".into()))?;
-        if end > bytes.len() {
-            return Err(crate::Error::InvalidImage(format!(
-                "cab: file slice {start}..{end} exceeds folder ({} bytes)",
-                bytes.len()
-            )));
-        }
-        Ok(Some(bytes[start..end].to_vec()))
+        Ok(match self.files.get(&key) {
+            Some(Some(slice)) => CabLookup::Slice(*slice, self.folders[slice.folder].clone()),
+            Some(None) => CabLookup::Unextractable(key),
+            None => CabLookup::NotRegular,
+        })
     }
+}
+
+/// Outcome of resolving a path to its folder slice (see [`CabFs::lookup`]).
+#[cfg(feature = "cab")]
+enum CabLookup {
+    /// Extractable regular file: its slice + an owned copy of the folder.
+    Slice(scan::FileSlice, scan::Folder),
+    /// A regular file we can't extract (spans cabinets / unsupported method).
+    Unextractable(String),
+    /// Not a regular file — defer to the inner `ArchiveFs`.
+    NotRegular,
 }
 
 impl crate::fs::FilesystemFactory for CabFs {
@@ -100,6 +96,27 @@ impl crate::fs::FilesystemFactory for CabFs {
     }
     fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
         Self::open(dev)
+    }
+}
+
+/// Caps an owned boxed reader to `remaining` bytes (the `Read::take`
+/// equivalent for a `Box<dyn Read>`, which isn't itself `Sized`-callable).
+#[cfg(feature = "cab")]
+struct LimitReader<'a> {
+    inner: Box<dyn std::io::Read + 'a>,
+    remaining: u64,
+}
+
+#[cfg(feature = "cab")]
+impl std::io::Read for LimitReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let want = buf.len().min(self.remaining as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.remaining -= n as u64;
+        Ok(n)
     }
 }
 
@@ -185,10 +202,24 @@ impl Filesystem for CabFs {
         path: &Path,
     ) -> Result<Box<dyn std::io::Read + 'a>> {
         #[cfg(feature = "cab")]
-        {
-            if let Some(bytes) = self.file_bytes(dev, path)? {
-                return Ok(Box::new(std::io::Cursor::new(bytes)));
+        match self.lookup(path)? {
+            CabLookup::Slice(slice, folder) => {
+                // Stream the folder, skip to the file's offset, cap at its
+                // length — bounded memory regardless of folder/file size.
+                let mut r = folder::decode_folder_reader(dev, &folder)?;
+                folder::skip_exact(&mut *r, slice.uncomp_offset)?;
+                return Ok(Box::new(LimitReader {
+                    inner: r,
+                    remaining: slice.len,
+                }));
             }
+            CabLookup::Unextractable(key) => {
+                return Err(crate::Error::Unsupported(format!(
+                    "cab: {key:?} cannot be extracted (spans cabinets or uses an \
+                     unsupported method)"
+                )));
+            }
+            CabLookup::NotRegular => {}
         }
         self.fs.read_file(dev, path)
     }
@@ -198,15 +229,33 @@ impl Filesystem for CabFs {
         dev: &'a mut dyn BlockDevice,
         path: &Path,
     ) -> Result<Box<dyn FileReadHandle + 'a>> {
+        // Random access needs the bytes in memory; buffer the *file* (its
+        // own length), not the whole folder. Huge files should use the
+        // streaming `read_file` instead.
         #[cfg(feature = "cab")]
-        {
-            if let Some(bytes) = self.file_bytes(dev, path)? {
+        match self.lookup(path)? {
+            CabLookup::Slice(slice, folder) => {
+                use std::io::Read;
+                let mut r = folder::decode_folder_reader(dev, &folder)?;
+                folder::skip_exact(&mut *r, slice.uncomp_offset)?;
+                let mut bytes = Vec::new();
+                (&mut *r)
+                    .take(slice.len)
+                    .read_to_end(&mut bytes)
+                    .map_err(crate::Error::from)?;
                 let len = bytes.len() as u64;
                 return Ok(Box::new(MemHandle {
                     cur: std::io::Cursor::new(bytes),
                     len,
                 }));
             }
+            CabLookup::Unextractable(key) => {
+                return Err(crate::Error::Unsupported(format!(
+                    "cab: {key:?} cannot be extracted (spans cabinets or uses an \
+                     unsupported method)"
+                )));
+            }
+            CabLookup::NotRegular => {}
         }
         self.fs.open_file_ro(dev, path)
     }
@@ -245,18 +294,26 @@ pub(crate) mod test_support {
     //! Minimal single-folder/single-file cabinet builder, shared by the
     //! in-crate unit tests and the `cabextract` cross-check integration test.
 
-    /// Build a cabinet with one folder (compression `type_compress`) holding
-    /// one file `name` of logical size `cb_file`, whose folder data is the
-    /// given CFDATA `blocks` (`(payload, cb_uncomp)` each).
+    /// Build a single-folder cabinet with one file `name` of logical size
+    /// `cb_file` (offset 0), whose folder data is the given CFDATA `blocks`.
     pub fn build_cab(
         type_compress: u16,
         blocks: &[(Vec<u8>, u16)],
         cb_file: u32,
         name: &str,
     ) -> Vec<u8> {
-        let name_bytes = name.as_bytes();
+        build_cab_files(type_compress, blocks, &[(name, cb_file, 0)])
+    }
+
+    /// Build a single-folder cabinet holding several files (each
+    /// `(name, cb_file, uoff_folder_start)`) over the given CFDATA `blocks`.
+    pub fn build_cab_files(
+        type_compress: u16,
+        blocks: &[(Vec<u8>, u16)],
+        files: &[(&str, u32, u32)],
+    ) -> Vec<u8> {
         let coff_files: u32 = 36 + 8;
-        let cffile_size = 16 + name_bytes.len() + 1;
+        let cffile_size: usize = files.iter().map(|(n, _, _)| 16 + n.len() + 1).sum();
         let coff_cab_start = coff_files as usize + cffile_size;
 
         let mut out = Vec::new();
@@ -270,7 +327,7 @@ pub(crate) mod test_support {
         out.push(3); // versionMinor
         out.push(1); // versionMajor
         out.extend_from_slice(&1u16.to_le_bytes()); // cFolders
-        out.extend_from_slice(&1u16.to_le_bytes()); // cFiles
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes()); // cFiles
         out.extend_from_slice(&0u16.to_le_bytes()); // flags
         out.extend_from_slice(&0u16.to_le_bytes()); // setID
         out.extend_from_slice(&0u16.to_le_bytes()); // iCabinet
@@ -278,15 +335,17 @@ pub(crate) mod test_support {
         out.extend_from_slice(&(coff_cab_start as u32).to_le_bytes());
         out.extend_from_slice(&(blocks.len() as u16).to_le_bytes());
         out.extend_from_slice(&type_compress.to_le_bytes());
-        // CFFILE.
-        out.extend_from_slice(&cb_file.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes()); // uoffFolderStart
-        out.extend_from_slice(&0u16.to_le_bytes()); // iFolder
-        out.extend_from_slice(&0u16.to_le_bytes()); // date
-        out.extend_from_slice(&0u16.to_le_bytes()); // time
-        out.extend_from_slice(&0u16.to_le_bytes()); // attribs
-        out.extend_from_slice(name_bytes);
-        out.push(0);
+        // CFFILE[].
+        for (name, cb_file, uoff) in files {
+            out.extend_from_slice(&cb_file.to_le_bytes());
+            out.extend_from_slice(&uoff.to_le_bytes()); // uoffFolderStart
+            out.extend_from_slice(&0u16.to_le_bytes()); // iFolder
+            out.extend_from_slice(&0u16.to_le_bytes()); // date
+            out.extend_from_slice(&0u16.to_le_bytes()); // time
+            out.extend_from_slice(&0u16.to_le_bytes()); // attribs
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+        }
         // CFDATA blocks (csum=0 → unchecked).
         for (payload, cb_uncomp) in blocks {
             out.extend_from_slice(&0u32.to_le_bytes()); // csum
@@ -436,6 +495,26 @@ mod tests {
             "l.txt",
         );
         assert_extracts(&cab, "/l.txt", &content);
+    }
+
+    #[test]
+    fn second_file_in_folder_skips_to_offset() {
+        // Two files share one Store folder; reading the second exercises
+        // skip_exact (offset > 0) + the length cap.
+        let a = b"first file contents AAAA".repeat(3);
+        let b = b"second file contents BBBB".repeat(3);
+        let mut folder = a.clone();
+        folder.extend_from_slice(&b);
+        let cab = build_cab_files(
+            0,
+            &[(folder.clone(), folder.len() as u16)],
+            &[
+                ("a.txt", a.len() as u32, 0),
+                ("b.txt", b.len() as u32, a.len() as u32),
+            ],
+        );
+        assert_eq!(read_file(&cab, "/a.txt").unwrap(), a);
+        assert_eq!(read_file(&cab, "/b.txt").unwrap(), b);
     }
 
     #[test]

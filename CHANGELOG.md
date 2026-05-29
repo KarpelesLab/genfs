@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(ext4)* arbitrary-depth extent tree writes — the in-place `open_file_rw`
+  path re-packs through `pack_extent_tree`, and the streaming append path
+  grows the rightmost spine and promotes the root past depth-2 (previously
+  capped at depth-1 / depth-2 respectively); validated against `e2fsck`
+
 ## [0.4.7](https://github.com/KarpelesLab/fstool/compare/v0.4.6...v0.4.7) - 2026-05-27
 
 ### Added

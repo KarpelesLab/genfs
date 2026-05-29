@@ -29,7 +29,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 |------------|------|-------|----------------|--------------------------------------------------------------------------------------------------------------------|
 | ext2       | ✅    | ✅     | ✅              | byte-exact with `genext2fs` on the same input                                                                      |
 | ext3       | ✅    | ✅     | ✅              | + JBD2 journal — real transactions on `open_file_rw` (Path A)                                                      |
-| ext4       | ✅    | ✅     | ✅              | extents (read: any depth; write: depth ≤ 1), FILETYPE, `metadata_csum`, xattrs, JBD2                               |
+| ext4       | ✅    | ✅     | ✅              | extents (read + write: any depth), FILETYPE, `metadata_csum`, xattrs, JBD2                                         |
 | FAT32      | ✅    | ✅     | ✅              | VFAT LFN entries, 8.3 short-name aliases                                                                           |
 | exFAT      | ✅    | ✅     | ✅              | format + create + remove + flush + `open_file_rw`                                                                  |
 | tar        | ✅    | ✅     | —              | ustar + PAX, `SCHILY.xattr.*` for xattrs; streaming-only                                                           |
@@ -451,9 +451,7 @@ cargo install fstool --no-default-features --features gzip,lz4,xz,lzma
 
 Things explicitly out of scope today, in rough order of likely-to-change:
 
-- **ext4 write path**: extent trees deeper than depth 1 (the reader
-  handles arbitrary depth); `flex_bg` on the write path (reader is
-  fine).
+- **ext4 write path**: `flex_bg` on the write path (reader is fine).
 - **APFS in-place edits**: `open_file_rw` rebuilds a fresh COW
   checkpoint over the entire file content, so it's whole-file
   granularity — partial-extent COW is not yet implemented, and

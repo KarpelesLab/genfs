@@ -3,8 +3,9 @@
 //! An ext4 inode that uses extents stores an extent header at the start of
 //! `i_block[..]` (12 bytes) followed by extent records. The 60-byte `i_block`
 //! array fits the header + up to 4 leaf extents. Inodes that need more
-//! extents put an extent index in `i_block` pointing at leaf blocks on disk
-//! (v1 only emits depth-0 trees — up to 4 extents per inode).
+//! extents put an extent index in `i_block` pointing at leaf blocks on disk,
+//! and trees of arbitrary depth nest further index levels below that — see
+//! [`pack_extent_tree`] for the bottom-up builder.
 //!
 //! References (UAPI / on-disk constants, not GPL code):
 //! - `linux/include/uapi/linux/types.h`-style layout of the extent structures
@@ -142,12 +143,14 @@ pub fn coalesce(data_blocks: &[u32]) -> Vec<ExtentRun> {
 }
 
 /// Pack an extent header + a list of leaf extents into a 60-byte
-/// `i_block` slice. Returns `Err` if more than [`MAX_EXTENTS_IN_INODE`]
-/// extents are supplied (depth-0 cap; multi-level trees are deferred).
+/// `i_block` slice. This is the depth-0 building block; callers needing
+/// more than [`MAX_EXTENTS_IN_INODE`] extents go through
+/// [`pack_extent_tree`], which nests deeper levels. Returns `Err` if more
+/// than the inline cap is supplied.
 pub fn pack_into_iblock(runs: &[ExtentRun]) -> crate::Result<[u8; 60]> {
     if runs.len() > MAX_EXTENTS_IN_INODE {
         return Err(crate::Error::Unsupported(format!(
-            "ext4: file requires {} extents, max {} per depth-0 tree (multi-level trees not yet implemented)",
+            "ext4: {} extents exceed the {}-extent inline depth-0 cap (use pack_extent_tree for deeper trees)",
             runs.len(),
             MAX_EXTENTS_IN_INODE
         )));

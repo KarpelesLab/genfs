@@ -619,6 +619,189 @@ fn ext4_fragmented_directory_promotes_to_depth1_extent_tree() {
     );
 }
 
+/// Force a regular file's extent tree past depth-1 into depth-2 through
+/// the in-place `open_file_rw` path, then confirm the multi-level tree —
+/// internal index blocks and leaves, each with its `ext4_extent_tail`
+/// CRC32C — is accepted by `e2fsck` and reads back byte-for-byte. With
+/// 1 KiB blocks a leaf holds ~84 extents, so depth-1 caps at 4 × 84 = 336;
+/// 500 logically-discontiguous single-block writes overflow that and add
+/// a second idx level.
+#[test]
+fn ext4_open_file_rw_depth2_extent_tree_passes_e2fsck() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    use fstool::fs::{Filesystem, OpenFlags};
+
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 1024,
+        blocks_count: 32 * 1024,
+        inodes_count: 4096,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    let n: u64 = 500;
+    let gap: u64 = 1024 * 8; // 8-block stride keeps runs from coalescing
+    let mark = b"DEEP2!";
+    {
+        let mut h = ext
+            .open_file_rw(
+                &mut dev,
+                std::path::Path::new("/deep.bin"),
+                OpenFlags {
+                    create: true,
+                    ..OpenFlags::default()
+                },
+                Some(FileMeta::with_mode(0o644)),
+            )
+            .unwrap();
+        for i in 0..n {
+            h.seek(SeekFrom::Start(i * gap)).unwrap();
+            h.write_all(mark).unwrap();
+        }
+        h.sync().unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+
+    // The inode must carry a depth-2 extent tree.
+    let ino = ext.path_to_inode(&mut dev, "/deep.bin").unwrap();
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    let mut iblock = [0u8; 60];
+    for (i, slot) in inode.block.iter().enumerate() {
+        iblock[i * 4..i * 4 + 4].copy_from_slice(&slot.to_le_bytes());
+    }
+    let depth = u16::from_le_bytes(iblock[6..8].try_into().unwrap());
+    assert_eq!(depth, 2, "expected depth-2 extent tree, got depth {depth}");
+
+    // Reopen and verify every marker survives.
+    {
+        let mut h = ext
+            .open_file_rw(
+                &mut dev,
+                std::path::Path::new("/deep.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+        for i in 0..n {
+            h.seek(SeekFrom::Start(i * gap)).unwrap();
+            let mut buf = vec![0u8; mark.len()];
+            h.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf[..], mark, "marker mismatch at index {i}");
+        }
+    }
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed on depth-2 extent image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Force a *directory's* extent tree to depth-2 through the streaming
+/// incremental-append path (the route directory growth takes,
+/// [`append_extent_deep`]'s production caller) and confirm `e2fsck`
+/// accepts it. Long entry names mean each 1 KiB dir block holds only a
+/// handful of entries, so a few thousand fragmented entries push the
+/// directory past the 336-extent depth-1 ceiling — exercising the
+/// single-entry interior index blocks the streaming split path emits
+/// (which the balanced repack/`open_file_rw` builder never produces).
+#[test]
+fn ext4_streaming_directory_depth2_extent_tree_passes_e2fsck() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 1024,
+        blocks_count: 64 * 1024,
+        inodes_count: 8192,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    let dir = ext
+        .add_dir_to(&mut dev, 2, b"big", FileMeta::with_mode(0o755))
+        .unwrap();
+
+    // ~200-byte names → ~4 entries per 1 KiB block, so ~2000 entries span
+    // ~500 dir blocks. A 1-block file between each entry fragments the
+    // dir's own block layout so each block becomes its own extent.
+    let n = 2000u32;
+    let payload = vec![0x5au8; 512];
+    for i in 0..n {
+        let name = format!("entry-{i:06}-{}", "x".repeat(200));
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(&payload).unwrap();
+        ext.add_file_to(
+            &mut dev,
+            dir,
+            name.as_bytes(),
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Confirm the directory inode reached depth-2.
+    let inode = ext.read_inode(&mut dev, dir).unwrap();
+    let mut iblock = [0u8; 60];
+    for (i, slot) in inode.block.iter().enumerate() {
+        iblock[i * 4..i * 4 + 4].copy_from_slice(&slot.to_le_bytes());
+    }
+    let depth = u16::from_le_bytes(iblock[6..8].try_into().unwrap());
+    assert_eq!(
+        depth, 2,
+        "expected directory to reach a depth-2 extent tree, got depth {depth}"
+    );
+
+    // Our reader must still enumerate every entry across the deep tree.
+    let entries = ext.list_inode(&mut dev, dir).unwrap();
+    let count = entries
+        .iter()
+        .filter(|e| e.name != "." && e.name != "..")
+        .count();
+    assert_eq!(count as u32, n, "reader miscounted deep-dir entries");
+
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed on depth-2 streaming dir image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
 /// Build an HTree-indexed directory (`EXT4_INDEX_FL`) and confirm
 /// e2fsck accepts it, debugfs sees it as indexed, and our reader
 /// enumerates every entry via the legacy linear-scan path that

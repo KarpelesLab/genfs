@@ -341,6 +341,18 @@ pub struct Ext {
     bootstrap: bool,
 }
 
+/// Outcome of appending one extent into a subtree (see
+/// [`Ext::append_into_node`]). Either the insert was absorbed locally, or
+/// the subtree split and produced a new sibling node the parent must link.
+enum NodeAppend {
+    /// Insert absorbed; payload is the count of metadata blocks allocated.
+    Done(u32),
+    /// The visited node was full; `idx` points at a freshly-allocated
+    /// sibling node (at the same depth) that the parent must add. `meta` is
+    /// the total metadata blocks allocated handling this insert.
+    NewSibling { idx: extent::ExtentIdx, meta: u32 },
+}
+
 impl Ext {
     /// Format the device, returning an `Ext` handle. At return the on-disk
     /// image is a valid ext2 containing just the root directory (and
@@ -658,18 +670,16 @@ impl Ext {
 
     /// Ext4 path: pack `data` into an extent tree stored in `i_block`
     /// and set `EXT4_EXTENTS_FL`. A run list that fits the 4-extent
-    /// inline budget stays depth-0 (no metadata blocks). Beyond that we
-    /// promote to depth-1: an inline idx node pointing at up to
-    /// `MAX_INDICES_IN_INODE` freshly-allocated leaf blocks, each
-    /// holding up to `per_leaf` extents. This mirrors the streaming
-    /// `append_extent_depth0` → `promote_extent_tree_to_depth1` path so
-    /// the one-shot build (used by `repack`) handles fragmented files
-    /// too. Returns the count of metadata (leaf) blocks allocated.
+    /// inline budget stays depth-0 (no metadata blocks). Beyond that
+    /// [`extent::pack_extent_tree`] builds a tree of whatever depth the
+    /// run count needs — leaves, then nested index levels until the top
+    /// fits the 4 inline `i_block` idx slots — so the one-shot build
+    /// (used by `repack`) handles arbitrarily fragmented files. Returns
+    /// the count of metadata (index + leaf) blocks allocated.
     ///
-    /// `ino` is needed so depth-1 leaf blocks can be tracked for
+    /// `ino` is needed so every staged tree block can be tracked for
     /// `ext4_extent_tail` CRC stamping at flush when `metadata_csum`
-    /// is on. Depth ≥ 2 (more than `MAX_INDICES_IN_INODE * per_leaf`
-    /// extents) still returns `Unsupported`.
+    /// is on.
     fn fill_block_pointers_extent(
         &mut self,
         ino: u32,
@@ -1158,9 +1168,9 @@ impl Ext {
     /// Append `new_phys` (at logical block `new_logical`) to an
     /// inline-extent-tree inode. Tries to extend the last extent first
     /// (zero allocation, best for the typical contiguous case); otherwise
-    /// adds a new extent. Promotes a depth-0 tree to depth-1 when more
-    /// than 4 leaf extents would be needed, and appends into an existing
-    /// depth-1 tree's last leaf.
+    /// adds a new extent. Promotes depth-0 → depth-1 when more than 4 leaf
+    /// extents are needed, and deeper still (depth-1 → 2 → 3 → …) as the
+    /// rightmost spine fills, via [`Self::append_extent_deep`].
     ///
     /// Returns the number of newly allocated metadata blocks (extent
     /// leaves) so the caller can fold them into `blocks_512`.
@@ -1182,10 +1192,7 @@ impl Ext {
         match header.depth {
             0 => self.append_extent_depth0(dev, inode_no, &iblock, new_logical, new_phys),
             1 => self.append_extent_depth1(dev, inode_no, new_logical, new_phys),
-            2 => self.append_extent_depth2(dev, inode_no, new_logical, new_phys),
-            d => Err(crate::Error::Unsupported(format!(
-                "ext4: extent tree depth {d} growth not supported (writer caps at depth-2)"
-            ))),
+            _ => self.append_extent_deep(dev, inode_no, new_logical, new_phys),
         }
     }
 
@@ -1409,13 +1416,15 @@ impl Ext {
         Ok(allocated_meta)
     }
 
-    /// Incrementally append one data block to a depth-2 extent tree.
-    /// Appends into the last index block's last leaf, growing the last
-    /// leaf → a new leaf under the last index block → a new index block
-    /// under `i_block`, in that order. Promotion past depth-2 (a 4th
-    /// index block whose own leaves all fill) is not supported — depth-2
-    /// already addresses tens of thousands of extents.
-    fn append_extent_depth2(
+    /// Incrementally append one data block to an extent tree of depth ≥ 2.
+    /// Walks the rightmost spine to the deepest leaf and inserts there,
+    /// then propagates node splits back up: a full leaf spawns a new leaf,
+    /// a full index node spawns a new sibling, and a full inline root is
+    /// promoted one level deeper. Because the streaming writer only ever
+    /// appends at the logical tail, only the rightmost path is touched, so
+    /// each call is O(depth). Returns the count of newly allocated metadata
+    /// (index + leaf) blocks for `blocks_512`.
+    fn append_extent_deep(
         &mut self,
         dev: &mut dyn BlockDevice,
         inode_no: u32,
@@ -1424,96 +1433,162 @@ impl Ext {
     ) -> Result<u32> {
         let bs = self.layout.block_size;
         let csum_tail = self.has_metadata_csum();
-        let per = extent::entries_per_leaf_block_capped(bs, csum_tail);
-        let new_run = extent::ExtentRun {
-            logical: new_logical,
-            len: 1,
-            physical: new_phys as u64,
-        };
 
         let inode_copy = self.inodes[self.inode_pos(inode_no).unwrap()].1;
         let iblock = extent::iblock_to_bytes(&inode_copy.block);
+        let header = extent::decode_header(&iblock[..12])?;
+        let depth = header.depth;
         let (_, mut top) = extent::decode_idx_iblock(&iblock)?;
-        let last_ib_phys = top.last().expect("depth-2 has ≥1 idx").leaf as u32;
+        let rightmost = top.last().expect("depth ≥ 2 root has ≥ 1 idx").leaf as u32;
 
-        // Parse the last index block's idx entries.
-        let ib_bytes = self.staged_block_bytes(dev, last_ib_phys)?;
-        let ib_hdr = extent::decode_header(&ib_bytes[..12])?;
-        let mut ib_indices: Vec<extent::ExtentIdx> = (0..ib_hdr.entries as usize)
-            .map(|i| extent::decode_idx(&ib_bytes[12 + i * 12..24 + i * 12]))
-            .collect();
-        let last_leaf_phys = ib_indices.last().expect("index block has ≥1 leaf").leaf as u32;
-        self.track_extent_leaf_block(last_leaf_phys, inode_no);
-
-        // Try extending / adding into the last leaf.
-        let leaf_bytes = self.staged_block_bytes(dev, last_leaf_phys)?;
-        let (_, mut leaf_runs) = extent::decode_leaf_block(&leaf_bytes[..bs as usize])?;
-        let extended = if let Some(last) = leaf_runs.last_mut() {
-            last.physical + last.len as u64 == new_phys as u64
-                && (last.logical + last.len as u32) == new_logical
-                && last.len < extent::MAX_LEN_PER_EXTENT
-                && {
-                    last.len += 1;
-                    true
+        // Recurse into the rightmost subtree (an on-disk index block).
+        match self.append_into_node(dev, inode_no, rightmost, depth - 1, new_logical, new_phys)? {
+            NodeAppend::Done(meta) => Ok(meta),
+            NodeAppend::NewSibling { idx, meta } => {
+                // The rightmost subtree split and handed us a fresh node at
+                // depth `depth - 1` to slot into the inline root.
+                if top.len() < extent::MAX_INDICES_IN_INODE {
+                    top.push(idx);
+                    let packed = extent::encode_idx_iblock(&top, depth);
+                    self.patch_inode(dev, inode_no, |i| {
+                        i.block = extent::bytes_to_iblock(&packed);
+                    })?;
+                    return Ok(meta);
                 }
-        } else {
-            false
-        };
-        if extended || leaf_runs.len() < per {
-            if !extended {
-                leaf_runs.push(new_run);
+                // Root is full → promote one level. The existing entries plus
+                // the new sibling (all depth-1 nodes relative to the root)
+                // move into a single fresh index block at `depth`, and the
+                // inline root becomes a one-entry `depth + 1` node pointing
+                // at it.
+                top.push(idx);
+                let combined_phys = self.alloc_data_block()?;
+                let combined_img = extent::encode_idx_block(&top, bs, csum_tail, depth)?;
+                self.push_data_block(combined_phys, combined_img);
+                self.track_extent_leaf_block(combined_phys, inode_no);
+                let new_top = [extent::ExtentIdx {
+                    block: top[0].block,
+                    leaf: combined_phys as u64,
+                }];
+                let packed = extent::encode_idx_iblock(&new_top, depth + 1);
+                self.patch_inode(dev, inode_no, |i| {
+                    i.block = extent::bytes_to_iblock(&packed);
+                })?;
+                Ok(meta + 1)
             }
-            let img = extent::encode_leaf_block(&leaf_runs, bs, csum_tail)?;
-            self.update_staged_block(last_leaf_phys, img);
-            return Ok(0);
         }
+    }
 
-        // Last leaf full → new leaf.
-        let new_leaf_phys = self.alloc_data_block()?;
-        let mut allocated_meta = 1u32;
-        let new_leaf_image = extent::encode_leaf_block(&[new_run], bs, csum_tail)?;
-        self.push_data_block(new_leaf_phys, new_leaf_image);
-        self.track_extent_leaf_block(new_leaf_phys, inode_no);
+    /// Recursive helper for [`Self::append_extent_deep`]: append into the
+    /// subtree rooted at on-disk index block `node_phys` (header depth
+    /// `node_depth` ≥ 1), always following the rightmost child. Returns
+    /// either [`NodeAppend::Done`] when the insert was absorbed without
+    /// growing this node's parent, or [`NodeAppend::NewSibling`] carrying a
+    /// freshly-allocated sibling node (at `node_depth`) that the caller must
+    /// link into the level above.
+    fn append_into_node(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        inode_no: u32,
+        node_phys: u32,
+        node_depth: u16,
+        new_logical: u32,
+        new_phys: u32,
+    ) -> Result<NodeAppend> {
+        let bs = self.layout.block_size;
+        let csum_tail = self.has_metadata_csum();
+        let per = extent::entries_per_leaf_block_capped(bs, csum_tail);
 
-        if ib_indices.len() < per {
-            // Add the leaf to the last index block.
-            ib_indices.push(extent::ExtentIdx {
-                block: new_logical,
-                leaf: new_leaf_phys as u64,
-            });
-            let ib_img = extent::encode_idx_block(&ib_indices, bs, csum_tail, 1)?;
-            self.update_staged_block(last_ib_phys, ib_img);
-            return Ok(allocated_meta);
+        let node_bytes = self.staged_block_bytes(dev, node_phys)?;
+        let node_hdr = extent::decode_header(&node_bytes[..12])?;
+        let mut indices: Vec<extent::ExtentIdx> = (0..node_hdr.entries as usize)
+            .map(|i| extent::decode_idx(&node_bytes[12 + i * 12..24 + i * 12]))
+            .collect();
+        let rightmost = indices.last().expect("index node has ≥ 1 entry").leaf as u32;
+
+        // The new child to splice into this node (a fresh leaf when this is
+        // a depth-1 node, or a fresh sibling bubbled up from below) along
+        // with how many metadata blocks its creation cost.
+        let (new_child, child_meta) = if node_depth == 1 {
+            // Children are leaves. Try the rightmost leaf in place first.
+            self.track_extent_leaf_block(rightmost, inode_no);
+            let leaf_bytes = self.staged_block_bytes(dev, rightmost)?;
+            let (_, mut leaf_runs) = extent::decode_leaf_block(&leaf_bytes[..bs as usize])?;
+            let extended = if let Some(last) = leaf_runs.last_mut() {
+                last.physical + last.len as u64 == new_phys as u64
+                    && (last.logical + last.len as u32) == new_logical
+                    && last.len < extent::MAX_LEN_PER_EXTENT
+                    && {
+                        last.len += 1;
+                        true
+                    }
+            } else {
+                false
+            };
+            if extended || leaf_runs.len() < per {
+                if !extended {
+                    leaf_runs.push(extent::ExtentRun {
+                        logical: new_logical,
+                        len: 1,
+                        physical: new_phys as u64,
+                    });
+                }
+                let img = extent::encode_leaf_block(&leaf_runs, bs, csum_tail)?;
+                self.update_staged_block(rightmost, img);
+                return Ok(NodeAppend::Done(0));
+            }
+            // Rightmost leaf is full → spawn a new leaf for the extent.
+            let new_leaf_phys = self.alloc_data_block()?;
+            let new_run = extent::ExtentRun {
+                logical: new_logical,
+                len: 1,
+                physical: new_phys as u64,
+            };
+            let img = extent::encode_leaf_block(&[new_run], bs, csum_tail)?;
+            self.push_data_block(new_leaf_phys, img);
+            self.track_extent_leaf_block(new_leaf_phys, inode_no);
+            (
+                extent::ExtentIdx {
+                    block: new_logical,
+                    leaf: new_leaf_phys as u64,
+                },
+                1,
+            )
+        } else {
+            // Children are index blocks → recurse into the rightmost one.
+            match self.append_into_node(
+                dev,
+                inode_no,
+                rightmost,
+                node_depth - 1,
+                new_logical,
+                new_phys,
+            )? {
+                NodeAppend::Done(meta) => return Ok(NodeAppend::Done(meta)),
+                NodeAppend::NewSibling { idx, meta } => (idx, meta),
+            }
+        };
+
+        // Splice `new_child` into this node, or split it when full.
+        if indices.len() < per {
+            indices.push(new_child);
+            let img = extent::encode_idx_block(&indices, bs, csum_tail, node_depth)?;
+            self.update_staged_block(node_phys, img);
+            self.track_extent_leaf_block(node_phys, inode_no);
+            return Ok(NodeAppend::Done(child_meta));
         }
-
-        // Last index block full → new index block under i_block.
-        if top.len() >= extent::MAX_INDICES_IN_INODE {
-            return Err(crate::Error::Unsupported(
-                "ext4: depth-2 extent tree full; depth-3 growth not supported".into(),
-            ));
-        }
-        let new_ib_phys = self.alloc_data_block()?;
-        allocated_meta += 1;
-        let new_ib_image = extent::encode_idx_block(
-            &[extent::ExtentIdx {
-                block: new_logical,
-                leaf: new_leaf_phys as u64,
-            }],
-            bs,
-            csum_tail,
-            1,
-        )?;
-        self.push_data_block(new_ib_phys, new_ib_image);
-        self.track_extent_leaf_block(new_ib_phys, inode_no);
-        top.push(extent::ExtentIdx {
-            block: new_logical,
-            leaf: new_ib_phys as u64,
-        });
-        let packed = extent::encode_idx_iblock(&top, 2);
-        self.patch_inode(dev, inode_no, |i| {
-            i.block = extent::bytes_to_iblock(&packed);
-        })?;
-        Ok(allocated_meta)
+        // This node is full → allocate a sibling at the same depth holding
+        // just the new child, and hand it up for the parent to link in.
+        let sib_phys = self.alloc_data_block()?;
+        let sib_img = extent::encode_idx_block(&[new_child], bs, csum_tail, node_depth)?;
+        self.push_data_block(sib_phys, sib_img);
+        self.track_extent_leaf_block(sib_phys, inode_no);
+        Ok(NodeAppend::NewSibling {
+            idx: extent::ExtentIdx {
+                block: new_child.block,
+                leaf: sib_phys as u64,
+            },
+            meta: child_meta + 1,
+        })
     }
 
     /// Append `new_phys` (at logical block `new_logical`) to an ext2/3
@@ -5904,53 +5979,186 @@ mod tests {
         assert!(reopened.sb.free_blocks_count > 0);
     }
 
+    /// Build an ext4 file whose extent tree spills all the way into
+    /// depth-2 through the in-place `open_file_rw` path, then reopen and
+    /// confirm every marked offset round-trips. With 1 KiB blocks a leaf
+    /// holds ~84 extents, so depth-1 caps at 4 × 84 = 336; ~400 sparse
+    /// single-block writes overflows that and forces a second idx level.
     #[test]
-    fn open_file_rw_refused_ext4_when_extent_depth_too_deep() {
-        // Synthesise an inode whose extent header claims depth > 0. The
-        // writer must refuse cleanly at open time rather than trying to
-        // walk an index it can't allocate.
-        let (ext, mut dev) = ext4_with_file(b"deep.bin", b"hello");
-
-        // Locate the file's inode and patch its i_block header so eh_depth = 2.
-        // Depth 0 (inline) and depth 1 (one level of idx → leaf) are both
-        // supported by the writer; depth 2+ still needs a second level of
-        // idx-block allocation and is refused.
-        let ino = ext
-            .path_to_inode(&mut dev, "/deep.bin")
-            .expect("path lookup");
-        let mut inode = ext.read_inode(&mut dev, ino).expect("read inode");
-        let mut bytes = extent::iblock_to_bytes(&inode.block);
-        // eh_depth lives at bytes 6..8 (little-endian).
-        bytes[6..8].copy_from_slice(&2u16.to_le_bytes());
-        inode.block = extent::bytes_to_iblock(&bytes);
-
-        // Write the patched inode straight to disk; we want the
-        // subsequent open_file_rw to see the on-disk state, not anything
-        // cached by `ext`.
-        let (group, idx) = ext.inode_location(ino);
-        let table_block = ext.layout.groups[group as usize].inode_table;
-        let bs = ext.layout.block_size as u64;
-        let off = table_block as u64 * bs + idx as u64 * ext.layout.inode_size as u64;
-        let mut enc = inode.encode().to_vec();
-        if ext.layout.inode_size as usize > enc.len() {
-            enc.resize(ext.layout.inode_size as usize, 0);
-        }
-        dev.write_at(off, &enc).expect("write patched inode");
-
-        // Reopen the FS so the staged-inode cache is empty.
-        let mut ext = Ext::open(&mut dev).expect("reopen");
-        let res = ext.open_file_rw(
+    fn open_file_rw_depth2_extent_round_trip_ext4() {
+        let mut dev = MemoryBackend::new(64u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 1024,
+            blocks_count: 32 * 1024,
+            inodes_count: 1024,
+            sparse_super: true,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
+        ext.add_file_to_streaming(
             &mut dev,
-            std::path::Path::new("/deep.bin"),
-            OpenFlags::default(),
-            None,
-        );
-        match res {
-            Ok(_) => panic!("must refuse on deeper extent tree"),
-            Err(crate::Error::Unsupported(msg)) => {
-                assert!(msg.contains("depth"), "unexpected message: {msg}");
+            constants::INO_ROOT_DIR,
+            b"deep2.bin",
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+            0,
+            FileMeta::default(),
+        )
+        .expect("add empty file");
+        ext.flush(&mut dev).expect("flush");
+
+        // 400 logically-discontiguous single-block writes. An 8-block gap
+        // between each keeps the runs from coalescing, so the leaf count
+        // crosses the depth-1 ceiling.
+        let n = 400u64;
+        let gap = 1024 * 8;
+        let mark = b"D2!";
+        {
+            let mut h = ext
+                .open_file_rw(
+                    &mut dev,
+                    std::path::Path::new("/deep2.bin"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .expect("open_file_rw on empty extent file");
+            for i in 0..n {
+                h.seek(SeekFrom::Start(i * gap)).unwrap();
+                h.write_all(mark).unwrap();
             }
-            Err(other) => panic!("expected Unsupported, got {other}"),
+            h.sync().expect("sync");
+        }
+
+        // The on-disk inode must now carry a depth-2 extent tree.
+        let ino = ext.path_to_inode(&mut dev, "/deep2.bin").expect("ino");
+        let inode = ext.read_inode(&mut dev, ino).expect("read inode");
+        let iblock = extent::iblock_to_bytes(&inode.block);
+        let header = extent::decode_header(&iblock[..12]).expect("header");
+        assert_eq!(
+            header.depth, 2,
+            "expected depth-2 extent tree, got depth {}",
+            header.depth
+        );
+
+        // Reopen from scratch and verify every marker survives, with an
+        // untouched block reading back as a hole.
+        let mut reopened = Ext::open(&mut dev).expect("reopen");
+        let mut h = reopened
+            .open_file_rw(
+                &mut dev,
+                std::path::Path::new("/deep2.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .expect("reopen rw on depth-2 file");
+        for i in 0..n {
+            h.seek(SeekFrom::Start(i * gap)).unwrap();
+            let mut buf = vec![0u8; mark.len()];
+            h.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf[..], mark, "marker mismatch at index {i}");
+        }
+        h.seek(SeekFrom::Start(gap - 1024)).unwrap();
+        let mut zero = vec![0u8; 1024];
+        h.read_exact(&mut zero).unwrap();
+        assert!(
+            zero.iter().all(|&b| b == 0),
+            "untouched region must be zero"
+        );
+    }
+
+    /// Drive the *streaming* incremental-append path
+    /// ([`Ext::append_data_block_to_inode`], the route directory growth
+    /// takes) hard enough to promote an extent tree all the way to depth-3,
+    /// exercising every new branch in [`Ext::append_extent_deep`]: leaf
+    /// split, index-node split (a new sibling bubbling up), and inline-root
+    /// promotion. With 1 KiB blocks a node holds ~84 entries, so depth-2
+    /// saturates at 4 × 84 × 84 = 28 224 extents; appending past that forces
+    /// depth-3. We then walk the tree back and confirm every extent — in
+    /// logical order — survived the rebuilds.
+    #[test]
+    fn append_extent_deep_streaming_promotes_to_depth3() {
+        let mut dev = MemoryBackend::new(96u64 * 1024 * 1024);
+        let opts = FormatOpts {
+            kind: FsKind::Ext4,
+            block_size: 1024,
+            blocks_count: 80 * 1024,
+            inodes_count: 1024,
+            ..FormatOpts::default()
+        };
+        let mut ext = Ext::format_with(&mut dev, &opts).expect("format ext4");
+        // A directory is the only inode that grows via the incremental
+        // append path; it starts depth-0 with one block (logical 0).
+        let dir = ext
+            .add_dir_to(
+                &mut dev,
+                constants::INO_ROOT_DIR,
+                b"d",
+                FileMeta::with_mode(0o755),
+            )
+            .expect("mkdir");
+
+        // Append sparse logical blocks so none coalesce; 28 225+ extents
+        // (plus the initial one) tip the tree into depth-3.
+        let n: u32 = 29_000;
+        let mut expect: Vec<(u32, u64)> = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let logical = 2 + i * 2; // gap of 1 between each → distinct runs
+            let phys = ext.alloc_data_block().expect("alloc data block");
+            ext.append_data_block_to_inode(&mut dev, dir, logical, phys)
+                .expect("append data block");
+            expect.push((logical, phys as u64));
+        }
+
+        // Inline root must now be depth-3.
+        let inode = ext
+            .inodes
+            .iter()
+            .find(|(i, _)| *i == dir)
+            .map(|(_, i)| *i)
+            .expect("dir staged");
+        let iblock = extent::iblock_to_bytes(&inode.block);
+        let header = extent::decode_header(&iblock[..12]).expect("header");
+        assert_eq!(
+            header.depth, 3,
+            "expected depth-3 extent tree, got depth {}",
+            header.depth
+        );
+
+        // Walk the whole tree from the staged blocks and collect leaf runs.
+        fn walk(
+            ext: &mut Ext,
+            dev: &mut dyn BlockDevice,
+            phys: u32,
+            out: &mut Vec<extent::ExtentRun>,
+        ) {
+            let buf = ext.staged_block_bytes(dev, phys).expect("staged block");
+            let bs = ext.layout.block_size as usize;
+            let hdr = extent::decode_header(&buf[..12]).expect("node header");
+            if hdr.depth == 0 {
+                let (_, mut runs) = extent::decode_leaf_block(&buf[..bs]).expect("leaf");
+                out.append(&mut runs);
+            } else {
+                for i in 0..hdr.entries as usize {
+                    let off = 12 + i * 12;
+                    let idx = extent::decode_idx(&buf[off..off + 12]);
+                    walk(ext, dev, idx.leaf as u32, out);
+                }
+            }
+        }
+        let (_, top) = extent::decode_idx_iblock(&iblock).expect("root idx");
+        let mut runs = Vec::new();
+        for idx in &top {
+            walk(&mut ext, &mut dev, idx.leaf as u32, &mut runs);
+        }
+
+        // The initial dir block (logical 0) plus our n appends, all in
+        // ascending logical order, every physical block intact.
+        assert_eq!(runs.len(), n as usize + 1, "extent count mismatch");
+        assert_eq!(runs[0].logical, 0, "initial dir block missing");
+        for (run, (logical, phys)) in runs[1..].iter().zip(expect.iter()) {
+            assert_eq!(run.logical, *logical, "logical mismatch");
+            assert_eq!(run.len, 1, "each sparse append is a single block");
+            assert_eq!(run.physical, *phys, "physical mismatch at {logical}");
         }
     }
 

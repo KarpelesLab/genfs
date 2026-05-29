@@ -16,10 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- *(compression)* gzip/zlib/xz/zstd now route through the `compcol` codec
-  crate (replacing `flate2`/`lzma-rs`/`zstd` for those algorithms);
-  cross-validated against `xz`, `mksquashfs`/`unsquashfs`. lzma stays on
-  `lzma-rs` and lz4/lzo on their crates pending compcol #9/#10/#14.
+- *(compression)* gzip/zlib/deflate/xz/zstd now route through the `compcol`
+  codec crate — dropping `flate2` and `zstd` entirely. Covers the shared
+  codec layer plus the zip DEFLATE, DMG zlib, and HFS+ decmpfs paths.
+  Cross-validated against `xz`, `mksquashfs`/`unsquashfs`, and real DMG
+  fixtures. lzma stays on `lzma-rs` and lz4/lzo on their crates pending
+  compcol #9/#10/#14; the block decoder uses a manual `decode`/`finish`
+  loop to dodge a `compcol::io::DecoderReader` end-of-input bug (#17).
 
 ## [0.4.7](https://github.com/KarpelesLab/fstool/compare/v0.4.6...v0.4.7) - 2026-05-27
 

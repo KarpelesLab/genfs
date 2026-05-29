@@ -96,8 +96,8 @@ impl EntryKind {
 pub enum Method {
     /// No compression — the byte range is the file content verbatim.
     Stored,
-    /// Raw DEFLATE (zip method 8). Decoded via `flate2` directly (the
-    /// shared codec layer only exposes gzip/zlib *framing*).
+    /// Raw DEFLATE (zip method 8). Decoded via `compcol::deflate` directly
+    /// (the shared codec layer only exposes gzip/zlib *framing*).
     Deflate,
     /// One of the streaming codecs in [`crate::compression`].
     Codec(crate::compression::Algo),

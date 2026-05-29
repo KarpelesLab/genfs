@@ -431,16 +431,13 @@ impl DmgBackend {
 }
 
 /// Inflate `src` as a zlib (RFC 1950) stream into a buffer of exactly
-/// `plain_len` bytes. Wraps the `flate2` reader API behind the `gzip`
-/// feature flag — the same flag that gates SquashFS gzip / zlib reads,
-/// so any build that can open a SquashFS can also open a zlib DMG.
+/// `plain_len` bytes. Routes through [`crate::compression`] (compcol's
+/// zlib) behind the `gzip` feature flag — the same flag that gates
+/// SquashFS gzip / zlib reads, so any build that can open a SquashFS can
+/// also open a zlib DMG.
 #[cfg(feature = "gzip")]
 fn decode_zlib(src: &[u8], plain_len: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut dec = flate2::read::ZlibDecoder::new(src);
-    let mut out = Vec::with_capacity(plain_len);
-    dec.read_to_end(&mut out)
-        .map_err(|e| crate::Error::InvalidImage(format!("dmg: zlib chunk inflate failed: {e}")))?;
+    let out = crate::compression::decompress(crate::compression::Algo::Zlib, src, plain_len)?;
     if out.len() != plain_len {
         return Err(crate::Error::InvalidImage(format!(
             "dmg: zlib chunk inflated to {} bytes but sector_count*512 = {}",
@@ -799,11 +796,10 @@ mod tests {
     }
 
     /// Zlib chunk: deflate a known payload, embed it, read it back.
-    /// Cross-checks the chunk router + the flate2 wiring.
+    /// Cross-checks the chunk router + the zlib wiring.
     #[cfg(feature = "gzip")]
     #[test]
     fn round_trip_zlib_chunk() {
-        use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         // 1024 bytes of varied data so deflate produces a meaningful
         // payload, not just a stored block.
@@ -811,13 +807,8 @@ mod tests {
         for (i, b) in plain.iter_mut().enumerate() {
             *b = ((i * 31 + 7) & 0xFF) as u8;
         }
-        let mut compressed = Vec::new();
-        {
-            let mut enc =
-                flate2::write::ZlibEncoder::new(&mut compressed, flate2::Compression::default());
-            enc.write_all(&plain).unwrap();
-            enc.finish().unwrap();
-        }
+        let compressed =
+            crate::compression::compress(crate::compression::Algo::Zlib, &plain).unwrap();
         let chunks = vec![Chunk {
             kind: ChunkType::Zlib,
             virtual_sector_start: 0,
@@ -977,7 +968,6 @@ mod tests {
     #[cfg(feature = "gzip")]
     #[test]
     fn round_trip_mixed_chunks() {
-        use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
 
         // Data layout, in sectors:
@@ -992,13 +982,8 @@ mod tests {
         for (i, b) in zlib_plain.iter_mut().enumerate() {
             *b = ((255 - (i & 0xFF)) & 0xFF) as u8;
         }
-        let mut zlib_payload = Vec::new();
-        {
-            let mut enc =
-                flate2::write::ZlibEncoder::new(&mut zlib_payload, flate2::Compression::default());
-            enc.write_all(&zlib_plain).unwrap();
-            enc.finish().unwrap();
-        }
+        let zlib_payload =
+            crate::compression::compress(crate::compression::Algo::Zlib, &zlib_plain).unwrap();
 
         // Data fork = raw_payload || zlib_payload.
         let mut fork = Vec::new();

@@ -2668,9 +2668,6 @@ mod tests {
     #[cfg(feature = "gzip")]
     #[test]
     fn read_decmpfs_type3_inline_zlib() {
-        use flate2::{Compression, write::ZlibEncoder};
-        use std::io::Write;
-
         let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
         let opts = writer::FormatOpts::default();
         let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
@@ -2683,9 +2680,8 @@ mod tests {
             .unwrap();
 
         let plain = b"hello hfsplus decmpfs inline zlib world!\n".repeat(20);
-        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&plain).unwrap();
-        let compressed = enc.finish().unwrap();
+        let compressed =
+            crate::compression::compress(crate::compression::Algo::Zlib, &plain).unwrap();
 
         // Build the decmpfs xattr payload: 16-byte header (type 3) +
         // inline zlib bytes.
@@ -2746,9 +2742,6 @@ mod tests {
     #[cfg(feature = "gzip")]
     #[test]
     fn read_decmpfs_type4_resource_fork_zlib() {
-        use flate2::{Compression, write::ZlibEncoder};
-        use std::io::Write;
-
         let mut dev = crate::block::MemoryBackend::new(16 * 1024 * 1024);
         let opts = writer::FormatOpts::default();
         let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
@@ -2766,9 +2759,7 @@ mod tests {
         let block2 = &plain[decmpfs::HFSCOMPRESS_BLOCK_SIZE..];
 
         let compress = |data: &[u8]| -> Vec<u8> {
-            let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
-            e.write_all(data).unwrap();
-            e.finish().unwrap()
+            crate::compression::compress(crate::compression::Algo::Zlib, data).unwrap()
         };
         let c1 = compress(block1);
         let c2 = compress(block2);

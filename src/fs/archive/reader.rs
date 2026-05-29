@@ -56,7 +56,11 @@ pub fn open<'a>(dev: &'a mut dyn BlockDevice, loc: DataLocator) -> Result<Box<dy
 
 #[cfg(feature = "gzip")]
 fn deflate_reader<'a, R: Read + 'a>(r: R) -> Result<Box<dyn Read + 'a>> {
-    Ok(Box::new(flate2::read::DeflateDecoder::new(r)))
+    use compcol::Algorithm;
+    Ok(Box::new(compcol::io::DecoderReader::new(
+        r,
+        compcol::deflate::Deflate::decoder(),
+    )))
 }
 
 #[cfg(not(feature = "gzip"))]

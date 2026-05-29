@@ -262,8 +262,13 @@ impl ZipWriter {
             dev,
             written: 0,
         };
+        use compcol::Algorithm;
+        // compcol's deflate level is 1..=9; map zip level 0 (store) up to 1.
+        let cfg = compcol::deflate::EncoderConfig {
+            level: self.opts.level.clamp(1, 9) as u8,
+        };
         let mut enc =
-            flate2::write::DeflateEncoder::new(sink, flate2::Compression::new(self.opts.level));
+            compcol::io::EncoderWriter::new(sink, compcol::deflate::Deflate::encoder_with(cfg));
         let mut remaining = len;
         while remaining > 0 {
             let want = remaining.min(buf.len() as u64) as usize;

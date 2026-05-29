@@ -340,16 +340,11 @@ fn decompress_resource_zlib(rf: &[u8], expected_len: u64) -> Result<Vec<u8>> {
 
 /// Inflate a zlib (RFC 1950) stream that should produce exactly
 /// `target_len` bytes. The decmpfs convention is identical to the
-/// DMG zlib path — we gate on the `gzip` feature for the same reason
-/// (`flate2`).
+/// DMG zlib path — both route through [`crate::compression`] (compcol's
+/// zlib) and gate on the `gzip` feature.
 #[cfg(feature = "gzip")]
 fn decompress_zlib_block(src: &[u8], target_len: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut dec = flate2::read::ZlibDecoder::new(src);
-    let mut out = Vec::with_capacity(target_len);
-    dec.read_to_end(&mut out).map_err(|e| {
-        crate::Error::InvalidImage(format!("hfs+: decmpfs zlib block inflate failed: {e}"))
-    })?;
+    let out = crate::compression::decompress(crate::compression::Algo::Zlib, src, target_len)?;
     if out.len() != target_len {
         return Err(crate::Error::InvalidImage(format!(
             "hfs+: decmpfs zlib block inflated to {} bytes but expected {target_len}",
@@ -399,12 +394,9 @@ mod tests {
     #[cfg(feature = "gzip")]
     #[test]
     fn inline_zlib_round_trip() {
-        use flate2::{Compression, write::ZlibEncoder};
-        use std::io::Write;
         let plain = b"hello hfsplus decmpfs world!".repeat(8);
-        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&plain).unwrap();
-        let compressed = enc.finish().unwrap();
+        let compressed =
+            crate::compression::compress(crate::compression::Algo::Zlib, &plain).unwrap();
         let out =
             decompress_inline(CompressionType::ZlibAttr, &compressed, plain.len() as u64).unwrap();
         assert_eq!(out, plain);
@@ -429,9 +421,6 @@ mod tests {
     #[cfg(feature = "gzip")]
     #[test]
     fn resource_fork_zlib_round_trip() {
-        use flate2::{Compression, write::ZlibEncoder};
-        use std::io::Write;
-
         // Build a synthesized resource fork with two zlib blocks
         // (forcing the block-table path). First block is 64 KiB,
         // second is the tail.
@@ -442,9 +431,7 @@ mod tests {
         let block2 = &plain[HFSCOMPRESS_BLOCK_SIZE..];
 
         let compress = |data: &[u8]| -> Vec<u8> {
-            let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
-            e.write_all(data).unwrap();
-            e.finish().unwrap()
+            crate::compression::compress(crate::compression::Algo::Zlib, data).unwrap()
         };
         let c1 = compress(block1);
         let c2 = compress(block2);

@@ -235,14 +235,45 @@ fn cap_check(buf: &[u8], max_out: usize) -> Result<()> {
 /// One-shot decompress with a hard output cap (decompression-bomb guard
 /// via [`compcol::limit::LimitedDecoder`], which aborts mid-stream rather
 /// than allocating the whole payload first).
+///
+/// Drives the decoder with a manual `decode`/`finish` loop over the whole
+/// `src` slice — the same shape as `compcol::vec::decompress_to_vec` —
+/// rather than `compcol::io::DecoderReader`, which mishandles end-of-input
+/// on some complete streams (e.g. small zlib; KarpelesLab/compcol#17).
 #[cfg(any(feature = "gzip", feature = "xz", feature = "lzma", feature = "zstd"))]
 fn cc_decompress<A: compcol::Algorithm>(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let dec = compcol::limit::LimitedDecoder::new(A::decoder(), max_out as u64);
-    let mut rdr = compcol::io::DecoderReader::new(src, dec);
+    use compcol::{Decoder, Status};
+    let mut dec = compcol::limit::LimitedDecoder::new(A::decoder(), max_out as u64);
     let mut out = Vec::new();
-    rdr.read_to_end(&mut out)
-        .map_err(|e| crate::Error::InvalidImage(format!("{} decode failed: {e}", A::NAME)))?;
+    let mut scratch = vec![0u8; 64 * 1024];
+    let mut consumed = 0usize;
+    loop {
+        let (p, status) = dec
+            .decode(&src[consumed..], &mut scratch)
+            .map_err(|e| crate::Error::InvalidImage(format!("{} decode failed: {e}", A::NAME)))?;
+        out.extend_from_slice(&scratch[..p.written]);
+        consumed += p.consumed;
+        match status {
+            Status::StreamEnd => return Ok(out),
+            Status::OutputFull => continue,
+            Status::InputEmpty => break,
+        }
+    }
+    loop {
+        let (p, status) = dec
+            .finish(&mut scratch)
+            .map_err(|e| crate::Error::InvalidImage(format!("{} decode failed: {e}", A::NAME)))?;
+        out.extend_from_slice(&scratch[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+        if p.written == 0 {
+            return Err(crate::Error::InvalidImage(format!(
+                "{} decode failed: truncated stream",
+                A::NAME
+            )));
+        }
+    }
     Ok(out)
 }
 
@@ -713,6 +744,25 @@ mod tests {
         let enc = compress(Algo::Gzip, &plain).unwrap();
         let dec = decompress(Algo::Gzip, &enc, 1 << 16).unwrap();
         assert_eq!(dec, plain);
+    }
+
+    /// Zlib (SquashFS gzip id-1, DMG/decmpfs) block round-trip, including
+    /// the small-and-very-compressible case decoded with an *exact* output
+    /// cap — the shape that surfaced the compcol `io::DecoderReader`
+    /// end-of-input bug (#17) and is now handled by the manual decode loop.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn zlib_block_round_trip() {
+        for plain in [
+            b"hello hfsplus decmpfs world!".repeat(8),
+            (0u8..=255).cycle().take(8192).collect(),
+            Vec::new(),
+        ] {
+            let enc = compress(Algo::Zlib, &plain).unwrap();
+            // Exact cap (max_out == output length) is the tight case.
+            let dec = decompress(Algo::Zlib, &enc, plain.len()).unwrap();
+            assert_eq!(dec, plain, "zlib round-trip mismatch (len {})", plain.len());
+        }
     }
 
     #[cfg(feature = "lz4")]

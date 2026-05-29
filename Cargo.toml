@@ -26,10 +26,11 @@ path = "src/bin/fstool/main.rs"
 # Archive backends (zip / cpio / ar) are always compiled — they add no new
 # dependencies (zip's DEFLATE rides the `gzip` feature; cpio/ar need no
 # codec). The remaining detection-only scaffolds (7z / rar / arc / lha /
-# lzx / sit) are likewise always present; when a pure-Rust decoder is wired
-# for one, it gains its own optional dependency behind a per-format feature
-# here, matching the codec pattern above. `cab` is the first such reader.
-default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
+# sit) are likewise always present; when a pure-Rust decoder is wired for
+# one, it gains its own optional dependency behind a per-format feature
+# here, matching the codec pattern above. `cab` and `amiga-lzx` are such
+# readers.
+default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
 # gzip/zlib/deflate/xz/zstd/lz4/lzo are served by `compcol` (uniform codec
 # crate); the `gzip` feature also covers zip DEFLATE, DMG zlib, and HFS+
 # decmpfs. lz4 uses compcol's raw block (SquashFS) + canonical frame (tar);
@@ -43,6 +44,8 @@ lz4 = ["dep:compcol", "compcol/lz4"]
 # Microsoft Cabinet (.cab) reader: Store/MSZIP/LZX/Quantum folders decode
 # via compcol. Read-only.
 cab = ["dep:compcol", "compcol/deflate", "compcol/lzx", "compcol/quantum"]
+# Amiga LZX (.lzx) reader: Store + LZX (compcol amiga_lzx) groups. Read-only.
+amiga-lzx = ["dep:compcol", "compcol/amiga_lzx"]
 zstd = ["dep:compcol", "compcol/zstd"]
 lzo = ["dep:compcol", "compcol/lzo"]
 # DMG chunk codecs beyond the always-available zero / raw / zlib / ADC set,

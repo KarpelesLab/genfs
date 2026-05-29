@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(lzx)* Amiga LZX (`.lzx`) read-only reader behind the `amiga-lzx` feature
+  — parses the `LZX` info header + 31-byte entry headers + merged file groups
+  and streams files out of their group (Store, and LZX mode 2 via
+  `compcol::amiga_lzx`). Container validated against the reference `unlzx`
+  extractor (committed fixture); creation unsupported.
 - *(cab)* Microsoft Cabinet (`.cab`) read-only reader behind the `cab`
   feature — parses CFHEADER/CFFOLDER/CFFILE/CFDATA and extracts Store / MSZIP
   (incl. multi-block via `reset_keep_window`) / LZX / Quantum folders via

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8](https://github.com/KarpelesLab/fstool/compare/v0.4.7...v0.4.8) - 2026-05-29
+
+### Added
+
+- *(compression)* move lzma to compcol; drop lzma-rs (sole codec backend)
+- *(lzx)* Amiga LZX (.lzx) read-only reader via compcol
+- *(dmg)* decode bzip2 + LZFSE chunks via compcol; drop bzip2-rs
+- *(compression)* move lz4 + lzo to compcol; drop lz4_flex + minilzo-rs
+- *(cab)* multi-block MSZIP via compcol 0.4.3 preset dictionary
+- *(cab)* read-only Microsoft Cabinet reader via compcol
+- *(compression)* retire flate2 — zip/DMG/HFS+ zlib+deflate on compcol
+- *(compression)* route gzip/zlib/xz/zstd through compcol
+- *(ext4)* arbitrary-depth extent tree writes (rw + streaming)
+- *(apfs)* accept hashed-key (case-insensitive) volumes for mutation
+- *(apfs)* apfs_drec_name_len_and_hash + DrecKeyLayout in build_drec_record
+- *(cli)* fstool shell --ro for safe read-only browsing
+- *(apfs)* refuse Apfs::open_writable on case-insensitive volumes
+- *(apfs)* wire Filesystem::truncate + override list_xattrs
+- *(apfs)* thread mtime through create_*_at + Filesystem create paths
+- *(apfs)* wire CLI mutators through Apfs::open_writable
+- *(apfs)* ring-buffer the xp_desc area so checkpoints don't exhaust
+- *(apfs)* wire Filesystem trait through Write-state mutators
+- *(apfs)* Write-state create_file_at / create_dir_at / create_symlink_at + xattr setters
+
+### Fixed
+
+- *(cli)* refuse compressed sources for mutators; refuse streaming FS for shell
+- *(apfs)* drop redundant drop(cx) flagged by clippy
+
+### Other
+
+- bump compcol to 0.4.4
+- *(cab)* stream folder extraction instead of buffering whole folder
+- *(fuzz)* make fuzz core deterministic — BTreeMap instead of HashMap
+- *(apfs)* macOS-gated fsck_apfs on hashed-key open_writable creates
+- *(apfs)* macOS-gated fsck_apfs run on open_writable create flow
+- *(apfs)* fold commit_checkpoint into commit_with_mutator
+- *(apfs)* introduce MutatorCx, generalise commit_with_mutator closure
+- *(apfs)* extract record builders to pub(crate) free functions
+
 ### Added
 
 - *(lzx)* Amiga LZX (`.lzx`) read-only reader behind the `amiga-lzx` feature

@@ -45,6 +45,62 @@ fn decode_handles_positive_clusters_per_mft_record() {
 }
 
 #[test]
+fn decode_rejects_negative_mft_record_shift_overflow() {
+    // clusters_per_mft_record = -127 would make `1 << 127` — must be rejected
+    // rather than panicking on shift overflow.
+    let buf = fake_boot(512, 8, 4, -127);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_negative_index_record_shift_overflow() {
+    let mut buf = fake_boot(512, 8, 4, -10);
+    buf[0x44] = (-127i8) as u8; // clusters_per_index_record
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_zero_bytes_per_sector() {
+    let buf = fake_boot(0, 8, 4, -10);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_non_power_of_two_bytes_per_sector() {
+    let buf = fake_boot(513, 8, 4, -10);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_oversized_bytes_per_sector() {
+    let buf = fake_boot(8192, 8, 4, -10);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_zero_sectors_per_cluster() {
+    let buf = fake_boot(512, 0, 4, -10);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_non_power_of_two_sectors_per_cluster() {
+    let buf = fake_boot(512, 3, 4, -10);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_oversized_positive_mft_record() {
+    // clusters_per_mft_record = 127 with a 4 KiB cluster → ~508 KiB which is
+    // within range, but with sectors_per_cluster pushing cluster_size up the
+    // resulting record exceeds 1 MiB. Use a positive value that overflows the
+    // record-size cap: 127 clusters * 4096 = 520192 (< 1 MiB, accepted), so
+    // use a larger cluster to exceed it.
+    let buf = fake_boot(4096, 8, 4, 64); // cluster 32 KiB * 64 = 2 MiB record
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
 fn decode_rejects_wrong_oem() {
     let mut buf = fake_boot(512, 8, 4, -10);
     buf[3..11].copy_from_slice(b"EXFAT   ");

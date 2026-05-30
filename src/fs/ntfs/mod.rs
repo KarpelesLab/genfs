@@ -95,6 +95,39 @@ pub const MFT_RECORD_UPCASE: u64 = 10;
 /// against malformed images.
 const MAX_SECURITY_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 
+/// Absolute ceiling on any single heap allocation sized from an untrusted
+/// on-disk field, independent of device size. Caps pathological values on
+/// huge backing devices (e.g. a 4 GiB `real_size` on a 1 TiB image).
+const MAX_UNTRUSTED_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// Validate that an allocation size derived from an untrusted on-disk field
+/// is plausible before we hand it to `Vec::with_capacity` / `vec![0; n]`.
+/// `want` is rejected if it exceeds either the device size or an absolute
+/// ceiling. Returns `want` as a `usize` on success.
+fn checked_alloc_len(want: u64, total: u64, what: &str) -> Result<usize> {
+    if want > total || want > MAX_UNTRUSTED_ALLOC {
+        return Err(crate::Error::InvalidImage(format!(
+            "ntfs: {what} size {want} exceeds device/allocation bounds"
+        )));
+    }
+    usize::try_from(want)
+        .map_err(|_| crate::Error::InvalidImage(format!("ntfs: {what} size {want} too large")))
+}
+
+/// Validate an attribute's `compression_unit` exponent and return the number
+/// of clusters per compression unit (`1 << compression_unit`). Real NTFS uses
+/// 4 (16-cluster units); we accept up to 16 and reject anything larger so the
+/// `1 << compression_unit` shift cannot overflow.
+fn validate_compression_unit(compression_unit: u8) -> Result<u64> {
+    if compression_unit > 16 {
+        return Err(crate::Error::InvalidImage(format!(
+            "ntfs: implausible compression_unit {compression_unit}"
+        )));
+    }
+    1u64.checked_shl(u32::from(compression_unit))
+        .ok_or_else(|| crate::Error::InvalidImage("ntfs: compression_unit shift overflow".into()))
+}
+
 pub fn probe(dev: &mut dyn BlockDevice) -> Result<bool> {
     if dev.total_size() < 11 {
         return Ok(false);
@@ -135,8 +168,30 @@ impl Ntfs {
         let mut buf = [0u8; 512];
         dev.read_at(0, &mut buf)?;
         let boot = BootSector::decode(&buf).ok_or_else(|| {
-            crate::Error::InvalidImage("ntfs: boot sector OEM ID is not 'NTFS    '".into())
+            crate::Error::InvalidImage(
+                "ntfs: boot sector OEM ID is not 'NTFS    ' or geometry is invalid".into(),
+            )
         })?;
+        // Geometry passed `decode`'s self-consistency checks; now bound the
+        // derived sizes against the actual device so a valid-but-hostile BPB
+        // cannot force allocations larger than the image can possibly hold.
+        let total = dev.total_size();
+        let cluster_size = u64::from(boot.cluster_size());
+        if cluster_size > total {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: cluster size exceeds device size".into(),
+            ));
+        }
+        // The MFT's first record must lie within the device.
+        let mft_byte = boot
+            .mft_lcn
+            .checked_mul(cluster_size)
+            .ok_or_else(|| crate::Error::InvalidImage("ntfs: $MFT LCN offset overflow".into()))?;
+        if mft_byte >= total {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: $MFT LCN points past end of device".into(),
+            ));
+        }
         Ok(Self {
             boot,
             mft_runs: Vec::new(),
@@ -195,7 +250,13 @@ impl Ntfs {
         // Bootstrap: read record 0 from the BPB-anchored MFT LCN. From
         // record 0 we extract $MFT's $DATA run list and cache it.
         if self.mft_runs.is_empty() {
-            let base = self.boot.mft_lcn * u64::from(self.boot.cluster_size());
+            let base = self
+                .boot
+                .mft_lcn
+                .checked_mul(u64::from(self.boot.cluster_size()))
+                .ok_or_else(|| {
+                    crate::Error::InvalidImage("ntfs: $MFT LCN offset overflow".into())
+                })?;
             // Record 0 is at the very start of the MFT — its index times
             // record_size is zero, so the read offset is just `base`.
             dev.read_at(base, out)?;
@@ -238,12 +299,24 @@ impl Ntfs {
         let mut vcn_bytes: u64 = 0;
         let mut found = false;
         for ext in &self.mft_runs {
-            let ext_bytes = ext.length * cluster_size;
-            if mft_byte_offset < vcn_bytes + ext_bytes {
+            let ext_bytes = ext.length.checked_mul(cluster_size).ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: MFT extent span overflow".into())
+            })?;
+            let vcn_end = vcn_bytes.checked_add(ext_bytes).ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: MFT run-list offset overflow".into())
+            })?;
+            if mft_byte_offset < vcn_end {
                 let local = mft_byte_offset - vcn_bytes;
                 match ext.lcn {
                     Some(lcn) => {
-                        let phys = lcn * cluster_size + local;
+                        let phys = lcn
+                            .checked_mul(cluster_size)
+                            .and_then(|b| b.checked_add(local))
+                            .ok_or_else(|| {
+                                crate::Error::InvalidImage(
+                                    "ntfs: MFT record byte offset overflow".into(),
+                                )
+                            })?;
                         dev.read_at(phys, out)?;
                     }
                     None => {
@@ -255,7 +328,7 @@ impl Ntfs {
                 found = true;
                 break;
             }
-            vcn_bytes += ext_bytes;
+            vcn_bytes = vcn_end;
         }
         if !found {
             return Err(crate::Error::InvalidImage(format!(
@@ -298,6 +371,7 @@ impl Ntfs {
                     // Non-resident $ATTRIBUTE_LIST: stream it cluster by
                     // cluster through a dedicated reader. This is uncommon
                     // (the list rarely overflows a record) but legal.
+                    let cap = checked_alloc_len(real_size, dev.total_size(), "$ATTRIBUTE_LIST")?;
                     let mut reader = NonResidentReader {
                         dev: &mut *dev,
                         cluster_size: self.boot.cluster_size() as u64,
@@ -309,7 +383,7 @@ impl Ntfs {
                         cached_vcn: u64::MAX,
                         cached_cluster_filled: false,
                     };
-                    let mut buf = Vec::with_capacity(real_size as usize);
+                    let mut buf = Vec::with_capacity(cap);
                     reader.read_to_end(&mut buf).map_err(crate::Error::from)?;
                     alist_bytes = Some(buf);
                 }
@@ -464,17 +538,33 @@ impl Ntfs {
             ));
         }
         let cluster_size = u64::from(self.boot.cluster_size());
-        let target_bytes = vcn * cluster_size;
+        let block_len = checked_alloc_len(block_size as u64, dev.total_size(), "index block")?;
+        let target_bytes = vcn.checked_mul(cluster_size).ok_or_else(|| {
+            crate::Error::InvalidImage("ntfs: index VCN byte offset overflow".into())
+        })?;
         let mut walked: u64 = 0;
-        let mut block_buf = vec![0u8; block_size];
+        let mut block_buf = vec![0u8; block_len];
         let mut found_offset: Option<u64> = None;
         for ext in alloc_runs {
-            let span = ext.length * cluster_size;
-            if target_bytes < walked + span {
+            let span = ext.length.checked_mul(cluster_size).ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: index extent span overflow".into())
+            })?;
+            let walked_end = walked.checked_add(span).ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: index run-list offset overflow".into())
+            })?;
+            if target_bytes < walked_end {
                 let local = target_bytes - walked;
                 match ext.lcn {
                     Some(lcn) => {
-                        found_offset = Some(lcn * cluster_size + local);
+                        found_offset = Some(
+                            lcn.checked_mul(cluster_size)
+                                .and_then(|b| b.checked_add(local))
+                                .ok_or_else(|| {
+                                    crate::Error::InvalidImage(
+                                        "ntfs: index LCN byte offset overflow".into(),
+                                    )
+                                })?,
+                        );
                     }
                     None => {
                         return Err(crate::Error::InvalidImage(
@@ -484,7 +574,7 @@ impl Ntfs {
                 }
                 break;
             }
-            walked += span;
+            walked = walked_end;
         }
         let phys = found_offset.ok_or_else(|| {
             crate::Error::InvalidImage(format!("ntfs: index VCN {vcn} not in run list"))
@@ -705,7 +795,12 @@ impl Ntfs {
 
         let cluster_size = self.boot.cluster_size() as u64;
         if is_compressed && compression_unit > 0 {
-            let cu_clusters = 1u64 << compression_unit;
+            let cu_clusters = validate_compression_unit(compression_unit)?;
+            // Bound the decode buffers (2 * cu_size) against the device.
+            let cu_size = cluster_size.checked_mul(cu_clusters).ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: compression-unit size overflow".into())
+            })?;
+            checked_alloc_len(cu_size, dev.total_size(), "compression unit")?;
             return Ok(Box::new(CompressedReader::new(
                 dev,
                 cluster_size,
@@ -827,7 +922,11 @@ impl Ntfs {
         }
         let cluster_size = self.boot.cluster_size() as u64;
         if is_compressed && compression_unit > 0 {
-            let cu_clusters = 1u64 << compression_unit;
+            let cu_clusters = validate_compression_unit(compression_unit)?;
+            let cu_size = cluster_size.checked_mul(cu_clusters).ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: compression-unit size overflow".into())
+            })?;
+            checked_alloc_len(cu_size, dev.total_size(), "compression unit")?;
             return Ok(NtfsSeekableReader::Compressed(CompressedReader::new(
                 dev,
                 cluster_size,
@@ -1123,8 +1222,15 @@ impl Ntfs {
         let entries_start = root_hdr.header_offset + root_hdr.first_entry_offset as usize;
         let entries_len = (root_hdr.bytes_in_use as usize).saturating_sub(16);
         let mut cache = HashMap::new();
-        let entry_buf = &root_value
-            [entries_start..entries_start + entries_len.min(root_value.len() - entries_start)];
+        // Guard the slice: a malicious $SII root can set first_entry_offset
+        // past the end of the resident value. Mirror index::walk_index_node.
+        if entries_start > root_value.len() {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: $SII root entries start past end of value".into(),
+            ));
+        }
+        let avail = root_value.len() - entries_start;
+        let entry_buf = &root_value[entries_start..entries_start + entries_len.min(avail)];
         for e in secure::walk_sii_node(entry_buf)? {
             cache.insert(e.security_id, (e.sds_offset, e.sds_size));
         }
@@ -1135,18 +1241,29 @@ impl Ntfs {
             && index_block_size > 0
         {
             let cluster_size = u64::from(self.boot.cluster_size());
-            let block_size = index_block_size as usize;
+            // Bound the per-block allocation against the device. This walk is
+            // best-effort (caller falls back to an empty cache), so an
+            // oversized block size aborts the walk rather than erroring.
+            let block_size =
+                checked_alloc_len(u64::from(index_block_size), dev.total_size(), "$SII block")?;
             let mut visited = std::collections::HashSet::<u64>::new();
             // Iterate every block in the run list rather than tree-
             // descending — $SII isn't deep in practice and a flat
             // scan keeps the cache builder simple.
             let mut walked: u64 = 0;
             for ext in &runs {
-                let span = ext.length * cluster_size;
+                let Some(span) = ext.length.checked_mul(cluster_size) else {
+                    break;
+                };
                 if let Some(lcn) = ext.lcn {
                     let mut local: u64 = 0;
                     while local < span {
-                        let phys = lcn * cluster_size + local;
+                        let Some(phys) = lcn
+                            .checked_mul(cluster_size)
+                            .and_then(|b| b.checked_add(local))
+                        else {
+                            break;
+                        };
                         if visited.insert(phys) {
                             let mut blk = vec![0u8; block_size];
                             if dev.read_at(phys, &mut blk).is_ok()
@@ -1169,7 +1286,7 @@ impl Ntfs {
                         local += block_size as u64;
                     }
                 }
-                walked += span;
+                walked = walked.saturating_add(span);
             }
             let _ = walked;
         }
@@ -1234,11 +1351,21 @@ impl<'a> NonResidentReader<'a> {
     fn map_vcn(&self, vcn: u64) -> std::io::Result<Option<u64>> {
         let mut walked: u64 = 0;
         for ext in &self.runs {
-            if vcn < walked + ext.length {
+            let walked_end = walked
+                .checked_add(ext.length)
+                .ok_or_else(|| std::io::Error::other("ntfs: run-list VCN length overflow"))?;
+            if vcn < walked_end {
                 let local = vcn - walked;
-                return Ok(ext.lcn.map(|lcn| (lcn + local) * self.cluster_size));
+                return match ext.lcn {
+                    Some(lcn) => lcn
+                        .checked_add(local)
+                        .and_then(|c| c.checked_mul(self.cluster_size))
+                        .map(Some)
+                        .ok_or_else(|| std::io::Error::other("ntfs: VCN byte offset overflow")),
+                    None => Ok(None),
+                };
             }
-            walked += ext.length;
+            walked = walked_end;
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -1375,11 +1502,21 @@ impl<'a> CompressedReader<'a> {
     fn map_vcn(&self, vcn: u64) -> std::io::Result<Option<u64>> {
         let mut walked: u64 = 0;
         for ext in &self.runs {
-            if vcn < walked + ext.length {
+            let walked_end = walked
+                .checked_add(ext.length)
+                .ok_or_else(|| std::io::Error::other("ntfs: run-list VCN length overflow"))?;
+            if vcn < walked_end {
                 let local = vcn - walked;
-                return Ok(ext.lcn.map(|lcn| (lcn + local) * self.cluster_size));
+                return match ext.lcn {
+                    Some(lcn) => lcn
+                        .checked_add(local)
+                        .and_then(|c| c.checked_mul(self.cluster_size))
+                        .map(Some)
+                        .ok_or_else(|| std::io::Error::other("ntfs: VCN byte offset overflow")),
+                    None => Ok(None),
+                };
             }
-            walked += ext.length;
+            walked = walked_end;
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,

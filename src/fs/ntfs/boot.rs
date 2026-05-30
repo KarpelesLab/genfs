@@ -30,6 +30,18 @@ pub struct BootSector {
     pub volume_serial: u64,
 }
 
+/// Largest cluster size we accept (bytes). Real NTFS tops out at 2 MiB
+/// clusters; we use that as the ceiling for `bytes_per_sector *
+/// sectors_per_cluster` so a malicious BPB cannot drive multi-MiB-per-cluster
+/// allocations.
+pub(crate) const MAX_CLUSTER_SIZE: u32 = 2 * 1024 * 1024;
+
+/// Minimum / maximum MFT and index record sizes (bytes). NTFS records are
+/// almost always 1024 bytes; we allow the full 256 B .. 1 MiB range that the
+/// on-disk encoding can express and reject anything outside it.
+pub(crate) const MIN_RECORD_SIZE: u32 = 256;
+pub(crate) const MAX_RECORD_SIZE: u32 = 1024 * 1024;
+
 impl BootSector {
     pub fn decode(buf: &[u8]) -> Option<Self> {
         if buf.len() < 80 || &buf[3..11] != NTFS_OEM {
@@ -43,6 +55,37 @@ impl BootSector {
         let clusters_per_mft_record = buf[0x40] as i8;
         let clusters_per_index_record = buf[0x44] as i8;
         let volume_serial = u64::from_le_bytes(buf[0x48..0x50].try_into().ok()?);
+
+        // Validate geometry up front so every downstream consumer (cluster /
+        // record sizing, divide-by, shifts) operates on sane values. A
+        // malicious image can put anything here, so reject rather than panic.
+        //
+        // `bytes_per_sector`: power of two in 256..=4096.
+        if !(256..=4096).contains(&bytes_per_sector) || !bytes_per_sector.is_power_of_two() {
+            return None;
+        }
+        // `sectors_per_cluster`: power of two >= 1. (Values >= 0x80 encode
+        // huge clusters via 2^(256-value) on real NTFS, but we keep the
+        // simple linear interpretation and bound the product below.)
+        if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
+            return None;
+        }
+        // Resulting cluster size must not overflow u32 and must stay within a
+        // sane ceiling.
+        let cluster_size =
+            u32::from(bytes_per_sector).checked_mul(u32::from(sectors_per_cluster))?;
+        if cluster_size > MAX_CLUSTER_SIZE {
+            return None;
+        }
+        // MFT / index record sizes must resolve to a sane byte range.
+        let mft_rec = Self::record_size(clusters_per_mft_record, cluster_size)?;
+        let idx_rec = Self::record_size(clusters_per_index_record, cluster_size)?;
+        if !(MIN_RECORD_SIZE..=MAX_RECORD_SIZE).contains(&mft_rec)
+            || !(MIN_RECORD_SIZE..=MAX_RECORD_SIZE).contains(&idx_rec)
+        {
+            return None;
+        }
+
         Some(Self {
             bytes_per_sector,
             sectors_per_cluster,
@@ -59,25 +102,27 @@ impl BootSector {
     /// `clusters_per_mft_record * cluster_size` (positive) or
     /// `1 << -value` bytes (negative; the canonical 1024-byte case).
     pub fn mft_record_size(&self) -> u32 {
-        Self::record_size(
-            self.clusters_per_mft_record,
-            u32::from(self.bytes_per_sector) * u32::from(self.sectors_per_cluster),
-        )
+        // Geometry is validated in `decode`, so this always resolves.
+        Self::record_size(self.clusters_per_mft_record, self.cluster_size())
+            .expect("mft_record_size validated in BootSector::decode")
     }
 
     /// Resolve the index record size in bytes from the BPB field.
     pub fn index_record_size(&self) -> u32 {
-        Self::record_size(
-            self.clusters_per_index_record,
-            u32::from(self.bytes_per_sector) * u32::from(self.sectors_per_cluster),
-        )
+        Self::record_size(self.clusters_per_index_record, self.cluster_size())
+            .expect("index_record_size validated in BootSector::decode")
     }
 
-    fn record_size(field: i8, cluster_size: u32) -> u32 {
+    /// Compute a record size in bytes from a `clusters_per_*_record` field.
+    /// Returns `None` on arithmetic overflow (negative field shifting past
+    /// 31, or positive field times `cluster_size` overflowing u32).
+    fn record_size(field: i8, cluster_size: u32) -> Option<u32> {
         if field >= 0 {
-            (field as u32) * cluster_size
+            (field as u32).checked_mul(cluster_size)
         } else {
-            1u32 << (-(field as i32))
+            // Negative field: record_size = 1 << -field. `-field` is in
+            // 1..=128; `checked_shl` rejects shifts >= 32.
+            1u32.checked_shl((-(field as i32)) as u32)
         }
     }
 

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Hardened every untrusted-input parser against malicious images/archives
+  following a full multi-section security audit. All issues were
+  denial-of-service class (panic / OOM / hang) reachable from the read path;
+  no memory-safety or arbitrary-write bugs were found (the lone `unsafe`
+  ioctl blocks were reviewed and are sound, and archive extraction is
+  image-namespaced, never host-FS). Fixes, by area:
+  - **Bounded structure traversal** (was: infinite loop / stack overflow):
+    cycle/depth guards on the ext4 extent-tree descent, XFS bmbt, HFS+ and
+    APFS B-tree descents + leaf-chains, and the `repack`/`analyze` source
+    directory walk (visited-inode set + depth/entry caps).
+  - **Capped untrusted-size allocations** (was: OOM): ext GDT, NTFS
+    `$DATA`/index/compression buffers, XFS remote symlinks, HFS+ decmpfs,
+    exFAT NoFatChain + FAT tables, FAT32 FAT, SquashFS block lists, ISO9660
+    Rock Ridge `CE`, tar PAX/GNU-longname bodies, ZIP64 central directory,
+    cpio name/file sizes, GPT entry array, RAR5 window, qcow2 L1/refcount —
+    each now bounded against the device/file size before allocating.
+  - **Validated geometry / checked arithmetic** (was: divide-by-zero,
+    shift-overflow, integer-overflow→OOB panics): ext, NTFS, XFS, F2FS
+    superblock/boot fields; GPT entry sizing; encrypted-DMG salt/IV length
+    fields; NTFS/DMG/GPT/cpio/ar offset math.
+  - **Reachable OOB-slice panics fixed**: GRF entry decode, GPT entries with
+    `entry_size < 128`, NTFS `$Secure:$SII`, encrypted-DMG salt/IV.
+  - Defense-in-depth: tar/`repack` path normalisation now drops `..`
+    segments. Each fix returns a clean `InvalidImage`/`Unsupported` instead
+    of crashing/hanging; ~30 regression tests were added.
+
 ### Changed
 
 - *(dmg)* encrypted-DMG (`encrcdsa` v2) crypto now runs on the pure-Rust

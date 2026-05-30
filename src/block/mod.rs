@@ -28,6 +28,7 @@ use std::io::{Read, Seek, Write};
 use crate::Result;
 
 pub mod crash_inject;
+pub mod diskcopy;
 pub mod dmg;
 pub mod file;
 pub mod memory;
@@ -35,6 +36,7 @@ pub mod qcow2;
 pub mod sliced;
 
 pub use crash_inject::{CrashInject, FailAfter};
+pub use diskcopy::DiskCopy42Backend;
 pub use dmg::DmgBackend;
 pub use file::FileBackend;
 pub use memory::MemoryBackend;
@@ -61,6 +63,12 @@ pub fn open_image(path: &Path) -> crate::Result<Box<dyn BlockDevice>> {
         Ok(Box::new(Qcow2Backend::open(path)?))
     } else if dmg::probe(path)? {
         Ok(Box::new(DmgBackend::open(path)?))
+    } else if diskcopy::probe(path)? {
+        // DiskCopy 4.2 wraps a raw volume; expose its data fork so detection
+        // sees the inner filesystem (classic HFS / MFS) transparently.
+        Ok(Box::new(DiskCopy42Backend::new(Box::new(
+            FileBackend::open(path)?,
+        ))?))
     } else {
         Ok(Box::new(FileBackend::open(path)?))
     }
@@ -98,6 +106,11 @@ pub fn open_image_read_only(path: &Path) -> crate::Result<Box<dyn BlockDevice>> 
         // DmgBackend has no write surface to gate — it's already
         // read-only by construction.
         Ok(Box::new(DmgBackend::open(path)?))
+    } else if diskcopy::probe(path)? {
+        // Read-only container by construction (writes are rejected).
+        Ok(Box::new(DiskCopy42Backend::new(Box::new(
+            FileBackend::open_read_only(path)?,
+        ))?))
     } else {
         Ok(Box::new(FileBackend::open_read_only(path)?))
     }

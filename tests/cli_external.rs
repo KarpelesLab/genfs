@@ -1616,3 +1616,63 @@ fn cli_shell_ro_browses_immutable_and_keeps_image_bytes() {
         "shell w/o --ro on tar.gz should still fail"
     );
 }
+
+/// `ls -R` walks a nested tree, prints a `path:` header per directory, and
+/// crucially terminates — never recursing into the `.`/`..` self/parent links
+/// that ext (and a `tar c .`) surface. Regression guard against the
+/// self-referential infinite recursion that an unguarded walker hits.
+#[test]
+fn cli_ls_recursive_walks_tree_and_terminates() {
+    let bin = FSTOOL;
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("a/b/c")).unwrap();
+    std::fs::create_dir_all(src.path().join("d")).unwrap();
+    std::fs::write(src.path().join("top.txt"), b"hi\n").unwrap();
+    std::fs::write(src.path().join("a/f1"), b"x\n").unwrap();
+    std::fs::write(src.path().join("a/b/f2"), b"y\n").unwrap();
+    std::fs::write(src.path().join("a/b/c/f3"), b"z\n").unwrap();
+    std::fs::write(src.path().join("d/f4"), b"w\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(bin)
+        .arg("create")
+        .arg("-t")
+        .arg("ext4")
+        .arg(src.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create -t ext4 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(bin)
+        .arg("ls")
+        .arg("-R")
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ls -R failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+
+    // A header per directory, at every depth.
+    for header in ["/:", "/a:", "/a/b:", "/a/b/c:", "/d:"] {
+        assert!(s.contains(header), "missing {header} header in:\n{s}");
+    }
+    // Every leaf file is listed somewhere.
+    for f in ["top.txt", "f1", "f2", "f3", "f4"] {
+        assert!(s.contains(f), "missing file {f} in:\n{s}");
+    }
+    // The `.` / `..` links are never descended (would emit a `/.:` header).
+    assert!(!s.contains("/.:"), "recursed into '.':\n{s}");
+    assert!(!s.contains("/..:"), "recursed into '..':\n{s}");
+}

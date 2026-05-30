@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(cli)* `fstool ls -R` / `--recursive` — walk subdirectories, printing each
+  directory under a `path:` header (like `ls -R`). Works on both block-device
+  images and streamed `.tar.<algo>` archives; never descends the `.`/`..`
+  self/parent links.
+- *(shell)* the interactive `fstool shell` now has **line editing and command
+  history** on a TTY (↑/↓ to recall, Ctrl-A/E, Ctrl-R reverse search) via
+  `rustyline`, with history persisted to `~/.fstool_history`. Behind the
+  default-on `readline` feature; piped/non-TTY input keeps the deterministic
+  line-buffered reader, and `default-features = false` drops the dependency.
 - *(hfs)* classic **HFS** (Hierarchical File System, Mac OS ≤ 8) read-only
   reader — parses the Master Directory Block at offset 1024 (`BD` signature),
   loads the catalog + extents-overflow B-trees into memory (512-byte nodes,

@@ -99,6 +99,10 @@ enum Command {
         /// Path inside the image to list. Defaults to `/`.
         #[arg(value_name = "PATH", default_value = "/")]
         path: String,
+        /// Recurse into subdirectories (like `ls -R`): each directory is
+        /// printed under a `path:` header.
+        #[arg(short = 'R', long)]
+        recursive: bool,
     },
 
     /// Print the contents of a regular file from inside an image to stdout.
@@ -300,7 +304,11 @@ fn run(cli: Cli) -> fstool::Result<()> {
             cluster_size: &cluster_size,
             options: &options,
         }),
-        Command::Ls { image, path } => ls(&image, &path),
+        Command::Ls {
+            image,
+            path,
+            recursive,
+        } => ls(&image, &path, recursive),
         Command::Cat { image, path } => cat(&image, &path),
         Command::Info { image } => info(&image),
         Command::Analyze {
@@ -1688,16 +1696,34 @@ fn ls_tar_stream(
     image: &str,
     path: &str,
     algo: Option<fstool::compression::Algo>,
+    recursive: bool,
 ) -> fstool::Result<()> {
-    use fstool::fs::tar::EntryKind as TarKind;
     let index = open_tar_stream_index(image, algo)?;
     let want = normalise_tar_path(path);
+    let mut out = std::io::stdout().lock();
+    if recursive {
+        ls_tar_recursive(&index, &want, &mut out)?;
+    } else {
+        let children = tar_children(&index, &want);
+        if children.is_empty() && want != "/" {
+            tar_require_dir(&index, &want)?;
+        }
+        for e in &children {
+            let _ = writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name);
+        }
+    }
+    Ok(())
+}
+
+/// The entries living directly under `want` in a tar stream index, deduped by
+/// leaf name (the tar may carry both an explicit dir entry and its members).
+fn tar_children(index: &fstool::fs::tar::TarStreamIndex, want: &str) -> Vec<fstool::fs::DirEntry> {
+    use fstool::fs::tar::EntryKind as TarKind;
     let mut children: Vec<fstool::fs::DirEntry> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (idx, ix) in index.entries().iter().enumerate() {
         let p = &ix.entry.path;
-        let parent = parent_of_tar_path(p);
-        if parent != want {
+        if parent_of_tar_path(p) != want {
             continue;
         }
         let leaf = leaf_of_tar_path(p);
@@ -1724,21 +1750,53 @@ fn ls_tar_stream(
             size,
         });
     }
-    if children.is_empty() && want != "/" {
-        let exists_as_dir = index.entries().iter().any(|ix| ix.entry.path == want);
-        let has_descendants = index.entries().iter().any(|ix| {
-            let p = &ix.entry.path;
-            p.starts_with(&want) && p.len() > want.len() && p.as_bytes()[want.len()] == b'/'
-        });
-        if !exists_as_dir && !has_descendants {
-            return Err(fstool::Error::InvalidArgument(format!(
-                "tar: no such directory {want:?}"
-            )));
-        }
+    children
+}
+
+/// Error unless `want` exists as a directory (or has descendants) in the index.
+fn tar_require_dir(index: &fstool::fs::tar::TarStreamIndex, want: &str) -> fstool::Result<()> {
+    let exists_as_dir = index.entries().iter().any(|ix| ix.entry.path == want);
+    let has_descendants = index.entries().iter().any(|ix| {
+        let p = &ix.entry.path;
+        p.starts_with(want) && p.len() > want.len() && p.as_bytes()[want.len()] == b'/'
+    });
+    if !exists_as_dir && !has_descendants {
+        return Err(fstool::Error::InvalidArgument(format!(
+            "tar: no such directory {want:?}"
+        )));
     }
-    let mut out = std::io::stdout().lock();
+    Ok(())
+}
+
+/// Recursive (`ls -R`) walk of a tar stream index: print `want` under a header,
+/// then descend into each subdirectory in listing order.
+fn ls_tar_recursive(
+    index: &fstool::fs::tar::TarStreamIndex,
+    want: &str,
+    out: &mut impl std::io::Write,
+) -> fstool::Result<()> {
+    if want != "/" {
+        tar_require_dir(index, want)?;
+    }
+    let children = tar_children(index, want);
+    writeln!(out, "{want}:")?;
     for e in &children {
-        let _ = writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name);
+        writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name)?;
+    }
+    writeln!(out)?;
+    for e in &children {
+        if e.kind == fstool::fs::EntryKind::Dir && is_descendable(&e.name) {
+            let child = if want == "/" {
+                format!("/{}", e.name)
+            } else {
+                format!("{want}/{}", e.name)
+            };
+            // A tar built from `.` carries a root self-entry whose parent is
+            // also `/`; never recurse back into the directory we're listing.
+            if child != want {
+                ls_tar_recursive(index, &child, out)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1882,9 +1940,7 @@ fn shell_cmd(image: &str, ro: bool) -> fstool::Result<()> {
         return fstool::inspect::with_target_device_read_only(&target, |dev| {
             let fs = fstool::inspect::AnyFs::open(dev)?;
             let mut sh = shell::Shell::new_read_only(fs);
-            let stdin = std::io::stdin();
-            let stdout = std::io::stdout();
-            sh.run(dev, stdin.lock(), stdout.lock())?;
+            run_shell(&mut sh, dev)?;
             // No dev.sync() — read-only.
             Ok(())
         });
@@ -1918,12 +1974,30 @@ fn shell_cmd(image: &str, ro: bool) -> fstool::Result<()> {
             )));
         }
         let mut sh = shell::Shell::new(fs);
-        let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
-        sh.run(dev, stdin.lock(), stdout.lock())?;
+        run_shell(&mut sh, dev)?;
         dev.sync()?;
         Ok(())
     })
+}
+
+/// Drive a [`shell::Shell`] to completion. On an interactive TTY (and with the
+/// `readline` feature on) this uses `rustyline` for line editing + history;
+/// otherwise — piped stdin, or the feature disabled — it falls back to the
+/// plain line-buffered reader so scripted input stays deterministic.
+fn run_shell(
+    sh: &mut shell::Shell,
+    dev: &mut dyn fstool::block::BlockDevice,
+) -> fstool::Result<()> {
+    #[cfg(feature = "readline")]
+    {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            return sh.run_interactive(dev);
+        }
+    }
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    sh.run(dev, stdin.lock(), stdout.lock())
 }
 
 fn rm(image: &str, fs_path: &str) -> fstool::Result<()> {
@@ -2555,22 +2629,72 @@ fn require_force_for_device(
     Ok(())
 }
 
-fn ls(image: &str, path: &str) -> fstool::Result<()> {
+fn ls(image: &str, path: &str, recursive: bool) -> fstool::Result<()> {
     // Compressed-tar archives stream-walk per invocation; bypass the
     // tempfile-spooling BlockDevice path entirely.
     if let Some(algo) = tar_input_codec(image) {
-        return ls_tar_stream(image, path, Some(algo));
+        return ls_tar_stream(image, path, Some(algo), recursive);
     }
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
-        let entries = fs.list(dev, path)?;
         let mut out = std::io::stdout().lock();
-        for e in &entries {
-            let _ = writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name);
+        if recursive {
+            ls_recursive(&mut fs, dev, path, &mut out)?;
+        } else {
+            let entries = fs.list(dev, path)?;
+            for e in &entries {
+                let _ = writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name);
+            }
         }
         Ok(())
     })
+}
+
+/// Depth-first `ls -R` over an opened filesystem: print the directory under a
+/// `path:` header, then recurse into each child directory in listing order.
+/// Only `EntryKind::Dir` children are descended (symlinks are never followed,
+/// so there are no loops to guard against); `.`/`..` are skipped defensively.
+fn ls_recursive(
+    fs: &mut fstool::inspect::AnyFs,
+    dev: &mut dyn fstool::block::BlockDevice,
+    dir: &str,
+    out: &mut impl std::io::Write,
+) -> fstool::Result<()> {
+    let entries = fs.list(dev, dir)?;
+    writeln!(out, "{dir}:")?;
+    for e in &entries {
+        writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name)?;
+    }
+    writeln!(out)?;
+    for e in &entries {
+        if e.kind == fstool::fs::EntryKind::Dir && is_descendable(&e.name) {
+            let child = join_image_path(dir, &e.name);
+            // Guard against a directory that lists itself as a child (some
+            // containers carry a `.`/`/` self-entry) — that would recurse
+            // forever.
+            if child != dir {
+                ls_recursive(fs, dev, &child, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a child entry name is a real subdirectory worth descending into:
+/// not empty, not the `.`/`..` self/parent links.
+fn is_descendable(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".."
+}
+
+/// Join an image-internal directory path with a child name, normalising the
+/// slash so the root (`/`) doesn't produce a doubled `//`.
+fn join_image_path(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
 }
 
 fn cat(image: &str, path: &str) -> fstool::Result<()> {

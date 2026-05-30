@@ -89,11 +89,11 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 | `create`      | Build a bare image of any supported FS (`-t ext4` / `fat32` / `xfs` / `hfs+` / `ntfs` / `f2fs` / `squashfs` / `iso` / `apfs` / `exfat` / `grf` / `zip` / `cpio` / `ar`) from a host directory tree. FS-specific knobs go through `-O key=val,key=val`. |
 | `build`       | Build from a TOML spec — bare FS or a partitioned disk image.           |
 | `info`        | Print partition table (whole-disk) or FS summary + root listing.        |
-| `ls`          | List a directory inside an image.                                       |
+| `ls`          | List a directory inside an image; `-R` walks subdirectories recursively. |
 | `cat`         | Stream a file's bytes out of an image to stdout.                        |
 | `add`         | Copy a host file / tree into an existing image (any mutable FS).        |
 | `rm`          | Unlink a file, symlink, device, or empty directory.                     |
-| `shell`       | SFTP-style REPL — `ls cd pwd cat put rm mkdir info`.                    |
+| `shell`       | SFTP-style REPL — `ls cd pwd cat put rm mkdir info`. On a TTY it has line editing + ↑/↓ command history (rustyline). |
 | `convert`     | Byte-level raw ↔ qcow2 conversion with optional grow.                   |
 | `repack`      | Walk one or more source FSes, merge bottom→top with whiteouts, rebuild into a fresh image. |
 

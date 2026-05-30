@@ -31,7 +31,12 @@ path = "src/bin/fstool/main.rs"
 # per-format feature (`cab`, `amiga-lzx`, `lha`, `arc`, `sit`, `sevenz`,
 # `rar`); each enables only the compcol codecs it can use today and returns a
 # clean `Unsupported` for methods whose codec hasn't landed in compcol yet.
-default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
+default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted", "readline"]
+# Line editing + command history for the interactive `fstool shell` (↑/↓
+# history, Ctrl-A/E, etc.) via `rustyline`. On by default; disable it
+# (`default-features = false`) to drop the dependency — the shell then falls
+# back to a plain line-buffered reader. No effect on piped/non-TTY input.
+readline = ["dep:rustyline"]
 # Every codec is served by `compcol` (one uniform crate): gzip/zlib/deflate/
 # xz/lzma/zstd/lz4/lzo, plus the CAB + Amiga-LZX archive codecs and the DMG
 # bzip2/lzfse decoders. The `gzip` feature also covers zip DEFLATE, DMG zlib,
@@ -120,6 +125,10 @@ tempfile = "3"
 # /lz4/lzo plus the CAB codecs. `std` is always on (for the `io` Read/Write
 # adapters); per-algorithm features are added by fstool's feature flags.
 compcol = { version = "0.4", optional = true, default-features = false, features = ["std"] }
+
+# Line editing + persistent history for the interactive shell. Optional, behind
+# the `readline` feature; the bin enables it by default. Pure-Rust line editor.
+rustyline = { version = "15", optional = true }
 
 # Encrypted DMG (encrcdsa v2) crypto — `purecrypto`, a pure-Rust no_std
 # toolkit (KarpelesLab, MIT). Opt-in via the `dmg-encrypted` feature; we

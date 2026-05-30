@@ -104,6 +104,56 @@ impl Shell {
         Ok(())
     }
 
+    /// Interactive REPL with line editing and command history (↑/↓ to recall
+    /// previous commands, Ctrl-A/E, Ctrl-R search, …) via `rustyline`. Used
+    /// when stdin is a TTY; piped input still flows through [`Shell::run`],
+    /// which keeps the deterministic, testable line-buffered path.
+    ///
+    /// History persists to `~/.fstool_history` between sessions. `Ctrl-C`
+    /// abandons the current line and re-prompts; `Ctrl-D` at an empty prompt
+    /// exits, matching a typical Unix shell.
+    #[cfg(feature = "readline")]
+    pub fn run_interactive(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        use rustyline::error::ReadlineError;
+
+        let mut rl = rustyline::DefaultEditor::new()
+            .map_err(|e| fstool::Error::Io(std::io::Error::other(e.to_string())))?;
+        let history = history_path();
+        if let Some(path) = history.as_ref() {
+            // A missing history file on first run is fine.
+            let _ = rl.load_history(path);
+        }
+
+        let mut output = std::io::stdout().lock();
+        loop {
+            let prompt = format!("fstool:{}> ", self.cwd);
+            match rl.readline(&prompt) {
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    let _ = rl.add_history_entry(trimmed);
+                    match self.dispatch(dev, trimmed, &mut output) {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(e) => writeln!(output, "error: {e}")?,
+                    }
+                }
+                // Ctrl-C: drop the half-typed line and re-prompt.
+                Err(ReadlineError::Interrupted) => continue,
+                // Ctrl-D at the prompt: exit the shell.
+                Err(ReadlineError::Eof) => break,
+                Err(e) => return Err(fstool::Error::Io(std::io::Error::other(e.to_string()))),
+            }
+        }
+
+        if let Some(path) = history.as_ref() {
+            let _ = rl.save_history(path);
+        }
+        Ok(())
+    }
+
     /// Dispatch one command line. Returns `Ok(true)` if the shell should
     /// exit (`quit` / `exit`), `Ok(false)` to continue, or an `Err` for
     /// the loop to print and recover from.
@@ -433,6 +483,16 @@ quit | exit         leave{ro_note}\n"
         };
         normalize_path(&combined)
     }
+}
+
+/// Where the interactive shell persists its command history. `~/.fstool_history`
+/// on Unix (via `$HOME`), `%USERPROFILE%\.fstool_history` on Windows. Returns
+/// `None` when neither home variable is set, in which case history is
+/// session-only.
+#[cfg(feature = "readline")]
+fn history_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(std::path::Path::new(&home).join(".fstool_history"))
 }
 
 fn split_cmd(line: &str) -> (&str, &str) {

@@ -298,8 +298,20 @@ where
 {
     let (fixed_klen, _fixed_kv) = read_root_kv_sizes(fsroot_block);
     let mut cur: Vec<u8> = fsroot_block.to_vec();
-    loop {
+    // APFS B-tree levels strictly decrease root→leaf. Bound the descent so a
+    // malicious image with a cyclic/corrupted fs-tree errors out instead of
+    // looping forever.
+    let mut prev_level: Option<u16> = None;
+    for _ in 0..=MAX_BTREE_DEPTH {
         let node = BTreeNode::decode(&cur)?;
+        if let Some(pl) = prev_level
+            && node.level >= pl
+        {
+            return Err(crate::Error::InvalidImage(
+                "apfs: fs-tree btree level did not strictly decrease on descent".into(),
+            ));
+        }
+        prev_level = Some(node.level);
         if node.is_leaf() {
             return scan_leaf_for_exact(&node, fixed_klen, target);
         }
@@ -308,7 +320,15 @@ where
         let paddr = ctx.resolve_vid(child_vid, read_block)?;
         cur = ctx.fetch_fs_block(paddr, read_block)?;
     }
+    Err(crate::Error::InvalidImage(
+        "apfs: fs-tree btree descent exceeded maximum depth".into(),
+    ))
 }
+
+/// Hard cap on B-tree descent depth, mirroring the omap guard. A valid
+/// fs-tree is never anywhere near this deep; the cap defends against a
+/// malicious image whose nodes never reach a leaf.
+const MAX_BTREE_DEPTH: usize = 64;
 
 /// A range-scan iterator over fs-tree leaf records whose key shares an
 /// `(oid, kind)` prefix with the start target. Owns its descent stack
@@ -344,8 +364,25 @@ impl RangeScan {
         let (fixed_klen, _) = read_root_kv_sizes(fsroot_block);
         let mut stack: Vec<(Vec<u8>, u32)> = Vec::new();
         let mut cur = fsroot_block.to_vec();
+        // Bound the initial descent: levels must strictly decrease and the
+        // depth is capped, so a malicious cyclic tree errors instead of
+        // looping / growing the stack without bound.
+        let mut prev_level: Option<u16> = None;
         loop {
+            if stack.len() > MAX_BTREE_DEPTH {
+                return Err(crate::Error::InvalidImage(
+                    "apfs: fs-tree range scan descent exceeded maximum depth".into(),
+                ));
+            }
             let node = BTreeNode::decode(&cur)?;
+            if let Some(pl) = prev_level
+                && node.level >= pl
+            {
+                return Err(crate::Error::InvalidImage(
+                    "apfs: fs-tree btree level did not strictly decrease on descent".into(),
+                ));
+            }
+            prev_level = Some(node.level);
             if node.is_leaf() {
                 // Find first key ≥ start.
                 let mut first = node.nkeys;
@@ -457,8 +494,23 @@ impl RangeScan {
             let paddr = ctx.resolve_vid(child_vid, read_block)?;
             let mut child = ctx.fetch_fs_block(paddr, read_block)?;
             // Push the child and keep descending if it's still internal.
+            // Bound the descent: levels must strictly decrease below the
+            // parent and the stack depth is capped, so a malicious cyclic
+            // tree errors instead of looping / growing the stack forever.
+            let mut prev_level = parent.level;
             loop {
+                if self.stack.len() > MAX_BTREE_DEPTH {
+                    return Err(crate::Error::InvalidImage(
+                        "apfs: fs-tree range scan descent exceeded maximum depth".into(),
+                    ));
+                }
                 let cn = BTreeNode::decode(&child)?;
+                if cn.level >= prev_level {
+                    return Err(crate::Error::InvalidImage(
+                        "apfs: fs-tree btree level did not strictly decrease on descent".into(),
+                    ));
+                }
+                prev_level = cn.level;
                 if cn.is_leaf() {
                     self.stack.push((child, 0));
                     return Ok(());

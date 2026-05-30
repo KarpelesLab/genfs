@@ -187,11 +187,23 @@ where
     }
 
     // Descend by re-binding to an owned child block each iteration.
+    // APFS B-tree levels strictly decrease from root to leaf, so we bound
+    // the descent by the root's level (capped) and require each step to
+    // strictly decrease `node.level`. This turns a corrupted/cyclic tree
+    // from a malicious image into a clean error instead of an infinite loop.
+    let max_depth = (root.level as usize).min(MAX_BTREE_DEPTH);
+    let mut prev_level = root.level;
     let child_idx = find_child_for_key(&root, klen, &target)?;
     let (_, mut child_paddr) = root.child_entry_at(child_idx, klen)?;
     let mut cur = fetch_block(child_paddr, block_size, read_block, cache)?;
-    loop {
+    for _ in 0..=max_depth {
         let node = BTreeNode::decode(&cur)?;
+        if node.level >= prev_level {
+            return Err(crate::Error::InvalidImage(
+                "apfs: omap btree level did not strictly decrease on descent".into(),
+            ));
+        }
+        prev_level = node.level;
         if node.is_leaf() {
             return scan_leaf_for_best(&node, klen, target_oid, target_xid);
         }
@@ -202,7 +214,15 @@ where
         // `node` borrow since `cur` is rebound).
         cur = fetch_block(child_paddr, block_size, read_block, cache)?;
     }
+    Err(crate::Error::InvalidImage(
+        "apfs: omap btree descent exceeded maximum depth".into(),
+    ))
 }
+
+/// Hard cap on B-tree descent depth. APFS levels are `u16`, but a valid
+/// tree is never anywhere near this deep; the cap defends against a
+/// malicious image whose root advertises an absurd `btn_level`.
+const MAX_BTREE_DEPTH: usize = 64;
 
 /// Locate the child of an internal omap node whose subtree may contain
 /// `target`. Per the spec, internal keys are the *first* key in their
@@ -456,6 +476,37 @@ mod tests {
         // Missing oid: descends to the appropriate leaf, finds nothing.
         let v = lookup_with_cache(&root, 7, 10, &mut read, &mut cache).unwrap();
         assert!(v.is_none());
+    }
+
+    /// A malicious omap whose internal node points to a same-level
+    /// (cyclic) child must yield a clean `InvalidImage` error rather than
+    /// looping forever. The root is level 1; its child at paddr 10 is
+    /// another level-1 internal node, so the strictly-decreasing guard
+    /// fires immediately.
+    #[test]
+    fn lookup_rejects_non_decreasing_levels() {
+        let block_size = 512usize;
+        // Non-root internal node (level 1) whose own child points to
+        // paddr 10 — i.e. back to itself.
+        let cyclic_child = build_internal_omap_node(block_size, &[(5, 0, 10)], false);
+
+        // Internal root (level 1) whose only child is paddr 10.
+        let root = build_internal_omap_node(block_size, &[(5, 0, 10)], true);
+
+        let mut device: std::collections::HashMap<u64, Vec<u8>> = Default::default();
+        device.insert(10, cyclic_child);
+
+        let mut read = |paddr: u64, buf: &mut [u8]| -> crate::Result<()> {
+            let b = device
+                .get(&paddr)
+                .ok_or_else(|| crate::Error::InvalidImage(format!("no block at {paddr}")))?;
+            buf.copy_from_slice(b);
+            Ok(())
+        };
+        let mut cache = NodeCache::new(NodeCache::DEFAULT_CAP);
+
+        let err = lookup_with_cache(&root, 5, 5, &mut read, &mut cache);
+        assert!(matches!(err, Err(crate::Error::InvalidImage(_))));
     }
 
     #[test]

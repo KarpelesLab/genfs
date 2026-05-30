@@ -2665,7 +2665,10 @@ fn read_spaceman_high_water(dev: &mut dyn BlockDevice, ctx: &ContainerCtx) -> Op
     }
     let main_block_count = u64::from_le_bytes(block[48..56].try_into().ok()?);
     let main_free_count = u64::from_le_bytes(block[72..80].try_into().ok()?);
-    Some(main_block_count - main_free_count)
+    // A malicious image can set main_free_count > main_block_count; fall back
+    // to the conservative `total_blocks / 2` default (signalled by `None`)
+    // rather than panicking on subtraction overflow.
+    main_block_count.checked_sub(main_free_count)
 }
 
 /// Walk the checkpoint descriptor area looking for an NXSB whose xid is

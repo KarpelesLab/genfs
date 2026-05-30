@@ -68,30 +68,22 @@ impl L1L2 {
         let l2_entries = (cluster_size / 8) as usize;
 
         // `l1_size` is attacker-controlled; `l1_size * 8` is allocated up front
-        // before any bounds-checked read. Cap it before allocating. A valid L1
-        // table never needs more entries than are required to map the image's
-        // virtual `size` (each entry covers `l2_entries * cluster_size` bytes),
-        // and the table bytes must fit within the file.
-        let bytes_per_l1_entry =
-            (l2_entries as u64)
-                .checked_mul(cluster_size)
-                .ok_or_else(|| {
-                    crate::Error::InvalidImage("qcow2: l2_entries * cluster_size overflows".into())
-                })?;
-        let max_l1_entries = header.size.div_ceil(bytes_per_l1_entry.max(1));
-        if header.l1_size as u64 > max_l1_entries {
-            return Err(crate::Error::InvalidImage(format!(
-                "qcow2: l1_size {} exceeds {max_l1_entries} entries needed to map size {}",
-                header.l1_size, header.size
-            )));
-        }
-        let l1_bytes = header.l1_size as usize * 8;
+        // before any bounds-checked read. The L1 table must physically fit
+        // within the file, so bounding its byte size against the file length
+        // caps the allocation (a small malicious image cannot force a large
+        // reservation). We deliberately do NOT require `l1_size` to equal the
+        // minimum entries needed to map the virtual size — valid images
+        // (including our own writer) legitimately over-provision the L1 table.
+        let l1_bytes = (header.l1_size as u64)
+            .checked_mul(8)
+            .ok_or_else(|| crate::Error::InvalidImage("qcow2: l1_size * 8 overflows".into()))?;
         let file_len = file.seek(SeekFrom::End(0))?;
-        if l1_bytes as u64 > file_len {
+        if l1_bytes > file_len {
             return Err(crate::Error::InvalidImage(format!(
                 "qcow2: L1 table ({l1_bytes} bytes) exceeds file length {file_len}"
             )));
         }
+        let l1_bytes = l1_bytes as usize;
         file.seek(SeekFrom::Start(header.l1_table_offset))?;
         let mut raw = vec![0u8; l1_bytes];
         file.read_exact(&mut raw)?;

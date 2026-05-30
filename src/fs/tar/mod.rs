@@ -170,11 +170,14 @@ impl Tar {
             }
             let h = Header::decode(&block)?;
             let data_off = pos + BLOCK_SIZE as u64;
-            let size_padded = (h.size + 511) & !511;
+            // `h.size` is attacker-controlled; pad with a saturating add so a
+            // near-u64::MAX size can't wrap to a tiny value and desync the
+            // scan. (Such an entry won't fit `total` and is skipped anyway.)
+            let size_padded = h.size.saturating_add(511) & !511;
             match h.typeflag {
                 header::TYPEFLAG_PAX => {
                     // Read the PAX body.
-                    let body = read_exact_at(dev, data_off, h.size as usize)?;
+                    let body = read_meta_body_at(dev, data_off, h.size, "PAX header")?;
                     pending.merge(pax::decode_records(&body)?);
                     pos = data_off + size_padded;
                     continue;
@@ -185,13 +188,13 @@ impl Tar {
                     continue;
                 }
                 header::TYPEFLAG_GNU_LONGNAME => {
-                    let body = read_exact_at(dev, data_off, h.size as usize)?;
+                    let body = read_meta_body_at(dev, data_off, h.size, "GNU long name")?;
                     pending.path = Some(trim_nul(body));
                     pos = data_off + size_padded;
                     continue;
                 }
                 header::TYPEFLAG_GNU_LONGLINK => {
-                    let body = read_exact_at(dev, data_off, h.size as usize)?;
+                    let body = read_meta_body_at(dev, data_off, h.size, "GNU long link")?;
                     pending.linkpath = Some(trim_nul(body));
                     pos = data_off + size_padded;
                     continue;
@@ -244,7 +247,7 @@ impl Tar {
 
             pos = data_off
                 + if matches!(kind, EntryKind::Regular) {
-                    (size + 511) & !511
+                    size.saturating_add(511) & !511
                 } else {
                     0
                 };
@@ -680,17 +683,51 @@ fn read_exact_at(dev: &mut dyn BlockDevice, offset: u64, len: usize) -> Result<V
     Ok(buf)
 }
 
+/// Read a metadata entry body (PAX / GNU long name / long link) at a fixed
+/// offset, rejecting an attacker-inflated `size` before allocating. These
+/// bodies are bounded by [`header::MAX_META_BODY`].
+fn read_meta_body_at(
+    dev: &mut dyn BlockDevice,
+    offset: u64,
+    size: u64,
+    what: &str,
+) -> Result<Vec<u8>> {
+    if size > header::MAX_META_BODY as u64 {
+        return Err(crate::Error::InvalidImage(format!(
+            "tar: {what} body size {size} exceeds {} byte cap",
+            header::MAX_META_BODY
+        )));
+    }
+    read_exact_at(dev, offset, size as usize)
+}
+
 /// Normalise a path to start with `/` and not end with `/` (root is `/`).
+///
+/// `.` segments are dropped and `..` segments are resolved (or, at the
+/// root, discarded) so a malicious member path such as `../../etc/passwd`
+/// can't escape the archive root when the index is later consulted.
 pub(crate) fn normalise_path(p: &str) -> String {
-    let trimmed = p.trim_end_matches('/');
-    if trimmed.is_empty() {
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                // Pop the last real segment; at the root there's nothing
+                // to pop, so the `..` is simply discarded (can't escape).
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    if stack.is_empty() {
         return "/".into();
     }
-    if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{trimmed}")
+    let mut out = String::new();
+    for seg in stack {
+        out.push('/');
+        out.push_str(seg);
     }
+    out
 }
 
 /// Streaming reader over one regular-file entry. Reads through the
@@ -1113,6 +1150,16 @@ impl<W: std::io::Write> TarSink for TarStreamWriter<W> {
 mod tests {
     use super::*;
     use crate::block::MemoryBackend;
+
+    #[test]
+    fn normalise_path_drops_dotdot_and_dot() {
+        // `..` must never let a member path escape the archive root.
+        assert_eq!(normalise_path("../../etc/passwd"), "/etc/passwd");
+        assert_eq!(normalise_path("a/../b"), "/b");
+        assert_eq!(normalise_path("./a/./b/"), "/a/b");
+        assert_eq!(normalise_path("/a/b/../../.."), "/");
+        assert_eq!(normalise_path(".."), "/");
+    }
 
     #[test]
     fn round_trip_minimal_archive() {

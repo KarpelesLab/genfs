@@ -370,22 +370,22 @@ impl<R: Read> TarStreamReader<R> {
             let size_padded = ((h.size + 511) & !511) as usize - h.size as usize;
             match h.typeflag {
                 header::TYPEFLAG_PAX => {
-                    let body = self.read_exact_padded(h.size as usize)?;
+                    let body = self.read_meta_body(h.size, "PAX header")?;
                     self.pending.merge(pax::decode_records(&body)?);
                     continue;
                 }
                 header::TYPEFLAG_PAX_GLOBAL => {
                     // Global headers are ignored; consume the body + padding.
-                    let _ = self.read_exact_padded(h.size as usize)?;
+                    let _ = self.read_meta_body(h.size, "PAX global header")?;
                     continue;
                 }
                 header::TYPEFLAG_GNU_LONGNAME => {
-                    let body = self.read_exact_padded(h.size as usize)?;
+                    let body = self.read_meta_body(h.size, "GNU long name")?;
                     self.pending.path = Some(trim_nul(body));
                     continue;
                 }
                 header::TYPEFLAG_GNU_LONGLINK => {
-                    let body = self.read_exact_padded(h.size as usize)?;
+                    let body = self.read_meta_body(h.size, "GNU long link")?;
                     self.pending.linkpath = Some(trim_nul(body));
                     continue;
                 }
@@ -482,6 +482,19 @@ impl<R: Read> TarStreamReader<R> {
             }
         }
         Ok(true)
+    }
+
+    /// Read a metadata entry body (PAX / GNU long name / long link),
+    /// rejecting an attacker-inflated `size` before allocating. These
+    /// bodies are bounded by [`header::MAX_META_BODY`].
+    fn read_meta_body(&mut self, size: u64, what: &str) -> Result<Vec<u8>> {
+        if size > header::MAX_META_BODY as u64 {
+            return Err(crate::Error::InvalidImage(format!(
+                "tar: {what} body size {size} exceeds {} byte cap",
+                header::MAX_META_BODY
+            )));
+        }
+        self.read_exact_padded(size as usize)
     }
 
     /// Read exactly `len` bytes from the inner stream and then discard

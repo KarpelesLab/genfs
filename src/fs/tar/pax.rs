@@ -83,6 +83,16 @@ pub fn decode_records(body: &[u8]) -> Result<Vec<Record>> {
         let len: usize = len_str
             .parse()
             .map_err(|_| crate::Error::InvalidImage(format!("tar: bad PAX length {len_str:?}")))?;
+        // The record length spans its own digits, the space, the
+        // `key=value` payload, and a trailing newline. It must therefore
+        // be strictly larger than the `digits + space` prefix (so `pos`
+        // makes progress) and at least 3 bytes overall. A `len` of 0 would
+        // both underflow `pos + len - 1` below and loop forever.
+        if len < 3 || len <= space + 1 {
+            return Err(crate::Error::InvalidImage(format!(
+                "tar: PAX record length {len} too small"
+            )));
+        }
         if pos + len > body.len() {
             return Err(crate::Error::InvalidImage(
                 "tar: PAX record length runs past end".into(),
@@ -231,6 +241,21 @@ mod tests {
         // Splittable: 50 chars + "/" + 50 chars → 101 total, splits at index 50
         let p = format!("{}/{}", "a".repeat(50), "b".repeat(50));
         assert!(path_fits_ustar(&p));
+    }
+
+    #[test]
+    fn rejects_zero_length_record() {
+        // A record claiming length 0 used to underflow `pos + len - 1` and
+        // never advance — turn it into a clean InvalidImage instead.
+        let err = decode_records(b"0 k=v\n").unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
+    }
+
+    #[test]
+    fn rejects_record_length_smaller_than_prefix() {
+        // Length that doesn't even cover the digits+space prefix.
+        let err = decode_records(b"2 k=v\n").unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
     }
 
     #[test]

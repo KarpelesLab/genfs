@@ -45,7 +45,15 @@ pub fn parse_system_use(dev: &mut dyn BlockDevice, sua: &[u8]) -> Option<RockRid
     let mut symlink = String::new();
     let mut had_any = false;
 
-    parse_block(sua, dev, &mut attrs, &mut name, &mut symlink, &mut had_any);
+    parse_block(
+        sua,
+        dev,
+        &mut attrs,
+        &mut name,
+        &mut symlink,
+        &mut had_any,
+        0,
+    );
 
     if !had_any {
         return None;
@@ -99,8 +107,15 @@ pub fn root_has_rr(dev: &mut dyn BlockDevice, pvd: &PrimaryVolumeDescriptor) -> 
     Ok(false)
 }
 
+/// Maximum number of `CE` continuation areas we will follow for a single
+/// directory record. A malicious image can otherwise chain (or cycle) `CE`
+/// entries to drive unbounded recursion and disk reads.
+const MAX_CE_DEPTH: usize = 8;
+
 /// Walk a contiguous SUA block, mutating the accumulator in place.
 /// `CE` entries recursively follow into a continuation area on disk.
+/// `depth` counts how many `CE` continuations we have already followed and
+/// is bounded by [`MAX_CE_DEPTH`].
 fn parse_block(
     sua: &[u8],
     dev: &mut dyn BlockDevice,
@@ -108,6 +123,7 @@ fn parse_block(
     name_acc: &mut String,
     symlink_acc: &mut String,
     any: &mut bool,
+    depth: usize,
 ) {
     let mut i = 0;
     while i + 4 <= sua.len() {
@@ -175,14 +191,31 @@ fn parse_block(
                 *any = true;
             }
             b"CE" if body.len() >= 24 => {
+                // Bound recursion / disk reads: stop following continuation
+                // areas once we have already chased MAX_CE_DEPTH of them.
+                // This also breaks any CE cycle a malicious image builds.
+                if depth >= MAX_CE_DEPTH {
+                    break;
+                }
                 let ce_lba = super::vd::decode_both_endian_u32(&body[0..8], "CE.lba").ok();
                 let ce_off = super::vd::decode_both_endian_u32(&body[8..16], "CE.offset").ok();
                 let ce_len = super::vd::decode_both_endian_u32(&body[16..24], "CE.len").ok();
                 if let (Some(lba), Some(off), Some(clen)) = (ce_lba, ce_off, ce_len) {
-                    let mut buf = vec![0u8; clen as usize];
-                    let abs = u64::from(lba) * u64::from(SECTOR_SIZE) + u64::from(off);
-                    if dev.read_at(abs, &mut buf).is_ok() {
-                        parse_block(&buf, dev, attrs, name_acc, symlink_acc, any);
+                    // The continuation area lives within one logical sector;
+                    // a SUA cannot span sectors. Reject any (offset, length)
+                    // that would read past a single sector — this caps the
+                    // attacker-controlled allocation to SECTOR_SIZE.
+                    let off = off as u64;
+                    let clen = clen as u64;
+                    let sector = u64::from(SECTOR_SIZE);
+                    if clen == 0 || off >= sector || off + clen > sector {
+                        // Out-of-range continuation pointer — ignore it.
+                    } else {
+                        let mut buf = vec![0u8; clen as usize];
+                        let abs = u64::from(lba) * sector + off;
+                        if dev.read_at(abs, &mut buf).is_ok() {
+                            parse_block(&buf, dev, attrs, name_acc, symlink_acc, any, depth + 1);
+                        }
                     }
                 }
             }

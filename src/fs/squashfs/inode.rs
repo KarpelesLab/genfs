@@ -422,6 +422,12 @@ fn full_block_count(file_size: u64, block_size: u64, has_fragment: bool) -> usiz
     }
 }
 
+/// Absolute ceiling on the number of block-size entries a single file
+/// inode may carry, independent of device size. A 1 MiB block holding a
+/// 2^48-byte file needs ~2.7e8 entries, far beyond any real image; this
+/// cap keeps the upfront allocation bounded even on huge backing devices.
+const MAX_BLOCK_SIZE_ENTRIES: usize = 16 * 1024 * 1024;
+
 fn read_block_sizes(
     dev: &mut dyn BlockDevice,
     mr: &mut MetadataReader,
@@ -429,7 +435,20 @@ fn read_block_sizes(
     offset: usize,
     count: usize,
 ) -> Result<(Vec<u32>, u64, usize)> {
-    let need = count * 4;
+    // `count` is derived from the attacker-controlled `file_size`. Each
+    // entry is a 4-byte block size stored in the metadata area, so the
+    // table can never be larger than the device itself. Cap it against
+    // `dev.total_size()` and an absolute ceiling before allocating, using
+    // checked arithmetic for `count * 4`.
+    let dev_cap = (dev.total_size() / 4).min(MAX_BLOCK_SIZE_ENTRIES as u64) as usize;
+    if count > dev_cap {
+        return Err(crate::Error::InvalidImage(format!(
+            "squashfs: file inode block-size count {count} exceeds device-bounded cap {dev_cap}"
+        )));
+    }
+    let need = count.checked_mul(4).ok_or_else(|| {
+        crate::Error::InvalidImage("squashfs: file inode block-size table overflows usize".into())
+    })?;
     let (raw, nb, no) = read_bytes(dev, mr, block_rel, offset, need)?;
     let mut sizes = Vec::with_capacity(count);
     for i in 0..count {

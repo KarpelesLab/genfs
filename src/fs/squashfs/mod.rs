@@ -278,6 +278,22 @@ impl Squashfs {
                 sb.major, sb.minor
             )));
         }
+        // Validate the block size the same way `format` validates its
+        // option: a power of two in [4 KiB, 1 MiB], with `block_log`
+        // consistent with `block_size`. A malicious image can otherwise
+        // drive bogus block geometry through the read path.
+        if !sb.block_size.is_power_of_two() || sb.block_size < 4096 || sb.block_size > 1_048_576 {
+            return Err(crate::Error::InvalidImage(format!(
+                "squashfs: block_size {} must be a power of two between 4 KiB and 1 MiB",
+                sb.block_size
+            )));
+        }
+        if u32::from(sb.block_log) != sb.block_size.trailing_zeros() {
+            return Err(crate::Error::InvalidImage(format!(
+                "squashfs: block_log {} inconsistent with block_size {}",
+                sb.block_log, sb.block_size
+            )));
+        }
         Ok(Self {
             sb,
             id_table: RefCell::new(idtable::IdTable::new()),
@@ -965,6 +981,28 @@ mod tests {
         dev.write_at(0, &fake_sb(4, 6)).unwrap();
         let s = Squashfs::open(&mut dev).unwrap();
         assert_eq!(s.compression(), Compression::Zstd);
+    }
+
+    #[test]
+    fn open_rejects_non_power_of_two_block_size() {
+        // 100_000 is not a power of two — reject before the read path
+        // trusts the geometry.
+        let sb = fake_sb_v4(6, 100_000, 0, 0, 0, u64::MAX, u64::MAX, u64::MAX);
+        let mut dev = MemoryBackend::new(4096);
+        dev.write_at(0, &sb).unwrap();
+        let err = Squashfs::open(&mut dev).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
+    }
+
+    #[test]
+    fn open_rejects_inconsistent_block_log() {
+        // Valid power-of-two block_size but a tampered block_log field.
+        let mut sb = fake_sb_v4(6, 131072, 0, 0, 0, u64::MAX, u64::MAX, u64::MAX);
+        sb[22..24].copy_from_slice(&9u16.to_le_bytes()); // should be 17
+        let mut dev = MemoryBackend::new(4096);
+        dev.write_at(0, &sb).unwrap();
+        let err = Squashfs::open(&mut dev).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
     }
 
     #[test]

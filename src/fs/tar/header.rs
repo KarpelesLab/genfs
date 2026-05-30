@@ -31,6 +31,14 @@ pub const NAME_LEN: usize = 100;
 pub const PREFIX_LEN: usize = 155;
 pub const LINKNAME_LEN: usize = 100;
 
+/// Upper bound on the in-memory body of a *metadata* entry (PAX header,
+/// PAX global header, GNU long name / long link). These describe a single
+/// path, linkpath, or a handful of records — kilobytes in practice. The
+/// header `size` field is attacker-controlled, so cap it before allocating
+/// to avoid OOM from a hostile image. 8 MiB is wildly generous for any
+/// legitimate path/record list.
+pub const MAX_META_BODY: usize = 8 * 1024 * 1024;
+
 pub const TYPEFLAG_REG: u8 = b'0';
 pub const TYPEFLAG_REG_OLD: u8 = b'\0'; // pre-ustar regular
 pub const TYPEFLAG_HARDLINK: u8 = b'1';

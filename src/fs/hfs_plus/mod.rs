@@ -848,7 +848,8 @@ impl HfsPlus {
                         "hfs+: decmpfs xattr stored in a fork that needs overflow extents".into(),
                     ));
                 };
-                let mut buf = vec![0u8; fork.logical_size as usize];
+                let len = cap_alloc(dev, fork.logical_size, "decmpfs xattr fork")?;
+                let mut buf = vec![0u8; len];
                 reader.read(dev, 0, &mut buf)?;
                 buf
             }
@@ -875,7 +876,12 @@ impl HfsPlus {
                 extents::FORK_RESOURCE,
                 "resource",
             )?;
-            let mut rf_bytes = vec![0u8; file.resource_fork.logical_size as usize];
+            let rf_len = cap_alloc(
+                dev,
+                file.resource_fork.logical_size,
+                "decmpfs resource fork",
+            )?;
+            let mut rf_bytes = vec![0u8; rf_len];
             rf_reader.read(dev, 0, &mut rf_bytes)?;
             decmpfs::decompress_resource_fork(
                 header.compression_type,
@@ -946,8 +952,23 @@ impl HfsPlus {
 
         let mut out = Vec::new();
         let node_size = u32::from(self.catalog.header.node_size);
+        let total_nodes = self.catalog.header.total_nodes;
         let mut node_idx = self.catalog.header.first_leaf_node;
+        // Bound the leaf-chain walk by the catalog node count: a malicious
+        // `fLink` cycle would otherwise loop forever.
+        let mut steps_left = total_nodes as usize;
         while node_idx != 0 {
+            if steps_left == 0 {
+                return Err(crate::Error::InvalidImage(
+                    "hfs+: catalog leaf chain exceeded node count (cycle?)".into(),
+                ));
+            }
+            steps_left -= 1;
+            if node_idx >= total_nodes {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: catalog leaf node {node_idx} >= total_nodes {total_nodes}"
+                )));
+            }
             let node = btree::read_node(dev, &self.catalog.fork, node_idx, node_size)?;
             let desc = btree::NodeDescriptor::decode(&node)?;
             if desc.kind != btree::KIND_LEAF {
@@ -1271,6 +1292,24 @@ fn bytes_to_osstr(b: &[u8; 4]) -> String {
 
 fn align2(n: usize) -> usize {
     n + (n & 1)
+}
+
+/// Validate an allocation size derived from an untrusted `logical_size`
+/// against the device's real capacity before we reserve a buffer for it.
+/// A malicious image can claim a multi-gigabyte fork on a tiny device to
+/// trigger an out-of-memory abort; cap the request at `dev.total_size()`
+/// and reject anything larger as `InvalidImage`. Returns the size as a
+/// `usize` suitable for `vec![0u8; n]`.
+fn cap_alloc(dev: &dyn BlockDevice, logical_size: u64, what: &str) -> Result<usize> {
+    let dev_size = dev.total_size();
+    if logical_size > dev_size {
+        return Err(crate::Error::InvalidImage(format!(
+            "hfs+: {what} claims {logical_size} bytes but device is only {dev_size} bytes"
+        )));
+    }
+    usize::try_from(logical_size).map_err(|_| {
+        crate::Error::InvalidImage(format!("hfs+: {what} size {logical_size} exceeds usize"))
+    })
 }
 
 fn split_path(path: &str) -> Vec<&str> {

@@ -169,7 +169,23 @@ impl ExtentsOverflow {
         // first matching record (or precedes it).
         let node_size = u32::from(self.header.node_size);
         let mut node_idx = self.header.root_node;
+        // Bound the descent by tree depth and reject out-of-range child
+        // pointers so a self-referential index node cannot loop forever.
+        let max_descent = self.header.tree_depth.max(1) as usize + 1;
+        let mut descent_left = max_descent;
         let leaf_idx = loop {
+            if descent_left == 0 {
+                return Err(crate::Error::InvalidImage(
+                    "hfs+: extents-overflow B-tree descent exceeded tree depth (cycle?)".into(),
+                ));
+            }
+            descent_left -= 1;
+            if node_idx >= self.header.total_nodes {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: extents-overflow child node {node_idx} >= total_nodes {}",
+                    self.header.total_nodes
+                )));
+            }
             let node = read_node(dev, &self.fork, node_idx, node_size)?;
             let desc = NodeDescriptor::decode(&node)?;
             let offs = record_offsets(&node, desc.num_records)?;
@@ -216,8 +232,24 @@ impl ExtentsOverflow {
         // record whose key matches (fork_type, file_id) with
         // start_block ≥ first_start_block. Stop as soon as we walk past
         // either the file_id or the fork_type boundary.
+        // Bound the forward leaf-chain walk by the node count and require a
+        // strictly-increasing fLink: a malicious image can otherwise build a
+        // leaf-chain cycle that loops forever.
         let mut cur = leaf_idx;
+        let mut steps_left = self.header.total_nodes as usize;
         while cur != 0 {
+            if steps_left == 0 {
+                return Err(crate::Error::InvalidImage(
+                    "hfs+: extents-overflow leaf chain exceeded node count (cycle?)".into(),
+                ));
+            }
+            steps_left -= 1;
+            if cur >= self.header.total_nodes {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: extents-overflow leaf node {cur} >= total_nodes {}",
+                    self.header.total_nodes
+                )));
+            }
             let node = read_node(dev, &self.fork, cur, node_size)?;
             let desc = NodeDescriptor::decode(&node)?;
             if desc.kind != KIND_LEAF {

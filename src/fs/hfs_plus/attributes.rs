@@ -247,7 +247,16 @@ impl Attributes {
         if node_idx == 0 {
             return Ok(None);
         }
-        loop {
+        // Bound the descent by tree depth and reject out-of-range child
+        // pointers: a malicious index record can otherwise loop forever.
+        let max_descent = self.header.tree_depth.max(1) as usize + 1;
+        for _ in 0..max_descent {
+            if node_idx >= self.header.total_nodes {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: attributes child node {node_idx} >= total_nodes {}",
+                    self.header.total_nodes
+                )));
+            }
             let node = read_node(dev, &self.fork, node_idx, node_size)?;
             let desc = NodeDescriptor::decode(&node)?;
             let offs = record_offsets(&node, desc.num_records)?;
@@ -299,6 +308,9 @@ impl Attributes {
                 )));
             }
         }
+        Err(crate::Error::InvalidImage(
+            "hfs+: attributes B-tree descent exceeded tree depth (cycle?)".into(),
+        ))
     }
 }
 

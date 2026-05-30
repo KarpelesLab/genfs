@@ -291,6 +291,17 @@ fn decompress_resource_zlib(rf: &[u8], expected_len: u64) -> Result<Vec<u8>> {
             "hfs+: decmpfs uncompressed size {expected_len} exceeds usize"
         ))
     })?;
+    // Cap the pre-reservation against what the block table can plausibly
+    // produce: each block inflates to at most HFSCOMPRESS_BLOCK_SIZE bytes,
+    // so a header claiming more is malformed. This prevents a 16-byte
+    // header from forcing a multi-gigabyte allocation.
+    let max_plausible = block_count.saturating_mul(HFSCOMPRESS_BLOCK_SIZE);
+    if expected > max_plausible {
+        return Err(crate::Error::InvalidImage(format!(
+            "hfs+: decmpfs uncompressed size {expected} exceeds {block_count} blocks \
+             × {HFSCOMPRESS_BLOCK_SIZE} bytes ({max_plausible})"
+        )));
+    }
     let mut out = Vec::with_capacity(expected);
     for i in 0..block_count {
         let entry_off = table_off + 8 * i;

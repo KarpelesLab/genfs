@@ -481,8 +481,18 @@ impl Catalog {
             return Ok(None);
         }
 
-        // Descend from root to leaf.
-        loop {
+        // Descend from root to leaf. A malicious image can point an index
+        // record's child at the same (or an out-of-range) node, looping
+        // forever; bound the descent by the tree depth and reject any
+        // child pointer past `total_nodes`.
+        let max_descent = self.header.tree_depth.max(1) as usize + 1;
+        for _ in 0..max_descent {
+            if node_idx >= self.header.total_nodes {
+                return Err(crate::Error::InvalidImage(format!(
+                    "hfs+: catalog child node {node_idx} >= total_nodes {}",
+                    self.header.total_nodes
+                )));
+            }
             let node = read_node(dev, &self.fork, node_idx, node_size)?;
             let desc = NodeDescriptor::decode(&node)?;
             let offs = record_offsets(&node, desc.num_records)?;
@@ -539,6 +549,9 @@ impl Catalog {
                 )));
             }
         }
+        Err(crate::Error::InvalidImage(
+            "hfs+: catalog B-tree descent exceeded tree depth (cycle?)".into(),
+        ))
     }
 }
 
@@ -623,5 +636,92 @@ mod tests {
         assert_eq!(key.name.to_string_lossy(), "hi");
         // encoded_len = 2 (length field) + 4 (parentID) + 2 (count) + 4 (chars) = 12 (even).
         assert_eq!(key.encoded_len, 12);
+    }
+
+    /// A crafted index node whose only record points its child pointer
+    /// back at itself must be rejected (cleanly, in bounded time) rather
+    /// than looping forever during descent.
+    #[test]
+    fn lookup_rejects_self_referential_index_node() {
+        use super::super::btree::{KIND_INDEX, NODE_DESCRIPTOR_SIZE};
+        use crate::block::{BlockDevice, MemoryBackend};
+
+        const NODE_SIZE: usize = 512;
+        // Root index node lives at node index 1; it points its child at
+        // itself, forming a one-node cycle.
+        let root_idx: u32 = 1;
+        let total_nodes: u32 = 4;
+
+        // Build the index record: key (parentID=1, empty name) + child ptr.
+        let mut rec: Vec<u8> = Vec::new();
+        rec.extend_from_slice(&4u16.to_be_bytes()); // key_length = parentID(4) + name(0)
+        rec.extend_from_slice(&1u32.to_be_bytes()); // parentID
+        rec.extend_from_slice(&0u16.to_be_bytes()); // name length = 0
+        // key encoded_len = 2 + 4 = 6 (already even); child pointer follows.
+        rec.extend_from_slice(&root_idx.to_be_bytes()); // child -> self
+
+        // Assemble the node buffer with a single index record.
+        let mut node = vec![0u8; NODE_SIZE];
+        node[8] = KIND_INDEX as u8;
+        node[9] = 1; // height
+        node[10..12].copy_from_slice(&1u16.to_be_bytes()); // numRecords = 1
+        let rec_start = NODE_DESCRIPTOR_SIZE;
+        node[rec_start..rec_start + rec.len()].copy_from_slice(&rec);
+        let rec_end = rec_start + rec.len();
+        // Offset table at the end: offset[0] = rec_start, offset[1] = rec_end.
+        node[NODE_SIZE - 2..NODE_SIZE].copy_from_slice(&(rec_start as u16).to_be_bytes());
+        node[NODE_SIZE - 4..NODE_SIZE - 2].copy_from_slice(&(rec_end as u16).to_be_bytes());
+
+        // Place the node at device offset root_idx * NODE_SIZE.
+        let mut dev = MemoryBackend::with_block_size(
+            (total_nodes as u64) * NODE_SIZE as u64,
+            NODE_SIZE as u32,
+        );
+        dev.write_at(root_idx as u64 * NODE_SIZE as u64, &node)
+            .unwrap();
+
+        // One extent covering the whole device; block_size == node_size so
+        // fork offsets map straight to device offsets.
+        let fork = ForkReader {
+            base_offset: 0,
+            block_size: NODE_SIZE as u32,
+            extents: vec![super::super::volume_header::ExtentDescriptor {
+                start_block: 0,
+                block_count: total_nodes,
+            }],
+            logical_size: (total_nodes as u64) * NODE_SIZE as u64,
+        };
+
+        let header = BTreeHeader {
+            tree_depth: 2,
+            root_node: root_idx,
+            leaf_records: 0,
+            first_leaf_node: 0,
+            last_leaf_node: 0,
+            node_size: NODE_SIZE as u16,
+            max_key_length: 0,
+            total_nodes,
+            free_nodes: 0,
+            clump_size: 0,
+            btree_type: 0,
+            key_compare_type: 0,
+            attributes: 0,
+        };
+        let cat = Catalog {
+            fork,
+            header,
+            case_sensitive: false,
+        };
+
+        let wanted = CatalogKey {
+            parent_id: 1,
+            name: UniStr::from_str_lossy("x"),
+            encoded_len: 0,
+        };
+        let err = cat.lookup(&mut dev, &wanted).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidImage(_)),
+            "expected InvalidImage, got {err:?}"
+        );
     }
 }

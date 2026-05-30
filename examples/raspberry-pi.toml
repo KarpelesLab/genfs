@@ -1,0 +1,45 @@
+# Example fstool spec: a Raspberry Pi SD-card image.
+#
+#   fstool build examples/raspberry-pi.toml -o /tmp/rpi.img
+#   fstool info /tmp/rpi.img            # lists the MBR partitions
+#   fstool ls   /tmp/rpi.img:1 /        # the FAT boot partition
+#   fstool ls   /tmp/rpi.img:2 /        # the ext4 root partition
+#
+# The classic Raspberry Pi layout: an MBR disk with a FAT32 *boot* partition
+# (the GPU firmware only reads FAT) followed by an ext4 *root* partition.
+# fstool lays out the partitions and formats both filesystems; populate them
+# from host directories by uncommenting the `source` lines below.
+
+[image]
+# Total card size. Use the smallest real card you target; the root
+# partition grows to fill whatever is left.
+size = "2GiB"
+partition_table = "mbr"
+
+# --- Partition 1: boot (FAT32) -------------------------------------------
+# Holds the firmware (bootcode.bin, start*.elf, fixup*.dat), the kernel
+# (kernel*.img), config.txt and cmdline.txt. MBR type "fat" = 0x0C
+# (W95 FAT32 LBA), which the Pi firmware looks for.
+[[partitions]]
+name = "boot"
+type = "fat"
+size = "256MiB"
+
+[partitions.filesystem]
+type = "fat32"
+volume_label = "boot"
+# source = "./boot"   # firmware + kernel + config.txt + cmdline.txt
+
+# --- Partition 2: root (ext4) --------------------------------------------
+# `size = "remaining"` fills the rest of the card. Must be the last entry.
+[[partitions]]
+name = "root"
+type = "linux"
+size = "remaining"
+
+[partitions.filesystem]
+type = "ext4"
+volume_label = "rootfs"
+# Pre-populate /dev so the system has console/null/zero/tty/… on first boot.
+rootdevs = "standard"
+# source = "./rootfs"   # your root tree (point cmdline.txt root= at /dev/mmcblk0p2)

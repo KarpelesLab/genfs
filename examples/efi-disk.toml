@@ -1,0 +1,46 @@
+# Example fstool spec: a UEFI-bootable GPT disk (also works as a USB stick).
+#
+#   fstool build examples/efi-disk.toml -o /tmp/efi.img
+#   fstool info /tmp/efi.img            # lists the GPT partitions
+#   sgdisk -p /tmp/efi.img             # cross-check with gdisk, optional
+#
+# The modern boot layout: a GPT disk with an EFI System Partition (FAT32)
+# plus an ext4 root. UEFI firmware mounts the ESP and runs the bootloader at
+# /EFI/BOOT/BOOTX64.EFI. Write this image to a USB stick (or use it as a VM
+# disk) and it boots on any UEFI machine — provided the ESP actually contains
+# a bootloader.
+#
+# fstool builds the partition table + filesystems and copies your files in;
+# it does NOT supply or install the bootloader. Put a UEFI application
+# (systemd-boot, GRUB's grubx64.efi, or a unified kernel image) at
+# `EFI/BOOT/BOOTX64.EFI` inside the ESP source tree.
+
+[image]
+size = "4GiB"
+partition_table = "gpt"
+
+# --- Partition 1: EFI System Partition (FAT32) ---------------------------
+# `type = "esp"` sets the standard ESP GPT type GUID
+# (C12A7328-F81F-11D2-BA4B-00A0C93EC93B). 512 MiB is generous; 100–260 MiB
+# is typical.
+[[partitions]]
+name = "EFI System Partition"
+type = "esp"
+size = "512MiB"
+
+[partitions.filesystem]
+type = "fat32"
+volume_label = "ESP"
+# source = "./esp"   # must contain EFI/BOOT/BOOTX64.EFI
+
+# --- Partition 2: root (ext4) --------------------------------------------
+[[partitions]]
+name = "root"
+type = "linux"
+size = "remaining"
+
+[partitions.filesystem]
+type = "ext4"
+volume_label = "rootfs"
+rootdevs = "standard"
+# source = "./rootfs"

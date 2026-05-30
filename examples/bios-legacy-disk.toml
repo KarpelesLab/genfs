@@ -1,0 +1,45 @@
+# Example fstool spec: a legacy-BIOS (MS-DOS / MBR) bootable disk.
+#
+#   fstool build examples/bios-legacy-disk.toml -o /tmp/disk.img
+#   fstool info /tmp/disk.img           # lists the MBR partitions
+#   fdisk -l    /tmp/disk.img          # cross-check, optional
+#
+# The traditional PC layout: an MBR disk with a small ext2 /boot partition
+# and an ext4 root. This is what you'd hand to GRUB or SYSLINUX.
+#
+# Two things fstool does NOT do (run them after building):
+#   * install a bootloader — `grub-install --target=i386-pc` embeds GRUB's
+#     boot code into the MBR and the post-MBR gap (the ~1 MiB before the
+#     first partition, which this layout leaves free), or use `syslinux`.
+#   * set the MBR "active"/boot flag — the bootloader installer sets it; the
+#     build spec has no per-partition bootable flag.
+# fstool lays out the partition table and the ext2/ext4 filesystems.
+
+[image]
+size = "2GiB"
+partition_table = "mbr"
+
+# --- Partition 1: /boot (ext2) -------------------------------------------
+# A small, simple, journalless filesystem for kernels + the bootloader's
+# stage files. ext2 keeps it maximally compatible with old bootloaders.
+[[partitions]]
+name = "boot"
+type = "linux"
+size = "256MiB"
+
+[partitions.filesystem]
+type = "ext2"
+volume_label = "boot"
+# source = "./boot"   # vmlinuz, initrd, grub/ or syslinux/ config
+
+# --- Partition 2: root (ext4) --------------------------------------------
+[[partitions]]
+name = "root"
+type = "linux"
+size = "remaining"
+
+[partitions.filesystem]
+type = "ext4"
+volume_label = "rootfs"
+rootdevs = "standard"
+# source = "./rootfs"

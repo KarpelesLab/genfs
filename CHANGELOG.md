@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that exposes the inner volume (data fork at file offset `0x54`), probed in
   `open_image` after qcow2/dmg so a DiskCopy-wrapped floppy (classic HFS, FAT,
   ISO, …) is detected and read transparently like a raw image.
+- *(part)* **Apple Partition Map** (APM) read-only support — the classic Mac /
+  PowerPC / `.toast` partitioning scheme. Detected via the Driver Descriptor
+  Map (`ER` at block 0) plus the `PM` partition map, surfaced exactly like
+  GPT/MBR: `fstool info disk.toast` lists the `Apple_HFS` / `Apple_Free` /
+  `Apple_partition_map` entries and `disk.toast:N` slices partition *N* (e.g.
+  reading the wrapped classic-HFS volume). Writing an APM is unsupported.
 
 - *(sevenz)* 7-Zip (`.7z`) read-only reader behind the `sevenz` feature —
   parses the full container (32-byte signature header, the optionally
@@ -55,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three header levels); the lh1/4/5/6/7 LZSS+Huffman methods list correctly but
   read as a clean `Unsupported` pending an `lha` codec in `compcol`. Creation
   is unsupported.
+
+### Changed
+
+- *(inspect)* the "no recognised filesystem" error no longer enumerates every
+  supported format — the growing list made the message hard to read. It now
+  reads simply `no recognised filesystem or archive on this image`.
 
 ## [0.4.9](https://github.com/KarpelesLab/fstool/compare/v0.4.8...v0.4.9) - 2026-05-30
 

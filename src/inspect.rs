@@ -33,7 +33,7 @@ use crate::fs::ntfs::Ntfs;
 use crate::fs::squashfs::Squashfs;
 use crate::fs::tar::Tar;
 use crate::fs::xfs::Xfs;
-use crate::part::{Gpt, Mbr, Partition, PartitionTable, slice_partition};
+use crate::part::{Apm, Gpt, Mbr, Partition, PartitionTable, slice_partition};
 
 /// Which filesystem an image carries.
 ///
@@ -242,7 +242,7 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     }
 
     Err(crate::Error::InvalidImage(
-        "inspect: no recognised filesystem (ext2/3/4, FAT32, exFAT, XFS, HFS+, HFS, APFS, tar, NTFS, F2FS, SquashFS, ISO 9660, GRF) or archive (zip, cpio, ar, 7z, rar, arc, lha, lzx, cab, sit) on this image".into(),
+        "inspect: no recognised filesystem or archive on this image".into(),
     ))
 }
 
@@ -1046,6 +1046,7 @@ impl Target {
 pub enum DetectedTable {
     Gpt(Box<Gpt>),
     Mbr(Box<Mbr>),
+    Apm(Box<Apm>),
 }
 
 impl DetectedTable {
@@ -1054,14 +1055,16 @@ impl DetectedTable {
         match self {
             Self::Gpt(g) => g.as_ref(),
             Self::Mbr(m) => m.as_ref(),
+            Self::Apm(a) => a.as_ref(),
         }
     }
 
-    /// Short label for UI ("gpt" / "mbr").
+    /// Short label for UI ("gpt" / "mbr" / "apm").
     pub fn label(&self) -> &'static str {
         match self {
             Self::Gpt(_) => "gpt",
             Self::Mbr(_) => "mbr",
+            Self::Apm(_) => "apm",
         }
     }
 
@@ -1100,6 +1103,13 @@ pub fn detect_partition_table(dev: &mut dyn BlockDevice) -> Result<Option<Detect
             let gpt = Gpt::read(dev)?;
             return Ok(Some(DetectedTable::Gpt(Box::new(gpt))));
         }
+    }
+    // Apple Partition Map: a Driver Descriptor Map ("ER") at block 0 plus a
+    // partition map entry ("PM") at block 1. Checked before MBR — APM disks
+    // carry no 0x55AA boot signature, so the two never collide.
+    if Apm::probe(dev) {
+        let apm = Apm::read(dev)?;
+        return Ok(Some(DetectedTable::Apm(Box::new(apm))));
     }
     // Legacy MBR: 0x55AA signature plus at least one partition entry whose
     // type byte is non-zero. (A zero-FS image with a stray 0x55AA in the

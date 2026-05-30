@@ -101,8 +101,9 @@ All commands accept partition-aware `disk.img:N` targets (1-indexed) — see
 "Partitions, block devices, qcow2" below.
 
 All inspection / modification commands accept a `disk.img:N` (1-indexed)
-target to walk into a partition of a GPT or MBR disk image. `fstool info
-disk.img` without the suffix prints the partition table itself.
+target to walk into a partition of a GPT, MBR, or Apple Partition Map disk
+image. `fstool info disk.img` without the suffix prints the partition table
+itself.
 
 ### FS-specific options (`-O`)
 
@@ -130,7 +131,9 @@ through the TOML spec — see "[filesystem.options]" below.
 
 - **Partition tables** — MBR (4 primaries) and GPT (128-entry, CRC32 on
   header + entry array, primary + backup, protective MBR). Cross-checked
-  against `sgdisk -v` and `fdisk -l`.
+  against `sgdisk -v` and `fdisk -l`. **Apple Partition Map** (the classic
+  Mac / `.toast` scheme) is read-only: `info` lists the `Apple_HFS` /
+  `Apple_Free` / `Apple_partition_map` entries and `disk.toast:N` slices one.
 - **Block devices** — on Unix, fstool can format and mutate real block
   devices (`/dev/sdX`, `/dev/nvme0n1`, loop devices). Capacity is queried via
   the kernel ioctl (`BLKGETSIZE64` on Linux, `DKIOCGETBLOCK*` on macOS) and

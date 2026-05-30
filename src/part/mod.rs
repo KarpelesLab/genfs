@@ -14,9 +14,11 @@ use uuid::Uuid;
 use crate::Result;
 use crate::block::{BlockDevice, SlicedBackend};
 
+pub mod apm;
 pub mod gpt;
 pub mod mbr;
 
+pub use apm::Apm;
 pub use gpt::Gpt;
 pub use mbr::Mbr;
 
@@ -89,6 +91,10 @@ pub enum PartitionKind {
     Mbr(u8),
     /// Raw GPT type UUID (escape hatch for unmapped types).
     Gpt(Uuid),
+    /// Apple Partition Map type string, e.g. `"Apple_HFS"`,
+    /// `"Apple_partition_map"`, `"Apple_Free"`. Read-only; has no MBR/GPT
+    /// encoding.
+    Apm(String),
 }
 
 impl PartitionKind {
@@ -107,6 +113,7 @@ impl PartitionKind {
             // a different kind explicitly if writing MBR.
             PartitionKind::BiosBoot => 0x00,
             PartitionKind::Gpt(_) => 0x00,
+            PartitionKind::Apm(_) => 0x00,
         }
     }
 
@@ -140,6 +147,7 @@ impl PartitionKind {
             }
             PartitionKind::Gpt(u) => *u,
             PartitionKind::Mbr(_) => Uuid::nil(),
+            PartitionKind::Apm(_) => Uuid::nil(),
         }
     }
 

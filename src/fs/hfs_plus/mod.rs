@@ -541,6 +541,61 @@ impl HfsPlus {
         ))
     }
 
+    /// Open a streaming reader over a file's **resource fork** (fork type
+    /// `0xFF`), reusing the same extent machinery as the data fork. Errors if
+    /// `path` isn't a regular file or has no resource fork. HFS-compressed
+    /// files are rejected: their "resource fork" holds `decmpfs` compression
+    /// blocks, not a user resource fork.
+    pub fn open_resource_fork_reader<'a>(
+        &self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<HfsPlusFileReader<'a>> {
+        let file = self.resource_fork_file(dev, path)?.ok_or_else(|| {
+            crate::Error::InvalidArgument(format!("hfs+: {path:?} has no resource fork"))
+        })?;
+        let size = file.resource_fork.logical_size;
+        let fork = self.open_fork(
+            dev,
+            &file.resource_fork,
+            file.file_id,
+            extents::FORK_RESOURCE,
+            "resource",
+        )?;
+        Ok(HfsPlusFileReader::streaming(dev, fork, size))
+    }
+
+    /// Resource-fork logical size for `path`, or `None` when the file has no
+    /// usable resource fork (absent, not a regular file, or HFS-compressed).
+    pub fn resource_fork_size(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<Option<u64>> {
+        Ok(self
+            .resource_fork_file(dev, path)?
+            .map(|f| f.resource_fork.logical_size))
+    }
+
+    /// Resolve `path` to a regular file carrying a genuine (non-`decmpfs`)
+    /// resource fork. `Ok(None)` means the path exists but has no usable
+    /// resource fork; a missing path propagates as an error.
+    fn resource_fork_file(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<Option<CatalogFile>> {
+        let file = match self.lookup_path(dev, path)? {
+            CatalogRecord::File(f) => self.resolve_hard_link(dev, f)?,
+            _ => return Ok(None),
+        };
+        // An HFS-compressed file stores its compressed payload in the resource
+        // fork (decmpfs type 4/8/12); that is not a user resource fork.
+        if file.bsd.owner_flags & decmpfs::UF_COMPRESSED != 0 {
+            return Ok(None);
+        }
+        if file.resource_fork.logical_size == 0 {
+            return Ok(None);
+        }
+        Ok(Some(file))
+    }
+
     /// Read a symlink's target by absolute path. Returns the raw
     /// UTF-8 bytes stored in the file's data fork as a `String`
     /// (HFS+ symlinks are conventionally stored as UTF-8 path text
@@ -1442,6 +1497,38 @@ impl crate::fs::Filesystem for HfsPlus {
         Ok(Box::new(r))
     }
 
+    /// Surface a file's resource fork as the macOS-standard
+    /// `com.apple.ResourceFork` extended attribute (read-only, capped at
+    /// 16 MiB), mirroring classic HFS. HFS-compressed files (whose resource
+    /// fork holds `decmpfs` storage) yield no such xattr.
+    fn list_xattrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::XattrPair>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("hfs+: non-UTF-8 path".into()))?;
+        let Some(file) = self.resource_fork_file(dev, s)? else {
+            return Ok(Vec::new());
+        };
+        const CAP: u64 = 16 * 1024 * 1024;
+        let size = file.resource_fork.logical_size.min(CAP) as usize;
+        let fork = self.open_fork(
+            dev,
+            &file.resource_fork,
+            file.file_id,
+            extents::FORK_RESOURCE,
+            "resource",
+        )?;
+        let mut buf = vec![0u8; size];
+        fork.read(dev, 0, &mut buf)?;
+        Ok(vec![crate::fs::XattrPair {
+            name: "com.apple.ResourceFork".into(),
+            value: buf,
+        }])
+    }
+
     fn getattr(
         &mut self,
         dev: &mut dyn BlockDevice,
@@ -1712,6 +1799,32 @@ mod tests {
         assert!(
             matches!(rec, catalog::CatalogRecord::File(_)),
             "canonical path should resolve to the created file"
+        );
+    }
+
+    /// A file with an empty resource fork must not be reported as having one:
+    /// `resource_fork_size` is `None`, the reader errors, and `list_xattrs`
+    /// surfaces no `com.apple.ResourceFork`. (Guards the gating in
+    /// `resource_fork_file`; the actual resource-fork *read* reuses the
+    /// data-fork `open_fork`/`FORK_RESOURCE` machinery, covered elsewhere.)
+    #[test]
+    fn empty_resource_fork_is_not_surfaced() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+        let data = b"no resources here\n".to_vec();
+        let mut src = std::io::Cursor::new(&data);
+        hfs.create_file(&mut dev, "/plain", &mut src, data.len() as u64, 0o644, 0, 0)
+            .unwrap();
+        hfs.flush(&mut dev).unwrap();
+        let mut hfs = HfsPlus::open(&mut dev).unwrap();
+
+        assert_eq!(hfs.resource_fork_size(&mut dev, "/plain").unwrap(), None);
+        assert!(hfs.open_resource_fork_reader(&mut dev, "/plain").is_err());
+        assert!(
+            crate::fs::Filesystem::list_xattrs(&mut hfs, &mut dev, std::path::Path::new("/plain"))
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(hfs+)* **resource-fork** support for HFS+/HFSX, matching classic HFS:
+  `HfsPlus::open_resource_fork_reader` reads the fork via the existing
+  fork-type-`0xFF` extent machinery, `cat --rsrc` / `resources` work on HFS+
+  files, and `list_xattrs` surfaces `com.apple.ResourceFork`. HFS-compressed
+  files are excluded (their resource fork holds `decmpfs` storage, not a user
+  resource fork).
 - *(hfs)* classic-HFS **resource-fork** support. The reader now reads each
   file's resource fork (its own extents, fork-type `0xFF`) and surfaces it three
   ways: `fstool cat --rsrc <img> <path>` streams the raw fork; a new `fstool

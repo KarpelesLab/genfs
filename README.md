@@ -34,7 +34,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | exFAT      | ✅    | ✅     | ✅              | format + create + remove + flush + `open_file_rw`                                                                  |
 | tar        | ✅    | ✅     | —              | ustar + PAX, `SCHILY.xattr.*` for xattrs; streaming-only                                                           |
 | XFS        | ✅    | ✅     | ✅              | shortform + block / leaf / node + multi-level B-tree dirs + BMBT; leaf-form xattrs; real XLOG transactions (Path A); passes `xfs_repair -n` single + multi-AG |
-| HFS+/HFSX  | ✅    | ✅     | ✅              | inline + extents-overflow, symlinks, hard links; decmpfs read (zlib types 3 + 4); real journal (Path A); passes `fsck.hfsplus` |
+| HFS+/HFSX  | ✅    | ✅     | ✅              | inline + extents-overflow, symlinks, hard links; decmpfs read (zlib types 3 + 4); **resource forks** (`cat --rsrc`, `resources`, `com.apple.ResourceFork` xattr); real journal (Path A); passes `fsck.hfsplus` |
 | HFS        | ✅    | —     | —              | classic HFS (Mac OS ≤ 8) read-only: MDB + catalog/extents B-trees, MacRoman names, data + **resource** fork extraction (`cat --rsrc`, `resources`, `com.apple.ResourceFork` xattr). Transparently unwraps **DiskCopy 4.2** images. Creation is unsupported |
 | APFS       | ✅    | ✅     | 🚧             | multi-level omap + fs-tree; spaceman with IP ring + SFQ free-queues; `open_file_rw` rebuilds a fresh COW checkpoint (whole-file overwrite only — no partial-extent COW yet); not yet `fsck_apfs` clean |
 | NTFS       | ✅    | ✅     | ✅              | MFT, attributes, $DATA + ADS, indexes; xattr map; multi-class `$Secure` ($SDS/$SDH/$SII); real `$LogFile` LFS records (Path A) |
@@ -90,8 +90,8 @@ through xattrs under `user.ntfs.*` and `system.ntfs_security`.
 | `build`       | Build from a TOML spec — bare FS or a partitioned disk image.           |
 | `info`        | Print partition table (whole-disk) or FS summary + root listing.        |
 | `ls`          | List a directory inside an image; `-R` walks subdirectories recursively. |
-| `cat`         | Stream a file's bytes out of an image to stdout. `--rsrc` streams the resource fork (classic HFS). |
-| `resources`   | Inventory a classic-HFS file's resource fork (ResEdit-style: `vers`/`ICN#`/`DITL`/… with decoded summaries); `--extract TYPE:ID` dumps one resource. |
+| `cat`         | Stream a file's bytes out of an image to stdout. `--rsrc` streams the resource fork (HFS / HFS+). |
+| `resources`   | Inventory an HFS / HFS+ file's resource fork (ResEdit-style: `vers`/`ICN#`/`DITL`/… with decoded summaries); `--extract TYPE:ID` dumps one resource. |
 | `add`         | Copy a host file / tree into an existing image (any mutable FS).        |
 | `rm`          | Unlink a file, symlink, device, or empty directory.                     |
 | `shell`       | SFTP-style REPL — `ls cd pwd cat put rm mkdir info`. On a TTY it has line editing + ↑/↓ command history (rustyline). |

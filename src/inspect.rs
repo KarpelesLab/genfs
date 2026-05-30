@@ -593,8 +593,9 @@ impl AnyFs {
     ) -> Result<Box<dyn std::io::Read + 'a>> {
         match self {
             Self::Hfs(hfs) => Ok(Box::new(hfs.open_resource_fork_reader(dev, path)?)),
+            Self::HfsPlus(hfs) => Ok(Box::new(hfs.open_resource_fork_reader(dev, path)?)),
             _ => Err(crate::Error::Unsupported(
-                "resource forks are only supported on classic HFS".into(),
+                "resource forks are only supported on HFS / HFS+".into(),
             )),
         }
     }

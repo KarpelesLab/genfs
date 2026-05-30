@@ -329,28 +329,34 @@ fn cross_format_repack_zip_to_cpio() {
 }
 
 #[test]
-fn scaffold_formats_detect_but_decline() {
-    // A fake 7z header: detection must name it, but reads must return a
-    // clean "detection-only" Unsupported rather than panicking.
+fn malformed_archive_is_handled_gracefully() {
+    // The archive readers must detect the format and never panic on a
+    // degenerate / garbage archive — an empty or clean `InvalidImage`
+    // result, not a crash. (7z used to be a detection-only scaffold; it is a
+    // real reader now, so this exercises graceful failure instead.)
     let work = tempfile::tempdir().unwrap();
-    let f = work.path().join("fake.7z");
+
+    // (a) Empty 7z — a valid archive with a zero-length next header.
+    let f = work.path().join("empty.7z");
     let mut bytes = b"7z\xBC\xAF\x27\x1C\x00\x04".to_vec();
     bytes.extend(std::iter::repeat_n(0u8, 200));
     std::fs::write(&f, &bytes).unwrap();
-
     let (ok, info, _) = run(&["info", f.to_str().unwrap()]);
-    // `info` prints the kind heading even though listing fails.
-    assert!(
-        info.contains("7z"),
-        "scaffold not detected: {info} (ok={ok})"
-    );
+    assert!(info.contains("7z"), "7z not detected: {info} (ok={ok})");
+    let (_ok, _out, err) = run(&["ls", f.to_str().unwrap(), "/"]);
+    assert!(!err.contains("panic"), "ls panicked on empty 7z: {err}");
 
-    let (ok, _, err) = run(&["ls", f.to_str().unwrap(), "/"]);
-    assert!(!ok, "scaffold ls should fail");
-    assert!(
-        err.contains("detection-only") || err.contains("not implemented"),
-        "error: {err}"
-    );
+    // (b) Garbage next-header — must fail cleanly, not panic.
+    let g = work.path().join("garbage.7z");
+    let mut gb = b"7z\xBC\xAF\x27\x1C\x00\x04".to_vec();
+    gb.extend_from_slice(&[0, 0, 0, 0]); // StartHeaderCRC
+    gb.extend_from_slice(&4u64.to_le_bytes()); // NextHeaderOffset
+    gb.extend_from_slice(&8u64.to_le_bytes()); // NextHeaderSize
+    gb.extend_from_slice(&[0, 0, 0, 0]); // NextHeaderCRC
+    gb.extend(std::iter::repeat_n(0xFFu8, 64)); // junk header body
+    std::fs::write(&g, &gb).unwrap();
+    let (_ok, _out, err) = run(&["ls", g.to_str().unwrap(), "/"]);
+    assert!(!err.contains("panic"), "ls panicked on garbage 7z: {err}");
 }
 
 #[test]

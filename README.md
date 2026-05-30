@@ -48,7 +48,8 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | lzx        | ✅    | —     | —              | Amiga LZX read-only: Store + LZX (mode 2) merged groups via `compcol::amiga_lzx`; container cross-checked with `unlzx`. Creation unsupported |
 | rar        | ✅    | —     | —              | RAR5 read-only incl. **solid** archives (a sequential walk / `repack` decodes the group once): Store + compressed (no-filter / x86 E8E9) via `compcol::rar5`; cross-checked with `unrar`. RAR4, encryption, stored-in-solid, other filters and creation are unsupported |
 | lha        | ✅    | —     | —              | LHA / LZH read-only: walks level-0/1/2 headers (long names + directories). `-lh0-` store decodes + is cross-checked with `lha`; the lh1/4/5/6/7 LZSS+Huffman methods list but read as `Unsupported` pending an `lha` codec in `compcol`. Creation unsupported |
-| 7z / arc / sit | 🚧 | — | — | detected by `info`; reader not implemented yet (returns a clear `Unsupported`) — pure-Rust decoders land behind per-format Cargo features |
+| arc        | ✅    | —     | —              | SEA ARC read-only: walks the flat header chain. Stored methods (1 old / 2) decode; the compressed methods (RLE90 / squeeze / crunch / squash) list but read as `Unsupported` pending ARC codecs in `compcol`. Creation unsupported |
+| 7z / sit   | 🚧 | — | — | detected by `info`; reader not implemented yet (returns a clear `Unsupported`) — pure-Rust decoders land behind per-format Cargo features |
 
 `🚧` marks writers / mutation paths with known gaps (see Limitations).
 All writable filesystems — ext2/3/4, FAT32, exFAT, XFS, HFS+, NTFS,
@@ -420,10 +421,12 @@ as `repack` decompresses it exactly once (a backward/random read of an
 earlier member re-decodes from the group start, bounded memory). `lha`
 (LHA/LZH, behind the `lha` feature) walks level-0/1/2 headers and reads
 `-lh0-` store members; its LZSS+Huffman methods list but read as
-`Unsupported` pending an `lha` codec in `compcol`. `7z`, `arc`, and `sit`
-are recognised by `info` today but their readers are scaffolds that return a
-clear `Unsupported`; pure-Rust decoders will land behind per-format Cargo
-features. (`rar` and `sit` are read-only-at-best —
+`Unsupported` pending an `lha` codec in `compcol`. `arc` (SEA ARC, behind the
+`arc` feature) walks the flat header chain and reads stored members; its
+compressed methods list but read as `Unsupported` pending ARC codecs in
+`compcol`. `7z` and `sit` are recognised by `info` today but their readers
+are scaffolds that return a clear `Unsupported`; pure-Rust decoders will land
+behind per-format Cargo features. (`rar` and `sit` are read-only-at-best —
 their creation is proprietary; RAR4, encrypted, stored-in-solid, and
 filtered-but-unsupported RAR5 streams stay `Unsupported`.)
 

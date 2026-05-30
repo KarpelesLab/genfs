@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(arc)* SEA ARC (`.arc`) read-only reader behind the `arc` feature — walks
+  the flat per-file header chain and indexes every member. The stored methods
+  (1 = old, 2 = with an original-size field) decode today; the compressed
+  methods (3 RLE90, 4 squeeze, 5–9 crunch/squash) list correctly but read as a
+  clean `Unsupported` pending ARC codecs in `compcol`. Creation is unsupported.
 - *(lha)* LHA / LZH (`.lzh`, `.lha`) read-only reader behind the `lha` feature
   — walks the header chain at levels 0, 1 and 2 (incl. the level-1 skip-size /
   extended-header math and level-2 ext-header filenames + directory

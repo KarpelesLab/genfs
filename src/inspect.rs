@@ -27,6 +27,7 @@ use crate::fs::exfat::Exfat;
 use crate::fs::ext::Ext;
 use crate::fs::f2fs::F2fs;
 use crate::fs::fat::Fat32;
+use crate::fs::hfs::Hfs;
 use crate::fs::hfs_plus::HfsPlus;
 use crate::fs::ntfs::Ntfs;
 use crate::fs::squashfs::Squashfs;
@@ -56,6 +57,8 @@ pub enum FsKind {
     Exfat,
     /// HFS+ — read-only.
     HfsPlus,
+    /// Classic HFS (Mac OS ≤ 8) — read-only.
+    Hfs,
     /// APFS — read-only, single-leaf-tree case only.
     Apfs,
     /// NTFS — scaffold; detection only, all ops return `Unsupported`.
@@ -211,6 +214,10 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
         if &hfs_sig == b"H+" || &hfs_sig == b"HX" {
             return Ok(FsKind::HfsPlus);
         }
+        // Classic HFS Master Directory Block signature `BD` at byte 1024.
+        if &hfs_sig == b"BD" {
+            return Ok(FsKind::Hfs);
+        }
     }
 
     // F2FS: 32-bit LE magic 0xF2F52010 at offset 1024 (primary) or
@@ -235,7 +242,7 @@ pub fn detect_fs(dev: &mut dyn BlockDevice) -> Result<FsKind> {
     }
 
     Err(crate::Error::InvalidImage(
-        "inspect: no recognised filesystem (ext2/3/4, FAT32, exFAT, XFS, HFS+, APFS, tar, NTFS, F2FS, SquashFS, ISO 9660, GRF) or archive (zip, cpio, ar, 7z, rar, arc, lha, lzx, cab, sit) on this image".into(),
+        "inspect: no recognised filesystem (ext2/3/4, FAT32, exFAT, XFS, HFS+, HFS, APFS, tar, NTFS, F2FS, SquashFS, ISO 9660, GRF) or archive (zip, cpio, ar, 7z, rar, arc, lha, lzx, cab, sit) on this image".into(),
     ))
 }
 
@@ -259,6 +266,7 @@ pub enum AnyFs {
     Exfat(Box<Exfat>),
     /// HFS+ — read-only.
     HfsPlus(Box<HfsPlus>),
+    Hfs(Box<Hfs>),
     /// APFS — read-only; single-leaf trees only.
     Apfs(Box<Apfs>),
     /// NTFS — scaffold; only `info` returns useful data, list/read error.
@@ -288,6 +296,7 @@ impl AnyFs {
             FsKind::Xfs => Ok(Self::Xfs(Box::new(Xfs::open(dev)?))),
             FsKind::Exfat => Ok(Self::Exfat(Box::new(Exfat::open(dev)?))),
             FsKind::HfsPlus => Ok(Self::HfsPlus(Box::new(HfsPlus::open(dev)?))),
+            FsKind::Hfs => Ok(Self::Hfs(Box::new(Hfs::open(dev)?))),
             FsKind::Apfs => Ok(Self::Apfs(Box::new(Apfs::open(dev)?))),
             FsKind::Ntfs => Ok(Self::Ntfs(Box::new(Ntfs::open(dev)?))),
             FsKind::F2fs => Ok(Self::F2fs(Box::new(F2fs::open(dev)?))),
@@ -374,6 +383,7 @@ impl AnyFs {
             Self::Xfs(_) => FsKind::Xfs,
             Self::Exfat(_) => FsKind::Exfat,
             Self::HfsPlus(_) => FsKind::HfsPlus,
+            Self::Hfs(_) => FsKind::Hfs,
             Self::Apfs(_) => FsKind::Apfs,
             Self::Ntfs(_) => FsKind::Ntfs,
             Self::F2fs(_) => FsKind::F2fs,
@@ -398,6 +408,7 @@ impl AnyFs {
             Self::Xfs(xfs) => xfs.list_path(dev, path),
             Self::Exfat(exfat) => exfat.list_path(dev, path),
             Self::HfsPlus(hfs) => hfs.list_path(dev, path),
+            Self::Hfs(hfs) => hfs.list_path(path),
             Self::Apfs(apfs) => apfs.list_path(dev, path),
             Self::Ntfs(ntfs) => ntfs.list_path(dev, path),
             Self::F2fs(f2) => f2.list_path(dev, path),
@@ -484,6 +495,10 @@ impl AnyFs {
                 let mut r = exfat.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
             }
+            Self::Hfs(hfs) => {
+                let mut r = hfs.open_file_reader(dev, path)?;
+                pump(&mut r, out, &mut buf)
+            }
             Self::HfsPlus(hfs) => {
                 let mut r = hfs.open_file_reader(dev, path)?;
                 pump(&mut r, out, &mut buf)
@@ -550,6 +565,7 @@ impl AnyFs {
             Self::Xfs(xfs) => Ok(Box::new(xfs.open_file_reader(dev, path)?)),
             Self::Exfat(exfat) => Ok(Box::new(exfat.open_file_reader(dev, path)?)),
             Self::HfsPlus(hfs) => Ok(Box::new(hfs.open_file_reader(dev, path)?)),
+            Self::Hfs(hfs) => Ok(Box::new(hfs.open_file_reader(dev, path)?)),
             Self::Apfs(apfs) => Ok(Box::new(apfs.open_file_reader(dev, path)?)),
             Self::Ntfs(ntfs) => Ok(Box::new(ntfs.open_file_reader(dev, path)?)),
             Self::F2fs(f2) => Ok(Box::new(f2.open_file_reader(dev, path)?)),
@@ -653,6 +669,7 @@ impl AnyFs {
             Self::Ext(ext) => crate::fs::Filesystem::mutation_capability(ext.as_ref()),
             Self::Fat32(fat) => crate::fs::Filesystem::mutation_capability(fat.as_ref()),
             Self::HfsPlus(h) => crate::fs::Filesystem::mutation_capability(h.as_ref()),
+            Self::Hfs(h) => crate::fs::Filesystem::mutation_capability(h.as_ref()),
             Self::Ntfs(n) => crate::fs::Filesystem::mutation_capability(n.as_ref()),
             Self::F2fs(fs2) => crate::fs::Filesystem::mutation_capability(fs2.as_ref()),
             Self::Squashfs(sq) => crate::fs::Filesystem::mutation_capability(sq.as_ref()),
@@ -678,6 +695,7 @@ impl AnyFs {
             Self::Ext(ext) => crate::fs::Filesystem::clone_capability(ext.as_ref()),
             Self::Fat32(fat) => crate::fs::Filesystem::clone_capability(fat.as_ref()),
             Self::HfsPlus(h) => crate::fs::Filesystem::clone_capability(h.as_ref()),
+            Self::Hfs(h) => crate::fs::Filesystem::clone_capability(h.as_ref()),
             Self::Ntfs(n) => crate::fs::Filesystem::clone_capability(n.as_ref()),
             Self::F2fs(fs2) => crate::fs::Filesystem::clone_capability(fs2.as_ref()),
             Self::Squashfs(sq) => crate::fs::Filesystem::clone_capability(sq.as_ref()),
@@ -757,6 +775,7 @@ impl AnyFs {
             Self::Ext(ext) => f(ext.as_mut()),
             Self::Fat32(fat) => f(fat.as_mut()),
             Self::HfsPlus(h) => f(h.as_mut()),
+            Self::Hfs(h) => f(h.as_mut()),
             Self::Ntfs(n) => f(n.as_mut()),
             Self::F2fs(fs2) => f(fs2.as_mut()),
             Self::Squashfs(sq) => f(sq.as_mut()),
@@ -801,6 +820,7 @@ impl AnyFs {
             | Self::Xfs(_)
             | Self::Exfat(_)
             | Self::HfsPlus(_)
+            | Self::Hfs(_)
             | Self::Apfs(_)
             | Self::Ntfs(_)
             | Self::F2fs(_)
@@ -825,6 +845,9 @@ impl AnyFs {
         }
         if let Self::HfsPlus(_) = self {
             return "hfs+";
+        }
+        if let Self::Hfs(_) = self {
+            return "hfs";
         }
         if let Self::Apfs(_) = self {
             return "apfs";
@@ -859,6 +882,7 @@ impl AnyFs {
             Self::Xfs(_)
             | Self::Exfat(_)
             | Self::HfsPlus(_)
+            | Self::Hfs(_)
             | Self::Apfs(_)
             | Self::Ntfs(_)
             | Self::F2fs(_)
@@ -970,6 +994,7 @@ impl AnyFs {
             Self::Xfs(b) => b,
             Self::Exfat(b) => b,
             Self::HfsPlus(b) => b,
+            Self::Hfs(b) => b,
             Self::Apfs(b) => b,
             Self::Ntfs(b) => b,
             Self::F2fs(b) => b,

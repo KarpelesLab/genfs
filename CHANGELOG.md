@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(hfs)* classic **HFS** (Hierarchical File System, Mac OS ≤ 8) read-only
+  reader — parses the Master Directory Block at offset 1024 (`BD` signature),
+  loads the catalog + extents-overflow B-trees into memory (512-byte nodes,
+  MacRoman Pascal names) and exposes each file's **data fork**. Resolves nested
+  paths and streams file contents via allocation-block extents. Validated
+  against a genuine System 6.0.8 disk image (extracts the real System/Finder/
+  Read Me contents) plus a synthetic-volume regression test. Resource forks,
+  HFS-wrapped HFS+ and creation are unsupported.
+- *(block)* **DiskCopy 4.2** container backend — a read-only device wrapper
+  that exposes the inner volume (data fork at file offset `0x54`), probed in
+  `open_image` after qcow2/dmg so a DiskCopy-wrapped floppy (classic HFS, FAT,
+  ISO, …) is detected and read transparently like a raw image.
+
 - *(sevenz)* 7-Zip (`.7z`) read-only reader behind the `sevenz` feature —
   parses the full container (32-byte signature header, the optionally
   LZMA-packed `kEncodedHeader` end header, `StreamsInfo` folders/coders/

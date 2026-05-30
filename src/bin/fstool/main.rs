@@ -2746,6 +2746,7 @@ fn print_fs_info(dev: &mut dyn fstool::block::BlockDevice, fs: &mut fstool::insp
         fstool::inspect::AnyFs::Xfs(xfs) => print_xfs_info(xfs),
         fstool::inspect::AnyFs::Exfat(exfat) => print_exfat_info(exfat),
         fstool::inspect::AnyFs::HfsPlus(hfs) => print_hfs_plus_info(hfs),
+        fstool::inspect::AnyFs::Hfs(hfs) => print_hfs_info(hfs),
         fstool::inspect::AnyFs::Apfs(apfs) => print_apfs_info(apfs),
         fstool::inspect::AnyFs::Ntfs(ntfs) => print_ntfs_info(ntfs),
         fstool::inspect::AnyFs::F2fs(f2) => print_f2fs_info(f2),
@@ -2825,6 +2826,10 @@ fn print_hfs_plus_info(hfs: &fstool::fs::hfs_plus::HfsPlus) {
     println!("total bytes:       {}", hfs.total_bytes());
     println!("block size:        {}", hfs.block_size());
     println!("volume name:       {:?}", hfs.volume_name());
+}
+
+fn print_hfs_info(hfs: &fstool::fs::hfs::Hfs) {
+    println!("volume name:       {:?}", hfs.volume_name);
 }
 
 fn print_apfs_info(apfs: &fstool::fs::apfs::Apfs) {

@@ -27,6 +27,7 @@ pub mod ext;
 pub mod f2fs;
 pub mod fat;
 pub mod grf;
+pub mod hfs;
 pub mod hfs_plus;
 pub mod iso9660;
 pub mod ntfs;

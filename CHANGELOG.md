@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(lha)* LHA / LZH (`.lzh`, `.lha`) read-only reader behind the `lha` feature
+  — walks the header chain at levels 0, 1 and 2 (incl. the level-1 skip-size /
+  extended-header math and level-2 ext-header filenames + directory
+  components) and indexes every member. `-lh0-` store decodes today
+  (cross-checked against the reference `lha` tool with genuine fixtures at all
+  three header levels); the lh1/4/5/6/7 LZSS+Huffman methods list correctly but
+  read as a clean `Unsupported` pending an `lha` codec in `compcol`. Creation
+  is unsupported.
+
 ## [0.4.9](https://github.com/KarpelesLab/fstool/compare/v0.4.8...v0.4.9) - 2026-05-30
 
 ### Added
@@ -33,67 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - *(changelog)* record security hardening pass
-
-### Security
-
-- Hardened every untrusted-input parser against malicious images/archives
-  following a full multi-section security audit. All issues were
-  denial-of-service class (panic / OOM / hang) reachable from the read path;
-  no memory-safety or arbitrary-write bugs were found (the lone `unsafe`
-  ioctl blocks were reviewed and are sound, and archive extraction is
-  image-namespaced, never host-FS). Fixes, by area:
-  - **Bounded structure traversal** (was: infinite loop / stack overflow):
-    cycle/depth guards on the ext4 extent-tree descent, XFS bmbt, HFS+ and
-    APFS B-tree descents + leaf-chains, and the `repack`/`analyze` source
-    directory walk (visited-inode set + depth/entry caps).
-  - **Capped untrusted-size allocations** (was: OOM): ext GDT, NTFS
-    `$DATA`/index/compression buffers, XFS remote symlinks, HFS+ decmpfs,
-    exFAT NoFatChain + FAT tables, FAT32 FAT, SquashFS block lists, ISO9660
-    Rock Ridge `CE`, tar PAX/GNU-longname bodies, ZIP64 central directory,
-    cpio name/file sizes, GPT entry array, RAR5 window, qcow2 L1/refcount —
-    each now bounded against the device/file size before allocating.
-  - **Validated geometry / checked arithmetic** (was: divide-by-zero,
-    shift-overflow, integer-overflow→OOB panics): ext, NTFS, XFS, F2FS
-    superblock/boot fields; GPT entry sizing; encrypted-DMG salt/IV length
-    fields; NTFS/DMG/GPT/cpio/ar offset math.
-  - **Reachable OOB-slice panics fixed**: GRF entry decode, GPT entries with
-    `entry_size < 128`, NTFS `$Secure:$SII`, encrypted-DMG salt/IV.
-  - Defense-in-depth: tar/`repack` path normalisation now drops `..`
-    segments. Each fix returns a clean `InvalidImage`/`Unsupported` instead
-    of crashing/hanging; ~30 regression tests were added.
-
-### Changed
-
-- *(dmg)* encrypted-DMG (`encrcdsa` v2) crypto now runs on the pure-Rust
-  `purecrypto` crate (KarpelesLab) instead of the RustCrypto stack. Drops
-  `aes`, `cbc`, `cipher`, `des`, `hmac`, `sha1`, and `pbkdf2` for a single
-  dependency: AES-128/256-CBC via `Cbc`, 3DES-EDE3-CBC keyblob unwrap via
-  `Cbc64`/`TdesEde3` (PKCS#7 stripped in-crate), HMAC-SHA1 chunk-IV
-  derivation, and PBKDF2-HMAC-SHA1 KEK derivation. Behaviour is unchanged —
-  the synthetic round-trips still pass and a new RFC 6070 PBKDF2-HMAC-SHA1
-  known-answer test pins the key-derivation bytes (so real Apple images still
-  decrypt). **MSRV is raised to 1.95** (purecrypto's minimum); the codebase
-  adopts `is_multiple_of` accordingly.
-
-### Added
-
-- *(rar)* RAR5 (`Rar!\x1A\x07\x01`) read-only reader behind the `rar` feature
-  — walks the block chain (vint headers, file headers, compression info) and
-  streams each member out of its packed run: **Store** raw, and compressed
-  (no-filter / x86 E8E9) via `compcol::rar5`. Cross-checked against the
-  reference `unrar` extractor (committed `rar -ma5` fixtures). RAR4,
-  encryption, and the delta/ARM/other RAR5 filters surface as a clean
-  `Unsupported`; creation is unsupported (proprietary).
-- *(rar)* **solid** RAR5 archives. A solid group's members share one LZ
-  window, so it's decoded as a single continuous stream over the concatenated
-  packed runs (compcol's `rar5` decoder is per-stream; we drive one resumable
-  decoder over the whole group). A persistent forward cursor lets a sequential
-  walk — notably `repack` — decompress the group **exactly once** instead of
-  re-decoding from the start per file; a backward/random read of an earlier
-  member rebuilds the cursor and re-decodes from the group start, staying
-  bounded-memory (no whole-group buffering). Validated against `unrar` with a
-  4-member cross-referencing fixture, plus a decode-once regression test. A
-  stored member inside a solid group stays `Unsupported`.
 
 ## [0.4.8](https://github.com/KarpelesLab/fstool/compare/v0.4.7...v0.4.8) - 2026-05-29
 

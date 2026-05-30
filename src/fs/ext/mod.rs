@@ -3543,7 +3543,32 @@ impl Ext {
         } else {
             bs
         };
-        let mut gdt = vec![0u8; layout.gdt_blocks as usize * bs as usize];
+        // Cap allocations sized from untrusted superblock geometry against the
+        // actual device size before allocating: a hostile image can claim a
+        // huge group count / GDT, driving an unbounded `vec![]` → OOM.
+        let total = dev.total_size();
+        let gdt_bytes = (layout.gdt_blocks as u64)
+            .checked_mul(bs)
+            .ok_or_else(|| crate::Error::InvalidImage("ext: gdt size overflow".into()))?;
+        let gdt_end = gdt_off
+            .checked_add(gdt_bytes)
+            .ok_or_else(|| crate::Error::InvalidImage("ext: gdt offset overflow".into()))?;
+        if gdt_end > total {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: group descriptor table ({gdt_bytes} bytes at {gdt_off}) exceeds device size {total}"
+            )));
+        }
+        // Each group costs at least two bitmap blocks we read below; reject a
+        // group count that can't physically fit on the device.
+        let max_groups = total / bs.max(1);
+        if layout.groups.len() as u64 > max_groups {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: num_groups {} exceeds device capacity {} blocks",
+                layout.groups.len(),
+                max_groups
+            )));
+        }
+        let mut gdt = vec![0u8; gdt_bytes as usize];
         dev.read_at(gdt_off, &mut gdt)?;
 
         let desc_size = layout.desc_size;
@@ -3670,6 +3695,12 @@ impl Ext {
             }
         }
         let (group, idx) = self.inode_location(ino);
+        if group as usize >= self.layout.groups.len() {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: inode {ino} maps to group {group} beyond {} groups",
+                self.layout.groups.len()
+            )));
+        }
         let table_block = self.layout.groups[group as usize].inode_table;
         let bs = self.layout.block_size as u64;
         let off = table_block as u64 * bs + idx as u64 * self.layout.inode_size as u64;
@@ -3788,18 +3819,56 @@ impl Ext {
             return Ok(0);
         };
 
-        // Descend through any further index levels, then the leaf.
+        // Descend through any further index levels, then the leaf. A
+        // malicious image can craft an extent tree whose internal nodes don't
+        // decrease in depth (or that points back at an ancestor block),
+        // producing an unbounded loop. Bound the descent by the declared
+        // inline depth (ext4 caps at 5), require each child's depth to be
+        // strictly one less than its parent's, validate the entry count
+        // against the per-block index capacity before iterating, and track
+        // visited physical blocks to reject cycles.
         let bs = self.layout.block_size as usize;
+        // Index entries are 12 bytes each after the 12-byte header.
+        let max_entries_per_block = (bs.saturating_sub(12) / 12) as u16;
+        let mut parent_depth = header.depth;
+        let mut visited: Vec<u32> = Vec::new();
         let mut buf = vec![0u8; bs];
         loop {
+            if visited.len() > header.depth as usize {
+                return Err(crate::Error::InvalidImage(
+                    "ext4: extent tree deeper than declared depth".into(),
+                ));
+            }
+            if visited.contains(&child) {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext4: extent tree cycle through physical block {child}"
+                )));
+            }
+            visited.push(child);
+
             self.read_block(dev, child, &mut buf)?;
             let h = extent::decode_header(&buf[..12])?;
+            // Child depth must strictly decrease by exactly one toward the
+            // leaf; anything else means a forged or circular tree.
+            if parent_depth == 0 || h.depth != parent_depth - 1 {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext4: extent node depth {} not one less than parent {parent_depth}",
+                    h.depth
+                )));
+            }
             if h.depth == 0 {
                 let (_, runs) = extent::decode_leaf_block(&buf)?;
                 return Ok(resolve_logical_in_runs(&runs, n));
             }
-            // Internal index block: parse its idx entries and pick the
-            // subtree covering `n`.
+            // Internal index block: bound the entry count to what the block
+            // can hold before walking it (each entry reads `buf[off..off+12]`).
+            if h.entries > max_entries_per_block {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ext4: extent index claims {} entries, block holds at most {max_entries_per_block}",
+                    h.entries
+                )));
+            }
+            // Parse its idx entries and pick the subtree covering `n`.
             let mut chosen: Option<u32> = None;
             for i in 0..h.entries as usize {
                 let off = 12 + i * 12;
@@ -3814,6 +3883,7 @@ impl Ext {
                 Some(c) => child = c,
                 None => return Ok(0),
             }
+            parent_depth = h.depth;
         }
     }
 
@@ -3926,6 +3996,12 @@ impl Ext {
     /// the standard fields + `i_extra_isize`.
     fn read_inline_xattrs(&self, dev: &mut dyn BlockDevice, ino: u32) -> Result<Vec<xattr::Xattr>> {
         let (group, idx) = self.inode_location(ino);
+        if group as usize >= self.layout.groups.len() {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: inode {ino} maps to group {group} beyond {} groups",
+                self.layout.groups.len()
+            )));
+        }
         let table_block = self.layout.groups[group as usize].inode_table;
         let bs = self.layout.block_size as u64;
         let inode_size = self.layout.inode_size as usize;

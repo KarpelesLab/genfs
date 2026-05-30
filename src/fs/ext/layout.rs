@@ -416,14 +416,80 @@ pub fn plan_layout(
 /// by [`super::Ext::open`] to reconstruct the geometry of an existing image
 /// without re-running the planner's defaulting heuristics.
 pub fn from_superblock(sb: &super::superblock::Superblock) -> crate::Result<Layout> {
+    // `block_size()` shifts `1024 << log_block_size`; a hostile value would
+    // overflow the shift (panic in debug, wrap in release). The on-disk max
+    // is 6 (64 KiB). Reject anything that can't yield a sane block size.
+    if sb.log_block_size > 6 {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext: bad log_block_size {}",
+            sb.log_block_size
+        )));
+    }
     let block_size = sb.block_size();
     if !block_size.is_power_of_two() || block_size < 1024 {
         return Err(crate::Error::InvalidImage(format!(
             "ext: bad block_size {block_size}"
         )));
     }
-    let group_input_blocks = sb.blocks_count - sb.first_data_block;
+
+    // Validate untrusted geometry fields BEFORE any division/allocation that
+    // is sized from them. A malicious image can set these to 0 (divide-by-
+    // zero) or to values that underflow/overflow the group arithmetic below.
+    if sb.blocks_per_group == 0 {
+        return Err(crate::Error::InvalidImage(
+            "ext: blocks_per_group is zero".into(),
+        ));
+    }
+    if sb.inodes_per_group == 0 {
+        return Err(crate::Error::InvalidImage(
+            "ext: inodes_per_group is zero".into(),
+        ));
+    }
+    // The inode bitmap is one block per group; `inodes_per_group` bits must
+    // fit in it, otherwise bitmap indexing reads out of bounds.
+    if sb.inodes_per_group as u64 > 8 * block_size as u64 {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext: inodes_per_group {} exceeds bitmap capacity {}",
+            sb.inodes_per_group,
+            8 * block_size
+        )));
+    }
+    // `s_desc_size` must be 0 (classic 32-byte), 32, or 64 (64-byte form,
+    // only valid with INCOMPAT_64BIT). Anything else mis-aligns descriptor
+    // slicing in the GDT and reads out of bounds.
+    let is_64bit = sb.feature_incompat & super::constants::feature::INCOMPAT_64BIT != 0;
+    match sb.desc_size {
+        0 | 32 => {}
+        64 if is_64bit => {}
+        other => {
+            return Err(crate::Error::InvalidImage(format!(
+                "ext: bad s_desc_size {other}"
+            )));
+        }
+    }
+    // `first_data_block` must lie strictly within the volume; otherwise the
+    // subtraction below underflows and yields a huge group count → OOM.
+    let group_input_blocks = sb
+        .blocks_count
+        .checked_sub(sb.first_data_block)
+        .filter(|_| sb.first_data_block < sb.blocks_count)
+        .ok_or_else(|| {
+            crate::Error::InvalidImage(format!(
+                "ext: first_data_block {} >= blocks_count {}",
+                sb.first_data_block, sb.blocks_count
+            ))
+        })?;
     let num_groups = group_input_blocks.div_ceil(sb.blocks_per_group);
+
+    // `inodes_count` must not claim more inodes than the group geometry can
+    // hold; otherwise `read_inode` derives a group index past `groups.len()`.
+    let max_inodes = sb.inodes_per_group as u64 * num_groups as u64;
+    if sb.inodes_count as u64 > max_inodes {
+        return Err(crate::Error::InvalidImage(format!(
+            "ext: inodes_count {} exceeds inodes_per_group*num_groups {}",
+            sb.inodes_count, max_inodes
+        )));
+    }
 
     let inode_table_blocks =
         (sb.inodes_per_group as u64 * sb.inode_size as u64).div_ceil(block_size as u64) as u32;
@@ -735,5 +801,104 @@ mod tests {
         assert!(!mode.group_has_backup(2));
         assert!(mode.group_has_backup(5));
         assert!(mode.group_has_backup(9));
+    }
+
+    // ── Hardening: from_superblock must reject malicious geometry ──
+
+    /// A minimal but internally consistent superblock (single 1 KiB group).
+    fn valid_sb() -> super::super::superblock::Superblock {
+        let mut sb = super::super::superblock::Superblock::ext2_default();
+        sb.inodes_count = 16;
+        sb.blocks_count = 1024;
+        sb.first_data_block = 1;
+        sb.log_block_size = 0; // 1 KiB
+        sb.blocks_per_group = 1024;
+        sb.frags_per_group = 1024;
+        sb.inodes_per_group = 16;
+        sb.inode_size = 128;
+        sb
+    }
+
+    #[test]
+    fn from_superblock_accepts_valid() {
+        assert!(from_superblock(&valid_sb()).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_blocks_per_group() {
+        let mut sb = valid_sb();
+        sb.blocks_per_group = 0;
+        assert!(matches!(
+            from_superblock(&sb),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_inodes_per_group() {
+        let mut sb = valid_sb();
+        sb.inodes_per_group = 0;
+        assert!(matches!(
+            from_superblock(&sb),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_first_data_block_past_end() {
+        let mut sb = valid_sb();
+        sb.first_data_block = sb.blocks_count; // underflow → huge num_groups
+        assert!(matches!(
+            from_superblock(&sb),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_inodes_per_group_exceeding_bitmap() {
+        let mut sb = valid_sb();
+        // 1 KiB block → bitmap holds 8192 bits.
+        sb.inodes_per_group = 8 * 1024 + 1;
+        assert!(matches!(
+            from_superblock(&sb),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_inodes_count_exceeding_capacity() {
+        let mut sb = valid_sb();
+        sb.inodes_count = u32::MAX; // far more than inodes_per_group*num_groups
+        assert!(matches!(
+            from_superblock(&sb),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_desc_size() {
+        let mut sb = valid_sb();
+        sb.desc_size = 48; // not 0/32/64
+        assert!(matches!(
+            from_superblock(&sb),
+            Err(crate::Error::InvalidImage(_))
+        ));
+        // 64 without INCOMPAT_64BIT is also rejected.
+        sb.desc_size = 64;
+        sb.feature_incompat = 0;
+        assert!(matches!(
+            from_superblock(&sb),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_log_block_size() {
+        let mut sb = valid_sb();
+        sb.log_block_size = 31; // would overflow `1024 << 31`
+        assert!(matches!(
+            from_superblock(&sb),
+            Err(crate::Error::InvalidImage(_))
+        ));
     }
 }

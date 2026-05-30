@@ -1,6 +1,6 @@
 [package]
 name = "fstool"
-version = "0.4.9"
+version = "0.4.10"
 edition = "2024"
 # Bumped from 1.85 by the `purecrypto` dependency (encrypted-DMG crypto),
 # whose own MSRV is 1.95.

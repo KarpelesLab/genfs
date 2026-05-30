@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.10](https://github.com/KarpelesLab/fstool/compare/v0.4.9...v0.4.10) - 2026-05-30
+
+### Added
+
+- *(hfs+)* resource-fork support (read, inventory, decode, extract)
+- *(hfs)* resource-fork support — read, inventory, decode, extract
+- *(cli)* --path-style {unix|native} + canonical HFS/HFS+ slash handling
+- *(cli)* ls -R recursion + readline line editing in the shell
+- *(part)* Apple Partition Map (APM) read-only support
+- *(hfs)* classic HFS read-only reader (DiskCopy 4.2 floppies, System ≤ 8)
+- *(block)* DiskCopy 4.2 container backend (transparent unwrap)
+- *(sevenz)* 7-Zip read-only reader (Copy/LZMA/BZip2/Deflate; rest pending compcol)
+- *(sit)* StuffIt classic SIT! read-only reader (store; rest pending compcol)
+- *(arc)* SEA ARC read-only reader (stored methods; compressed pending compcol)
+- *(lha)* LHA/LZH read-only reader (lh0 store; lh-series pending compcol)
+
+### Other
+
+- *(release-plz)* authenticate with RELEASE_PLZ_TOKEN (PAT)
+- *(archive)* skip 7z/lha cross-checks when the reference tool misbehaves
+- *(archive)* update scaffold test now that 7z/lha/arc/sit decode
+
 ### Added
 
 - *(hfs+)* **resource-fork** support for HFS+/HFSX, matching classic HFS:

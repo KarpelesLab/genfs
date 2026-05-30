@@ -49,6 +49,11 @@ pub const BMBT_KEY_SIZE: usize = 8;
 /// Bytes per pointer in a bmbt B-tree node.
 pub const BMBT_PTR_SIZE: usize = 8;
 
+/// Maximum bmbt tree depth. XFS caps the block-map B-tree at
+/// `XFS_BTREE_MAXLEVELS` (9); any image claiming a deeper tree (or one whose
+/// child pointers fail to strictly decrease the level) is malformed.
+pub const BMBT_MAX_LEVELS: u16 = 9;
+
 /// v4 BMBT block magic ("BMAP").
 pub const XFS_BMAP_MAGIC: u32 = 0x424D_4150;
 /// v5 BMBT block magic ("BMA3").
@@ -351,27 +356,52 @@ pub fn walk_btree(
         return decode_extents(&lit[4..], root_numrecs as u32);
     }
     let mut out = Vec::new();
-    // DFS: stack of (level, fsb) to visit. Push children L→R so that
-    // popping yields left-to-right order? We instead use a queue-style
-    // recursive walk for clarity, since we don't need RAII unwind.
+    let mut visited = std::collections::BTreeSet::new();
+    // DFS down the tree. A malicious image can point a child back at itself
+    // or an ancestor, or keep the level constant, which would otherwise
+    // recurse forever and overflow the stack. We guard with: (1) a hard cap
+    // on tree depth (XFS bmbt has at most XFS_BTREE_MAXLEVELS = 9 levels);
+    // (2) a strict `child.level == parent.level - 1` requirement; and (3) a
+    // visited-FSB set rejecting any block reached twice.
     fn walk(
         dev: &mut dyn BlockDevice,
         layout: &BmbtLayout,
         fsb: u64,
+        expect_level: u16,
+        depth: u16,
+        visited: &mut std::collections::BTreeSet<u64>,
         sink: &mut Vec<Extent>,
     ) -> Result<()> {
+        if depth > BMBT_MAX_LEVELS {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: bmbt tree exceeds max depth {BMBT_MAX_LEVELS}"
+            )));
+        }
+        if !visited.insert(fsb) {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: bmbt cycle detected at fsb {fsb}"
+            )));
+        }
         let node = read_node_block(dev, layout, fsb)?;
+        if node.level != expect_level {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: bmbt node at fsb {fsb} has level {} but expected {expect_level}",
+                node.level
+            )));
+        }
         if node.level == 0 {
             sink.extend(node.recs);
         } else {
+            let child_level = node.level - 1;
             for child in node.ptrs {
-                walk(dev, layout, child, sink)?;
+                walk(dev, layout, child, child_level, depth + 1, visited, sink)?;
             }
         }
         Ok(())
     }
+    let child_level = root_level - 1;
     for child in root_ptrs {
-        walk(dev, layout, child, &mut out)?;
+        walk(dev, layout, child, child_level, 1, &mut visited, &mut out)?;
     }
     Ok(out)
 }
@@ -551,6 +581,47 @@ mod tests {
         assert_eq!(extents[1], e1);
         assert_eq!(extents[2], e2);
         assert_eq!(extents[3], e3);
+    }
+
+    /// A self-referential internal node (a child pointer aimed at its own
+    /// block, with a non-decreasing level) must be rejected rather than
+    /// recursing forever / overflowing the stack.
+    #[test]
+    fn walk_rejects_self_referential_btree() {
+        let blocksize = 4096u32;
+        let agblocks = 256u32;
+        let agblklog = 8u8;
+        let layout = BmbtLayout {
+            blocksize,
+            agblocks,
+            agblklog,
+            is_v5: true,
+        };
+        let total = (agblocks as u64) * 4 * blocksize as u64;
+        let mut dev = MemoryBackend::new(total);
+
+        // Internal node at FSB 10, level=1, with a single pointer back to
+        // itself (FSB 10). Without the level-decrement + cycle guards this
+        // would recurse forever.
+        let hdr = layout.node_header_bytes();
+        let max_recs = (blocksize as usize - hdr) / (BMBT_KEY_SIZE + BMBT_PTR_SIZE);
+        let mut block = vec![0u8; blocksize as usize];
+        block[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
+        block[4..6].copy_from_slice(&1u16.to_be_bytes()); // level=1
+        block[6..8].copy_from_slice(&1u16.to_be_bytes()); // numrecs=1
+        let ptrs_start = hdr + max_recs * BMBT_KEY_SIZE;
+        block[ptrs_start..ptrs_start + 8].copy_from_slice(&10u64.to_be_bytes());
+        dev.write_at(fsb_to_byte(agblklog, blocksize, agblocks, 10), &block)
+            .unwrap();
+
+        // Root: level=2, one pointer to the self-referential node.
+        let mut root = vec![0u8; 64];
+        root[0..2].copy_from_slice(&2u16.to_be_bytes());
+        root[2..4].copy_from_slice(&1u16.to_be_bytes());
+        root[56..64].copy_from_slice(&10u64.to_be_bytes());
+
+        let r = walk_btree(&mut dev, &layout, &root);
+        assert!(matches!(r, Err(crate::Error::InvalidImage(_))));
     }
 
     #[test]

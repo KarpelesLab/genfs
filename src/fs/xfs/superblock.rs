@@ -165,8 +165,46 @@ impl Superblock {
         // version. We read it from the on-disk layout: offset 192 in v4+.
         let dirblklog = buf[192];
 
+        // Range-check every log/shift field BEFORE using it in a shift, so a
+        // malicious image can't trigger a shift-overflow panic. The shifts
+        // below all use `checked_shl`; a `None` result means the log field is
+        // inconsistent with its companion size field.
+        if blocklog >= 32 {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: bad blocklog {blocklog} (must be < 32)"
+            )));
+        }
+        if inodelog >= 16 {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: bad inodelog {inodelog} (must be < 16)"
+            )));
+        }
+        if inopblog >= 16 {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: bad inopblog {inopblog} (must be < 16)"
+            )));
+        }
+        if agblklog >= 64 {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: bad agblklog {agblklog} (must be < 64)"
+            )));
+        }
+        // Cap the multi-block directory-block shift so `dir_block_size`
+        // (`blocksize << dirblklog`) stays within a few MiB and never
+        // overflows. XFS allows dir blocks up to 64 KiB; require the product
+        // to fit in u32 and stay <= 8 MiB.
+        const MAX_DIR_BLOCK_SIZE: u32 = 8 * 1024 * 1024;
+        match blocksize.checked_shl(dirblklog as u32) {
+            Some(dbs) if dbs <= MAX_DIR_BLOCK_SIZE => {}
+            _ => {
+                return Err(crate::Error::InvalidImage(format!(
+                    "xfs: bad dirblklog {dirblklog} (blocksize {blocksize} << dirblklog oversized)"
+                )));
+            }
+        }
+
         // Sanity-check the log fields where we depend on them.
-        if 1u32 << blocklog != blocksize {
+        if 1u32.checked_shl(blocklog as u32) != Some(blocksize) {
             return Err(crate::Error::InvalidImage(format!(
                 "xfs: blocklog {blocklog} disagrees with blocksize {blocksize}"
             )));
@@ -176,12 +214,12 @@ impl Superblock {
                 "xfs: bad inodesize {inodesize}"
             )));
         }
-        if 1u16 << inodelog != inodesize {
+        if 1u16.checked_shl(inodelog as u32) != Some(inodesize) {
             return Err(crate::Error::InvalidImage(format!(
                 "xfs: inodelog {inodelog} disagrees with inodesize {inodesize}"
             )));
         }
-        if inopblock == 0 || (1u16 << inopblog) != inopblock {
+        if inopblock == 0 || 1u16.checked_shl(inopblog as u32) != Some(inopblock) {
             return Err(crate::Error::InvalidImage(format!(
                 "xfs: inopblog {inopblog} disagrees with inopblock {inopblock}"
             )));
@@ -191,6 +229,14 @@ impl Superblock {
         }
         if agblocks == 0 {
             return Err(crate::Error::InvalidImage("xfs: agblocks is 0".into()));
+        }
+        // `agblklog` must be large enough to address every block in an AG:
+        // `1 << agblklog >= agblocks`. (agblklog < 64 was checked above, so
+        // the shift cannot overflow here.)
+        if (1u64 << agblklog as u32) < agblocks as u64 {
+            return Err(crate::Error::InvalidImage(format!(
+                "xfs: agblklog {agblklog} too small for agblocks {agblocks}"
+            )));
         }
         let version = versionnum & XFS_SB_VERSION_NUMBITS;
         if version != XFS_SB_VERSION_4 && version != XFS_SB_VERSION_5 {
@@ -242,7 +288,12 @@ impl Superblock {
     /// than FS blocks (multi-block directory blocks); the multiplier is
     /// `1 << sb_dirblklog`.
     pub fn dir_block_size(&self) -> u32 {
-        self.blocksize << (self.dirblklog as u32)
+        // `Superblock::decode` validates `dirblklog` so this shift cannot
+        // overflow for a successfully-decoded superblock; saturate defensively
+        // rather than panic if called on a hand-built value.
+        self.blocksize
+            .checked_shl(self.dirblklog as u32)
+            .unwrap_or(u32::MAX)
     }
 
     /// Byte offset on the device where the internal log begins. Translates
@@ -365,6 +416,51 @@ mod tests {
     fn decode_rejects_inconsistent_blocklog() {
         let mut buf = synth(4096, 8192, 2048, 4, 512, 8, 128, XFS_SB_VERSION_5);
         buf[120] = 11; // 1<<11 = 2048, not 4096
+        assert!(matches!(
+            Superblock::decode(&buf),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_dirblklog() {
+        // dirblklog is at byte 192; a huge value would overflow
+        // `blocksize << dirblklog` or yield an enormous dir-block alloc.
+        let mut buf = synth(4096, 8192, 2048, 4, 512, 8, 128, XFS_SB_VERSION_5);
+        buf[192] = 40; // 4096 << 40 overflows u32 / is wildly oversized
+        assert!(matches!(
+            Superblock::decode(&buf),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_huge_agblklog() {
+        // agblklog >= 64 would overflow `1u64 << agblklog`.
+        let mut buf = synth(4096, 8192, 2048, 4, 512, 8, 128, XFS_SB_VERSION_5);
+        buf[124] = 64;
+        assert!(matches!(
+            Superblock::decode(&buf),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_agblklog_too_small_for_agblocks() {
+        // 1<<agblklog must be >= agblocks (2048 here needs agblklog >= 11).
+        let mut buf = synth(4096, 8192, 2048, 4, 512, 8, 128, XFS_SB_VERSION_5);
+        buf[124] = 5; // 1<<5 = 32 < 2048
+        assert!(matches!(
+            Superblock::decode(&buf),
+            Err(crate::Error::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_out_of_range_blocklog() {
+        // blocklog >= 32 must be rejected before any shift is attempted.
+        let mut buf = synth(4096, 8192, 2048, 4, 512, 8, 128, XFS_SB_VERSION_5);
+        buf[120] = 200;
         assert!(matches!(
             Superblock::decode(&buf),
             Err(crate::Error::InvalidImage(_))

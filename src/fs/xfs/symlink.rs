@@ -24,6 +24,10 @@ use super::bmbt::{BmbtLayout, Extent};
 /// Magic at the start of a v5 symlink data block ("XSLM").
 pub const XFS_SYMLINK_MAGIC: u32 = 0x5853_4C4D;
 
+/// Maximum symlink target length the kernel allows (`PATH_MAX`). A target
+/// claiming more than this is malformed and we refuse to allocate for it.
+pub const XFS_SYMLINK_MAXLEN: u64 = 4096;
+
 /// Size of the v5 symlink-block header.
 pub const XFS_SYMLINK_HDR_SIZE: usize = 56;
 
@@ -56,10 +60,31 @@ pub fn decode_remote(
     if size == 0 {
         return Ok(String::new());
     }
+    // Cap the claimed target length BEFORE allocating so a malicious inode
+    // with a huge `di_size` can't drive an unbounded `Vec::with_capacity`.
+    // The kernel limits symlink targets to PATH_MAX (4096).
+    if size > XFS_SYMLINK_MAXLEN {
+        return Err(crate::Error::InvalidImage(format!(
+            "xfs: remote symlink size {size} exceeds PATH_MAX {XFS_SYMLINK_MAXLEN}"
+        )));
+    }
     let bs = layout.blocksize as u64;
     let agblklog = layout.agblklog as u32;
     let agblocks = layout.agblocks as u64;
-    let mut out = Vec::with_capacity(size as usize);
+    // Also bound `size` by the bytes the extent list can actually back, so we
+    // never reserve more than the data on disk could supply.
+    let backed_bytes: u64 = extents
+        .iter()
+        .map(|e| (e.blockcount as u64).saturating_mul(bs))
+        .fold(0u64, |a, b| a.saturating_add(b));
+    if size > backed_bytes {
+        return Err(crate::Error::InvalidImage(format!(
+            "xfs: remote symlink size {size} exceeds {backed_bytes} bytes backed by extents"
+        )));
+    }
+    // Reserve a modest amount up front and grow as bytes arrive, rather than
+    // trusting `size` for the initial capacity.
+    let mut out = Vec::with_capacity((size as usize).min(bs as usize));
     let mut remaining = size as usize;
     // We assume extents are sorted by logical offset (XFS invariant). Walk
     // them in array order.
@@ -185,6 +210,49 @@ mod tests {
         }];
         let s = decode_remote(&mut dev, &layout, &extents, target.len() as u64).unwrap();
         assert_eq!(s, target);
+    }
+
+    #[test]
+    fn remote_rejects_oversized_size() {
+        // A `di_size` far above PATH_MAX must be rejected before any large
+        // allocation, regardless of what the extents could back.
+        let layout = BmbtLayout {
+            blocksize: 4096,
+            agblocks: 256,
+            agblklog: 8,
+            is_v5: true,
+        };
+        let mut dev = MemoryBackend::new(256 * 4096);
+        let extents = vec![Extent {
+            offset: 0,
+            startblock: 5,
+            blockcount: 1,
+            unwritten: false,
+        }];
+        let r = decode_remote(&mut dev, &layout, &extents, 1 << 40);
+        assert!(matches!(r, Err(crate::Error::InvalidImage(_))));
+    }
+
+    #[test]
+    fn remote_rejects_size_exceeding_extents() {
+        // size within PATH_MAX but larger than the single 512-byte block the
+        // extents can supply.
+        let layout = BmbtLayout {
+            blocksize: 512,
+            agblocks: 64,
+            agblklog: 6,
+            is_v5: false,
+        };
+        let mut dev = MemoryBackend::new(64 * 512 * 2);
+        let extents = vec![Extent {
+            offset: 0,
+            startblock: 3,
+            blockcount: 1,
+            unwritten: false,
+        }];
+        // 4000 <= PATH_MAX but > 512 bytes backed by the one extent block.
+        let r = decode_remote(&mut dev, &layout, &extents, 4000);
+        assert!(matches!(r, Err(crate::Error::InvalidImage(_))));
     }
 
     #[test]

@@ -38,6 +38,20 @@ use crate::fs::ext::{Ext, FsKind};
 use crate::fs::tar::{TarEntryMeta, TarStreamWriter};
 use crate::fs::{DeviceKind, FileMeta, Filesystem, XattrPair};
 
+/// Hard ceiling on directory-tree depth when walking a source image.
+/// A malicious source can encode a directory entry whose inode loops
+/// back at an ancestor; without a bound the depth-first walk descends
+/// forever. 4096 is far deeper than any legitimate tree (most cap well
+/// below 256) yet aborts a crafted cycle promptly.
+const MAX_WALK_DEPTH: usize = 4096;
+
+/// Hard ceiling on the total number of entries visited while walking a
+/// source image. Backstops [`MAX_WALK_DEPTH`] for cycles that stay
+/// shallow but fan out (and for backends that report inode 0, where the
+/// visited-inode set can't help). 64 Mi entries dwarfs any real image
+/// but bounds a self-referential one to finite work.
+const MAX_WALK_ENTRIES: u64 = 64 * 1024 * 1024;
+
 /// Progress reporter for a running repack. The CLI installs one with
 /// [`enter`] before driving the copy path and tears it down with
 /// [`leave`] afterward; the inner copy code calls [`note`] for each
@@ -936,11 +950,26 @@ pub fn walk_anyfs(
     use crate::fs::EntryKind;
     let mut link_map: std::collections::HashMap<(u32, u32), String> =
         std::collections::HashMap::new();
-    let mut stack: Vec<String> = vec!["/".to_string()];
-    while let Some(dir) = stack.pop() {
+    // Cycle/over-depth guard for a malicious source: a crafted directory
+    // entry whose inode points back at an ancestor would otherwise loop
+    // forever, pushing ever-deeper paths. Track visited directory inodes
+    // (when the backend reports a meaningful one) and always enforce a
+    // hard depth + entry-count ceiling as the backstop for backends that
+    // report inode 0.
+    let mut visited_dirs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut entries_seen: u64 = 0;
+    let mut stack: Vec<(String, usize)> = vec![("/".to_string(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
         for e in src_fs.list(src_dev, &dir)? {
             if e.name == "." || e.name == ".." || e.name == "lost+found" {
                 continue;
+            }
+            entries_seen += 1;
+            if entries_seen > MAX_WALK_ENTRIES {
+                return Err(crate::Error::InvalidImage(format!(
+                    "source directory tree exceeds {MAX_WALK_ENTRIES} entries — refusing \
+                     to walk a possibly cyclic image"
+                )));
             }
             let child = join_fs_path(&dir, &e.name);
             note(&child);
@@ -957,8 +986,25 @@ pub fn walk_anyfs(
             };
             match attrs.kind {
                 EntryKind::Dir => {
+                    // Refuse to re-enter a directory inode we've already
+                    // descended into (a cycle), and never descend past the
+                    // depth ceiling. Both abort with InvalidImage rather
+                    // than looping / exhausting memory.
+                    if attrs.inode != 0 && !visited_dirs.insert(attrs.inode) {
+                        return Err(crate::Error::InvalidImage(format!(
+                            "source directory cycle: {child:?} re-enters inode {} — \
+                             refusing to walk a cyclic image",
+                            attrs.inode
+                        )));
+                    }
+                    if depth >= MAX_WALK_DEPTH {
+                        return Err(crate::Error::InvalidImage(format!(
+                            "source directory nesting exceeds depth {MAX_WALK_DEPTH} at \
+                             {child:?} — refusing to walk a possibly cyclic image"
+                        )));
+                    }
                     sink.put_dir(&child, meta, &xattrs)?;
-                    stack.push(child);
+                    stack.push((child, depth + 1));
                 }
                 EntryKind::Regular => {
                     if attrs.inode != 0 && attrs.nlink > 1 {
@@ -1060,9 +1106,14 @@ pub fn walk_tar_stream(reader: &mut dyn Read, sink: &mut dyn RepackSink) -> Resu
     // emits `./`-prefixed members; the stream reader's `normalise_path`
     // only fixes leading/trailing slashes, leaving interior `.`s that
     // would otherwise create a bogus `/.` directory).
+    // Defense-in-depth: also drop `..` segments so a crafted tar member
+    // path can't ascend out of its destination subtree.
     fn collapse(p: &str) -> String {
         let mut out = String::new();
-        for seg in p.split('/').filter(|s| !s.is_empty() && *s != ".") {
+        for seg in p
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        {
             out.push('/');
             out.push_str(seg);
         }
@@ -1457,18 +1508,44 @@ pub(crate) fn scan_into_build_plan(
     plan: &mut crate::fs::ext::BuildPlan,
 ) -> Result<()> {
     use crate::fs::EntryKind;
-    let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("/")];
-    while let Some(dir) = stack.pop() {
+    // Mirror the cycle/over-depth guard in `walk_anyfs`: this sizing
+    // pre-pass walks the same untrusted source and must not loop forever
+    // on a crafted directory cycle. Use the listing's inode directly
+    // (no getattr here), plus a depth + entry-count ceiling backstop.
+    let mut visited_dirs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut entries_seen: u64 = 0;
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from("/"), 0)];
+    while let Some((dir, depth)) = stack.pop() {
         let entries = fs.list(dev, &dir)?;
         for e in entries {
             if e.name == "." || e.name == ".." || e.name == "lost+found" {
                 continue;
             }
+            entries_seen += 1;
+            if entries_seen > MAX_WALK_ENTRIES {
+                return Err(crate::Error::InvalidImage(format!(
+                    "source directory tree exceeds {MAX_WALK_ENTRIES} entries — refusing \
+                     to walk a possibly cyclic image"
+                )));
+            }
             let child = dir.join(&e.name);
             match e.kind {
                 EntryKind::Dir => {
+                    if e.inode != 0 && !visited_dirs.insert(e.inode) {
+                        return Err(crate::Error::InvalidImage(format!(
+                            "source directory cycle: {child:?} re-enters inode {} — \
+                             refusing to walk a cyclic image",
+                            e.inode
+                        )));
+                    }
+                    if depth >= MAX_WALK_DEPTH {
+                        return Err(crate::Error::InvalidImage(format!(
+                            "source directory nesting exceeds depth {MAX_WALK_DEPTH} at \
+                             {child:?} — refusing to walk a possibly cyclic image"
+                        )));
+                    }
                     plan.add_dir();
-                    stack.push(child);
+                    stack.push((child, depth + 1));
                 }
                 EntryKind::Regular => plan.add_file(e.size),
                 EntryKind::Symlink => {
@@ -1754,5 +1831,156 @@ mod ticker_layout_tests {
         assert!(8 + line.chars().count() <= 30);
         // Even tight, the trailing characters survive (in particular `.bin`).
         assert!(line.contains(".bin"));
+    }
+}
+
+#[cfg(test)]
+mod cycle_guard_tests {
+    use super::scan_into_build_plan;
+    use crate::block::MemoryBackend;
+    use crate::fs::ext::{BuildPlan, FsKind};
+    use crate::fs::{DirEntry, EntryKind, FileMeta, FileSource, Filesystem};
+    use std::io::Read;
+    use std::path::Path;
+
+    /// Minimal in-memory `Filesystem` whose directory listing is driven
+    /// by a closure `(path) -> entries`. Only `list` is exercised by
+    /// `scan_into_build_plan`; every mutating method is unreachable here.
+    struct ListFs<F: FnMut(&Path) -> Vec<DirEntry>> {
+        list_fn: F,
+    }
+
+    impl<F: FnMut(&Path) -> Vec<DirEntry>> Filesystem for ListFs<F> {
+        fn list(
+            &mut self,
+            _dev: &mut dyn crate::block::BlockDevice,
+            path: &Path,
+        ) -> crate::Result<Vec<DirEntry>> {
+            Ok((self.list_fn)(path))
+        }
+
+        fn create_file(
+            &mut self,
+            _: &mut dyn crate::block::BlockDevice,
+            _: &Path,
+            _: FileSource,
+            _: FileMeta,
+        ) -> crate::Result<()> {
+            unimplemented!()
+        }
+        fn create_dir(
+            &mut self,
+            _: &mut dyn crate::block::BlockDevice,
+            _: &Path,
+            _: FileMeta,
+        ) -> crate::Result<()> {
+            unimplemented!()
+        }
+        fn create_symlink(
+            &mut self,
+            _: &mut dyn crate::block::BlockDevice,
+            _: &Path,
+            _: &Path,
+            _: FileMeta,
+        ) -> crate::Result<()> {
+            unimplemented!()
+        }
+        fn create_device(
+            &mut self,
+            _: &mut dyn crate::block::BlockDevice,
+            _: &Path,
+            _: crate::fs::DeviceKind,
+            _: u32,
+            _: u32,
+            _: FileMeta,
+        ) -> crate::Result<()> {
+            unimplemented!()
+        }
+        fn remove(&mut self, _: &mut dyn crate::block::BlockDevice, _: &Path) -> crate::Result<()> {
+            unimplemented!()
+        }
+        fn read_file<'a>(
+            &'a mut self,
+            _: &'a mut dyn crate::block::BlockDevice,
+            _: &Path,
+        ) -> crate::Result<Box<dyn Read + 'a>> {
+            unimplemented!()
+        }
+        fn flush(&mut self, _: &mut dyn crate::block::BlockDevice) -> crate::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    fn dir_entry(name: &str, inode: u32) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            inode,
+            kind: EntryKind::Dir,
+            size: 0,
+        }
+    }
+
+    /// A directory whose child re-uses an ancestor's inode (a cycle)
+    /// must abort with `InvalidImage`, not loop forever.
+    #[test]
+    fn scan_rejects_inode_cycle() {
+        let mut dev = MemoryBackend::new(1 << 20);
+        // Every directory lists a single child "loop" pointing back at
+        // the same inode 42 — a self-referential cycle.
+        let mut fs = ListFs {
+            list_fn: |_path: &Path| vec![dir_entry("loop", 42)],
+        };
+        let mut plan = BuildPlan::new(4096, FsKind::Ext4);
+        let err = scan_into_build_plan(&mut dev, &mut fs, &mut plan).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidImage(_)),
+            "expected InvalidImage, got {err:?}"
+        );
+    }
+
+    /// Backends that report inode 0 (no per-path identity) can't be
+    /// caught by the visited-set — the depth ceiling must still abort an
+    /// unbounded descent.
+    #[test]
+    fn scan_depth_caps_zero_inode_descent() {
+        let mut dev = MemoryBackend::new(1 << 20);
+        // Each directory has one child dir with inode 0 → infinite depth
+        // without the depth cap.
+        let mut fs = ListFs {
+            list_fn: |_path: &Path| vec![dir_entry("deeper", 0)],
+        };
+        let mut plan = BuildPlan::new(4096, FsKind::Ext4);
+        let err = scan_into_build_plan(&mut dev, &mut fs, &mut plan).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::InvalidImage(_)),
+            "expected InvalidImage, got {err:?}"
+        );
+    }
+
+    /// A finite, acyclic tree (distinct inodes, bounded depth) must
+    /// complete cleanly — the guard must not reject valid sources.
+    #[test]
+    fn scan_accepts_finite_acyclic_tree() {
+        let mut dev = MemoryBackend::new(1 << 20);
+        // "/" → dir "a" (inode 2); "/a" → file "f"; everything else empty.
+        let mut fs = ListFs {
+            list_fn: |path: &Path| {
+                if path == Path::new("/") {
+                    vec![dir_entry("a", 2)]
+                } else if path == Path::new("/a") {
+                    vec![DirEntry {
+                        name: "f".to_string(),
+                        inode: 3,
+                        kind: EntryKind::Regular,
+                        size: 10,
+                    }]
+                } else {
+                    vec![]
+                }
+            },
+        };
+        let mut plan = BuildPlan::new(4096, FsKind::Ext4);
+        scan_into_build_plan(&mut dev, &mut fs, &mut plan)
+            .expect("finite acyclic tree must scan cleanly");
     }
 }

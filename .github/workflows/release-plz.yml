@@ -14,9 +14,6 @@ permissions:
   # this for a short-lived registry token instead of using a long-lived
   # CARGO_REGISTRY_TOKEN secret.
   id-token: write
-  # Needed for the `gh workflow run release-binaries.yml` dispatch below;
-  # workflow_dispatch requires `actions: write` even with GITHUB_TOKEN.
-  actions: write
 
 # Don't run two release-plz jobs in parallel.
 concurrency:
@@ -40,27 +37,14 @@ jobs:
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # release-plz creates the GitHub Release with the workflow's
-      # GITHUB_TOKEN. GitHub deliberately suppresses downstream workflow
-      # triggers for GITHUB_TOKEN-originated events to prevent recursion,
-      # so `release: published` doesn't fire. workflow_dispatch is the
-      # exception — chain into release-binaries explicitly per release.
-      - name: Trigger release-binaries for each new release
-        if: ${{ steps.release-plz.outputs.releases_created == 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASES: ${{ steps.release-plz.outputs.releases }}
-        run: |
-          # release-plz emits `.releases[].tag` (not `.tag_name`); see
-          # https://release-plz.dev/docs/github/output for the schema.
-          echo "$RELEASES" | jq -r '.[].tag' | while read -r tag; do
-            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-              continue
-            fi
-            echo "Dispatching release-binaries for $tag"
-            gh workflow run release-binaries.yml -f tag="$tag"
-          done
+          # Use a PAT (RELEASE_PLZ_TOKEN) rather than the default
+          # GITHUB_TOKEN so the GitHub Release / tag is created by a real
+          # identity. GitHub suppresses downstream workflow triggers for
+          # GITHUB_TOKEN-originated events (anti-recursion); a PAT does not,
+          # so the `release: published` event fires natively and
+          # release-binaries.yml runs on its own — no explicit dispatch
+          # needed. (crates.io publishing still uses OIDC, above.)
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
   release-plz-pr:
     name: release-plz PR
@@ -77,4 +61,7 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT so the opened/updated release PR triggers CI (a PR opened
+          # with the default GITHUB_TOKEN does not fire `pull_request`
+          # workflows).
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

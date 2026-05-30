@@ -639,7 +639,7 @@ fn align_records_to_sector(bytes: u64) -> u64 {
 fn dir_record_size(node: &Node, rock_ridge: bool, joliet: bool) -> usize {
     let name_bytes = iso_name_bytes(&node.name, joliet, matches!(node.kind, NodeKind::Dir));
     // Pad name to even length (ECMA-119 §9.1.12).
-    let name_pad = if name_bytes % 2 == 0 { 1 } else { 0 };
+    let name_pad = if name_bytes.is_multiple_of(2) { 1 } else { 0 };
     let base = 33 + name_bytes + name_pad;
     if rock_ridge {
         // Rock Ridge SUA size per child: NM (5 + name) + PX (36) +
@@ -1109,7 +1109,11 @@ fn encode_child_record(
 
     let name_bytes = iso_identifier_bytes(&child.name, joliet, matches!(child.kind, NodeKind::Dir));
     let len_fi = name_bytes.len() as u8;
-    let name_pad = if name_bytes.len() % 2 == 0 { 1 } else { 0 };
+    let name_pad = if name_bytes.len().is_multiple_of(2) {
+        1
+    } else {
+        0
+    };
 
     let want_rr = opts.rock_ridge && !joliet;
     let mut sua: Vec<u8> = Vec::new();

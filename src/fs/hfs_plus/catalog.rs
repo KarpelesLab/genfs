@@ -197,7 +197,11 @@ impl CatalogKey {
                  (parent + {name_len} name bytes)"
             )));
         }
-        let encoded_len = if used % 2 == 0 { used } else { used + 1 };
+        let encoded_len = if used.is_multiple_of(2) {
+            used
+        } else {
+            used + 1
+        };
         Ok(Self {
             parent_id,
             name,

@@ -2,7 +2,9 @@
 name = "fstool"
 version = "0.4.8"
 edition = "2024"
-rust-version = "1.85"
+# Bumped from 1.85 by the `purecrypto` dependency (encrypted-DMG crypto),
+# whose own MSRV is 1.95.
+rust-version = "1.95"
 description = "Build disk images and filesystems (ext2/3/4, MBR, GPT) from a directory tree and TOML spec, in the spirit of genext2fs."
 license = "MIT"
 repository = "https://github.com/KarpelesLab/fstool"
@@ -58,18 +60,10 @@ lzo = ["dep:compcol", "compcol/lzo"]
 # lzfse test vector — compcol's LZFSE is decode-only.)
 dmg-bzip2 = ["dep:compcol", "compcol/bzip2"]
 dmg-lzfse = ["dep:compcol", "compcol/lzfse"]
-# Password-protected DMG read support (`encrcdsa` v2). Pulls in the
-# RustCrypto AES/DES/CBC/HMAC/SHA1/PBKDF2 crates — all pure Rust. Gated
-# so a slim build can drop them.
-dmg-encrypted = [
-    "dep:aes",
-    "dep:cbc",
-    "dep:cipher",
-    "dep:des",
-    "dep:hmac",
-    "dep:sha1",
-    "dep:pbkdf2",
-]
+# Password-protected DMG read support (`encrcdsa` v2). Served by the
+# `purecrypto` crate (AES-CBC, 3DES-EDE3-CBC via Cbc64, HMAC-SHA1, SHA-1,
+# PBKDF2) — pure-Rust, no foreign code. Gated so a slim build can drop it.
+dmg-encrypted = ["dep:purecrypto"]
 # FUSE adapter: enables the `fstool mount` subcommand which exposes an
 # ext{2,3,4} image as a userspace filesystem via libfuse (Linux) or
 # macFUSE (macOS). Off by default so the core build doesn't need a C
@@ -111,15 +105,11 @@ tempfile = "3"
 # adapters); per-algorithm features are added by fstool's feature flags.
 compcol = { version = "0.4", optional = true, default-features = false, features = ["std"] }
 
-# Encrypted DMG (encrcdsa v2) deps — all pure-Rust from the RustCrypto
-# organization. Opt-in via the `dmg-encrypted` feature.
-aes = { version = "0.8", optional = true }
-cbc = { version = "0.1", optional = true, features = ["std"] }
-cipher = { version = "0.4", optional = true, features = ["block-padding"] }
-des = { version = "0.8", optional = true }
-hmac = { version = "0.12", optional = true }
-sha1 = { version = "0.10", optional = true }
-pbkdf2 = { version = "0.12", optional = true, default-features = false, features = ["hmac"] }
+# Encrypted DMG (encrcdsa v2) crypto — `purecrypto`, a pure-Rust no_std
+# toolkit (KarpelesLab, MIT). Opt-in via the `dmg-encrypted` feature; we
+# pull only the symmetric/hash/kdf modules (`kdf` re-enables `hash` +
+# `cipher`), not its TLS/PQC/RSA surface.
+purecrypto = { version = "0.4", optional = true, default-features = false, features = ["std", "cipher", "hash", "kdf"] }
 
 # FUSE adapter — Linux uses libfuse, macOS uses macFUSE. Off by default
 # (see the `fuse` feature). `fuser` is the maintained successor to

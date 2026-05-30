@@ -71,7 +71,7 @@ pub fn fletcher64(block: &[u8]) -> u64 {
 /// the two-pass procedure: payload first, then the cksum bytes; on a
 /// valid block both running sums are zero at the end.
 pub fn verify(block: &[u8]) -> bool {
-    if block.len() < 8 || block.len() % 4 != 0 {
+    if block.len() < 8 || !block.len().is_multiple_of(4) {
         return false;
     }
     // Reject sentinel cksum values (matches the reference implementation;

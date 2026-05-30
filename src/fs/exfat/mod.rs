@@ -1428,7 +1428,7 @@ fn unix_to_exfat_timestamp(unix_secs: u32) -> u32 {
 /// (none of which are century-boundary edge cases, but we keep the full
 /// rule for clarity).
 fn is_leap(year: u32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 /// Set or clear bit `cluster - 2` in the allocation bitmap. No-op if the

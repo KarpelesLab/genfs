@@ -125,7 +125,7 @@ pub fn encode_lfn_run(name: &str, csum: u8) -> Vec<[u8; ENTRY_SIZE]> {
     // multiple of 13.
     let mut units: Vec<u16> = name.encode_utf16().collect();
     units.push(0x0000);
-    while units.len() % LFN_CHARS_PER_ENTRY != 0 {
+    while !units.len().is_multiple_of(LFN_CHARS_PER_ENTRY) {
         units.push(0xFFFF);
     }
     let n_entries = units.len() / LFN_CHARS_PER_ENTRY;

@@ -940,12 +940,11 @@ impl Ntfs {
         }
 
         // Resolve shared security descriptor via $Secure if applicable.
-        if !have_inline_security {
-            if let Some(id) = security_id {
-                if let Some(sd) = self.resolve_security_descriptor(dev, id)? {
-                    out.insert(xattr_keys::SECURITY.into(), sd);
-                }
-            }
+        if !have_inline_security
+            && let Some(id) = security_id
+            && let Some(sd) = self.resolve_security_descriptor(dev, id)?
+        {
+            out.insert(xattr_keys::SECURITY.into(), sd);
         }
 
         // Pull each ADS payload through the streaming reader, with a
@@ -1132,54 +1131,47 @@ impl Ntfs {
 
         // Walk allocation blocks if any. Each INDX block carries the same
         // entry stream layout we just decoded for the root.
-        if let Some(runs) = alloc_runs {
-            if index_block_size > 0 {
-                let cluster_size = u64::from(self.boot.cluster_size());
-                let block_size = index_block_size as usize;
-                let mut visited = std::collections::HashSet::<u64>::new();
-                // Iterate every block in the run list rather than tree-
-                // descending — $SII isn't deep in practice and a flat
-                // scan keeps the cache builder simple.
-                let mut walked: u64 = 0;
-                for ext in &runs {
-                    let span = ext.length * cluster_size;
-                    if let Some(lcn) = ext.lcn {
-                        let mut local: u64 = 0;
-                        while local < span {
-                            let phys = lcn * cluster_size + local;
-                            if visited.insert(phys) {
-                                let mut blk = vec![0u8; block_size];
-                                if dev.read_at(phys, &mut blk).is_ok()
-                                    && mft::apply_fixup(
-                                        &mut blk,
-                                        self.boot.bytes_per_sector as usize,
-                                    )
+        if let Some(runs) = alloc_runs
+            && index_block_size > 0
+        {
+            let cluster_size = u64::from(self.boot.cluster_size());
+            let block_size = index_block_size as usize;
+            let mut visited = std::collections::HashSet::<u64>::new();
+            // Iterate every block in the run list rather than tree-
+            // descending — $SII isn't deep in practice and a flat
+            // scan keeps the cache builder simple.
+            let mut walked: u64 = 0;
+            for ext in &runs {
+                let span = ext.length * cluster_size;
+                if let Some(lcn) = ext.lcn {
+                    let mut local: u64 = 0;
+                    while local < span {
+                        let phys = lcn * cluster_size + local;
+                        if visited.insert(phys) {
+                            let mut blk = vec![0u8; block_size];
+                            if dev.read_at(phys, &mut blk).is_ok()
+                                && mft::apply_fixup(&mut blk, self.boot.bytes_per_sector as usize)
                                     .is_ok()
-                                {
-                                    if let Ok(blk_hdr) = index::IndexBlockHeader::parse(&blk) {
-                                        let s = blk_hdr.entries_start();
-                                        let l = blk_hdr.entries_byte_len();
-                                        if s + l <= blk.len() {
-                                            let entries = &blk[s..s + l];
-                                            if let Ok(rows) = secure::walk_sii_node(entries) {
-                                                for r in rows {
-                                                    cache.insert(
-                                                        r.security_id,
-                                                        (r.sds_offset, r.sds_size),
-                                                    );
-                                                }
-                                            }
+                                && let Ok(blk_hdr) = index::IndexBlockHeader::parse(&blk)
+                            {
+                                let s = blk_hdr.entries_start();
+                                let l = blk_hdr.entries_byte_len();
+                                if s + l <= blk.len() {
+                                    let entries = &blk[s..s + l];
+                                    if let Ok(rows) = secure::walk_sii_node(entries) {
+                                        for r in rows {
+                                            cache.insert(r.security_id, (r.sds_offset, r.sds_size));
                                         }
                                     }
                                 }
                             }
-                            local += block_size as u64;
                         }
+                        local += block_size as u64;
                     }
-                    walked += span;
                 }
-                let _ = walked;
+                walked += span;
             }
+            let _ = walked;
         }
         Ok(cache)
     }

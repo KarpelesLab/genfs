@@ -126,7 +126,7 @@ impl Progress {
             let mut err = std::io::stderr().lock();
             let _ = write!(err, "\r\x1b[Krepack: {line}");
             let _ = err.flush();
-        } else if self.verbose && self.files % 500 == 0 {
+        } else if self.verbose && self.files.is_multiple_of(500) {
             eprintln!("repack: {line}");
         }
     }

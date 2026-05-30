@@ -1081,12 +1081,12 @@ impl Writer {
         let child = existing
             .ok_or_else(|| crate::Error::InvalidArgument(format!("f2fs: not found: {path:?}")))?;
         // Non-empty directory?
-        if let Some(grand) = self.children.get(&child) {
-            if !grand.is_empty() {
-                return Err(crate::Error::InvalidArgument(format!(
-                    "f2fs: directory not empty: {path:?}"
-                )));
-            }
+        if let Some(grand) = self.children.get(&child)
+            && !grand.is_empty()
+        {
+            return Err(crate::Error::InvalidArgument(format!(
+                "f2fs: directory not empty: {path:?}"
+            )));
         }
         // Detach.
         if let Some(kids) = self.children.get_mut(&parent_nid) {
@@ -1102,10 +1102,10 @@ impl Writer {
         self.children.remove(&child);
         self.child_index.remove(&child);
         // If the removed entry was a directory, the parent loses a link.
-        if let Some(parent) = self.inodes.get_mut(&parent_nid) {
-            if parent.links > 1 {
-                parent.links -= 1;
-            }
+        if let Some(parent) = self.inodes.get_mut(&parent_nid)
+            && parent.links > 1
+        {
+            parent.links -= 1;
         }
         Ok(())
     }

@@ -622,7 +622,7 @@ impl<'a> FileHandle for XfsFileHandle<'a> {
             self.shrink_alloc(keep_blocks)?;
             self.len = new_len;
             // Zero trailing bytes within the final retained block.
-            if new_len % bs != 0 && new_len > 0 {
+            if !new_len.is_multiple_of(bs) && new_len > 0 {
                 let last_blk = (new_len - 1) / bs;
                 let blk_end = (last_blk + 1) * bs;
                 let zero_to = blk_end.min(keep_blocks * bs);

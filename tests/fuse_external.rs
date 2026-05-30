@@ -126,10 +126,10 @@ fn build_seed_image(path: &Path) -> Vec<(&'static str, &'static [u8])> {
 fn wait_until_mounted(mountpoint: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if let Ok(mut rd) = std::fs::read_dir(mountpoint) {
-            if rd.next().is_some() {
-                return;
-            }
+        if let Ok(mut rd) = std::fs::read_dir(mountpoint)
+            && rd.next().is_some()
+        {
+            return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }

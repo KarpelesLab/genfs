@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(dmg)* encrypted-DMG (`encrcdsa` v2) crypto now runs on the pure-Rust
+  `purecrypto` crate (KarpelesLab) instead of the RustCrypto stack. Drops
+  `aes`, `cbc`, `cipher`, `des`, `hmac`, `sha1`, and `pbkdf2` for a single
+  dependency: AES-128/256-CBC via `Cbc`, 3DES-EDE3-CBC keyblob unwrap via
+  `Cbc64`/`TdesEde3` (PKCS#7 stripped in-crate), HMAC-SHA1 chunk-IV
+  derivation, and PBKDF2-HMAC-SHA1 KEK derivation. Behaviour is unchanged —
+  the synthetic round-trips still pass and a new RFC 6070 PBKDF2-HMAC-SHA1
+  known-answer test pins the key-derivation bytes (so real Apple images still
+  decrypt). **MSRV is raised to 1.95** (purecrypto's minimum); the codebase
+  adopts `is_multiple_of` accordingly.
+
 ### Added
 
 - *(rar)* RAR5 (`Rar!\x1A\x07\x01`) read-only reader behind the `rar` feature

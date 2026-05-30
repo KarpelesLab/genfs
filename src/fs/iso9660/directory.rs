@@ -69,7 +69,7 @@ impl DirRecord {
         let identifier = buf[id_start..id_end].to_vec();
         // System Use Area starts after the identifier, padded to even
         // length (ECMA-119 §9.1.12).
-        let sua_start = id_end + if len_fi % 2 == 0 { 1 } else { 0 };
+        let sua_start = id_end + if len_fi.is_multiple_of(2) { 1 } else { 0 };
         let sua_end = usize::from(len_dr);
         let system_use = if sua_start < sua_end {
             buf[sua_start..sua_end].to_vec()
@@ -172,14 +172,12 @@ pub fn read_directory(
         };
 
         let mut symlink_target = None;
-        if use_rock_ridge {
-            if let Some(rr) = rock_ridge::parse_system_use(dev, &rec.system_use) {
-                if let Some(nm) = rr.alternate_name {
-                    cooked = nm;
-                }
-                if let Some(sl) = rr.symlink_target {
-                    symlink_target = Some(sl);
-                }
+        if use_rock_ridge && let Some(rr) = rock_ridge::parse_system_use(dev, &rec.system_use) {
+            if let Some(nm) = rr.alternate_name {
+                cooked = nm;
+            }
+            if let Some(sl) = rr.symlink_target {
+                symlink_target = Some(sl);
             }
         }
 

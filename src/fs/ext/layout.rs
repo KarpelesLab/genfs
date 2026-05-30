@@ -103,7 +103,7 @@ fn is_power_of(mut n: u32, base: u32) -> bool {
     if n == 0 {
         return false;
     }
-    while n % base == 0 {
+    while n.is_multiple_of(base) {
         n /= base;
     }
     n == 1
@@ -241,7 +241,7 @@ pub fn plan_layout(
     // case uses 8*block_size which is always a multiple of 8; the small
     // single-group case uses blocks_count directly, so blocks_count must be
     // a multiple of 8 there.
-    if blocks_per_group % 8 != 0 {
+    if !blocks_per_group.is_multiple_of(8) {
         return Err(crate::Error::InvalidArgument(format!(
             "ext: blocks_count {blocks_count} must be a multiple of 8 for a \
              single-group filesystem (blocks_per_group must be byte-aligned)"

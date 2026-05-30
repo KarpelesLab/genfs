@@ -307,10 +307,10 @@ impl FuseFilesystem for FstoolFs {
     }
 
     fn destroy(&mut self) {
-        if self.writable {
-            if let Err(e) = self.fs.flush(self.dev.as_mut()) {
-                eprintln!("fstool fuse: flush on unmount failed: {e}");
-            }
+        if self.writable
+            && let Err(e) = self.fs.flush(self.dev.as_mut())
+        {
+            eprintln!("fstool fuse: flush on unmount failed: {e}");
         }
         let _ = self.dev.sync();
     }
@@ -391,15 +391,13 @@ impl FuseFilesystem for FstoolFs {
             || attrs.atime.is_some()
             || attrs.mtime.is_some()
             || attrs.ctime.is_some();
-        if asked_attrs {
-            if let Err(e) = self.fs.set_attrs(self.dev.as_mut(), &path, attrs) {
-                return reply.error(fs_err_to_errno(&e));
-            }
+        if asked_attrs && let Err(e) = self.fs.set_attrs(self.dev.as_mut(), &path, attrs) {
+            return reply.error(fs_err_to_errno(&e));
         }
-        if let Some(sz) = size {
-            if let Err(e) = self.fs.truncate(self.dev.as_mut(), &path, sz) {
-                return reply.error(fs_err_to_errno(&e));
-            }
+        if let Some(sz) = size
+            && let Err(e) = self.fs.truncate(self.dev.as_mut(), &path, sz)
+        {
+            return reply.error(fs_err_to_errno(&e));
         }
         match self.fs.getattr(self.dev.as_mut(), &path) {
             Ok(a) => {

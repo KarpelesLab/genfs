@@ -325,11 +325,11 @@ impl<'a> F2fsFileHandle<'a> {
             // Trim the final partial dirty block.
             let last_idx = new_len / bs;
             let last_off = (new_len % bs) as usize;
-            if last_off != 0 {
-                if let Some(b) = self.dirty.get_mut(&last_idx) {
-                    for byte in b.iter_mut().skip(last_off) {
-                        *byte = 0;
-                    }
+            if last_off != 0
+                && let Some(b) = self.dirty.get_mut(&last_idx)
+            {
+                for byte in b.iter_mut().skip(last_off) {
+                    *byte = 0;
                 }
             }
             if self.inline {

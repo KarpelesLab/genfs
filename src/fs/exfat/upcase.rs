@@ -58,7 +58,7 @@ impl Upcase {
                 bytes.len()
             )));
         }
-        if data_length % 2 != 0 {
+        if !data_length.is_multiple_of(2) {
             return Err(crate::Error::InvalidImage(
                 "exfat: upcase table DataLength is not a multiple of 2".into(),
             ));

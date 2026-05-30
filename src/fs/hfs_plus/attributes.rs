@@ -105,7 +105,11 @@ impl AttrKey {
             code_units.push(u16::from_be_bytes([buf[off], buf[off + 1]]));
         }
         let used = payload_len;
-        let encoded_len = if used % 2 == 0 { used } else { used + 1 };
+        let encoded_len = if used.is_multiple_of(2) {
+            used
+        } else {
+            used + 1
+        };
         Ok(Self {
             file_id,
             start_block,

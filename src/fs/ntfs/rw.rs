@@ -167,14 +167,13 @@ impl<'a> NtfsFileHandle<'a> {
         self.dev.write_at(start * self.cluster_size, &zero)?;
 
         // Try to merge with the last existing run.
-        if let Some(last) = self.runs.last_mut() {
-            if let Some(last_lcn) = last.lcn {
-                if last_lcn + last.length == start {
-                    last.length += extra_clusters;
-                    self.dirty = true;
-                    return Ok(());
-                }
-            }
+        if let Some(last) = self.runs.last_mut()
+            && let Some(last_lcn) = last.lcn
+            && last_lcn + last.length == start
+        {
+            last.length += extra_clusters;
+            self.dirty = true;
+            return Ok(());
         }
         self.runs.push(Extent {
             lcn: Some(start),
@@ -760,15 +759,14 @@ fn locate_logfile(fs: &mut super::Ntfs, dev: &mut dyn BlockDevice) -> Result<(u6
     let hdr = mft::RecordHeader::parse(&rec)?;
     for attr_res in AttributeIter::new(&rec, hdr.first_attribute_offset as usize) {
         let attr = attr_res?;
-        if attr.type_code == TYPE_DATA && attr.name.is_empty() {
-            if let AttributeKind::NonResident {
+        if attr.type_code == TYPE_DATA
+            && attr.name.is_empty()
+            && let AttributeKind::NonResident {
                 runs, real_size, ..
             } = attr.kind
-            {
-                if let Some(first) = runs.first().and_then(|r| r.lcn) {
-                    return Ok((first * cluster_size, real_size));
-                }
-            }
+            && let Some(first) = runs.first().and_then(|r| r.lcn)
+        {
+            return Ok((first * cluster_size, real_size));
         }
     }
     Ok((0, 0))

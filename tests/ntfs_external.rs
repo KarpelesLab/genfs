@@ -269,10 +269,10 @@ fn read_volume_label(ntfs: &mut Ntfs, dev: &mut dyn BlockDevice) -> Option<Strin
     let hdr = mft::RecordHeader::parse(&buf).ok()?;
     for attr_res in AttributeIter::new(&buf, hdr.first_attribute_offset as usize) {
         let attr = attr_res.ok()?;
-        if attr.type_code == TYPE_VOLUME_NAME {
-            if let AttributeKind::Resident { value, .. } = attr.kind {
-                return Some(decode_utf16le(value));
-            }
+        if attr.type_code == TYPE_VOLUME_NAME
+            && let AttributeKind::Resident { value, .. } = attr.kind
+        {
+            return Some(decode_utf16le(value));
         }
     }
     None

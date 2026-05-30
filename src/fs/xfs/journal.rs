@@ -500,7 +500,7 @@ pub fn replay_log(
         )));
     }
     let h_len = h_len as usize;
-    if h_len % BBSIZE as usize != 0 || h_len == 0 {
+    if !h_len.is_multiple_of(BBSIZE as usize) || h_len == 0 {
         return Err(crate::Error::Unsupported(format!(
             "xfs: log replay only handles BB-aligned records (h_len = {h_len})"
         )));

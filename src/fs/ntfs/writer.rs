@@ -1182,10 +1182,10 @@ impl super::Ntfs {
     /// for subsequent lookups.
     fn resolve_dir(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
         let norm = normalize_path(path);
-        if let Some(w) = self.writer.as_ref() {
-            if let Some(&rec) = w.dir_cache.get(&norm) {
-                return Ok(rec);
-            }
+        if let Some(w) = self.writer.as_ref()
+            && let Some(&rec) = w.dir_cache.get(&norm)
+        {
+            return Ok(rec);
         }
         let rec = self.lookup_path(dev, &norm)?;
         if let Some(w) = self.writer.as_mut() {

@@ -344,10 +344,16 @@ impl EncryptedDmgBackend {
             ));
         }
 
-        // Derive the KEK with PBKDF2-SHA1. The output is 24 bytes (=
-        // 3DES key length).
+        // Derive the KEK with PBKDF2-HMAC-SHA1. The output is 24 bytes (=
+        // 3DES key length). Reject a zero iteration count up front —
+        // `purecrypto`'s pbkdf2 panics on it, and it's a malformed header.
+        if header.pbkdf2_iteration_count == 0 {
+            return Err(crate::Error::InvalidImage(
+                "encrcdsa: pbkdf2 iteration count is zero".into(),
+            ));
+        }
         let mut kek = [0u8; 24];
-        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(
+        purecrypto::kdf::pbkdf2::<purecrypto::hash::Sha1>(
             password.as_bytes(),
             header.salt(),
             header.pbkdf2_iteration_count,
@@ -420,7 +426,7 @@ impl EncryptedDmgBackend {
         // AES-CBC decrypt in place. No padding — the chunk's ciphertext
         // is always a multiple of the AES block size (16 bytes), and the
         // plaintext is the chunk's literal contents.
-        if ciphertext.len() % 16 != 0 {
+        if !ciphertext.len().is_multiple_of(16) {
             return Err(crate::Error::InvalidImage(format!(
                 "encrcdsa: chunk ciphertext length {} is not a multiple of 16",
                 ciphertext.len()
@@ -443,84 +449,95 @@ impl EncryptedDmgBackend {
 /// of 16; `iv` and `key` MUST be 16 bytes each.
 #[cfg(feature = "dmg-encrypted")]
 fn decrypt_aes128_cbc(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) -> Result<()> {
-    use cipher::{BlockDecryptMut, KeyIvInit, generic_array::GenericArray};
+    use purecrypto::cipher::{Aes128, Cbc};
 
-    let mut dec = cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv).map_err(|e| {
-        crate::Error::InvalidImage(format!("encrcdsa: AES-128-CBC init failed: {e}"))
-    })?;
-    for block in buf.chunks_exact_mut(16) {
-        let g: &mut GenericArray<u8, _> = GenericArray::from_mut_slice(block);
-        dec.decrypt_block_mut(g);
-    }
-    Ok(())
+    let key: &[u8; 16] = key
+        .try_into()
+        .map_err(|_| crate::Error::InvalidImage("encrcdsa: AES-128 key not 16 bytes".into()))?;
+    Cbc::new(Aes128::new(key), iv)
+        .decrypt(buf)
+        .map_err(|e| crate::Error::InvalidImage(format!("encrcdsa: AES-128-CBC: {e}")))
 }
 
 /// AES-256-CBC decrypt `buf` in place. `buf.len()` MUST be a multiple
 /// of 16; `iv` is 16 bytes, `key` is 32 bytes.
 #[cfg(feature = "dmg-encrypted")]
 fn decrypt_aes256_cbc(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) -> Result<()> {
-    use cipher::{BlockDecryptMut, KeyIvInit, generic_array::GenericArray};
+    use purecrypto::cipher::{Aes256, Cbc};
 
-    let mut dec = cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv).map_err(|e| {
-        crate::Error::InvalidImage(format!("encrcdsa: AES-256-CBC init failed: {e}"))
-    })?;
-    for block in buf.chunks_exact_mut(16) {
-        let g: &mut GenericArray<u8, _> = GenericArray::from_mut_slice(block);
-        dec.decrypt_block_mut(g);
-    }
-    Ok(())
+    let key: &[u8; 32] = key
+        .try_into()
+        .map_err(|_| crate::Error::InvalidImage("encrcdsa: AES-256 key not 32 bytes".into()))?;
+    Cbc::new(Aes256::new(key), iv)
+        .decrypt(buf)
+        .map_err(|e| crate::Error::InvalidImage(format!("encrcdsa: AES-256-CBC: {e}")))
 }
 
 /// 3DES-CBC decrypt `ciphertext` with `(kek, iv)`, then strip PKCS#7
 /// padding. Returns the plaintext keyblob (typically 36 or 52 bytes).
 #[cfg(feature = "dmg-encrypted")]
 fn decrypt_keyblob(kek: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    use cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+    use purecrypto::cipher::{Cbc64, TdesEde3};
 
-    if kek.len() != 24 {
-        return Err(crate::Error::InvalidImage(format!(
+    let kek24: &[u8; 24] = kek.try_into().map_err(|_| {
+        crate::Error::InvalidImage(format!(
             "encrcdsa: KEK has wrong length {} (expected 24)",
             kek.len()
-        )));
-    }
+        ))
+    })?;
     if iv.len() < 8 {
         return Err(crate::Error::InvalidImage(format!(
             "encrcdsa: 3DES IV slice too short ({} bytes)",
             iv.len()
         )));
     }
-    // 3DES uses an 8-byte IV; the on-disk IV slot is 32 bytes but only
-    // the first 8 are live.
-    let iv8: [u8; 8] = iv[..8].try_into().unwrap();
-    let dec = cbc::Decryptor::<des::TdesEde3>::new_from_slices(kek, &iv8)
-        .map_err(|e| crate::Error::InvalidImage(format!("encrcdsa: 3DES-CBC init failed: {e}")))?;
-    if ciphertext.len() % 8 != 0 || ciphertext.is_empty() {
+    if !ciphertext.len().is_multiple_of(8) || ciphertext.is_empty() {
         return Err(crate::Error::InvalidImage(format!(
             "encrcdsa: keyblob ciphertext length {} is not a positive multiple of 8",
             ciphertext.len()
         )));
     }
+    // 3DES uses an 8-byte IV; the on-disk IV slot is 32 bytes but only
+    // the first 8 are live.
+    let iv8: [u8; 8] = iv[..8].try_into().unwrap();
     let mut buf = ciphertext.to_vec();
-    let plain_slice = dec.decrypt_padded_mut::<Pkcs7>(&mut buf).map_err(|_| {
+    Cbc64::new(TdesEde3::new(kek24), &iv8)
+        .decrypt(&mut buf)
+        .map_err(|e| crate::Error::InvalidImage(format!("encrcdsa: 3DES-CBC: {e}")))?;
+    // `purecrypto`'s CBC is raw-block (caller pads), so strip PKCS#7 here.
+    // A bad password yields garbage plaintext whose trailer fails this
+    // check — that's the "wrong password" signal.
+    let plain = strip_pkcs7(&buf, 8).ok_or_else(|| {
         crate::Error::Unsupported(
             "encrcdsa: keyblob unwrap failed — wrong password, or unsupported padding".into(),
         )
     })?;
-    let plain_len = plain_slice.len();
-    buf.truncate(plain_len);
-    Ok(buf)
+    Ok(plain.to_vec())
+}
+
+/// Strip PKCS#7 padding from `buf` (block size `block`, 1..=255). Returns
+/// the unpadded prefix, or `None` if the padding is malformed.
+#[cfg(feature = "dmg-encrypted")]
+fn strip_pkcs7(buf: &[u8], block: usize) -> Option<&[u8]> {
+    let n = *buf.last()? as usize;
+    if n == 0 || n > block || n > buf.len() {
+        return None;
+    }
+    let cut = buf.len() - n;
+    if buf[cut..].iter().all(|&b| b as usize == n) {
+        Some(&buf[..cut])
+    } else {
+        None
+    }
 }
 
 /// Compute the AES-CBC IV for `chunk_index`: first 16 bytes of
 /// `HMAC-SHA1(hmac_key, chunk_index_as_u32_be)`.
 #[cfg(feature = "dmg-encrypted")]
 fn chunk_iv(hmac_key: &[u8; 20], chunk_index: u32) -> [u8; 16] {
-    use hmac::{Hmac, Mac};
+    use purecrypto::hash::{Hmac, Sha1};
 
-    let mut mac =
-        Hmac::<sha1::Sha1>::new_from_slice(hmac_key).expect("HMAC-SHA1 accepts any key length");
-    mac.update(&chunk_index.to_be_bytes());
-    let tag = mac.finalize().into_bytes();
+    let tag = Hmac::<Sha1>::mac(hmac_key, &chunk_index.to_be_bytes());
     let mut iv = [0u8; 16];
     iv.copy_from_slice(&tag[..16]);
     iv
@@ -657,6 +674,43 @@ impl EncryptedDmgBackend {
 mod tests {
     use super::*;
 
+    /// Encrypt-side helpers mirroring the read path, used to synthesise
+    /// fixtures. PKCS#7-pad `aes_key || hmac_key` to an 8-byte boundary and
+    /// 3DES-EDE3-CBC encrypt it under `(kek, iv8)` — the inverse of
+    /// [`decrypt_keyblob`].
+    #[cfg(feature = "dmg-encrypted")]
+    fn encrypt_keyblob(
+        kek: &[u8; 24],
+        iv8: &[u8; 8],
+        aes_key: &[u8],
+        hmac_key: &[u8; 20],
+    ) -> Vec<u8> {
+        use purecrypto::cipher::{Cbc64, TdesEde3};
+
+        let mut blob = [aes_key, &hmac_key[..]].concat();
+        let pad = 8 - (blob.len() % 8);
+        blob.extend(std::iter::repeat_n(pad as u8, pad));
+        Cbc64::new(TdesEde3::new(kek), iv8)
+            .encrypt(&mut blob)
+            .unwrap();
+        blob
+    }
+
+    /// AES-CBC encrypt `buf` in place under a 16- or 32-byte key.
+    #[cfg(feature = "dmg-encrypted")]
+    fn aes_cbc_encrypt(key: &[u8], iv: &[u8; 16], buf: &mut [u8]) {
+        use purecrypto::cipher::{Aes128, Aes256, Cbc};
+        match key.len() {
+            16 => Cbc::new(Aes128::new(key.try_into().unwrap()), iv)
+                .encrypt(buf)
+                .unwrap(),
+            32 => Cbc::new(Aes256::new(key.try_into().unwrap()), iv)
+                .encrypt(buf)
+                .unwrap(),
+            n => panic!("test AES key must be 16 or 32 bytes, got {n}"),
+        }
+    }
+
     /// Build a synthetic v2 header buffer with the supplied fields and
     /// a heap-allocated keyblob. Returns a fresh `Vec<u8>` whose layout
     /// matches what an encrypted DMG would carry at file offset 0.
@@ -708,6 +762,50 @@ mod tests {
         buf[0xC8..0xD0].copy_from_slice(&data_offset.to_be_bytes());
         buf[0xD0..0xD8].copy_from_slice(&(n_chunks * block_size as u64).to_be_bytes());
         buf
+    }
+
+    /// Interop guard for the key-derivation primitive: the bytes
+    /// `purecrypto`'s PBKDF2-HMAC-SHA1 produces must match the RFC 6070
+    /// known-answer vectors. This is what determines whether a genuine
+    /// Apple `encrcdsa` image's KEK comes out right, so pin it to spec
+    /// (transitively covering SHA-1 + HMAC-SHA1).
+    #[cfg(feature = "dmg-encrypted")]
+    #[test]
+    fn pbkdf2_hmac_sha1_rfc6070() {
+        fn derive(pw: &[u8], salt: &[u8], iters: u32, n: usize) -> Vec<u8> {
+            let mut out = vec![0u8; n];
+            purecrypto::kdf::pbkdf2::<purecrypto::hash::Sha1>(pw, salt, iters, &mut out);
+            out
+        }
+        // RFC 6070 §2.
+        assert_eq!(
+            derive(b"password", b"salt", 1, 20),
+            hex(b"0c60c80f961f0e71f3a9b524af6012062fe037a6")
+        );
+        assert_eq!(
+            derive(b"password", b"salt", 2, 20),
+            hex(b"ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957")
+        );
+        assert_eq!(
+            derive(
+                b"passwordPASSWORDpassword",
+                b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+                4096,
+                25
+            ),
+            hex(b"3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038")
+        );
+    }
+
+    /// Decode an ASCII-hex byte string into raw bytes (test helper).
+    #[cfg(feature = "dmg-encrypted")]
+    fn hex(s: &[u8]) -> Vec<u8> {
+        s.chunks(2)
+            .map(|c| {
+                let v = std::str::from_utf8(c).unwrap();
+                u8::from_str_radix(v, 16).unwrap()
+            })
+            .collect()
     }
 
     #[test]
@@ -798,9 +896,6 @@ mod tests {
     #[cfg(feature = "dmg-encrypted")]
     #[test]
     fn round_trip_synthetic_aes128() {
-        use cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
-        use hmac::{Hmac, Mac};
-
         let password = "correct horse battery staple";
         // Iteration count kept tiny on purpose — we don't want the test
         // suite to take seconds. Real images use 100k+.
@@ -812,43 +907,25 @@ mod tests {
 
         // 1) Derive the KEK the same way the open path does.
         let mut kek = [0u8; 24];
-        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), salt, iter_count, &mut kek);
+        purecrypto::kdf::pbkdf2::<purecrypto::hash::Sha1>(
+            password.as_bytes(),
+            salt,
+            iter_count,
+            &mut kek,
+        );
 
         // 2) Build + 3DES-CBC encrypt the keyblob.
-        let mut keyblob_plain = Vec::new();
-        keyblob_plain.extend_from_slice(&aes_key);
-        keyblob_plain.extend_from_slice(&hmac_key);
-        let mut keyblob_pad = keyblob_plain.clone();
-        // PKCS#7 padding to the next multiple of 8.
-        let unpadded_len = keyblob_pad.len();
-        let pad_len = 8 - (unpadded_len % 8);
-        keyblob_pad.resize(unpadded_len + 16, 0); // buffer space for encrypt
-        let enc = cbc::Encryptor::<des::TdesEde3>::new_from_slices(&kek, &blob_iv8).unwrap();
-        let ct = enc
-            .encrypt_padded_mut::<Pkcs7>(&mut keyblob_pad, unpadded_len)
-            .unwrap();
-        let keyblob_ciphertext = ct.to_vec();
-        assert_eq!(keyblob_ciphertext.len(), unpadded_len + pad_len);
+        let keyblob_ciphertext = encrypt_keyblob(&kek, &blob_iv8, &aes_key, &hmac_key);
 
-        // 3) Build a 4096-byte plaintext chunk and encrypt it. The IV
-        //    is HMAC-SHA1(hmac_key, 0u32 BE)[..16].
+        // 3) Build a 4096-byte plaintext chunk and encrypt it under the
+        //    chunk-zero IV (HMAC-SHA1(hmac_key, 0u32 BE)[..16]).
         let mut plaintext = vec![0u8; 4096];
         for (i, b) in plaintext.iter_mut().enumerate() {
             *b = ((i * 31 + 7) & 0xFF) as u8;
         }
-        let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&hmac_key).unwrap();
-        mac.update(&0u32.to_be_bytes());
-        let tag = mac.finalize().into_bytes();
-        let mut iv16 = [0u8; 16];
-        iv16.copy_from_slice(&tag[..16]);
-        // Encrypt the chunk in place. No padding — chunk length is an
-        // exact multiple of 16. The CBC state advances block-by-block.
-        let mut aes_enc = cbc::Encryptor::<aes::Aes128>::new_from_slices(&aes_key, &iv16).unwrap();
+        let iv16 = chunk_iv(&hmac_key, 0);
         let mut chunk_ct = plaintext.clone();
-        for block in chunk_ct.chunks_exact_mut(16) {
-            let g = cipher::generic_array::GenericArray::from_mut_slice(block);
-            aes_enc.encrypt_block_mut(g);
-        }
+        aes_cbc_encrypt(&aes_key, &iv16, &mut chunk_ct);
 
         // 4) Lay out the file: header(0xD8 bytes) + chunk ciphertext.
         let data_offset = 0xD8u64;
@@ -888,9 +965,6 @@ mod tests {
     #[cfg(feature = "dmg-encrypted")]
     #[test]
     fn round_trip_synthetic_aes256() {
-        use cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
-        use hmac::{Hmac, Mac};
-
         let password = "another-password";
         let iter_count: u32 = 64;
         let salt: &[u8] = b"sodium_chloride_xx"; // 18 bytes
@@ -899,19 +973,14 @@ mod tests {
         let hmac_key: [u8; 20] = *b"hmac-key-20-bytes-OK";
 
         let mut kek = [0u8; 24];
-        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), salt, iter_count, &mut kek);
+        purecrypto::kdf::pbkdf2::<purecrypto::hash::Sha1>(
+            password.as_bytes(),
+            salt,
+            iter_count,
+            &mut kek,
+        );
 
-        let mut keyblob_plain = Vec::new();
-        keyblob_plain.extend_from_slice(&aes_key);
-        keyblob_plain.extend_from_slice(&hmac_key);
-        let unpadded_len = keyblob_plain.len();
-        let mut keyblob_pad = keyblob_plain.clone();
-        keyblob_pad.resize(unpadded_len + 16, 0);
-        let enc = cbc::Encryptor::<des::TdesEde3>::new_from_slices(&kek, &blob_iv8).unwrap();
-        let ct = enc
-            .encrypt_padded_mut::<Pkcs7>(&mut keyblob_pad, unpadded_len)
-            .unwrap();
-        let keyblob_ciphertext = ct.to_vec();
+        let keyblob_ciphertext = encrypt_keyblob(&kek, &blob_iv8, &aes_key, &hmac_key);
 
         // Two-chunk plaintext to also exercise the second-chunk IV path.
         let mut plain = vec![0u8; 8192];
@@ -920,19 +989,10 @@ mod tests {
         }
         let mut chunks_ct = Vec::with_capacity(8192);
         for chunk_idx in 0u32..2 {
-            let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&hmac_key).unwrap();
-            mac.update(&chunk_idx.to_be_bytes());
-            let tag = mac.finalize().into_bytes();
-            let mut iv16 = [0u8; 16];
-            iv16.copy_from_slice(&tag[..16]);
-            let mut aes_enc =
-                cbc::Encryptor::<aes::Aes256>::new_from_slices(&aes_key, &iv16).unwrap();
+            let iv16 = chunk_iv(&hmac_key, chunk_idx);
             let start = (chunk_idx as usize) * 4096;
             let mut buf = plain[start..start + 4096].to_vec();
-            for block in buf.chunks_exact_mut(16) {
-                let g = cipher::generic_array::GenericArray::from_mut_slice(block);
-                aes_enc.encrypt_block_mut(g);
-            }
+            aes_cbc_encrypt(&aes_key, &iv16, &mut buf);
             chunks_ct.extend_from_slice(&buf);
         }
 
@@ -972,8 +1032,6 @@ mod tests {
     #[cfg(feature = "dmg-encrypted")]
     #[test]
     fn wrong_password_rejected() {
-        use cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
-
         let password = "supersecret";
         let iter_count: u32 = 100;
         let salt: &[u8] = b"saltsaltsaltsaltsalt";
@@ -982,19 +1040,14 @@ mod tests {
         let hmac_key: [u8; 20] = *b"HMACKEY-20-BYTES!!??";
 
         let mut kek = [0u8; 24];
-        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), salt, iter_count, &mut kek);
+        purecrypto::kdf::pbkdf2::<purecrypto::hash::Sha1>(
+            password.as_bytes(),
+            salt,
+            iter_count,
+            &mut kek,
+        );
 
-        let mut keyblob_plain = Vec::new();
-        keyblob_plain.extend_from_slice(&aes_key);
-        keyblob_plain.extend_from_slice(&hmac_key);
-        let unpadded_len = keyblob_plain.len();
-        let mut keyblob_pad = keyblob_plain.clone();
-        keyblob_pad.resize(unpadded_len + 16, 0);
-        let enc = cbc::Encryptor::<des::TdesEde3>::new_from_slices(&kek, &blob_iv8).unwrap();
-        let ct = enc
-            .encrypt_padded_mut::<Pkcs7>(&mut keyblob_pad, unpadded_len)
-            .unwrap();
-        let keyblob_ciphertext = ct.to_vec();
+        let keyblob_ciphertext = encrypt_keyblob(&kek, &blob_iv8, &aes_key, &hmac_key);
 
         let data_offset = 0xD8u64;
         let mut file_bytes = build_header_bytes(
@@ -1026,8 +1079,6 @@ mod tests {
     #[cfg(feature = "dmg-encrypted")]
     #[test]
     fn read_at_rejects_out_of_bounds() {
-        use cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
-
         let password = "pw";
         let iter_count: u32 = 50;
         let salt: &[u8] = b"saltsaltsaltsaltsalt";
@@ -1036,19 +1087,14 @@ mod tests {
         let hmac_key: [u8; 20] = *b"HMACKEY-20-BYTES!!??";
 
         let mut kek = [0u8; 24];
-        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), salt, iter_count, &mut kek);
+        purecrypto::kdf::pbkdf2::<purecrypto::hash::Sha1>(
+            password.as_bytes(),
+            salt,
+            iter_count,
+            &mut kek,
+        );
 
-        let mut keyblob_plain = Vec::new();
-        keyblob_plain.extend_from_slice(&aes_key);
-        keyblob_plain.extend_from_slice(&hmac_key);
-        let unpadded_len = keyblob_plain.len();
-        let mut keyblob_pad = keyblob_plain.clone();
-        keyblob_pad.resize(unpadded_len + 16, 0);
-        let enc = cbc::Encryptor::<des::TdesEde3>::new_from_slices(&kek, &blob_iv8).unwrap();
-        let ct = enc
-            .encrypt_padded_mut::<Pkcs7>(&mut keyblob_pad, unpadded_len)
-            .unwrap();
-        let keyblob_ciphertext = ct.to_vec();
+        let keyblob_ciphertext = encrypt_keyblob(&kek, &blob_iv8, &aes_key, &hmac_key);
 
         // Two zero chunks of ciphertext (decryption result will be
         // garbage but won't trip OOB checks since we only test that

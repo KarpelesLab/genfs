@@ -729,19 +729,20 @@ mod tests {
 
         // Now write each child's body (data blocks) + inode block.
         for (nid, mut ino, body, phys_inode) in inode_blocks {
-            if let Some(bytes) = &body {
-                if !ino.is_inline_data() && !bytes.is_empty() {
-                    let n_blocks = bytes.len().div_ceil(F2FS_BLKSIZE);
-                    for i in 0..n_blocks {
-                        let phys = alloc();
-                        let start = i * F2FS_BLKSIZE;
-                        let end = (start + F2FS_BLKSIZE).min(bytes.len());
-                        let mut blk = vec![0u8; F2FS_BLKSIZE];
-                        blk[..end - start].copy_from_slice(&bytes[start..end]);
-                        dev.write_at(phys as u64 * bs, &blk).unwrap();
-                        if i < super::constants::ADDRS_PER_INODE {
-                            ino.i_addr[i] = phys;
-                        }
+            if let Some(bytes) = &body
+                && !ino.is_inline_data()
+                && !bytes.is_empty()
+            {
+                let n_blocks = bytes.len().div_ceil(F2FS_BLKSIZE);
+                for i in 0..n_blocks {
+                    let phys = alloc();
+                    let start = i * F2FS_BLKSIZE;
+                    let end = (start + F2FS_BLKSIZE).min(bytes.len());
+                    let mut blk = vec![0u8; F2FS_BLKSIZE];
+                    blk[..end - start].copy_from_slice(&bytes[start..end]);
+                    dev.write_at(phys as u64 * bs, &blk).unwrap();
+                    if i < super::constants::ADDRS_PER_INODE {
+                        ino.i_addr[i] = phys;
                     }
                 }
             }

@@ -4601,27 +4601,29 @@ fn try_append_dir_entry(
     // accepts blocks that are *entirely* empty (single placeholder) and
     // blocks whose first entry is a real one, but flags "placeholder stub
     // followed by real entries" as a corrupted block.
-    if let Some(first) = dir::decode_entry(block, with_filetype) {
-        if first.inode == 0 && first.name.is_empty() && first.rec_len >= usable && needed <= usable
-        {
-            // Wipe the usable region (the csum tail past `usable` is
-            // untouched), then encode the single new entry to span it.
-            for b in block[..usable].iter_mut() {
-                *b = 0;
-            }
-            let mut tail = Vec::with_capacity(usable);
-            dir::encode_entry(
-                &mut tail,
-                inode,
-                name,
-                usable as u16,
-                file_type,
-                with_filetype,
-            );
-            debug_assert_eq!(tail.len(), usable);
-            block[..usable].copy_from_slice(&tail);
-            return Ok(true);
+    if let Some(first) = dir::decode_entry(block, with_filetype)
+        && first.inode == 0
+        && first.name.is_empty()
+        && first.rec_len >= usable
+        && needed <= usable
+    {
+        // Wipe the usable region (the csum tail past `usable` is
+        // untouched), then encode the single new entry to span it.
+        for b in block[..usable].iter_mut() {
+            *b = 0;
         }
+        let mut tail = Vec::with_capacity(usable);
+        dir::encode_entry(
+            &mut tail,
+            inode,
+            name,
+            usable as u16,
+            file_type,
+            with_filetype,
+        );
+        debug_assert_eq!(tail.len(), usable);
+        block[..usable].copy_from_slice(&tail);
+        return Ok(true);
     }
 
     let mut off = 0usize;

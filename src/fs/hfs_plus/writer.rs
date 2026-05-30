@@ -1878,11 +1878,11 @@ pub(crate) fn ensure_private_dir(writer: &mut Writer) -> Result<u32> {
         parent_id: ROOT_FOLDER_ID,
         name,
     };
-    if let Some(body) = writer.catalog.get_mut(&folder_key) {
-        if body.len() >= 58 {
-            let cur = u16::from_be_bytes([body[56], body[57]]);
-            body[56..58].copy_from_slice(&(cur | 0x4000).to_be_bytes());
-        }
+    if let Some(body) = writer.catalog.get_mut(&folder_key)
+        && body.len() >= 58
+    {
+        let cur = u16::from_be_bytes([body[56], body[57]]);
+        body[56..58].copy_from_slice(&(cur | 0x4000).to_be_bytes());
     }
     Ok(cnid)
 }
@@ -2753,13 +2753,13 @@ pub fn open_writable(
     // ---- 1. Load the allocation bitmap.
     let bitmap_bytes = (total_blocks as u64).div_ceil(8) as usize;
     let mut bitmap = vec![0u8; bitmap_bytes];
-    if let Some(first) = vh.allocation_file.extents.first() {
-        if first.block_count > 0 {
-            let off = u64::from(first.start_block) * u64::from(block_size);
-            // The on-disk bitmap may span more bytes than the live size
-            // (rounded up to a whole block); only read what we need.
-            dev.read_at(off, &mut bitmap)?;
-        }
+    if let Some(first) = vh.allocation_file.extents.first()
+        && first.block_count > 0
+    {
+        let off = u64::from(first.start_block) * u64::from(block_size);
+        // The on-disk bitmap may span more bytes than the live size
+        // (rounded up to a whole block); only read what we need.
+        dev.read_at(off, &mut bitmap)?;
     }
     let free_blocks = count_free_bits(&bitmap, total_blocks);
 

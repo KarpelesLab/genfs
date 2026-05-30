@@ -1001,7 +1001,7 @@ impl<'a> Ext2FileHandle<'a> {
         // bytes of that block must read as zero. The freshly-allocated
         // tail blocks are already zeroed by `zero_block_on_disk`, but
         // the *existing* tail block needs a partial zero-fill.
-        if old_len % bs != 0 {
+        if !old_len.is_multiple_of(bs) {
             let last_n = (old_len / bs) as u32;
             let blk = self.read_logical_block(last_n)?;
             if blk != 0 {

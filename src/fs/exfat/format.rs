@@ -157,7 +157,7 @@ pub fn compute_geometry(total_bytes: u64, opts: &FormatOpts) -> Result<Geometry>
             "exfat: volume too small ({total_bytes} bytes; need at least 1 MiB)"
         )));
     }
-    if total_bytes % bytes_per_sector as u64 != 0 {
+    if !total_bytes.is_multiple_of(bytes_per_sector as u64) {
         return Err(crate::Error::InvalidArgument(format!(
             "exfat: total_bytes {total_bytes} is not a multiple of sector size {bytes_per_sector}"
         )));

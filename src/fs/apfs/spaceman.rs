@@ -221,7 +221,9 @@ pub(super) fn build_spaceman(layout: &SpacemanLayout) -> Result<EmittedSpaceman>
         )));
     }
     if layout.ip_block_count == 0
-        || layout.ip_block_count % SPACEMAN_IP_BM_TX_MULTIPLIER as u64 != 0
+        || !layout
+            .ip_block_count
+            .is_multiple_of(SPACEMAN_IP_BM_TX_MULTIPLIER as u64)
     {
         return Err(crate::Error::InvalidArgument(format!(
             "apfs spaceman: ip_block_count {} must be a non-zero multiple of \

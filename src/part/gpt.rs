@@ -80,12 +80,12 @@ impl Gpt {
             if p.uuid.is_none() {
                 p.uuid = Some(Uuid::new_v4());
             }
-            if let Some(ref n) = p.name {
-                if n.encode_utf16().count() > 36 {
-                    return Err(crate::Error::InvalidArgument(format!(
-                        "GPT partition name exceeds 36 UTF-16 code units: {n:?}"
-                    )));
-                }
+            if let Some(ref n) = p.name
+                && n.encode_utf16().count() > 36
+            {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "GPT partition name exceeds 36 UTF-16 code units: {n:?}"
+                )));
             }
         }
         check_no_overlap(&partitions)?;

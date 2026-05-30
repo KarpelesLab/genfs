@@ -82,14 +82,14 @@ fn parse_hdiutil_devices(plist: &str) -> (Vec<String>, Option<String>) {
     }
     // If we never spotted a whole-disk path, derive one by trimming
     // any `sN` suffix off the first per-slice node.
-    if whole.is_none() {
-        if let Some(d) = devs.first() {
-            let tail = d.trim_start_matches("/dev/disk");
-            if let Some(idx) = tail.find('s') {
-                whole = Some(format!("/dev/disk{}", &tail[..idx]));
-            } else {
-                whole = Some(d.clone());
-            }
+    if whole.is_none()
+        && let Some(d) = devs.first()
+    {
+        let tail = d.trim_start_matches("/dev/disk");
+        if let Some(idx) = tail.find('s') {
+            whole = Some(format!("/dev/disk{}", &tail[..idx]));
+        } else {
+            whole = Some(d.clone());
         }
     }
     devs.sort();
@@ -395,13 +395,13 @@ fn apfs_writer_round_trips_through_macos_mount() {
             continue;
         }
         if in_mp_key {
-            if let Some(s) = t.strip_prefix("<string>") {
-                if let Some(end) = s.find("</string>") {
-                    let mp = &s[..end];
-                    if !mp.is_empty() {
-                        mount_point = Some(mp.to_string());
-                        break;
-                    }
+            if let Some(s) = t.strip_prefix("<string>")
+                && let Some(end) = s.find("</string>")
+            {
+                let mp = &s[..end];
+                if !mp.is_empty() {
+                    mount_point = Some(mp.to_string());
+                    break;
                 }
             }
             in_mp_key = false;

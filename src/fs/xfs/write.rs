@@ -2034,11 +2034,11 @@ impl Xfs {
             extents.sort_by_key(|(s, _)| *s);
             let mut coalesced: Vec<(u32, u32)> = Vec::with_capacity(extents.len());
             for (s, c) in extents {
-                if let Some((ls, lc)) = coalesced.last_mut() {
-                    if *ls + *lc == s {
-                        *lc += c;
-                        continue;
-                    }
+                if let Some((ls, lc)) = coalesced.last_mut()
+                    && *ls + *lc == s
+                {
+                    *lc += c;
+                    continue;
                 }
                 coalesced.push((s, c));
             }

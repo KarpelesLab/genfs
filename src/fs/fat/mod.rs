@@ -565,7 +565,36 @@ impl Fat32 {
                 boot.bytes_per_sector
             )));
         }
-        // Read the first FAT copy.
+        // Validate the on-disk geometry before sizing any allocation from
+        // the untrusted `fat_size_32` field. The FAT(s) plus reserved
+        // sectors must fit inside the declared volume, and the volume must
+        // fit on the device.
+        let total_sectors = boot.total_sectors as u64;
+        let volume_bytes = total_sectors
+            .checked_mul(SECTOR as u64)
+            .ok_or_else(|| crate::Error::InvalidImage("fat32: total_sectors overflow".into()))?;
+        if volume_bytes > dev.total_size() {
+            return Err(crate::Error::InvalidImage(format!(
+                "fat32: volume of {volume_bytes} bytes exceeds device size {}",
+                dev.total_size()
+            )));
+        }
+        let meta_sectors = (boot.reserved_sector_count as u64)
+            .checked_add(
+                (boot.num_fats as u64)
+                    .checked_mul(boot.fat_size as u64)
+                    .ok_or_else(|| {
+                        crate::Error::InvalidImage("fat32: FAT sector count overflow".into())
+                    })?,
+            )
+            .ok_or_else(|| crate::Error::InvalidImage("fat32: metadata sector overflow".into()))?;
+        if meta_sectors > total_sectors {
+            return Err(crate::Error::InvalidImage(format!(
+                "fat32: reserved + FATs ({meta_sectors} sectors) overruns volume of {total_sectors} sectors"
+            )));
+        }
+        // Read the first FAT copy. `fat_size` is now bounded by the volume,
+        // which is bounded by the device, so this allocation is safe.
         let fat_bytes_len = boot.fat_size as u64 * SECTOR as u64;
         let mut fat_bytes = vec![0u8; fat_bytes_len as usize];
         let fat_off = boot.reserved_sector_count as u64 * SECTOR as u64;
@@ -1172,6 +1201,22 @@ mod tests {
         assert_eq!(bs, backup);
         // Root cluster's FAT entry is an end-of-chain marker.
         assert!(Fat::is_eoc(fs.fat.get(2)));
+    }
+
+    #[test]
+    fn open_rejects_oversized_fat_size() {
+        // A malicious fat_size_32 (sectors per FAT) must not size a huge
+        // allocation; `open` should reject it before allocating the FAT.
+        let (mut dev, _fs) = fresh_volume();
+        let mut bs = [0u8; 512];
+        dev.read_at(0, &mut bs).unwrap();
+        // fat_size_32 lives at byte offset 36.
+        bs[36..40].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        dev.write_at(0, &bs).unwrap();
+        match Fat32::open(&mut dev) {
+            Err(crate::Error::InvalidImage(_)) => {}
+            other => panic!("expected InvalidImage, got {other:?}"),
+        }
     }
 
     #[test]

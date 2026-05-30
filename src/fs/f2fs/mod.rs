@@ -311,8 +311,16 @@ impl F2fs {
         }
         // Walk every populated data block in the directory's logical
         // sequence. Each 4 KiB block decodes independently — we just
-        // concatenate the dentries.
+        // concatenate the dentries. `inode.size` is attacker-controlled;
+        // a directory cannot legitimately span more blocks than the volume
+        // holds, so reject an oversized `i_size` before looping over it.
         let total_blocks = inode.size.div_ceil(F2FS_BLKSIZE as u64);
+        if total_blocks > self.sb.block_count {
+            return Err(crate::Error::InvalidImage(format!(
+                "f2fs: directory i_size {} spans {total_blocks} blocks, exceeds volume block_count {}",
+                inode.size, self.sb.block_count
+            )));
+        }
         let mut out = Vec::new();
         let mut buf = vec![0u8; F2FS_BLKSIZE];
         for i in 0..total_blocks {

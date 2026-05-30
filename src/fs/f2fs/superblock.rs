@@ -96,6 +96,21 @@ impl Superblock {
         // 0x0C log_sectors_per_block (unused — we only support 4 KiB blocks)
         let log_blocksize = r32(0x10);
         let log_blocks_per_seg = r32(0x14);
+
+        // Validate the log-shift geometry before any field derived from it
+        // is used (block_size = 1 << log_blocksize feeds NAT/SIT geometry
+        // and every shift below). An out-of-range shift would overflow or
+        // produce nonsensical addresses; F2FS fixes these values, so an
+        // image with anything else is malformed. Reject early.
+        if log_blocksize != 12 {
+            return None;
+        }
+        if log_sectorsize != 9 {
+            return None;
+        }
+        if !(1..=10).contains(&log_blocks_per_seg) {
+            return None;
+        }
         let segs_per_sec = r32(0x18);
         let secs_per_zone = r32(0x1C);
         // 0x20 checksum_offset
@@ -208,4 +223,49 @@ pub fn load(dev: &mut dyn BlockDevice) -> Result<Superblock> {
     Err(crate::Error::InvalidImage(
         "f2fs: superblock magic not found in either primary or backup slot".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal, valid superblock buffer (magic + canonical log shifts).
+    fn valid_sb() -> Vec<u8> {
+        let mut buf = vec![0u8; 0x400];
+        buf[0x00..0x04].copy_from_slice(&F2FS_MAGIC.to_le_bytes());
+        buf[0x08..0x0C].copy_from_slice(&9u32.to_le_bytes()); // log_sectorsize
+        buf[0x10..0x14].copy_from_slice(&12u32.to_le_bytes()); // log_blocksize
+        buf[0x14..0x18].copy_from_slice(&9u32.to_le_bytes()); // log_blocks_per_seg
+        buf
+    }
+
+    #[test]
+    fn decode_accepts_canonical_geometry() {
+        assert!(Superblock::decode(&valid_sb()).is_some());
+    }
+
+    #[test]
+    fn decode_rejects_bad_log_blocksize() {
+        let mut buf = valid_sb();
+        buf[0x10..0x14].copy_from_slice(&13u32.to_le_bytes());
+        assert!(Superblock::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn decode_rejects_bad_log_sectorsize() {
+        let mut buf = valid_sb();
+        buf[0x08..0x0C].copy_from_slice(&10u32.to_le_bytes());
+        assert!(Superblock::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn decode_rejects_insane_log_blocks_per_seg() {
+        let mut buf = valid_sb();
+        // A value of 31 would make `1 << log_blocks_per_seg` overflow geometry.
+        buf[0x14..0x18].copy_from_slice(&31u32.to_le_bytes());
+        assert!(Superblock::decode(&buf).is_none());
+        // Zero is also rejected.
+        buf[0x14..0x18].copy_from_slice(&0u32.to_le_bytes());
+        assert!(Superblock::decode(&buf).is_none());
+    }
 }

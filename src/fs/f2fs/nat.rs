@@ -63,11 +63,24 @@ pub fn lookup_node(
     // region, odd-half pages the second half. (This is the bitmap-less
     // simplification described above.)
     let blocks_per_seg = sb.blocks_per_seg();
-    let nat_total_blocks = sb.segment_count_nat * blocks_per_seg;
+    // `segment_count_nat`, `blocks_per_seg`, and `nat_blkaddr` are all
+    // untrusted; use checked arithmetic so a crafted superblock can't
+    // overflow into a bogus (but in-bounds-looking) physical page.
+    let nat_total_blocks = sb
+        .segment_count_nat
+        .checked_mul(blocks_per_seg)
+        .ok_or_else(|| crate::Error::InvalidImage("f2fs: NAT geometry overflow".into()))?;
     let half = nat_total_blocks / 2;
     let pack = cp.cur_nat_pack as u32;
-    let phys_page = sb.nat_blkaddr + pack * half + page_idx as u32;
-    if (phys_page - sb.nat_blkaddr) >= nat_total_blocks {
+    let nat_offset = pack
+        .checked_mul(half)
+        .and_then(|x| x.checked_add(page_idx as u32))
+        .ok_or_else(|| crate::Error::InvalidImage("f2fs: NAT page index overflow".into()))?;
+    let phys_page = sb
+        .nat_blkaddr
+        .checked_add(nat_offset)
+        .ok_or_else(|| crate::Error::InvalidImage("f2fs: NAT page address overflow".into()))?;
+    if nat_offset >= nat_total_blocks {
         return Err(crate::Error::InvalidImage(format!(
             "f2fs: nid {nid} out of NAT range"
         )));

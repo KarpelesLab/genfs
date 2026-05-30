@@ -109,12 +109,46 @@ impl Exfat {
         // Read the primary FAT. exFAT may have NumberOfFats == 2 (TexFAT);
         // we only need the primary copy for read.
         let fat_off = boot.fat_byte_offset();
-        let fat_len = boot.fat_byte_length() as usize;
-        if fat_len == 0 {
+        let fat_byte_len = boot.fat_byte_length();
+        if fat_byte_len == 0 {
             return Err(crate::Error::InvalidImage(
                 "exfat: FatLength is zero".into(),
             ));
         }
+        // Validate the FAT region lies wholly within the volume, that the
+        // volume itself fits the device, and that the FAT is large enough
+        // to map every cluster — `(cluster_count + 2)` 32-bit entries.
+        // This bounds the allocation below against untrusted FatLength.
+        let bps = boot.bytes_per_sector() as u64;
+        let volume_bytes = boot
+            .volume_length
+            .checked_mul(bps)
+            .ok_or_else(|| crate::Error::InvalidImage("exfat: VolumeLength overflow".into()))?;
+        if volume_bytes > dev.total_size() {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: VolumeLength {volume_bytes} bytes exceeds device size {}",
+                dev.total_size()
+            )));
+        }
+        let fat_end = fat_off
+            .checked_add(fat_byte_len)
+            .ok_or_else(|| crate::Error::InvalidImage("exfat: FAT region overflow".into()))?;
+        if fat_end > volume_bytes {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: FAT region [{fat_off}, {fat_end}) overruns volume of {volume_bytes} bytes"
+            )));
+        }
+        // The FAT must hold at least (cluster_count + 2) 32-bit entries.
+        let need_fat_bytes = (boot.cluster_count as u64)
+            .checked_add(2)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| crate::Error::InvalidImage("exfat: ClusterCount overflow".into()))?;
+        if fat_byte_len < need_fat_bytes {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: FatLength covers {fat_byte_len} bytes but ClusterCount needs {need_fat_bytes}"
+            )));
+        }
+        let fat_len = fat_byte_len as usize;
         let mut fat_bytes = vec![0u8; fat_len];
         dev.read_at(fat_off, &mut fat_bytes)?;
         let fat = Fat::decode(&fat_bytes);
@@ -430,10 +464,34 @@ impl Exfat {
             return Ok(Vec::new());
         }
         let cb = self.boot.bytes_per_cluster() as u64;
-        let n = data_length.div_ceil(cb) as u32;
+        let n_u64 = data_length.div_ceil(cb);
+        // `data_length` is attacker-controlled; reject any value implying
+        // more clusters than the volume actually has before allocating a
+        // vector sized by `n`.
+        if n_u64 > self.boot.cluster_count as u64 {
+            return Err(crate::Error::InvalidImage(format!(
+                "exfat: DataLength {data_length} implies {n_u64} clusters, exceeds ClusterCount {}",
+                self.boot.cluster_count
+            )));
+        }
+        let n = n_u64 as u32;
         if no_fat_chain {
-            // Contiguous run.
-            return Ok((0..n).map(|i| first_cluster + i).collect());
+            // Contiguous run. Bounds-check each cluster against the valid
+            // data range [2, cluster_count + 2) and use checked addition.
+            let max_cluster = self.boot.cluster_count + 2;
+            let mut chain = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let c = first_cluster
+                    .checked_add(i)
+                    .ok_or_else(|| crate::Error::InvalidImage("exfat: cluster overflow".into()))?;
+                if c < 2 || c >= max_cluster {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "exfat: contiguous cluster {c} out of range [2, {max_cluster})"
+                    )));
+                }
+                chain.push(c);
+            }
+            return Ok(chain);
         }
         // Otherwise walk the FAT chain — but only return as many clusters
         // as the file actually needs. (The FAT chain may, in principle,
@@ -463,11 +521,33 @@ impl Exfat {
         }
         let cb = self.boot.bytes_per_cluster() as u64;
         let chain = if no_fat_chain {
-            let n = match hint_byte_len {
-                Some(b) if b > 0 => b.div_ceil(cb) as u32,
+            let n_u64 = match hint_byte_len {
+                Some(b) if b > 0 => b.div_ceil(cb),
                 _ => 1,
             };
-            (0..n).map(|i| first_cluster + i).collect()
+            // `hint_byte_len` is attacker-controlled; clamp the contiguous
+            // run to the volume's cluster count and bounds-check each
+            // cluster before building the vector.
+            if n_u64 > self.boot.cluster_count as u64 {
+                return Err(crate::Error::InvalidImage(format!(
+                    "exfat: length implies {n_u64} clusters, exceeds ClusterCount {}",
+                    self.boot.cluster_count
+                )));
+            }
+            let max_cluster = self.boot.cluster_count + 2;
+            let mut v = Vec::with_capacity(n_u64 as usize);
+            for i in 0..n_u64 as u32 {
+                let c = first_cluster
+                    .checked_add(i)
+                    .ok_or_else(|| crate::Error::InvalidImage("exfat: cluster overflow".into()))?;
+                if c < 2 || c >= max_cluster {
+                    return Err(crate::Error::InvalidImage(format!(
+                        "exfat: contiguous cluster {c} out of range [2, {max_cluster})"
+                    )));
+                }
+                v.push(c);
+            }
+            v
         } else {
             self.fat.chain(first_cluster)?
         };
@@ -1787,6 +1867,22 @@ mod tests {
         assert_eq!(fs.root_directory_cluster(), CL_ROOT);
         assert_eq!(fs.volume_label(), "MYVOL");
         assert!(fs.total_bytes() > 0);
+    }
+
+    #[test]
+    fn open_rejects_oversized_fat_length() {
+        // A malicious FatLength must not size a multi-gigabyte allocation;
+        // `open` should reject it as InvalidImage before allocating.
+        let mut dev = build_test_image();
+        let mut bs = [0u8; 512];
+        dev.read_at(0, &mut bs).unwrap();
+        bs[84..88].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // FatLength
+        dev.write_at(0, &bs).unwrap();
+        match Exfat::open(&mut dev) {
+            Err(crate::Error::InvalidImage(_)) => {}
+            Err(e) => panic!("expected InvalidImage, got {e:?}"),
+            Ok(_) => panic!("expected InvalidImage, got Ok"),
+        }
     }
 
     #[test]

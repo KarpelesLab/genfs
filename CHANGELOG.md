@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(sit)* StuffIt (`.sit`) read-only reader behind the `sit` feature — parses
+  the **classic** `SIT!` container (22-byte archive header + 112-byte per-file
+  entry headers, resource + data forks, big-endian) and indexes every member
+  by its data fork, honouring the folder start/end markers for nested paths.
+  Data-fork method 0 (store) decodes today; the compressed methods (RLE90,
+  LZW, Huffman, LZAH, LZ+Huffman, Arsenic, …) and the entire StuffIt 5 format
+  list/detect but read as a clean `Unsupported` pending StuffIt codecs in
+  `compcol`. Creation is unsupported.
 - *(arc)* SEA ARC (`.arc`) read-only reader behind the `arc` feature — walks
   the flat per-file header chain and indexes every member. The stored methods
   (1 = old, 2 = with an original-size field) decode today; the compressed

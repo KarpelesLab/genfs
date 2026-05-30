@@ -32,7 +32,7 @@ path = "src/bin/fstool/main.rs"
 # gains its own optional dependency behind a per-format feature here,
 # matching the codec pattern above. `cab`, `amiga-lzx`, and `rar` are such
 # readers.
-default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
+default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "sit", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
 # Every codec is served by `compcol` (one uniform crate): gzip/zlib/deflate/
 # xz/lzma/zstd/lz4/lzo, plus the CAB + Amiga-LZX archive codecs and the DMG
 # bzip2/lzfse decoders. The `gzip` feature also covers zip DEFLATE, DMG zlib,
@@ -55,6 +55,10 @@ lha = []
 # methods 1/2 decode today; the compressed methods (RLE90 / squeeze / crunch /
 # squash) list but read as Unsupported pending ARC codecs in compcol.
 arc = []
+# StuffIt (.sit) reader (read-only): classic `SIT!` container — data-fork
+# method 0 (store) decodes; compressed methods + StuffIt 5 list/detect but
+# read as Unsupported pending StuffIt codecs in compcol.
+sit = []
 # RAR reader (read-only): RAR5 store + compressed via compcol's rar5 decoder,
 # including solid groups (decoded as one continuous stream; a sequential walk
 # such as repack decompresses the group once). (RAR4 would add compcol/rar1+

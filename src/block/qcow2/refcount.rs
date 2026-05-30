@@ -66,7 +66,25 @@ impl Refcount {
     /// are loaded lazily on demand.
     pub fn load<F: Read + Seek>(file: &mut F, header: &Header) -> Result<Self> {
         let cluster_size = header.cluster_size();
-        let table_entries = (header.refcount_table_clusters as u64 * cluster_size / 8) as usize;
+
+        // `refcount_table_clusters` is attacker-controlled and the table is
+        // allocated up front (`table_clusters * cluster_size` bytes) before any
+        // bounds-checked read. Cap it before allocating: the table can never
+        // legitimately be larger than the file that holds it.
+        let table_bytes = (header.refcount_table_clusters as u64)
+            .checked_mul(cluster_size)
+            .ok_or_else(|| {
+                crate::Error::InvalidImage(
+                    "qcow2: refcount_table_clusters * cluster_size overflows".into(),
+                )
+            })?;
+        let file_len = file.seek(SeekFrom::End(0))?;
+        if table_bytes > file_len {
+            return Err(crate::Error::InvalidImage(format!(
+                "qcow2: refcount table ({table_bytes} bytes) exceeds file length {file_len}"
+            )));
+        }
+        let table_entries = (table_bytes / 8) as usize;
         let mut raw = vec![0u8; table_entries * 8];
         file.seek(SeekFrom::Start(header.refcount_table_offset))?;
         file.read_exact(&mut raw)?;

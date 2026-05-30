@@ -188,7 +188,26 @@ pub fn slice_partition<'a, B: BlockDevice + ?Sized, P: PartitionTable + ?Sized>(
         ))
     })?;
     let bs = u64::from(dev.block_size());
-    SlicedBackend::new(dev, p.start_lba * bs, p.size_lba * bs)
+    // `start_lba` / `size_lba` come from an attacker-controlled partition
+    // table; multiplying by the block size can overflow u64. Reject overflow
+    // rather than wrapping into a bogus (and possibly in-bounds) span.
+    let start = p
+        .start_lba
+        .checked_mul(bs)
+        .ok_or(crate::Error::OutOfBounds {
+            offset: p.start_lba,
+            len: bs,
+            size: dev.total_size(),
+        })?;
+    let len = p
+        .size_lba
+        .checked_mul(bs)
+        .ok_or(crate::Error::OutOfBounds {
+            offset: p.size_lba,
+            len: bs,
+            size: dev.total_size(),
+        })?;
+    SlicedBackend::new(dev, start, len)
 }
 
 /// Parse a UUID from a `const` hyphenated string. Panics on malformed input

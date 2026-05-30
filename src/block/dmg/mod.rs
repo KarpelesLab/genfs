@@ -418,7 +418,10 @@ impl DmgBackend {
         }
         let idx = after - 1;
         let c = &self.chunks[idx];
-        let end = c.virtual_sector_start + c.sector_count;
+        // Saturating add: an overflowing end can only make the span larger, so
+        // `sector >= end` stays correct without risking a panic on a malformed
+        // chunk whose start + count wraps u64.
+        let end = c.virtual_sector_start.saturating_add(c.sector_count);
         if sector >= end {
             return Err(crate::Error::OutOfBounds {
                 offset: sector * 512,
@@ -498,8 +501,27 @@ impl BlockDevice for DmgBackend {
             let idx = self.find_chunk_idx(sector)?;
             let chunk = self.chunks[idx];
 
-            let chunk_byte_start = chunk.virtual_sector_start * 512;
-            let chunk_byte_end = chunk_byte_start + chunk.sector_count * 512;
+            // Chunk geometry comes from the (untrusted) mish table; compute
+            // its virtual byte span with checked arithmetic so a malformed
+            // chunk can't overflow into a bogus in-bounds slice.
+            let chunk_byte_start =
+                chunk
+                    .virtual_sector_start
+                    .checked_mul(512)
+                    .ok_or(crate::Error::OutOfBounds {
+                        offset: chunk.virtual_sector_start,
+                        len: 512,
+                        size: self.virtual_size,
+                    })?;
+            let chunk_byte_end = chunk
+                .sector_count
+                .checked_mul(512)
+                .and_then(|span| chunk_byte_start.checked_add(span))
+                .ok_or(crate::Error::OutOfBounds {
+                    offset: chunk_byte_start,
+                    len: chunk.sector_count,
+                    size: self.virtual_size,
+                })?;
 
             // Decode the chunk once; we may take a partial slice on
             // either end. A future optimisation is to LRU-cache the

@@ -116,7 +116,39 @@ impl Gpt {
             )));
         }
 
-        let entries_bytes = hdr.num_entries as usize * hdr.entry_size as usize;
+        // Validate the entries-array geometry against untrusted header fields
+        // before allocating. The header CRC is no protection here: an attacker
+        // who controls the image can recompute it, so these caps must stand on
+        // their own.
+        //
+        // - `entry_size` must be at least 128 (the on-disk entry layout we
+        //   decode) and a power of two (the spec mandates 128 and requires the
+        //   size be a power of two), so we never stride by a bogus value or
+        //   slice past the buffer.
+        // - `num_entries` is capped to a sane maximum to bound the allocation.
+        // - the total array must fit within the device.
+        if hdr.entry_size < ENTRY_SIZE || !hdr.entry_size.is_power_of_two() {
+            return Err(crate::Error::InvalidImage(format!(
+                "GPT entry_size {} invalid (must be a power of two >= {ENTRY_SIZE})",
+                hdr.entry_size
+            )));
+        }
+        const MAX_NUM_ENTRIES: u32 = 4096;
+        if hdr.num_entries > MAX_NUM_ENTRIES {
+            return Err(crate::Error::InvalidImage(format!(
+                "GPT num_entries {} exceeds maximum {MAX_NUM_ENTRIES}",
+                hdr.num_entries
+            )));
+        }
+        let entries_bytes = (hdr.num_entries as u64)
+            .checked_mul(hdr.entry_size as u64)
+            .filter(|&n| n <= dev.total_size())
+            .ok_or_else(|| {
+                crate::Error::InvalidImage(format!(
+                    "GPT entries array ({} x {}) overflows or exceeds device size",
+                    hdr.num_entries, hdr.entry_size
+                ))
+            })? as usize;
         let mut entries_buf = vec![0u8; entries_bytes];
         dev.read_at(hdr.entries_start_lba * 512, &mut entries_buf)?;
         let computed = crc32fast::hash(&entries_buf);
@@ -130,8 +162,10 @@ impl Gpt {
         let mut partitions = Vec::new();
         for i in 0..hdr.num_entries as usize {
             let off = i * hdr.entry_size as usize;
-            let ent = &entries_buf[off..off + 128];
-            if let Some(p) = decode_entry(ent) {
+            // `entry_size >= 128` is enforced above, so the full stride is in
+            // bounds; decode only the first 128 bytes of each entry.
+            let ent = &entries_buf[off..off + hdr.entry_size as usize];
+            if let Some(p) = decode_entry(&ent[..128]) {
                 partitions.push(p);
             }
         }
@@ -388,6 +422,10 @@ fn decode_entry(b: &[u8]) -> Option<Partition> {
     let part_uuid = uuid_from_gpt_bytes(&uuid_bytes);
     let start = u64::from_le_bytes(b[32..40].try_into().unwrap());
     let end = u64::from_le_bytes(b[40..48].try_into().unwrap());
+    // `size_lba = end - start + 1`. Guard against an attacker-supplied entry
+    // where `end < start` (underflow) or `end == u64::MAX` (overflow); treat
+    // either as a malformed entry and skip it.
+    let size_lba = end.checked_sub(start).and_then(|d| d.checked_add(1))?;
     let attrs = u64::from_le_bytes(b[48..56].try_into().unwrap());
     let mut name = String::new();
     let mut name_units = [0u16; 36];
@@ -404,7 +442,7 @@ fn decode_entry(b: &[u8]) -> Option<Partition> {
     }
     Some(Partition {
         start_lba: start,
-        size_lba: end - start + 1,
+        size_lba,
         kind: PartitionKind::from_gpt_uuid(type_uuid),
         uuid: Some(part_uuid),
         name: if name.is_empty() { None } else { Some(name) },
@@ -519,6 +557,85 @@ mod tests {
         ];
         let err = Gpt::build(parts).unwrap_err();
         assert!(matches!(err, crate::Error::InvalidArgument(_)));
+    }
+
+    /// Patch the primary GPT header (LBA 1) in place via `mutate`, then
+    /// recompute and store its header CRC so the doctored header passes the
+    /// CRC gate — modelling an attacker who controls the image.
+    fn patch_primary_header(dev: &mut MemoryBackend, mutate: impl FnOnce(&mut [u8; 512])) {
+        let mut hdr = [0u8; 512];
+        dev.read_at(512, &mut hdr).unwrap();
+        mutate(&mut hdr);
+        let header_size = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
+        hdr[16..20].fill(0);
+        let crc = crc32fast::hash(&hdr[..header_size as usize]);
+        hdr[16..20].copy_from_slice(&crc.to_le_bytes());
+        dev.write_at(512, &hdr).unwrap();
+    }
+
+    #[test]
+    fn rejects_bogus_entry_size_too_small() {
+        // entry_size < 128 would underflow the fixed-128 slice / mis-stride.
+        let mut dev = MemoryBackend::new(mb(64));
+        let gpt = Gpt::build(vec![Partition::new(
+            2048,
+            1024,
+            PartitionKind::LinuxFilesystem,
+        )])
+        .unwrap();
+        gpt.write(&mut dev).unwrap();
+        patch_primary_header(&mut dev, |h| {
+            h[84..88].copy_from_slice(&64u32.to_le_bytes()); // entry_size = 64
+        });
+        let err = Gpt::read(&mut dev).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
+    }
+
+    #[test]
+    fn rejects_non_power_of_two_entry_size() {
+        let mut dev = MemoryBackend::new(mb(64));
+        let gpt = Gpt::build(vec![Partition::new(
+            2048,
+            1024,
+            PartitionKind::LinuxFilesystem,
+        )])
+        .unwrap();
+        gpt.write(&mut dev).unwrap();
+        patch_primary_header(&mut dev, |h| {
+            h[84..88].copy_from_slice(&192u32.to_le_bytes()); // 192 >= 128 but not a power of two
+        });
+        let err = Gpt::read(&mut dev).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
+    }
+
+    #[test]
+    fn rejects_oversized_num_entries() {
+        // Huge num_entries would size a multi-GiB allocation -> OOM.
+        let mut dev = MemoryBackend::new(mb(64));
+        let gpt = Gpt::build(vec![Partition::new(
+            2048,
+            1024,
+            PartitionKind::LinuxFilesystem,
+        )])
+        .unwrap();
+        gpt.write(&mut dev).unwrap();
+        patch_primary_header(&mut dev, |h| {
+            h[80..84].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        });
+        let err = Gpt::read(&mut dev).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
+    }
+
+    #[test]
+    fn decode_entry_rejects_end_before_start() {
+        // end < start would underflow `end - start + 1`.
+        let mut b = [0u8; 128];
+        b[0..16].copy_from_slice(&uuid_to_gpt_bytes(
+            PartitionKind::LinuxFilesystem.as_gpt_uuid(),
+        ));
+        b[32..40].copy_from_slice(&100u64.to_le_bytes()); // start
+        b[40..48].copy_from_slice(&50u64.to_le_bytes()); // end < start
+        assert!(decode_entry(&b).is_none());
     }
 
     #[test]

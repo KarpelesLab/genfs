@@ -186,9 +186,28 @@ impl EncryptedDmgHeader {
         let pbkdf2_prng_algorithm = u32::from_be_bytes(buf[0x18..0x1C].try_into().unwrap());
         let pbkdf2_iteration_count = u32::from_be_bytes(buf[0x1C..0x20].try_into().unwrap());
         let pbkdf2_salt_length = u32::from_be_bytes(buf[0x20..0x24].try_into().unwrap());
+        // The salt buffer on disk is exactly 32 bytes; a larger live length
+        // would make `salt()` slice past it and panic. Reject early.
+        if pbkdf2_salt_length > 32 {
+            return Err(crate::Error::InvalidImage(format!(
+                "encrcdsa: pbkdf2_salt_length {pbkdf2_salt_length} exceeds 32-byte salt buffer"
+            )));
+        }
         let mut pbkdf2_salt = [0u8; 32];
         pbkdf2_salt.copy_from_slice(&buf[0x24..0x44]);
         let blob_enc_iv_size = u32::from_be_bytes(buf[0x44..0x48].try_into().unwrap());
+        // Same for the IV buffer: 32 bytes on disk. We also require at least 8
+        // live bytes, since the 3DES-CBC unwrap consumes an 8-byte IV.
+        if blob_enc_iv_size > 32 {
+            return Err(crate::Error::InvalidImage(format!(
+                "encrcdsa: blob_enc_iv_size {blob_enc_iv_size} exceeds 32-byte IV buffer"
+            )));
+        }
+        if blob_enc_iv_size < 8 {
+            return Err(crate::Error::InvalidImage(format!(
+                "encrcdsa: blob_enc_iv_size {blob_enc_iv_size} too small (need >= 8 for 3DES-CBC)"
+            )));
+        }
         let mut blob_enc_iv = [0u8; 32];
         blob_enc_iv.copy_from_slice(&buf[0x48..0x68]);
         let blob_enc_key_bits = u32::from_be_bytes(buf[0x68..0x6C].try_into().unwrap());
@@ -407,10 +426,9 @@ impl EncryptedDmgBackend {
     fn decrypt_chunk(&mut self, chunk_index: u64) -> Result<Vec<u8>> {
         let block_size = self.header.block_size as usize;
         // Read the chunk's ciphertext.
-        let abs_offset = self
-            .header
-            .data_offset
-            .checked_add(chunk_index * self.header.block_size as u64)
+        let abs_offset = chunk_index
+            .checked_mul(self.header.block_size as u64)
+            .and_then(|rel| self.header.data_offset.checked_add(rel))
             .ok_or_else(|| {
                 crate::Error::InvalidImage(
                     "encrcdsa: chunk absolute offset overflows the data fork".into(),
@@ -849,6 +867,60 @@ mod tests {
             crate::Error::Unsupported(_) => {}
             _ => panic!("expected Unsupported, got {err:?}"),
         }
+    }
+
+    #[test]
+    fn header_rejects_oversized_salt_length() {
+        // salt() would slice past the 32-byte buffer and panic.
+        let mut buf = build_header_bytes(
+            1000,
+            b"saltsaltsaltsaltsalt",
+            b"iv8iv8iv",
+            &[0u8; 48],
+            0,
+            4096,
+            1,
+            0x1000,
+        );
+        buf[0x20..0x24].copy_from_slice(&33u32.to_be_bytes());
+        let err = EncryptedDmgHeader::decode(&buf).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
+    }
+
+    #[test]
+    fn header_rejects_oversized_blob_iv_size() {
+        // blob_iv() would slice past the 32-byte buffer and panic.
+        let mut buf = build_header_bytes(
+            1000,
+            b"saltsaltsaltsaltsalt",
+            b"iv8iv8iv",
+            &[0u8; 48],
+            0,
+            4096,
+            1,
+            0x1000,
+        );
+        buf[0x44..0x48].copy_from_slice(&33u32.to_be_bytes());
+        let err = EncryptedDmgHeader::decode(&buf).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
+    }
+
+    #[test]
+    fn header_rejects_undersized_blob_iv_size() {
+        // < 8 live IV bytes can't drive the 3DES-CBC unwrap.
+        let mut buf = build_header_bytes(
+            1000,
+            b"saltsaltsaltsaltsalt",
+            b"iv8iv8iv",
+            &[0u8; 48],
+            0,
+            4096,
+            1,
+            0x1000,
+        );
+        buf[0x44..0x48].copy_from_slice(&4u32.to_be_bytes());
+        let err = EncryptedDmgHeader::decode(&buf).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
     }
 
     #[test]

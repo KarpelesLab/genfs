@@ -66,7 +66,32 @@ impl L1L2 {
     pub fn load<F: Read + Seek>(file: &mut F, header: &Header) -> Result<Self> {
         let cluster_size = header.cluster_size();
         let l2_entries = (cluster_size / 8) as usize;
+
+        // `l1_size` is attacker-controlled; `l1_size * 8` is allocated up front
+        // before any bounds-checked read. Cap it before allocating. A valid L1
+        // table never needs more entries than are required to map the image's
+        // virtual `size` (each entry covers `l2_entries * cluster_size` bytes),
+        // and the table bytes must fit within the file.
+        let bytes_per_l1_entry =
+            (l2_entries as u64)
+                .checked_mul(cluster_size)
+                .ok_or_else(|| {
+                    crate::Error::InvalidImage("qcow2: l2_entries * cluster_size overflows".into())
+                })?;
+        let max_l1_entries = header.size.div_ceil(bytes_per_l1_entry.max(1));
+        if header.l1_size as u64 > max_l1_entries {
+            return Err(crate::Error::InvalidImage(format!(
+                "qcow2: l1_size {} exceeds {max_l1_entries} entries needed to map size {}",
+                header.l1_size, header.size
+            )));
+        }
         let l1_bytes = header.l1_size as usize * 8;
+        let file_len = file.seek(SeekFrom::End(0))?;
+        if l1_bytes as u64 > file_len {
+            return Err(crate::Error::InvalidImage(format!(
+                "qcow2: L1 table ({l1_bytes} bytes) exceeds file length {file_len}"
+            )));
+        }
         file.seek(SeekFrom::Start(header.l1_table_offset))?;
         let mut raw = vec![0u8; l1_bytes];
         file.read_exact(&mut raw)?;

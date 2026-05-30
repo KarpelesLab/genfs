@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9](https://github.com/KarpelesLab/fstool/compare/v0.4.8...v0.4.9) - 2026-05-30
+
+### Added
+
+- *(dmg)* switch encrypted-DMG crypto to purecrypto
+- *(rar)* support solid RAR5 archives, decoding the group once
+- *(rar)* RAR5 read-only reader (store + compressed) via compcol::rar5
+
+### Fixed
+
+- *(qcow2)* bound L1 table by file length, not minimum entries
+- *(repack)* bound source directory walk against cycles + strip '..'
+- *(archive,grf)* bounds-check entry fields and cap untrusted allocations
+- *(iso9660,squashfs,tar)* cap untrusted allocations + bound RR/PAX parsing
+- *(f2fs,exfat,fat)* cap untrusted-size allocations and validate geometry
+- *(apfs)* bound B-tree descent + checked spaceman math against malicious images
+- *(hfs+)* harden HFS+ reader against malicious images
+- *(xfs)* harden XFS reader against malicious images
+- *(ntfs)* harden NTFS reader against malicious images
+- *(ext)* harden ext2/3/4 reader against malicious images
+- *(block,part)* validate GPT/DMG/qcow2 header fields against malicious images
+- *(doc)* drop intra-doc links to private items (cargo doc -D warnings)
+
+### Other
+
+- *(changelog)* record security hardening pass
+
 ### Security
 
 - Hardened every untrusted-input parser against malicious images/archives

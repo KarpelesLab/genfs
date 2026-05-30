@@ -33,28 +33,39 @@ use std::path::Path;
 
 use fstool::Result;
 use fstool::block::BlockDevice;
-use fstool::inspect::AnyFs;
+use fstool::inspect::{AnyFs, FsKind};
+use fstool::path_style::{self, PathStyle};
 
 /// An interactive shell over an opened image.
 pub struct Shell {
     fs: AnyFs,
     /// Current working directory inside the image. Always absolute and
-    /// normalised (no `.`/`..`/empty segments).
+    /// normalised (no `.`/`..`/empty segments), and always in **canonical**
+    /// (unix, `/`-separated) form — display translation happens at the edges.
     cwd: String,
     /// True when the shell is in read-only mode (`fstool shell --ro`).
     /// `put` / `rm` / `mkdir` are refused at dispatch time and the
     /// underlying device is opened `O_RDONLY` by the caller.
     read_only: bool,
+    /// How the user spells paths (separator + name display). Captured from the
+    /// `--path-style` flag.
+    style: PathStyle,
+    /// The opened filesystem's kind, so path translation knows its native
+    /// separator.
+    kind: FsKind,
 }
 
 impl Shell {
     /// A new shell rooted at `/` over `fs`. The shell is mutating —
     /// `put` / `rm` / `mkdir` go through to the FS writer.
-    pub fn new(fs: AnyFs) -> Self {
+    pub fn new(fs: AnyFs, style: PathStyle) -> Self {
+        let kind = fs.kind();
         Self {
             fs,
             cwd: "/".into(),
             read_only: false,
+            style,
+            kind,
         }
     }
 
@@ -63,11 +74,14 @@ impl Shell {
     /// / `help` work. Intended for `fstool shell --ro` where the
     /// caller has opened the BlockDevice read-only (so even a
     /// missed gate fails at the syscall).
-    pub fn new_read_only(fs: AnyFs) -> Self {
+    pub fn new_read_only(fs: AnyFs, style: PathStyle) -> Self {
+        let kind = fs.kind();
         Self {
             fs,
             cwd: "/".into(),
             read_only: true,
+            style,
+            kind,
         }
     }
 
@@ -83,7 +97,11 @@ impl Shell {
         mut output: impl Write,
     ) -> Result<()> {
         loop {
-            write!(output, "fstool:{}> ", self.cwd)?;
+            write!(
+                output,
+                "fstool:{}> ",
+                path_style::display_path(&self.cwd, self.kind, self.style)
+            )?;
             output.flush()?;
             let mut line = String::new();
             let n = input.read_line(&mut line)?;
@@ -126,7 +144,10 @@ impl Shell {
 
         let mut output = std::io::stdout().lock();
         loop {
-            let prompt = format!("fstool:{}> ", self.cwd);
+            let prompt = format!(
+                "fstool:{}> ",
+                path_style::display_path(&self.cwd, self.kind, self.style)
+            );
             match rl.readline(&prompt) {
                 Ok(line) => {
                     let trimmed = line.trim();
@@ -171,7 +192,11 @@ impl Shell {
                 Ok(false)
             }
             "pwd" => {
-                writeln!(output, "{}", self.cwd)?;
+                writeln!(
+                    output,
+                    "{}",
+                    path_style::display_path(&self.cwd, self.kind, self.style)
+                )?;
                 Ok(false)
             }
             "ls" => {
@@ -268,7 +293,12 @@ quit | exit         leave{ro_note}\n"
                 fstool::fs::EntryKind::Symlink => "@",
                 _ => "",
             };
-            writeln!(output, "{}{}", e.name, suffix)?;
+            writeln!(
+                output,
+                "{}{}",
+                path_style::display_name(&e.name, self.kind, self.style),
+                suffix
+            )?;
         }
         Ok(())
     }
@@ -472,14 +502,18 @@ quit | exit         leave{ro_note}\n"
         Ok(())
     }
 
-    /// Resolve `path` against [`Self::cwd`]: absolute paths normalise as
-    /// themselves; relative paths are joined onto cwd. Both then go
-    /// through [`normalize_path`] to collapse `.`, `..`, and `//`.
+    /// Resolve a user-typed `path` against [`Self::cwd`]. The input is first
+    /// translated from the active [`PathStyle`] into canonical (`/`-separated)
+    /// form; absolute canonical paths normalise as themselves, relative ones
+    /// are joined onto cwd. Both then go through [`normalize_path`] to collapse
+    /// `.`, `..`, and `//`. The returned path — and `cwd` — are always
+    /// canonical; display translation happens only at the print edges.
     fn resolve(&self, path: &str) -> String {
-        let combined = if path.starts_with('/') {
-            path.to_string()
+        let canon = path_style::to_canonical(path, self.kind, self.style);
+        let combined = if canon.starts_with('/') {
+            canon
         } else {
-            join(&self.cwd, path)
+            join(&self.cwd, &canon)
         };
         normalize_path(&combined)
     }

@@ -783,7 +783,7 @@ fn split_parent_and_name(fs: &HfsPlus, path_str: &str) -> Result<(u32, UniStr)> 
         .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume opened read-only".into()))?;
     let mut cnid = super::catalog::ROOT_FOLDER_ID;
     for part in prefix {
-        let name = UniStr::from_str_lossy(part);
+        let name = UniStr::from_path_component(part);
         let (_, child_cnid, rec_type) = writer.lookup(cnid, &name).ok_or_else(|| {
             crate::Error::InvalidArgument(format!("hfs+: parent component {part:?} does not exist"))
         })?;
@@ -794,5 +794,5 @@ fn split_parent_and_name(fs: &HfsPlus, path_str: &str) -> Result<(u32, UniStr)> 
         }
         cnid = child_cnid;
     }
-    Ok((cnid, UniStr::from_str_lossy(last)))
+    Ok((cnid, UniStr::from_path_component(last)))
 }

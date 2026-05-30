@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(cli)* global `--path-style {unix|native}` flag. `unix` (default) separates
+  every path with `/` and shows a literal `/` inside an HFS/HFS+ name as `:`
+  (the macOS convention); `native` uses the filesystem's own separator (`:` for
+  HFS/HFS+, `\` for FAT/exFAT/NTFS, `/` elsewhere) and preserves real
+  filenames. Translation happens only at the CLI/shell boundary — readers,
+  `repack`, and on-disk formats are unaffected.
 - *(cli)* `fstool ls -R` / `--recursive` — walk subdirectories, printing each
   directory under a `path:` header (like `ls -R`). Works on both block-device
   images and streamed `.tar.<algo>` archives; never descends the `.`/`..`
@@ -76,6 +82,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(inspect)* the "no recognised filesystem" error no longer enumerates every
   supported format — the growing list made the message hard to read. It now
   reads simply `no recognised filesystem or archive on this image`.
+- *(hfs, hfs+)* a literal `/` inside a classic-Mac filename (legal there, since
+  the separator is `:`) is now canonicalised to `:` on listing and resolution,
+  so it can't be mistaken for a path separator. Fixes mis-resolution / `ls -R`
+  aborting on real volumes (e.g. a directory named `A/ROSE Includes`), and
+  means such names repack into a tar/zip as `A:ROSE Includes`. HFS+ previously
+  left the raw `/` in place (latent bug); it now matches classic HFS.
 
 ## [0.4.9](https://github.com/KarpelesLab/fstool/compare/v0.4.8...v0.4.9) - 2026-05-30
 

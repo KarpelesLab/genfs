@@ -105,6 +105,25 @@ target to walk into a partition of a GPT, MBR, or Apple Partition Map disk
 image. `fstool info disk.img` without the suffix prints the partition table
 itself.
 
+### Path style (`--path-style`)
+
+Classic Mac filesystems separate path components with `:`, so `/` is a legal
+*filename* character (a real directory can be named `A/ROSE Includes`). The
+global `--path-style` flag picks how paths are spelled:
+
+- **`unix`** (default) — `/` separates everywhere; a literal `/` inside an
+  HFS/HFS+ name is shown as `:` (the convention macOS itself uses). So
+  `fstool ls disk.toast:2 …` lists `A:ROSE Includes`, and **repack to a tar/zip
+  renders the name the same way** (`A:ROSE Includes`) — a literal `/` can't go
+  in an archive member name without being read as a directory separator.
+- **`native`** — the filesystem's own separator (`:` for HFS/HFS+, `\` for
+  FAT/exFAT/NTFS, `/` elsewhere); real filenames are preserved. Navigate with
+  the native separator, e.g.
+  `fstool ls --path-style native disk.toast:2 ':Apple Software Library:…:A/ROSE Includes'`.
+
+`native` only changes how the CLI and shell *display and accept* paths; on-disk
+formats (and the canonical names used by `repack`/`add`) are unaffected.
+
 ### FS-specific options (`-O`)
 
 Most filesystems expose tunables (block size, label, compression codec,

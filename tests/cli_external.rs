@@ -1676,3 +1676,47 @@ fn cli_ls_recursive_walks_tree_and_terminates() {
     assert!(!s.contains("/.:"), "recursed into '.':\n{s}");
     assert!(!s.contains("/..:"), "recursed into '..':\n{s}");
 }
+
+/// `--path-style` is accepted, and on a `/`-native filesystem (ext) `native`
+/// is a no-op equal to the default `unix`. (HFS/HFS+ native behaviour — where
+/// the separator actually differs — is exercised by the path_style unit tests
+/// and the HFS/HFS+ reader fixtures; it needs a Mac volume the CLI tests don't
+/// fabricate.)
+#[test]
+fn cli_path_style_flag_is_a_noop_on_ext() {
+    let bin = FSTOOL;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("dir")).unwrap();
+    std::fs::write(src.path().join("dir/f"), b"x\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(bin)
+        .args(["create", "-t", "ext4"])
+        .arg(src.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "create failed");
+
+    let run = |style: &str| {
+        let o = Command::new(bin)
+            .args(["ls", "-R", "--path-style", style])
+            .arg(img.path())
+            .arg("/")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "ls -R --path-style {style} failed");
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    // Native and unix produce identical output for an ext filesystem, and the
+    // default (no flag) matches unix.
+    assert_eq!(run("unix"), run("native"));
+    let default = Command::new(bin)
+        .args(["ls", "-R"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&default.stdout), run("unix"));
+}

@@ -438,7 +438,7 @@ impl HfsPlus {
             .as_ref()
             .ok_or_else(|| crate::Error::InvalidArgument("hfs+: volume is read-only".into()))?;
         for part in prefix {
-            let name = UniStr::from_str_lossy(part);
+            let name = UniStr::from_path_component(part);
             let (_, child_cnid, rec_type) = w.lookup(cnid, &name).ok_or_else(|| {
                 crate::Error::InvalidArgument(format!(
                     "hfs+: parent component {part:?} does not exist"
@@ -451,7 +451,7 @@ impl HfsPlus {
             }
             cnid = child_cnid;
         }
-        Ok((cnid, UniStr::from_str_lossy(last)))
+        Ok((cnid, UniStr::from_path_component(last)))
     }
 
     /// Total byte capacity advertised by the volume header.
@@ -650,7 +650,7 @@ impl HfsPlus {
     ) -> Result<CatalogRecord> {
         let key = CatalogKey {
             parent_id,
-            name: UniStr::from_str_lossy(name),
+            name: UniStr::from_path_component(name),
             encoded_len: 0,
         };
         self.catalog.lookup(dev, &key)?.ok_or_else(|| {
@@ -1030,7 +1030,7 @@ impl HfsPlus {
                     _ => 0,
                 };
                 out.push(FsDirEntry {
-                    name: key.name.to_string_lossy(),
+                    name: key.name.to_display_name(),
                     inode: child_id,
                     kind,
                     size,
@@ -1665,6 +1665,54 @@ mod tests {
                 "{path:?} hlnk record's own data fork must be empty"
             );
         }
+    }
+
+    /// HFS+'s separator is `:`, so `/` is a legal filename byte. A canonical
+    /// path component carries that real `/` as `:`; creating `/A:ROSE Includes`
+    /// must store the on-disk name `A/ROSE Includes`, list it back as the
+    /// canonical `A:ROSE Includes`, and resolve via the canonical path. (Mirror
+    /// of the classic-HFS `A/B` fixture; guards the latent split-on-`/` bug.)
+    #[test]
+    fn slash_in_name_round_trips_through_colon() {
+        let mut dev = crate::block::MemoryBackend::new(8 * 1024 * 1024);
+        let opts = writer::FormatOpts::default();
+        let mut hfs = HfsPlus::format(&mut dev, &opts).unwrap();
+
+        let data = b"a-rose-by-any-other-name\n".to_vec();
+        let mut src = std::io::Cursor::new(&data);
+        hfs.create_file(
+            &mut dev,
+            "/A:ROSE Includes",
+            &mut src,
+            data.len() as u64,
+            0o644,
+            0,
+            0,
+        )
+        .unwrap();
+        hfs.flush(&mut dev).unwrap();
+
+        // Re-open to exercise the read-side resolver + listing.
+        let hfs = HfsPlus::open(&mut dev).unwrap();
+
+        // Listing surfaces the canonical (colon) form — no raw `/` leaks.
+        let names: Vec<String> = hfs
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "A:ROSE Includes"),
+            "expected canonical 'A:ROSE Includes' in {names:?}"
+        );
+
+        // The canonical path resolves back to the file (separator-safe).
+        let rec = hfs.lookup_path(&mut dev, "/A:ROSE Includes").unwrap();
+        assert!(
+            matches!(rec, catalog::CatalogRecord::File(_)),
+            "canonical path should resolve to the created file"
+        );
     }
 
     /// Round-trip: format + populate + flush, then `HfsPlus::open` the

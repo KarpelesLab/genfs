@@ -25,6 +25,7 @@ use clap::{Parser, Subcommand};
 use fstool::block::{BlockDevice, FileBackend};
 use fstool::format_opts::OptionMap;
 use fstool::fs::ext::{Ext, FsKind};
+use fstool::path_style::{self, PathStyle};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,6 +34,18 @@ use fstool::fs::ext::{Ext, FsKind};
     about = "Build and inspect disk-image filesystems (ext2/3/4, MBR, GPT)."
 )]
 struct Cli {
+    /// How filesystem paths are spelled. `unix` (default): `/` separates
+    /// everywhere, and a literal `/` inside an HFS/HFS+ name shows as `:`.
+    /// `native`: the filesystem's own separator (`:` for HFS/HFS+, `\` for
+    /// FAT/exFAT/NTFS, `/` elsewhere) with real filenames preserved.
+    #[arg(
+        long = "path-style",
+        value_enum,
+        default_value_t = fstool::path_style::PathStyle::Unix,
+        global = true
+    )]
+    path_style: fstool::path_style::PathStyle,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -308,8 +321,8 @@ fn run(cli: Cli) -> fstool::Result<()> {
             image,
             path,
             recursive,
-        } => ls(&image, &path, recursive),
-        Command::Cat { image, path } => cat(&image, &path),
+        } => ls(&image, &path, recursive, cli.path_style),
+        Command::Cat { image, path } => cat(&image, &path, cli.path_style),
         Command::Info { image } => info(&image),
         Command::Analyze {
             source,
@@ -322,9 +335,9 @@ fn run(cli: Cli) -> fstool::Result<()> {
             image,
             host_src,
             fs_dest,
-        } => add(&image, &host_src, &fs_dest),
-        Command::Rm { image, fs_path } => rm(&image, &fs_path),
-        Command::Shell { image, ro } => shell_cmd(&image, ro),
+        } => add(&image, &host_src, &fs_dest, cli.path_style),
+        Command::Rm { image, fs_path } => rm(&image, &fs_path, cli.path_style),
+        Command::Shell { image, ro } => shell_cmd(&image, ro, cli.path_style),
         Command::Convert {
             src,
             dst,
@@ -1925,7 +1938,7 @@ fn sum_source_file_bytes(
     src_fs.total_file_bytes(src_dev)
 }
 
-fn shell_cmd(image: &str, ro: bool) -> fstool::Result<()> {
+fn shell_cmd(image: &str, ro: bool, style: PathStyle) -> fstool::Result<()> {
     let target = fstool::inspect::Target::parse(image);
     if ro {
         // Read-only shell: open the underlying file O_RDONLY (any
@@ -1939,7 +1952,7 @@ fn shell_cmd(image: &str, ro: bool) -> fstool::Result<()> {
         // rm / mkdir itself.
         return fstool::inspect::with_target_device_read_only(&target, |dev| {
             let fs = fstool::inspect::AnyFs::open(dev)?;
-            let mut sh = shell::Shell::new_read_only(fs);
+            let mut sh = shell::Shell::new_read_only(fs, style);
             run_shell(&mut sh, dev)?;
             // No dev.sync() — read-only.
             Ok(())
@@ -1973,7 +1986,7 @@ fn shell_cmd(image: &str, ro: bool) -> fstool::Result<()> {
                 },
             )));
         }
-        let mut sh = shell::Shell::new(fs);
+        let mut sh = shell::Shell::new(fs, style);
         run_shell(&mut sh, dev)?;
         dev.sync()?;
         Ok(())
@@ -2000,12 +2013,13 @@ fn run_shell(
     sh.run(dev, stdin.lock(), stdout.lock())
 }
 
-fn rm(image: &str, fs_path: &str) -> fstool::Result<()> {
+fn rm(image: &str, fs_path: &str, style: PathStyle) -> fstool::Result<()> {
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open_writable(dev)?;
-        fs.remove(dev, fs_path)?;
+        let cpath = path_style::to_canonical(fs_path, fs.kind(), style);
+        fs.remove(dev, &cpath)?;
         fs.flush(dev)?;
         dev.sync()?;
         eprintln!("removed {fs_path}");
@@ -2013,16 +2027,24 @@ fn rm(image: &str, fs_path: &str) -> fstool::Result<()> {
     })
 }
 
-fn add(image: &str, host_src: &std::path::Path, fs_dest: &str) -> fstool::Result<()> {
+fn add(
+    image: &str,
+    host_src: &std::path::Path,
+    fs_dest: &str,
+    style: PathStyle,
+) -> fstool::Result<()> {
     let meta = std::fs::symlink_metadata(host_src)?;
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::reject_compressed_for_mutation(&target)?;
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open_writable(dev)?;
+        // Only the in-image destination is style-translated; `host_src` is a
+        // real host path and must be left untouched.
+        let dest = path_style::to_canonical(fs_dest, fs.kind(), style);
         if meta.is_dir() {
-            fs.add_dir_tree(dev, fs_dest, host_src)?;
+            fs.add_dir_tree(dev, &dest, host_src)?;
         } else if meta.is_file() {
-            fs.add_file(dev, fs_dest, host_src)?;
+            fs.add_file(dev, &dest, host_src)?;
         } else {
             return Err(fstool::Error::InvalidArgument(format!(
                 "add: {} is neither a regular file nor a directory",
@@ -2629,22 +2651,31 @@ fn require_force_for_device(
     Ok(())
 }
 
-fn ls(image: &str, path: &str, recursive: bool) -> fstool::Result<()> {
+fn ls(image: &str, path: &str, recursive: bool, style: PathStyle) -> fstool::Result<()> {
     // Compressed-tar archives stream-walk per invocation; bypass the
-    // tempfile-spooling BlockDevice path entirely.
+    // tempfile-spooling BlockDevice path entirely. Tar's separator is `/`, so
+    // path-style is a no-op there — pass the path through unchanged.
     if let Some(algo) = tar_input_codec(image) {
         return ls_tar_stream(image, path, Some(algo), recursive);
     }
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let kind = fs.kind();
+        let cpath = path_style::to_canonical(path, kind, style);
         let mut out = std::io::stdout().lock();
         if recursive {
-            ls_recursive(&mut fs, dev, path, &mut out)?;
+            ls_recursive(&mut fs, dev, &cpath, kind, style, &mut out)?;
         } else {
-            let entries = fs.list(dev, path)?;
+            let entries = fs.list(dev, &cpath)?;
             for e in &entries {
-                let _ = writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name);
+                let _ = writeln!(
+                    out,
+                    "{}\t{:?}\t{}",
+                    e.inode,
+                    e.kind,
+                    path_style::display_name(&e.name, kind, style)
+                );
             }
         }
         Ok(())
@@ -2659,12 +2690,23 @@ fn ls_recursive(
     fs: &mut fstool::inspect::AnyFs,
     dev: &mut dyn fstool::block::BlockDevice,
     dir: &str,
+    kind: fstool::inspect::FsKind,
+    style: PathStyle,
     out: &mut impl std::io::Write,
 ) -> fstool::Result<()> {
     let entries = fs.list(dev, dir)?;
-    writeln!(out, "{dir}:")?;
+    // `dir` and `e.name` are canonical; translate ONLY for display. The
+    // recursion below must keep using the canonical values, or a name with a
+    // separator-collision (e.g. HFS "A/ROSE Includes") would be mis-resolved.
+    writeln!(out, "{}:", path_style::display_path(dir, kind, style))?;
     for e in &entries {
-        writeln!(out, "{}\t{:?}\t{}", e.inode, e.kind, e.name)?;
+        writeln!(
+            out,
+            "{}\t{:?}\t{}",
+            e.inode,
+            e.kind,
+            path_style::display_name(&e.name, kind, style)
+        )?;
     }
     writeln!(out)?;
     for e in &entries {
@@ -2674,7 +2716,7 @@ fn ls_recursive(
             // containers carry a `.`/`/` self-entry) — that would recurse
             // forever.
             if child != dir {
-                ls_recursive(fs, dev, &child, out)?;
+                ls_recursive(fs, dev, &child, kind, style, out)?;
             }
         }
     }
@@ -2697,15 +2739,16 @@ fn join_image_path(dir: &str, name: &str) -> String {
     }
 }
 
-fn cat(image: &str, path: &str) -> fstool::Result<()> {
+fn cat(image: &str, path: &str, style: PathStyle) -> fstool::Result<()> {
     if let Some(algo) = tar_input_codec(image) {
         return cat_tar_stream(image, path, Some(algo));
     }
     let target = fstool::inspect::Target::parse(image);
     fstool::inspect::with_target_device(&target, |dev| {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let cpath = path_style::to_canonical(path, fs.kind(), style);
         let mut out = std::io::stdout().lock();
-        fs.copy_file_to(dev, path, &mut out)?;
+        fs.copy_file_to(dev, &cpath, &mut out)?;
         Ok(())
     })
 }

@@ -23,6 +23,7 @@ pub mod fuse_adapter;
 pub mod inspect;
 pub mod merge;
 pub mod part;
+pub mod path_style;
 pub mod repack;
 pub mod spec;
 

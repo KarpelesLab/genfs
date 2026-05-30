@@ -109,6 +109,24 @@ impl UniStr {
     pub fn to_string_lossy(&self) -> String {
         String::from_utf16_lossy(&self.code_units)
     }
+
+    /// Build a `UniStr` from a **canonical path component**, undoing the
+    /// display swap: HFS+'s separator is `:`, so a literal `/` is a legal
+    /// filename character. fstool's canonical form stores that real `/` as `:`
+    /// (a real `:` can never occur in an HFS+ name, so the mapping is exact).
+    /// This reverses it — `:`→`/` — so the component matches / writes the name
+    /// the catalog actually stores. Use this, not [`UniStr::from_str_lossy`],
+    /// wherever a path component is resolved or created against the catalog.
+    pub fn from_path_component(s: &str) -> Self {
+        Self::from_str_lossy(&s.replace(':', "/"))
+    }
+
+    /// Decode a catalog name into its **canonical** display form: the on-disk
+    /// literal `/` is swapped to `:` so the name carries no `/` and round-trips
+    /// through fstool's `/`-separated paths. Inverse of [`Self::from_path_component`].
+    pub fn to_display_name(&self) -> String {
+        self.to_string_lossy().replace('/', ":")
+    }
 }
 
 /// Case-insensitive folding for a single Basic-Multilingual-Plane code

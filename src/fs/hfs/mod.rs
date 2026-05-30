@@ -323,7 +323,14 @@ impl Hfs {
             if 6 + name_len > key.len() {
                 return Ok(());
             }
-            let name = macroman::decode(&key[6..6 + name_len]);
+            // Classic HFS uses `:` as the path separator, so `/` (0x2F) is a
+            // *legal* character inside a filename (e.g. "A/ROSE Includes").
+            // fstool — like every POSIX tool — separates path components with
+            // `/`, so a raw `/` in a name would be mis-split. Swap it to `:`,
+            // exactly as macOS's own BSD layer does when surfacing HFS names
+            // (Finder shows `/`, the shell shows `:`). `:` itself can never
+            // appear in a raw HFS name, so the mapping is unambiguous.
+            let name = macroman::decode(&key[6..6 + name_len]).replace('/', ":");
 
             match data[0] {
                 1 if data.len() >= 18 => {
@@ -750,6 +757,9 @@ mod tests {
             leaf_record(2, b"hello.txt", &file_record(17, HELLO.len() as u32, 3)),
             leaf_record(2, b"sub", &dir_record(16)),
             leaf_record(16, b"deep.txt", &file_record(18, DEEP.len() as u32, 4)),
+            // A classic-Mac name with a `/` in it (path separator is `:` on
+            // HFS). Reuses hello.txt's data block. Must surface as `A:B`.
+            leaf_record(2, b"A/B", &file_record(19, HELLO.len() as u32, 3)),
         ];
         let mut pos = 14usize;
         let mut offs = vec![14u16];
@@ -801,6 +811,13 @@ mod tests {
             .collect();
         assert!(root.contains(&("hello.txt".into(), EntryKind::Regular)));
         assert!(root.contains(&("sub".into(), EntryKind::Dir)));
+        // A classic-Mac name with a literal `/` ("A/B") surfaces canonically as
+        // "A:B" — the `/` (legal on HFS, whose separator is `:`) is swapped so
+        // it can't be mistaken for a path separator.
+        assert!(
+            root.contains(&("A:B".into(), EntryKind::Regular)),
+            "expected canonical 'A:B' in root: {root:?}"
+        );
 
         let sub: Vec<_> = fs
             .list(&mut dev, Path::new("/sub"))
@@ -812,6 +829,9 @@ mod tests {
 
         assert_eq!(read_all(&mut fs, &mut dev, "/hello.txt"), HELLO);
         assert_eq!(read_all(&mut fs, &mut dev, "/sub/deep.txt"), DEEP);
+        // Resolving the canonical "A:B" reaches the entry (its data fork
+        // aliases hello.txt's block, so the bytes match HELLO).
+        assert_eq!(read_all(&mut fs, &mut dev, "/A:B"), HELLO);
     }
 
     /// The same volume wrapped in a DiskCopy 4.2 header is detected + read

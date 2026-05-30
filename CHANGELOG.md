@@ -13,9 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — walks the block chain (vint headers, file headers, compression info) and
   streams each member out of its packed run: **Store** raw, and compressed
   (no-filter / x86 E8E9) via `compcol::rar5`. Cross-checked against the
-  reference `unrar` extractor (committed `rar -ma5` fixtures). RAR4, solid
-  archives, encryption, and the delta/ARM/other RAR5 filters surface as a
-  clean `Unsupported`; creation is unsupported (proprietary).
+  reference `unrar` extractor (committed `rar -ma5` fixtures). RAR4,
+  encryption, and the delta/ARM/other RAR5 filters surface as a clean
+  `Unsupported`; creation is unsupported (proprietary).
+- *(rar)* **solid** RAR5 archives. A solid group's members share one LZ
+  window, so it's decoded as a single continuous stream over the concatenated
+  packed runs (compcol's `rar5` decoder is per-stream; we drive one resumable
+  decoder over the whole group). A persistent forward cursor lets a sequential
+  walk — notably `repack` — decompress the group **exactly once** instead of
+  re-decoding from the start per file; a backward/random read of an earlier
+  member rebuilds the cursor and re-decodes from the group start, staying
+  bounded-memory (no whole-group buffering). Validated against `unrar` with a
+  4-member cross-referencing fixture, plus a decode-once regression test. A
+  stored member inside a solid group stays `Unsupported`.
 
 ## [0.4.8](https://github.com/KarpelesLab/fstool/compare/v0.4.7...v0.4.8) - 2026-05-29
 

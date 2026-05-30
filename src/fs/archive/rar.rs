@@ -8,12 +8,21 @@
 //! With the `rar` Cargo feature this is a real **read-only RAR5** reader:
 //! it walks the RAR5 block chain (vint-encoded headers), and extracts each
 //! file's contiguous packed run — Store verbatim, or compressed via
-//! `compcol::rar5` (LZ77/Huffman incl. the x86 E8/E8E9 filters). Non-solid
-//! archives only.
+//! `compcol::rar5` (LZ77/Huffman incl. the x86 E8/E8E9 filters).
 //!
-//! Out of scope (clean `Unsupported`): RAR4, solid archives, encryption,
-//! the delta/ARM/other RAR5 filters compcol doesn't decode, multi-volume
-//! sets. Without the `rar` feature this stays a detection-only scaffold.
+//! **Solid archives** are supported: a solid group is the concatenation of
+//! its members' packed runs decoded as one continuous stream with a shared
+//! LZ window (`compcol::rar5` itself is per-stream, so we drive a single
+//! resumable decoder over the whole group ourselves). A persistent forward
+//! cursor ([`imp::LiveSolid`]) lets a sequential walk — notably `repack` —
+//! decompress the group exactly **once**; a backward/random read of an
+//! earlier member rebuilds the cursor and re-decodes from the group start
+//! (correct, bounded memory, no whole-group buffering).
+//!
+//! Out of scope (clean `Unsupported`): RAR4, encryption, stored members
+//! inside a solid group, the delta/ARM/other RAR5 filters compcol doesn't
+//! decode, multi-volume sets. Without the `rar` feature this stays a
+//! detection-only scaffold.
 
 use std::path::Path;
 
@@ -26,7 +35,18 @@ use crate::fs::{DirEntry, FileAttrs, FileReadHandle, Filesystem, MutationCapabil
 pub struct RarFs {
     fs: ArchiveFs,
     #[cfg(feature = "rar")]
-    files: std::collections::HashMap<String, Option<imp::RarFile>>,
+    files: std::collections::HashMap<String, imp::Entry>,
+    /// Solid groups (>1 member). `imp::Entry::Solid` indexes into this.
+    #[cfg(feature = "rar")]
+    groups: Vec<imp::SolidGroup>,
+    /// Persistent forward decode cursor for the most-recently-read solid
+    /// group, so a sequential walk decompresses the group only once.
+    #[cfg(feature = "rar")]
+    live: Option<imp::LiveSolid>,
+    /// Count of solid-cursor (re)builds — instrumentation for the
+    /// decode-once guarantee. An in-order walk of a group builds it once.
+    #[cfg(feature = "rar")]
+    rebuilds: usize,
 }
 
 impl RarFs {
@@ -42,12 +62,18 @@ impl RarFs {
             return Ok(Self {
                 fs: ArchiveFs::scaffold("rar"),
                 files: std::collections::HashMap::new(),
+                groups: Vec::new(),
+                live: None,
+                rebuilds: 0,
             });
         }
         let p = imp::scan(dev)?;
         Ok(Self {
             fs: ArchiveFs::from_index(p.index),
             files: p.files,
+            groups: p.groups,
+            live: None,
+            rebuilds: 0,
         })
     }
 
@@ -132,10 +158,13 @@ impl Filesystem for RarFs {
     ) -> Result<Box<dyn std::io::Read + 'a>> {
         #[cfg(feature = "rar")]
         match self.lookup(path)? {
-            imp::Lookup::File(f) => return imp::open_file(dev, &f),
+            imp::Lookup::Plain(f) => return imp::open_file(dev, &f),
+            imp::Lookup::Solid { group, member } => {
+                return self.read_solid(dev, group, member);
+            }
             imp::Lookup::Unextractable(key) => {
                 return Err(crate::Error::Unsupported(format!(
-                    "rar: {key:?} cannot be extracted (solid, encrypted, or unsupported method)"
+                    "rar: {key:?} cannot be extracted (encrypted, stored-in-solid, or unsupported method)"
                 )));
             }
             imp::Lookup::NotRegular => {}
@@ -150,16 +179,23 @@ impl Filesystem for RarFs {
     ) -> Result<Box<dyn FileReadHandle + 'a>> {
         #[cfg(feature = "rar")]
         match self.lookup(path)? {
-            imp::Lookup::File(f) => {
+            imp::Lookup::Plain(f) => {
                 use std::io::Read;
                 let mut r = imp::open_file(dev, &f)?;
                 let mut bytes = Vec::new();
                 r.read_to_end(&mut bytes).map_err(crate::Error::from)?;
                 return Ok(Box::new(imp::mem_handle(bytes)));
             }
+            imp::Lookup::Solid { group, member } => {
+                use std::io::Read;
+                let mut r = self.read_solid(dev, group, member)?;
+                let mut bytes = Vec::new();
+                r.read_to_end(&mut bytes).map_err(crate::Error::from)?;
+                return Ok(Box::new(imp::mem_handle(bytes)));
+            }
             imp::Lookup::Unextractable(key) => {
                 return Err(crate::Error::Unsupported(format!(
-                    "rar: {key:?} cannot be extracted (solid, encrypted, or unsupported method)"
+                    "rar: {key:?} cannot be extracted (encrypted, stored-in-solid, or unsupported method)"
                 )));
             }
             imp::Lookup::NotRegular => {}
@@ -204,10 +240,52 @@ impl RarFs {
             .ok_or_else(|| crate::Error::InvalidArgument("rar: non-UTF-8 path".to_string()))?;
         let key = crate::fs::archive::tree::normalise_path(s);
         Ok(match self.files.get(&key) {
-            Some(Some(f)) => imp::Lookup::File(*f),
-            Some(None) => imp::Lookup::Unextractable(key),
+            Some(imp::Entry::Plain(f)) => imp::Lookup::Plain(*f),
+            Some(imp::Entry::Solid { group, member }) => imp::Lookup::Solid {
+                group: *group,
+                member: *member,
+            },
+            Some(imp::Entry::Unextractable) => imp::Lookup::Unextractable(key),
             None => imp::Lookup::NotRegular,
         })
+    }
+
+    /// Open member `member` of solid `group` as a bounded streaming reader,
+    /// driving the persistent forward cursor so that an in-order walk decodes
+    /// the group only once. A request for a member at or after the cursor
+    /// advances it (skipping intervening output); a request before the cursor
+    /// rebuilds it and re-decodes from the group start.
+    fn read_solid<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        group: usize,
+        member: usize,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        let RarFs {
+            live,
+            groups,
+            rebuilds,
+            ..
+        } = self;
+        let g = &groups[group];
+        let start = g.starts[member];
+        let remaining = g.starts[member + 1] - start;
+
+        // Reuse the live cursor only if it's this group and hasn't already
+        // advanced past where we need to start; otherwise rebuild from zero.
+        let reusable = matches!(live, Some(l) if l.group == group && l.out_pos <= start);
+        if !reusable {
+            *live = Some(imp::LiveSolid::new(group, g.window, g.total));
+            *rebuilds += 1;
+        }
+        let l = live.as_mut().unwrap();
+        imp::skip_to(l, g, dev, start)?;
+        Ok(Box::new(imp::SolidReader {
+            live: l,
+            areas: &g.areas,
+            dev,
+            remaining,
+        }))
     }
 }
 
@@ -218,10 +296,21 @@ mod imp {
     use std::collections::HashMap;
     use std::io::{self, Read};
 
+    // Bring the `compcol::Decoder` trait methods (`decode` / `discard_output`
+    // / `finish`) into scope without shadowing the concrete
+    // `compcol::rar5::Decoder` type, plus the `Status` enum.
+    use compcol::Decoder as _;
+    use compcol::Status;
+
     use crate::block::BlockDevice;
     use crate::fs::archive::reader::BoundedDevReader;
     use crate::fs::archive::{ArchiveEntry, ArchiveIndex, DataLocator, EntryKind, Method};
     use crate::{Error, Result};
+
+    /// Staging chunk pulled from the device per refill while driving the solid
+    /// decoder. The decoder buffers input internally, so this only needs to be
+    /// large enough to amortise `read_at` calls.
+    const SOLID_CHUNK: usize = 64 * 1024;
 
     // RAR5 header types.
     const HEAD_FILE: u64 = 2;
@@ -244,15 +333,76 @@ mod imp {
         pub store: bool,
     }
 
+    /// What a path resolves to in the per-file table.
+    pub enum Entry {
+        /// Standalone member (its own 1-member group): decoded independently.
+        Plain(RarFile),
+        /// Member of a multi-member solid group; indices into `RarFs::groups`.
+        Solid { group: usize, member: usize },
+        /// Recognised but undecodable (encrypted, stored-in-solid, …).
+        Unextractable,
+    }
+
     pub enum Lookup {
-        File(RarFile),
+        Plain(RarFile),
+        Solid { group: usize, member: usize },
         Unextractable(String),
         NotRegular,
     }
 
+    /// One member's packed run within a solid group.
+    #[derive(Debug, Clone, Copy)]
+    pub struct DataArea {
+        pub offset: u64,
+        pub pack: u64,
+    }
+
+    /// A solid group: members' packed runs form one continuous LZ stream
+    /// sharing a single window. `starts[i]..starts[i+1]` is member `i`'s byte
+    /// range in the decoded output; `starts` has `members + 1` entries.
+    pub struct SolidGroup {
+        pub areas: Vec<DataArea>,
+        pub window: usize,
+        pub starts: Vec<u64>,
+        pub total: u64,
+    }
+
+    /// Persistent forward decode cursor over one solid group. The owned
+    /// `compcol::rar5::Decoder` carries the LZ window across members; the
+    /// compressed cursor (`in_area`/`in_off`) and the staging buffer survive
+    /// across `read_file` calls so a member boundary mid-chunk is seamless.
+    pub struct LiveSolid {
+        pub group: usize,
+        dec: compcol::rar5::Decoder,
+        /// Decompressed bytes emitted **or** discarded so far (absolute in the
+        /// group's output). The next sequential member begins exactly here.
+        pub out_pos: u64,
+        in_area: usize,
+        in_off: u64,
+        in_buf: Vec<u8>,
+        in_consumed: usize,
+        in_filled: usize,
+    }
+
+    impl LiveSolid {
+        pub fn new(group: usize, window: usize, total: u64) -> Self {
+            LiveSolid {
+                group,
+                dec: compcol::rar5::Decoder::with_unpack_size_and_window(total, window),
+                out_pos: 0,
+                in_area: 0,
+                in_off: 0,
+                in_buf: vec![0u8; SOLID_CHUNK],
+                in_consumed: 0,
+                in_filled: 0,
+            }
+        }
+    }
+
     pub struct Parsed {
         pub index: ArchiveIndex,
-        pub files: HashMap<String, Option<RarFile>>,
+        pub files: HashMap<String, Entry>,
+        pub groups: Vec<SolidGroup>,
     }
 
     /// Read a RAR5 vint (base-128 LE, high bit = continue) from `buf` at
@@ -313,11 +463,28 @@ mod imp {
         Ok(buf)
     }
 
+    /// One member collected during the scan, before groups are finalised.
+    struct MemberB {
+        path: String,
+        data_offset: u64,
+        pack: u64,
+        unpack: u64,
+        method: u64,
+        window: usize,
+    }
+
     /// Parse a RAR5 archive into the directory tree + per-file table.
+    ///
+    /// Files are grouped by solid runs: a file with the solid bit **clear**
+    /// (or the very first file) starts a new group; a file with the bit
+    /// **set** continues the current group. 1-member groups become
+    /// [`Entry::Plain`] (independent decode, the non-solid path); multi-member
+    /// groups become a [`SolidGroup`] with each member an [`Entry::Solid`].
     pub fn scan(dev: &mut dyn BlockDevice) -> Result<Parsed> {
         let dev_len = dev.total_size();
         let mut index = ArchiveIndex::new("rar");
-        let mut files: HashMap<String, Option<RarFile>> = HashMap::new();
+        // Members collected per solid run, in archive order.
+        let mut groups_b: Vec<Vec<MemberB>> = Vec::new();
 
         let mut pos: u64 = 8; // past the 8-byte signature
         while pos + 5 <= dev_len {
@@ -387,21 +554,19 @@ mod imp {
                     let method = (comp >> 7) & 0x7;
                     let dict_n = (comp >> 10) & 0xf;
                     let window = 0x20000usize << dict_n;
-                    // method 0 = store; anything else is RAR5 LZ. Encryption
-                    // (header type 4 anywhere, or per-file) and solid streams
-                    // aren't handled → mark Unextractable.
-                    let slice = if solid {
-                        None
-                    } else {
-                        Some(RarFile {
-                            data_offset: header_end,
-                            pack_size: data_size,
-                            unpack_size,
-                            window,
-                            store: method == 0,
-                        })
-                    };
-                    files.insert(path, slice);
+                    // A non-solid file (or the first file overall) starts a new
+                    // group; a solid file continues the current one.
+                    if !solid || groups_b.is_empty() {
+                        groups_b.push(Vec::new());
+                    }
+                    groups_b.last_mut().unwrap().push(MemberB {
+                        path,
+                        data_offset: header_end,
+                        pack: data_size,
+                        unpack: unpack_size,
+                        method,
+                        window,
+                    });
                 } else if path != "/" && is_dir {
                     index.push(ArchiveEntry::dir(path));
                 }
@@ -410,7 +575,67 @@ mod imp {
             pos = header_end + data_size;
         }
 
-        Ok(Parsed { index, files })
+        // Finalise groups into the per-file table + solid-group vector.
+        let mut files: HashMap<String, Entry> = HashMap::new();
+        let mut groups: Vec<SolidGroup> = Vec::new();
+        for members in groups_b {
+            if members.len() == 1 {
+                let m = &members[0];
+                files.insert(
+                    m.path.clone(),
+                    Entry::Plain(RarFile {
+                        data_offset: m.data_offset,
+                        pack_size: m.pack,
+                        unpack_size: m.unpack,
+                        window: m.window,
+                        store: m.method == 0,
+                    }),
+                );
+                continue;
+            }
+            // Multi-member solid group. A stored member isn't part of the LZ
+            // bitstream, so it would break the continuous decode — refuse the
+            // whole group cleanly rather than mis-decode.
+            if members.iter().any(|m| m.method == 0) {
+                for m in &members {
+                    files.insert(m.path.clone(), Entry::Unextractable);
+                }
+                continue;
+            }
+            let gi = groups.len();
+            let window = members[0].window;
+            let mut areas = Vec::with_capacity(members.len());
+            let mut starts = Vec::with_capacity(members.len() + 1);
+            let mut total = 0u64;
+            starts.push(0);
+            for (mi, m) in members.iter().enumerate() {
+                areas.push(DataArea {
+                    offset: m.data_offset,
+                    pack: m.pack,
+                });
+                total += m.unpack;
+                starts.push(total);
+                files.insert(
+                    m.path.clone(),
+                    Entry::Solid {
+                        group: gi,
+                        member: mi,
+                    },
+                );
+            }
+            groups.push(SolidGroup {
+                areas,
+                window,
+                starts,
+                total,
+            });
+        }
+
+        Ok(Parsed {
+            index,
+            files,
+            groups,
+        })
     }
 
     /// RAR stores forward-slash paths already; normalise to absolute.
@@ -436,6 +661,160 @@ mod imp {
         } else {
             let dec = compcol::rar5::Decoder::with_unpack_size_and_window(f.unpack_size, f.window);
             Ok(Box::new(compcol::io::DecoderReader::new(run, dec)))
+        }
+    }
+
+    /// Refill the staging buffer from the next compressed bytes of the solid
+    /// group, advancing past exhausted data areas. A fill never spans a data
+    /// area (the decoder treats the concatenation as one stream regardless).
+    /// Returns `false` once the group's whole compressed input is consumed.
+    fn refill(
+        in_buf: &mut [u8],
+        in_consumed: &mut usize,
+        in_filled: &mut usize,
+        in_area: &mut usize,
+        in_off: &mut u64,
+        areas: &[DataArea],
+        dev: &mut dyn BlockDevice,
+    ) -> Result<bool> {
+        while *in_area < areas.len() && *in_off >= areas[*in_area].pack {
+            *in_area += 1;
+            *in_off = 0;
+        }
+        if *in_area >= areas.len() {
+            return Ok(false);
+        }
+        let a = areas[*in_area];
+        let avail = a.pack - *in_off;
+        let want = (in_buf.len() as u64).min(avail) as usize;
+        dev.read_at(a.offset + *in_off, &mut in_buf[..want])?;
+        *in_consumed = 0;
+        *in_filled = want;
+        *in_off += want as u64;
+        Ok(true)
+    }
+
+    /// Advance the live cursor's decoder forward to absolute group offset
+    /// `target`, discarding the intervening output without materialising it.
+    /// For an in-order walk `target == out_pos` and this is a no-op.
+    pub fn skip_to(
+        l: &mut LiveSolid,
+        g: &SolidGroup,
+        dev: &mut dyn BlockDevice,
+        target: u64,
+    ) -> Result<()> {
+        while l.out_pos < target {
+            let LiveSolid {
+                dec,
+                in_buf,
+                in_consumed,
+                in_filled,
+                in_area,
+                in_off,
+                out_pos,
+                ..
+            } = l;
+            if *in_consumed >= *in_filled
+                && !refill(
+                    in_buf,
+                    in_consumed,
+                    in_filled,
+                    in_area,
+                    in_off,
+                    &g.areas,
+                    dev,
+                )?
+            {
+                return Err(Error::InvalidImage(
+                    "rar: solid stream ended before a member offset".into(),
+                ));
+            }
+            let n = (target - *out_pos) as usize;
+            let (p, _status) = dec
+                .discard_output(&in_buf[*in_consumed..*in_filled], n)
+                .map_err(|e| Error::InvalidImage(format!("rar: solid skip failed: {e:?}")))?;
+            *in_consumed += p.consumed;
+            *out_pos += p.written as u64;
+            if p.consumed == 0 && p.written == 0 {
+                return Err(Error::InvalidImage(
+                    "rar: solid decode stalled during skip".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Streaming reader over one member of a solid group. Drives the shared
+    /// resumable decoder (mirroring `compcol::io::DecoderReader`'s loop),
+    /// pulling compressed bytes from the device on demand and capping output
+    /// at the member's length so the cursor lands exactly on the next member.
+    pub struct SolidReader<'a> {
+        pub live: &'a mut LiveSolid,
+        pub areas: &'a [DataArea],
+        pub dev: &'a mut dyn BlockDevice,
+        pub remaining: u64,
+    }
+
+    impl Read for SolidReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 || buf.is_empty() {
+                return Ok(0);
+            }
+            let want = (buf.len() as u64).min(self.remaining) as usize;
+            loop {
+                let LiveSolid {
+                    dec,
+                    in_buf,
+                    in_consumed,
+                    in_filled,
+                    in_area,
+                    in_off,
+                    out_pos,
+                    ..
+                } = &mut *self.live;
+                let had_input = if *in_consumed < *in_filled {
+                    true
+                } else {
+                    refill(
+                        in_buf,
+                        in_consumed,
+                        in_filled,
+                        in_area,
+                        in_off,
+                        self.areas,
+                        self.dev,
+                    )
+                    .map_err(io::Error::other)?
+                };
+                let (p, status) =
+                    dec.decode(&in_buf[*in_consumed..*in_filled], &mut buf[..want])?;
+                *in_consumed += p.consumed;
+                *out_pos += p.written as u64;
+                if p.written > 0 {
+                    self.remaining -= p.written as u64;
+                    return Ok(p.written);
+                }
+                if !had_input {
+                    // No compressed input left and nothing emitted: flush the
+                    // decoder's tail. A well-formed member ends here.
+                    let (pf, _s) = dec.finish(&mut buf[..want])?;
+                    if pf.written > 0 {
+                        *out_pos += pf.written as u64;
+                        self.remaining -= pf.written as u64;
+                        return Ok(pf.written);
+                    }
+                    return Ok(0);
+                }
+                // Had input but produced nothing — normally the decoder
+                // buffered an incomplete block (consumed all, InputEmpty) and
+                // the next loop refills. Guard against a wedged decoder.
+                if p.consumed == 0 && !matches!(status, Status::OutputFull) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "rar: solid decode made no progress",
+                    ));
+                }
+            }
         }
     }
 
@@ -552,19 +931,119 @@ mod tests {
         }
     }
 
-    /// Files that continue a solid stream aren't supported — they need the
-    /// decoder state from the previous file. (The first file in a solid
-    /// archive isn't flagged solid and still extracts.) `lorem.txt` is the
-    /// second, solid-flagged member, so reading it returns a clean
-    /// Unsupported.
+    /// Solid archive: the second member (`lorem.txt`) continues the first's
+    /// LZ window, so it now decodes correctly via the shared cursor.
     #[test]
-    fn solid_member_is_unsupported() {
+    fn solid_two_member_round_trip() {
         let arc = include_bytes!("testdata/solid5.rar");
-        assert_eq!(read_file(arc, "/hello.txt").unwrap(), hello()); // first: not solid
-        let err = read_file(arc, "/lorem.txt").unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(_)),
-            "expected Unsupported, got {err:?}"
-        );
+        assert_eq!(read_file(arc, "/hello.txt").unwrap(), hello());
+        assert_eq!(read_file(arc, "/lorem.txt").unwrap(), lorem());
+    }
+
+    // The `solidmulti5.rar` fixture was built with
+    //   rar a -ma5 -s -m5 solidmulti5.rar alpha.txt beta.txt gamma.txt big.txt
+    // over files that deliberately share a long recurring phrase, so later
+    // members genuinely back-reference earlier members' window. `rar` stores
+    // them alphabetically: alpha, beta, big, gamma.
+    const SHARED: &str = "The quick brown fox jumps over the lazy dog while the lazy dog sleeps. ";
+    fn alpha() -> Vec<u8> {
+        format!(
+            "{}{}",
+            SHARED.repeat(30),
+            "alpha-unique-padding ".repeat(20)
+        )
+        .into_bytes()
+    }
+    fn beta() -> Vec<u8> {
+        format!("{}{}", "beta intro ".repeat(5), SHARED.repeat(50)).into_bytes()
+    }
+    fn gamma() -> Vec<u8> {
+        format!(
+            "{}{}",
+            "Lorem ipsum dolor sit amet. ".repeat(15),
+            SHARED.repeat(25)
+        )
+        .into_bytes()
+    }
+    fn big() -> Vec<u8> {
+        format!("{}{}", SHARED.repeat(200), "0123456789 ".repeat(500)).into_bytes()
+    }
+    /// Members in the archive's stored (alphabetical) order.
+    fn multi_members() -> [(&'static str, Vec<u8>); 4] {
+        [
+            ("alpha.txt", alpha()),
+            ("beta.txt", beta()),
+            ("big.txt", big()),
+            ("gamma.txt", gamma()),
+        ]
+    }
+
+    /// Every member of a 4-file solid group decodes to its exact contents.
+    #[test]
+    fn solid_multi_member_round_trip() {
+        let arc = include_bytes!("testdata/solidmulti5.rar");
+        for (name, want) in multi_members() {
+            assert_eq!(
+                read_file(arc, &format!("/{name}")).unwrap(),
+                want,
+                "mismatch for {name}"
+            );
+        }
+    }
+
+    /// Reading the whole solid group in archive order through one `RarFs`
+    /// decompresses it **once**: the forward cursor is built a single time and
+    /// never rewinds. (Reading an earlier member afterwards forces a rebuild.)
+    #[test]
+    fn solid_group_decoded_once_in_order() {
+        let arc = include_bytes!("testdata/solidmulti5.rar");
+        let mut dev = dev_from(arc);
+        let mut fs = RarFs::open(&mut dev).unwrap();
+        for (name, want) in multi_members() {
+            let mut r = fs
+                .read_file(&mut dev, Path::new(&format!("/{name}")))
+                .unwrap();
+            let mut out = Vec::new();
+            r.read_to_end(&mut out).unwrap();
+            drop(r);
+            assert_eq!(out, want, "mismatch for {name}");
+        }
+        // One build for the group; the cursor advanced straight through.
+        assert_eq!(fs.rebuilds, 1, "group should decode exactly once in order");
+        let live = fs.live.as_ref().unwrap();
+        assert_eq!(live.out_pos, fs.groups[live.group].total);
+
+        // A backward read (earlier member) now forces exactly one rebuild.
+        let mut r = fs.read_file(&mut dev, Path::new("/alpha.txt")).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        drop(r);
+        assert_eq!(out, alpha());
+        assert_eq!(fs.rebuilds, 2, "backward seek should rebuild once");
+    }
+
+    /// Cross-check the solid fixture against the reference `unrar`.
+    #[test]
+    fn solid_matches_unrar_reference() {
+        use std::process::Command;
+        if Command::new("unrar").arg("--help").output().is_err() {
+            eprintln!("skipping: unrar not installed");
+            return;
+        }
+        let arc = include_bytes!("testdata/solidmulti5.rar");
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(tmp.as_file_mut(), arc).unwrap();
+        for (name, _) in multi_members() {
+            let out = Command::new("unrar")
+                .args(["p", "-inul", tmp.path().to_str().unwrap(), name])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "unrar p failed for {name}");
+            assert_eq!(
+                read_file(arc, &format!("/{name}")).unwrap(),
+                out.stdout,
+                "reader vs unrar mismatch for {name}"
+            );
+        }
     }
 }

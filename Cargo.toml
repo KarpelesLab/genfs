@@ -45,8 +45,10 @@ lz4 = ["dep:compcol", "compcol/lz4"]
 cab = ["dep:compcol", "compcol/deflate", "compcol/lzx", "compcol/quantum"]
 # Amiga LZX (.lzx) reader: Store + LZX (compcol amiga_lzx) groups. Read-only.
 amiga-lzx = ["dep:compcol", "compcol/amiga_lzx"]
-# RAR reader (read-only): RAR5 store + compressed via compcol's rar5 decoder.
-# (RAR4 would add compcol/rar1+rar2+rar3 later.)
+# RAR reader (read-only): RAR5 store + compressed via compcol's rar5 decoder,
+# including solid groups (decoded as one continuous stream; a sequential walk
+# such as repack decompresses the group once). (RAR4 would add compcol/rar1+
+# rar2+rar3 later.)
 rar = ["dep:compcol", "compcol/rar5"]
 zstd = ["dep:compcol", "compcol/zstd"]
 lzo = ["dep:compcol", "compcol/lzo"]

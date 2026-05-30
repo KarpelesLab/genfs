@@ -46,7 +46,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | ar         | ✅    | ✅     | —              | GNU + BSD long names (read), GNU write; flat (no directories); repack-only                                       |
 | cab        | ✅    | —     | —              | Microsoft Cabinet read-only: Store / MSZIP / LZX / Quantum folders decode via `compcol` (cross-checked with `cabextract`). Spanned cabinets and creation are unsupported |
 | lzx        | ✅    | —     | —              | Amiga LZX read-only: Store + LZX (mode 2) merged groups via `compcol::amiga_lzx`; container cross-checked with `unlzx`. Creation unsupported |
-| rar        | ✅    | —     | —              | RAR5 read-only: Store + compressed (no-filter / x86 E8E9) via `compcol::rar5`; cross-checked with `unrar`. RAR4, solid archives, encryption, other filters and creation are unsupported |
+| rar        | ✅    | —     | —              | RAR5 read-only incl. **solid** archives (a sequential walk / `repack` decodes the group once): Store + compressed (no-filter / x86 E8E9) via `compcol::rar5`; cross-checked with `unrar`. RAR4, encryption, stored-in-solid, other filters and creation are unsupported |
 | 7z / arc / lha / sit | 🚧 | — | — | detected by `info`; reader not implemented yet (returns a clear `Unsupported`) — pure-Rust decoders land behind per-format Cargo features |
 
 `🚧` marks writers / mutation paths with known gaps (see Limitations).
@@ -412,13 +412,16 @@ fstool repack app.zip out.cpio --fs-type cpio     # convert between archives
 The writers are repack-only (`MutationCapability::Streaming`, like tar): an
 existing archive can't be edited in place — `add` / `rm` steer you to
 `repack`, which rebuilds. `cab` (Store/MSZIP/LZX/Quantum), `lzx` (Amiga
-LZX), and `rar` (RAR5 Store/compressed) are read-only readers via `compcol`,
-behind the `cab` / `amiga-lzx` / `rar` features. `7z`, `arc`, `lha`, and
-`sit` are recognised by `info` today but their readers are scaffolds that
-return a clear `Unsupported`; pure-Rust decoders will land behind per-format
-Cargo features. (`rar` and `sit` are read-only-at-best — their creation is
-proprietary; RAR4, solid, encrypted, and filtered-but-unsupported RAR5
-streams stay `Unsupported`.)
+LZX), and `rar` (RAR5 Store/compressed, incl. **solid** groups) are read-only
+readers via `compcol`, behind the `cab` / `amiga-lzx` / `rar` features. A
+solid RAR group is decoded as one continuous stream; a sequential walk such
+as `repack` decompresses it exactly once (a backward/random read of an
+earlier member re-decodes from the group start, bounded memory). `7z`,
+`arc`, `lha`, and `sit` are recognised by `info` today but their readers are
+scaffolds that return a clear `Unsupported`; pure-Rust decoders will land
+behind per-format Cargo features. (`rar` and `sit` are read-only-at-best —
+their creation is proprietary; RAR4, encrypted, stored-in-solid, and
+filtered-but-unsupported RAR5 streams stay `Unsupported`.)
 
 zip's Deflate support rides the existing `gzip` Cargo feature (raw DEFLATE via
 `compcol`); a build without it falls back to Stored. `cpio` and `ar` need no

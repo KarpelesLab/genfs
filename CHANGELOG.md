@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.11](https://github.com/KarpelesLab/fstool/compare/v0.4.10...v0.4.11) - 2026-05-30
+
+### Other
+
+- *(examples)* add Raspberry Pi, EFI, and legacy-BIOS disk specs
+
 ## [0.4.10](https://github.com/KarpelesLab/fstool/compare/v0.4.9...v0.4.10) - 2026-05-30
 
 ### Added

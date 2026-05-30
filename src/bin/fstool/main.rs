@@ -126,6 +126,26 @@ enum Command {
         /// Path inside the image to read.
         #[arg(value_name = "PATH")]
         path: String,
+        /// Stream the file's resource fork instead of its data fork
+        /// (classic HFS only).
+        #[arg(long = "rsrc", visible_alias = "resource-fork")]
+        rsrc: bool,
+    },
+
+    /// List a classic-HFS file's resource fork — the typed, numbered
+    /// resources (ICN# icons, vers strings, DITL dialogs, …) you'd open in
+    /// ResEdit. With `--extract`, dump one resource's raw bytes to stdout.
+    Resources {
+        /// Image path, optionally with `:N` to select partition N.
+        #[arg(value_name = "IMAGE[:N]")]
+        image: String,
+        /// Path to the file inside the image.
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Dump a single resource's bytes to stdout instead of listing.
+        /// Format `TYPE:ID`, e.g. `vers:1` or `'STR :-16396'`.
+        #[arg(long, value_name = "TYPE:ID")]
+        extract: Option<String>,
     },
 
     /// One-screen summary of an existing image. On a partitioned image
@@ -322,7 +342,12 @@ fn run(cli: Cli) -> fstool::Result<()> {
             path,
             recursive,
         } => ls(&image, &path, recursive, cli.path_style),
-        Command::Cat { image, path } => cat(&image, &path, cli.path_style),
+        Command::Cat { image, path, rsrc } => cat(&image, &path, rsrc, cli.path_style),
+        Command::Resources {
+            image,
+            path,
+            extract,
+        } => resources_cmd(&image, &path, extract.as_deref(), cli.path_style),
         Command::Info { image } => info(&image),
         Command::Analyze {
             source,
@@ -2739,8 +2764,13 @@ fn join_image_path(dir: &str, name: &str) -> String {
     }
 }
 
-fn cat(image: &str, path: &str, style: PathStyle) -> fstool::Result<()> {
+fn cat(image: &str, path: &str, rsrc: bool, style: PathStyle) -> fstool::Result<()> {
     if let Some(algo) = tar_input_codec(image) {
+        if rsrc {
+            return Err(fstool::Error::Unsupported(
+                "cat --rsrc: tar/archive members have no resource fork".into(),
+            ));
+        }
         return cat_tar_stream(image, path, Some(algo));
     }
     let target = fstool::inspect::Target::parse(image);
@@ -2748,9 +2778,103 @@ fn cat(image: &str, path: &str, style: PathStyle) -> fstool::Result<()> {
         let mut fs = fstool::inspect::AnyFs::open(dev)?;
         let cpath = path_style::to_canonical(path, fs.kind(), style);
         let mut out = std::io::stdout().lock();
-        fs.copy_file_to(dev, &cpath, &mut out)?;
+        if rsrc {
+            let mut r = fs.open_resource_fork_reader(dev, &cpath)?;
+            std::io::copy(&mut r, &mut out)?;
+        } else {
+            fs.copy_file_to(dev, &cpath, &mut out)?;
+        }
         Ok(())
     })
+}
+
+/// `fstool resources` — inventory a classic-HFS file's resource fork, or with
+/// `--extract TYPE:ID` dump one resource's raw bytes to stdout.
+fn resources_cmd(
+    image: &str,
+    path: &str,
+    extract: Option<&str>,
+    style: PathStyle,
+) -> fstool::Result<()> {
+    use fstool::resfork::ResourceFork;
+    let target = fstool::inspect::Target::parse(image);
+    fstool::inspect::with_target_device(&target, |dev| {
+        let mut fs = fstool::inspect::AnyFs::open(dev)?;
+        let cpath = path_style::to_canonical(path, fs.kind(), style);
+        let raw = fs.read_resource_fork(dev, &cpath)?;
+        let total_bytes = raw.len();
+        let rf = ResourceFork::parse(raw)?;
+
+        if let Some(spec) = extract {
+            let (ostype, id) = parse_resource_spec(spec)?;
+            let bytes = rf.resource_bytes(&ostype, id).ok_or_else(|| {
+                fstool::Error::InvalidArgument(format!(
+                    "resources: no {}:{id} in {path:?}",
+                    fstool::resfork::ostype_str(&ostype)
+                ))
+            })?;
+            std::io::stdout().lock().write_all(bytes)?;
+        } else {
+            print_resources(path, total_bytes, &rf);
+        }
+        Ok(())
+    })
+}
+
+/// Parse a `TYPE:ID` selector. TYPE is padded to four bytes with spaces; the ID
+/// is the final colon-separated field (so a type containing `:` still works).
+fn parse_resource_spec(spec: &str) -> fstool::Result<([u8; 4], i16)> {
+    let (ty, id) = spec.rsplit_once(':').ok_or_else(|| {
+        fstool::Error::InvalidArgument(format!("resources: expected TYPE:ID, got {spec:?}"))
+    })?;
+    let id: i16 = id
+        .parse()
+        .map_err(|_| fstool::Error::InvalidArgument(format!("resources: bad id {id:?}")))?;
+    let tb = ty.as_bytes();
+    if tb.len() > 4 {
+        return Err(fstool::Error::InvalidArgument(format!(
+            "resources: type {ty:?} is longer than 4 bytes"
+        )));
+    }
+    let mut ostype = *b"    ";
+    ostype[..tb.len()].copy_from_slice(tb);
+    Ok((ostype, id))
+}
+
+fn print_resources(path: &str, total_bytes: usize, rf: &fstool::resfork::ResourceFork) {
+    let types = rf.types();
+    let total: usize = types.iter().map(|t| t.items.len()).sum();
+    println!("file:          {path}");
+    println!(
+        "resource fork: {total_bytes} bytes ({} type{}, {total} resource{})",
+        types.len(),
+        if types.len() == 1 { "" } else { "s" },
+        if total == 1 { "" } else { "s" },
+    );
+    if types.is_empty() {
+        return;
+    }
+    println!();
+    println!("TYPE  ID      SIZE      NAME / DECODED");
+    for t in types {
+        for r in &t.items {
+            let data = rf.bytes_of(r);
+            let decoded = fstool::resfork::decode_summary(&t.ostype, data);
+            let label = match (&r.name, &decoded) {
+                (Some(n), Some(d)) => format!("\"{n}\"  {d}"),
+                (Some(n), None) => format!("\"{n}\""),
+                (None, Some(d)) => d.clone(),
+                (None, None) => String::new(),
+            };
+            println!(
+                "{:<4}  {:>6}  {:>8}  {}",
+                fstool::resfork::ostype_str(&t.ostype),
+                r.id,
+                r.len,
+                label
+            );
+        }
+    }
 }
 
 fn analyze_cmd(

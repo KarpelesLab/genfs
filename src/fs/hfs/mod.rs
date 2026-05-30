@@ -11,10 +11,12 @@
 //! `open` we read the whole catalog + extents-overflow B-trees into memory and
 //! build a parent→children map. That sidesteps HFS's exact key-ordering table
 //! (we match names by case-insensitive scan, never by B-tree key comparison)
-//! and keeps `list`/`cat` simple. Each file's **data fork** is exposed (the
-//! resource fork is Mac metadata and ignored, like the StuffIt reader).
+//! and keeps `list`/`cat` simple. Both the **data fork** and the **resource
+//! fork** are readable: the data fork is the file body, and the resource fork
+//! is reached via `open_resource_fork_reader` and surfaced as the
+//! `com.apple.ResourceFork` xattr (see also the `resfork` parser).
 
-mod macroman;
+use crate::macroman;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -69,6 +71,10 @@ struct Node {
     mtime: u32,
     /// Data-fork inline extents (files only).
     inline: ExtRec,
+    /// Resource-fork logical size (files only; 0 when absent).
+    rsrc_size: u64,
+    /// Resource-fork inline extents (files only).
+    rsrc_inline: ExtRec,
 }
 
 /// Classic HFS volume (read-only, in-memory catalog).
@@ -342,12 +348,15 @@ impl Hfs {
                         size: 0,
                         mtime: be32(data, 14),
                         inline: [(0, 0); 3],
+                        rsrc_size: 0,
+                        rsrc_inline: [(0, 0); 3],
                     });
                 }
-                2 if data.len() >= 86 => {
+                2 if data.len() >= 98 => {
                     // File record (after cdrType + cdrResrv2 at @0/@1):
-                    // filFlNum @ +20, filLgLen (data fork) @ +26, filMdDat @
-                    // +48, data-fork filExtRec @ +74.
+                    // filFlNum @ +20, filLgLen (data fork) @ +26, filRLgLen
+                    // (resource fork) @ +36, filMdDat @ +48, data-fork filExtRec
+                    // @ +74, resource-fork filRExtRec @ +86.
                     children.entry(parent).or_default().push(Node {
                         name,
                         cnid: be32(data, 20),
@@ -355,6 +364,8 @@ impl Hfs {
                         size: be32(data, 26) as u64,
                         mtime: be32(data, 48),
                         inline: ext_rec(data, 74),
+                        rsrc_size: be32(data, 36) as u64,
+                        rsrc_inline: ext_rec(data, 86),
                     });
                 }
                 _ => {} // thread records (3/4) and anything else: ignore
@@ -451,6 +462,52 @@ impl Hfs {
             total: size,
             pos: 0,
         })
+    }
+
+    /// Open a streaming reader over a file's **resource fork** (fork type
+    /// `0xFF`). Reuses the same extent machinery as the data fork. Errors if the
+    /// path is a directory, doesn't exist, or the file has no resource fork.
+    pub fn open_resource_fork_reader<'a>(
+        &self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<HfsFileReader<'a>> {
+        let (cnid, size, inline) = match self.resolve(path) {
+            Some(Resolved::File(n)) => (n.cnid, n.rsrc_size, n.rsrc_inline),
+            Some(Resolved::Dir(_)) => {
+                return Err(Error::InvalidArgument(format!(
+                    "hfs: {path:?} is a directory"
+                )));
+            }
+            None => {
+                return Err(Error::InvalidArgument(format!(
+                    "hfs: no such file {path:?}"
+                )));
+            }
+        };
+        if size == 0 {
+            return Err(Error::InvalidArgument(format!(
+                "hfs: {path:?} has no resource fork"
+            )));
+        }
+        let dev_len = dev.total_size();
+        let extents = self.full_extents(cnid, 0xFF, &inline, size);
+        let ranges = self.fork_ranges(&extents, size, dev_len)?;
+        Ok(HfsFileReader {
+            dev,
+            ranges,
+            total: size,
+            pos: 0,
+        })
+    }
+
+    /// Resource-fork logical size for `path`, or `None` if the path is not a
+    /// file or has an empty resource fork.
+    pub fn resource_fork_size(&self, path: &str) -> Option<u64> {
+        match self.resolve(path) {
+            Some(Resolved::File(n)) if n.rsrc_size > 0 => Some(n.rsrc_size),
+            _ => None,
+        }
     }
 
     pub fn format(_dev: &mut dyn BlockDevice, _opts: &()) -> Result<Self> {
@@ -660,6 +717,32 @@ impl Filesystem for Hfs {
         Ok(())
     }
 
+    /// Surface a file's resource fork as the macOS-standard
+    /// `com.apple.ResourceFork` extended attribute (read-only, capped at
+    /// 16 MiB), so it appears in `info` and is carried through `repack`/`add`
+    /// to xattr-capable destinations — exactly how macOS `ditto`/`cp -p`
+    /// preserve resource forks. Files without a resource fork yield no xattrs.
+    fn list_xattrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &Path,
+    ) -> Result<Vec<crate::fs::XattrPair>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| Error::InvalidArgument("hfs: non-UTF-8 path".into()))?;
+        if self.resource_fork_size(s).is_none() {
+            return Ok(Vec::new());
+        }
+        const CAP: u64 = 16 * 1024 * 1024;
+        let r = self.open_resource_fork_reader(dev, s)?;
+        let mut buf = Vec::new();
+        r.take(CAP).read_to_end(&mut buf)?;
+        Ok(vec![crate::fs::XattrPair {
+            name: "com.apple.ResourceFork".into(),
+            value: buf,
+        }])
+    }
+
     fn mutation_capability(&self) -> MutationCapability {
         MutationCapability::Immutable
     }
@@ -672,6 +755,7 @@ mod tests {
 
     const HELLO: &[u8] = b"Hello from classic HFS!\n";
     const DEEP: &[u8] = b"Deep file in sub.\n";
+    const RSRC: &[u8] = b"resource fork payload bytes\n";
 
     fn put_u16(v: &mut [u8], o: usize, x: u16) {
         v[o..o + 2].copy_from_slice(&x.to_be_bytes());
@@ -697,6 +781,21 @@ mod tests {
         put_ext(&mut d, 74, &[(start_block, 1), (0, 0), (0, 0)]); // filExtRec
         d
     }
+    /// Like [`file_record`] but also gives the file a resource fork (filRLgLen
+    /// @ +36, filRExtRec @ +86).
+    fn file_record_with_rsrc(
+        cnid: u32,
+        size: u32,
+        start_block: u16,
+        rsrc_size: u32,
+        rsrc_block: u16,
+    ) -> Vec<u8> {
+        let mut d = file_record(cnid, size, start_block);
+        d[36..40].copy_from_slice(&rsrc_size.to_be_bytes()); // filRLgLen
+        d[40..44].copy_from_slice(&512u32.to_be_bytes()); // filRPyLen (1 block)
+        put_ext(&mut d, 86, &[(rsrc_block, 1), (0, 0), (0, 0)]); // filRExtRec
+        d
+    }
     fn dir_record(cnid: u32) -> Vec<u8> {
         let mut d = vec![0u8; 70];
         d[0] = 1; // cdrType = directory
@@ -719,11 +818,11 @@ mod tests {
     /// (header + one leaf) over `/hello.txt`, `/sub/`, `/sub/deep.txt`, with
     /// 512-byte allocation blocks. Layout (512-byte sectors): boot(0,1),
     /// MDB(2), bitmap(3), then alloc blocks from sector 4 — catalog(0,1),
-    /// extents(2), hello data(3), deep data(4).
+    /// extents(2), hello data(3), deep data(4), hello resource fork(5).
     fn build_volume() -> Vec<u8> {
         let block = 512usize;
         let al_bl_st = 4u16;
-        let num_alloc_blocks = 5usize;
+        let num_alloc_blocks = 6usize;
         let mut v = vec![0u8; (al_bl_st as usize + num_alloc_blocks + 1) * block];
 
         // MDB at 1024.
@@ -754,7 +853,12 @@ mod tests {
         v[leaf + 8] = 0xFF; // leaf node
         v[leaf + 9] = 1; // height
         let recs = [
-            leaf_record(2, b"hello.txt", &file_record(17, HELLO.len() as u32, 3)),
+            // hello.txt carries a resource fork (data @ block 3, rsrc @ block 5).
+            leaf_record(
+                2,
+                b"hello.txt",
+                &file_record_with_rsrc(17, HELLO.len() as u32, 3, RSRC.len() as u32, 5),
+            ),
             leaf_record(2, b"sub", &dir_record(16)),
             leaf_record(16, b"deep.txt", &file_record(18, DEEP.len() as u32, 4)),
             // A classic-Mac name with a `/` in it (path separator is `:` on
@@ -778,6 +882,9 @@ mod tests {
         v[hd..hd + HELLO.len()].copy_from_slice(HELLO);
         let dd = (al_bl_st as usize + 4) * block;
         v[dd..dd + DEEP.len()].copy_from_slice(DEEP);
+        // hello.txt's resource fork (alloc block 5).
+        let rd = (al_bl_st as usize + 5) * block;
+        v[rd..rd + RSRC.len()].copy_from_slice(RSRC);
 
         v
     }
@@ -793,6 +900,44 @@ mod tests {
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut r, &mut out).unwrap();
         out
+    }
+
+    /// The resource fork is read from its own extents (`filRLgLen` @ +36,
+    /// `filRExtRec` @ +86, fork-type 0xFF) — independent of the data fork — and
+    /// surfaced via the `com.apple.ResourceFork` xattr. Files without one yield
+    /// no xattrs and an error from the reader.
+    #[test]
+    fn resource_fork_round_trip() {
+        let vol = build_volume();
+        let mut dev = dev_from(&vol);
+        let mut fs = Hfs::open(&mut dev).unwrap();
+
+        // hello.txt has a resource fork distinct from its data fork.
+        let mut r = fs
+            .open_resource_fork_reader(&mut dev, "/hello.txt")
+            .unwrap();
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+        assert_eq!(got, RSRC);
+        // Data fork is unchanged.
+        assert_eq!(read_all(&mut fs, &mut dev, "/hello.txt"), HELLO);
+
+        // Surfaced as the macOS-standard xattr.
+        let xattrs = fs.list_xattrs(&mut dev, Path::new("/hello.txt")).unwrap();
+        assert_eq!(xattrs.len(), 1);
+        assert_eq!(xattrs[0].name, "com.apple.ResourceFork");
+        assert_eq!(xattrs[0].value, RSRC);
+
+        // deep.txt has no resource fork: reader errors, no xattrs.
+        assert!(
+            fs.open_resource_fork_reader(&mut dev, "/sub/deep.txt")
+                .is_err()
+        );
+        assert!(
+            fs.list_xattrs(&mut dev, Path::new("/sub/deep.txt"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Parse the synthetic volume directly: tree + nested dir + file extraction.

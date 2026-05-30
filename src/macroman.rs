@@ -1,8 +1,9 @@
-//! MacRoman → Unicode decoding for classic HFS filenames.
+//! MacRoman → Unicode decoding for classic-Mac byte strings.
 //!
-//! Classic HFS stores names as MacRoman (8-bit) Pascal strings. Bytes
-//! `0x00–0x7F` are ASCII; `0x80–0xFF` map to the Unicode code points below
-//! (the standard Apple MacRoman table).
+//! Classic Mac OS stored text (HFS filenames, `STR`/`vers` resource payloads,
+//! resource names, …) as MacRoman (8-bit). Bytes `0x00–0x7F` are ASCII;
+//! `0x80–0xFF` map to the Unicode code points below (the standard Apple
+//! MacRoman table).
 
 /// Unicode code points for MacRoman bytes `0x80..=0xFF`.
 #[rustfmt::skip]

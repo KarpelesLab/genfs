@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(hfs)* classic-HFS **resource-fork** support. The reader now reads each
+  file's resource fork (its own extents, fork-type `0xFF`) and surfaces it three
+  ways: `fstool cat --rsrc <img> <path>` streams the raw fork; a new `fstool
+  resources <img> <path>` command parses the resource map and lists every type
+  with each resource's id/name/size and a decoded summary for common types
+  (`vers`, `STR `, `STR#`, `TEXT`, `ICN#`/`ICON`, `DITL`), with `--extract
+  TYPE:ID` to dump one resource; and `list_xattrs` exposes the fork as the
+  macOS-standard `com.apple.ResourceFork` xattr (so it shows in `info` and rides
+  through `repack`/`add` to xattr-capable targets). New filesystem-agnostic
+  `resfork` module + a crate-level `macroman` module (promoted from the HFS
+  reader).
 - *(cli)* global `--path-style {unix|native}` flag. `unix` (default) separates
   every path with `/` and shows a literal `/` inside an HFS/HFS+ name as `:`
   (the macOS convention); `native` uses the filesystem's own separator (`:` for

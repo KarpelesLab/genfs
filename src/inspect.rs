@@ -583,6 +583,33 @@ impl AnyFs {
         }
     }
 
+    /// Open a streaming reader over a file's **resource fork**. Only classic
+    /// HFS carries resource forks in fstool today; every other filesystem
+    /// returns [`crate::Error::Unsupported`].
+    pub fn open_resource_fork_reader<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        match self {
+            Self::Hfs(hfs) => Ok(Box::new(hfs.open_resource_fork_reader(dev, path)?)),
+            _ => Err(crate::Error::Unsupported(
+                "resource forks are only supported on classic HFS".into(),
+            )),
+        }
+    }
+
+    /// Read a file's whole resource fork into memory (capped at 64 MiB — larger
+    /// than any classic resource fork). Convenience for the resource-map parser.
+    pub fn read_resource_fork(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<Vec<u8>> {
+        use std::io::Read;
+        const CAP: u64 = 64 * 1024 * 1024;
+        let r = self.open_resource_fork_reader(dev, path)?;
+        let mut buf = Vec::new();
+        r.take(CAP).read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
     /// Add a regular file at `dest_path`, populated from a host file.
     /// Parent directories must already exist. Dispatches through the
     /// generic [`crate::fs::Filesystem`] trait. Filesystems whose

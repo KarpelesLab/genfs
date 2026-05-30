@@ -21,10 +21,12 @@ pub mod fs;
 #[cfg(feature = "fuse")]
 pub mod fuse_adapter;
 pub mod inspect;
+pub mod macroman;
 pub mod merge;
 pub mod part;
 pub mod path_style;
 pub mod repack;
+pub mod resfork;
 pub mod spec;
 
 pub use error::{Error, Result};

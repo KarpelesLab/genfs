@@ -2,9 +2,10 @@
 //!
 //! Recognised by `detect_fs` via the `MSCF` signature. With the `cab` Cargo
 //! feature this is a real **read-only** reader: it parses the cabinet (see
-//! [`scan`]) and extracts a file by *streaming* its owning CFFOLDER through
-//! `compcol`, skipping to the file's offset and capping at its length (see
-//! [`folder`]) — so memory stays bounded even for folders that decompress to
+//! the `scan` module) and extracts a file by *streaming* its owning CFFOLDER
+//! through `compcol`, skipping to the file's offset and capping at its length
+//! (see the `folder` module) — so memory stays bounded even for folders that
+//! decompress to
 //! many gigabytes. Supported folder methods: None (Store), MSZIP, LZX, and
 //! Quantum. Spanned/multi-cabinet sets and archive creation are not
 //! supported.

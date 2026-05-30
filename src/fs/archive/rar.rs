@@ -14,7 +14,7 @@
 //! its members' packed runs decoded as one continuous stream with a shared
 //! LZ window (`compcol::rar5` itself is per-stream, so we drive a single
 //! resumable decoder over the whole group ourselves). A persistent forward
-//! cursor ([`imp::LiveSolid`]) lets a sequential walk — notably `repack` —
+//! cursor (`imp::LiveSolid`) lets a sequential walk — notably `repack` —
 //! decompress the group exactly **once**; a backward/random read of an
 //! earlier member rebuilds the cursor and re-decodes from the group start
 //! (correct, bounded memory, no whole-group buffering).

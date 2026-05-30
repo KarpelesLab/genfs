@@ -50,7 +50,7 @@ fstool repack base.tar patch.tar flat.tar        # OCI-style layer merge with .w
 | lha        | ✅    | —     | —              | LHA / LZH read-only: walks level-0/1/2 headers (long names + directories). `-lh0-` store decodes + is cross-checked with `lha`; the lh1/4/5/6/7 LZSS+Huffman methods list but read as `Unsupported` pending an `lha` codec in `compcol`. Creation unsupported |
 | arc        | ✅    | —     | —              | SEA ARC read-only: walks the flat header chain. Stored methods (1 old / 2) decode; the compressed methods (RLE90 / squeeze / crunch / squash) list but read as `Unsupported` pending ARC codecs in `compcol`. Creation unsupported |
 | sit        | ✅    | —     | —              | StuffIt read-only: classic `SIT!` container (data-fork indexing, folder markers). Method 0 (store) decodes; compressed methods + StuffIt 5 list/detect but read as `Unsupported` pending StuffIt codecs in `compcol`. Creation unsupported |
-| 7z         | 🚧    | —     | —              | detected by `info`; reader not implemented yet (returns a clear `Unsupported`) — pure-Rust decoder lands behind the `sevenz` Cargo feature |
+| 7z         | ✅    | —     | —              | 7-Zip read-only: parses the container (incl. LZMA-packed headers + solid folders sliced per substream); single-coder **Copy / LZMA / BZip2 / Deflate** folders decode (cross-checked with `7z`). **LZMA2** (the default), BCJ filters, PPMd, encryption and multi-coder pipelines list but read as `Unsupported` pending raw-LZMA2 + branch-filter codecs in `compcol`. Creation unsupported |
 
 `🚧` marks writers / mutation paths with known gaps (see Limitations).
 All writable filesystems — ext2/3/4, FAT32, exFAT, XFS, HFS+, NTFS,
@@ -428,11 +428,15 @@ compressed methods list but read as `Unsupported` pending ARC codecs in
 `compcol`. `sit` (StuffIt, behind the `sit` feature) parses the classic
 `SIT!` container and reads stored members; its compressed methods and the
 whole StuffIt 5 format list/detect but read as `Unsupported` pending StuffIt
-codecs in `compcol`. `7z` is recognised by `info` today but its reader is a
-scaffold that returns a clear `Unsupported`; a pure-Rust decoder will land
-behind the `sevenz` Cargo feature. (`rar` and `sit` are read-only-at-best —
-their creation is proprietary; RAR4, encrypted, stored-in-solid, and
-filtered-but-unsupported RAR5 streams stay `Unsupported`.)
+codecs in `compcol`. `7z` (behind the `sevenz` feature) parses the full
+container (LZMA-packed headers, solid folders sliced per substream) and reads
+single-coder Copy / LZMA / BZip2 / Deflate folders; LZMA2 (the default), BCJ
+filters, PPMd, encryption and multi-coder pipelines list but read as
+`Unsupported` pending raw-LZMA2 + branch-filter codecs in `compcol`. Every
+archive format now has a reader — there are no detection-only scaffolds left.
+(`rar` and `sit` are read-only-at-best — their creation is proprietary; RAR4,
+encrypted, stored-in-solid, and filtered-but-unsupported RAR5 streams stay
+`Unsupported`.)
 
 zip's Deflate support rides the existing `gzip` Cargo feature (raw DEFLATE via
 `compcol`); a build without it falls back to Stored. `cpio` and `ar` need no

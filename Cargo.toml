@@ -27,12 +27,11 @@ path = "src/bin/fstool/main.rs"
 #
 # Archive backends (zip / cpio / ar) are always compiled — they add no new
 # dependencies (zip's DEFLATE rides the `gzip` feature; cpio/ar need no
-# codec). The remaining detection-only scaffolds (7z / arc / lha / sit) are
-# likewise always present; when a pure-Rust decoder is wired for one, it
-# gains its own optional dependency behind a per-format feature here,
-# matching the codec pattern above. `cab`, `amiga-lzx`, and `rar` are such
-# readers.
-default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "sit", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
+# codec). Every other archive format has a read-only reader behind its own
+# per-format feature (`cab`, `amiga-lzx`, `lha`, `arc`, `sit`, `sevenz`,
+# `rar`); each enables only the compcol codecs it can use today and returns a
+# clean `Unsupported` for methods whose codec hasn't landed in compcol yet.
+default = ["gzip", "xz", "lzma", "lz4", "zstd", "lzo", "cab", "amiga-lzx", "lha", "arc", "sit", "sevenz", "rar", "dmg-bzip2", "dmg-lzfse", "dmg-encrypted"]
 # Every codec is served by `compcol` (one uniform crate): gzip/zlib/deflate/
 # xz/lzma/zstd/lz4/lzo, plus the CAB + Amiga-LZX archive codecs and the DMG
 # bzip2/lzfse decoders. The `gzip` feature also covers zip DEFLATE, DMG zlib,
@@ -59,6 +58,11 @@ arc = []
 # method 0 (store) decodes; compressed methods + StuffIt 5 list/detect but
 # read as Unsupported pending StuffIt codecs in compcol.
 sit = []
+# 7-Zip (.7z) reader (read-only): parses the container + single-coder folders
+# (Copy / LZMA / BZip2 / Deflate via compcol; solid folders sliced per
+# substream). LZMA2 / BCJ filters / PPMd / multi-coder / encryption list but
+# read as Unsupported pending raw-LZMA2 + branch-filter codecs in compcol.
+sevenz = ["dep:compcol", "compcol/lzma", "compcol/bzip2", "compcol/deflate"]
 # RAR reader (read-only): RAR5 store + compressed via compcol's rar5 decoder,
 # including solid groups (decoded as one continuous stream; a sequential walk
 # such as repack decompresses the group once). (RAR4 would add compcol/rar1+

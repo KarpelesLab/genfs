@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(sevenz)* 7-Zip (`.7z`) read-only reader behind the `sevenz` feature —
+  parses the full container (32-byte signature header, the optionally
+  LZMA-packed `kEncodedHeader` end header, `StreamsInfo` folders/coders/
+  substreams and `FilesInfo` UTF-16 names + empty-stream/empty-file vectors)
+  and maps every file to its folder substream. Single-coder **Copy / LZMA /
+  BZip2 / Deflate** folders decode (solid folders are decoded once and sliced
+  per substream; LZMA reuses compcol's `.lzma` decoder via a synthesized
+  header), cross-checked against the reference `7z` tool. LZMA2 (the 7-Zip
+  default), BCJ/Delta filters, PPMd, encryption and any multi-coder pipeline
+  list correctly but read as a clean `Unsupported`, pending a raw-LZMA2 entry
+  point + branch-filter codecs in `compcol`. Creation is unsupported. This
+  completes the archive table — **no detection-only scaffolds remain**.
 - *(sit)* StuffIt (`.sit`) read-only reader behind the `sit` feature — parses
   the **classic** `SIT!` container (22-byte archive header + 112-byte per-file
   entry headers, resource + data forks, big-endian) and indexes every member

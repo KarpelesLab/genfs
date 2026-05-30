@@ -311,6 +311,12 @@ mod imp {
     /// decoder. The decoder buffers input internally, so this only needs to be
     /// large enough to amortise `read_at` calls.
     const SOLID_CHUNK: usize = 64 * 1024;
+    /// Ceiling on the LZ window we will allocate from a file's dict bits.
+    /// RAR5's dict_n maxes at 15 (1 GiB nominal); a malicious archive can
+    /// set it to force an OOM. Cap at 64 MiB — larger windows just mean a
+    /// slightly less efficient (but correct) decode for honest archives,
+    /// which in practice never exceed this for the files we extract.
+    const MAX_WINDOW: usize = 64 * 1024 * 1024;
 
     // RAR5 header types.
     const HEAD_FILE: u64 = 2;
@@ -553,7 +559,16 @@ mod imp {
                     let solid = comp & 0x40 != 0;
                     let method = (comp >> 7) & 0x7;
                     let dict_n = (comp >> 10) & 0xf;
-                    let window = 0x20000usize << dict_n;
+                    // Compute the window with a 32-bit-safe shift and clamp
+                    // it: dict_n up to 15 would otherwise demand up to 1 GiB.
+                    // Also bound by the archive's real size — the window can
+                    // never usefully exceed the bytes we can read.
+                    let window = 0x20000u32
+                        .checked_shl(dict_n as u32)
+                        .map(|w| w as usize)
+                        .unwrap_or(MAX_WINDOW)
+                        .min(MAX_WINDOW)
+                        .min((dev_len as usize).max(0x20000));
                     // A non-solid file (or the first file overall) starts a new
                     // group; a solid file continues the current one.
                     if !solid || groups_b.is_empty() {

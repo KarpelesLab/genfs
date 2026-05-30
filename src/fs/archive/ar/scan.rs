@@ -54,8 +54,27 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
             .unwrap_or(0o644);
 
         let data_off = pos + HEADER_LEN;
+        // Reject a body that can't fit before allocating buffers sized
+        // from the untrusted size field.
+        if size > total - data_off {
+            return Err(Error::InvalidImage(
+                "ar: member body extends past end of archive".into(),
+            ));
+        }
         // Advance past this member (bodies are padded to an even offset).
-        let next = data_off + size + (size & 1);
+        // Use checked arithmetic so a crafted size can't wrap the cursor.
+        let next = data_off
+            .checked_add(size)
+            .and_then(|end| end.checked_add(size & 1))
+            .filter(|&next| next <= total)
+            .ok_or_else(|| Error::InvalidImage("ar: record advance overflows archive".into()))?;
+        // Forward-progress guard: each record is at least HEADER_LEN bytes,
+        // so a valid `next` must move strictly past `pos`.
+        if next <= pos {
+            return Err(Error::InvalidImage(
+                "ar: record makes no forward progress".into(),
+            ));
+        }
 
         // GNU long-name string table.
         if raw_name == "//" {

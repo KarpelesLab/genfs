@@ -74,7 +74,10 @@ fn find_eocd(dev: &mut dyn BlockDevice) -> Result<Eocd> {
         cd_offset = le64(&rec, 48);
     }
 
-    if cd_offset + cd_size > total {
+    let cd_end = cd_offset
+        .checked_add(cd_size)
+        .ok_or_else(|| Error::InvalidImage("zip: central-directory size overflow".into()))?;
+    if cd_end > total {
         return Err(Error::InvalidImage(
             "zip: central directory extends past end of archive".into(),
         ));

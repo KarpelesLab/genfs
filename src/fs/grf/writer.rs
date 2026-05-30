@@ -187,7 +187,9 @@ fn read_source(src: FileSource) -> Result<Vec<u8>> {
     // Seek to the start in case the caller passed a `Reader` that
     // had already been read from (defensive — most won't have).
     let _ = reader.seek(SeekFrom::Start(0));
-    let mut out = Vec::with_capacity(len as usize);
+    // Cap the capacity hint: `len` is source-declared and may be hostile.
+    // The actual read still grows the vec as needed for honest sources.
+    let mut out = Vec::with_capacity((len as usize).min(64 << 20));
     reader.read_to_end(&mut out)?;
     Ok(out)
 }

@@ -205,9 +205,15 @@ impl Grf {
             let flag_type = if cycle == 0 { 1 } else { 0 };
             crypt::decode_des_etc(&mut comp, flag_type, cycle);
         }
+        let comp_slice = comp.get(..entry.len as usize).ok_or_else(|| {
+            crate::Error::InvalidImage(format!(
+                "grf: entry compressed len {} exceeds aligned buffer {}",
+                entry.len, entry.len_aligned
+            ))
+        })?;
         let plain = crate::compression::decompress(
             crate::compression::Algo::Zlib,
-            &comp[..entry.len as usize],
+            comp_slice,
             entry.size as usize,
         )?;
         Ok(plain)

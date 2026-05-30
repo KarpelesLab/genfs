@@ -171,6 +171,13 @@ pub(crate) fn decode_v200(buf: &[u8]) -> Result<Vec<Entry>> {
             continue;
         }
 
+        if raw.len > raw.len_aligned {
+            return Err(crate::Error::InvalidImage(format!(
+                "grf: entry len {} exceeds len_aligned {}",
+                raw.len, raw.len_aligned
+            )));
+        }
+
         let name = encoding::cp949_to_utf8(name_bytes).into_owned();
         out.push(Entry {
             name,
@@ -228,6 +235,12 @@ pub(crate) fn decode_v102(buf: &[u8]) -> Result<Vec<Entry>> {
         // v0x102/0x103 magic offsets on the size fields.
         let actual_len = raw.len.wrapping_sub(raw.size).wrapping_sub(715);
         let actual_aligned = raw.len_aligned.wrapping_sub(37579);
+
+        if actual_len > actual_aligned {
+            return Err(crate::Error::InvalidImage(format!(
+                "grf: entry len {actual_len} exceeds len_aligned {actual_aligned}"
+            )));
+        }
 
         let name = encoding::cp949_to_utf8(&name_bytes).into_owned();
         let mut entry = Entry {
@@ -347,6 +360,24 @@ mod tests {
         let entries = decode_v200(&blob).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "real.txt");
+    }
+
+    #[test]
+    fn v200_rejects_len_gt_len_aligned() {
+        // A hostile entry where the compressed len exceeds the aligned
+        // buffer size would let read_entry slice past the read buffer.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"evil.bin\0");
+        RawEntry {
+            len: 100,
+            len_aligned: 8,
+            size: 10,
+            flags: GRF_FLAG_FILE,
+            pos: 0,
+        }
+        .encode_into(&mut blob);
+        let err = decode_v200(&blob).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidImage(_)));
     }
 
     #[test]

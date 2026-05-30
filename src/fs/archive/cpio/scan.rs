@@ -8,6 +8,9 @@ use crate::{Error, Result};
 
 const NEWC_HEADER_LEN: u64 = 110;
 const ODC_HEADER_LEN: u64 = 76;
+/// Upper bound on a single record's name length. Real cpio names are
+/// path-length bounded; anything larger is a malicious header.
+const MAX_NAMESIZE: u64 = 64 * 1024;
 
 fn parse_radix(buf: &[u8], radix: u32, what: &str) -> Result<u64> {
     let s = std::str::from_utf8(buf)
@@ -111,6 +114,19 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
 
         // Name follows the header (namesize includes the trailing NUL).
         let name_off = pos + hdr.header_len;
+        if hdr.namesize > MAX_NAMESIZE {
+            return Err(Error::InvalidImage(format!(
+                "cpio: namesize {} exceeds {MAX_NAMESIZE} limit",
+                hdr.namesize
+            )));
+        }
+        // Reject name/body that can't fit in what's left of the device
+        // before allocating buffers sized from untrusted header fields.
+        if name_off > total || hdr.namesize > total - name_off {
+            return Err(Error::InvalidImage(
+                "cpio: name extends past end of archive".into(),
+            ));
+        }
         let mut name_buf = vec![0u8; hdr.namesize as usize];
         dev.read_at(name_off, &mut name_buf)?;
         while name_buf.last() == Some(&0) {
@@ -119,9 +135,26 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
         let name = String::from_utf8_lossy(&name_buf).into_owned();
 
         // Records are 4-byte aligned from the archive start (newc) so a
-        // file-offset alignment equals record-relative alignment.
+        // file-offset alignment equals record-relative alignment. Use
+        // checked arithmetic so a malicious filesize can't wrap the
+        // record cursor past the end of the device.
         let body_off = align_up(name_off + hdr.namesize, hdr.align);
-        let next = align_up(body_off + hdr.filesize, hdr.align);
+        if body_off > total || hdr.filesize > total - body_off {
+            return Err(Error::InvalidImage(
+                "cpio: file body extends past end of archive".into(),
+            ));
+        }
+        let next = body_off
+            .checked_add(hdr.filesize)
+            .map(|end| align_up(end, hdr.align))
+            .filter(|&next| next <= total)
+            .ok_or_else(|| Error::InvalidImage("cpio: record advance overflows archive".into()))?;
+        // Forward-progress guard: a zero-length record would loop forever.
+        if next <= pos {
+            return Err(Error::InvalidImage(
+                "cpio: record makes no forward progress".into(),
+            ));
+        }
 
         if name == TRAILER {
             break;
@@ -163,4 +196,47 @@ pub fn scan(dev: &mut dyn BlockDevice) -> Result<ArchiveIndex> {
     }
 
     Ok(idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::MemoryBackend;
+
+    /// Build a 110-byte newc header with the given namesize/filesize hex
+    /// fields; everything else zero.
+    fn newc_header(namesize: u32, filesize: u32) -> Vec<u8> {
+        let mut h = Vec::with_capacity(NEWC_HEADER_LEN as usize);
+        h.extend_from_slice(MAGIC_NEWC); // magic (6)
+        // 13 eight-char hex fields follow. filesize is field index 6,
+        // namesize is field index 10 (0-based, after magic).
+        for i in 0..13 {
+            let v = match i {
+                6 => filesize,
+                10 => namesize,
+                _ => 0,
+            };
+            h.extend_from_slice(format!("{v:08X}").as_bytes());
+        }
+        assert_eq!(h.len(), NEWC_HEADER_LEN as usize);
+        h
+    }
+
+    #[test]
+    fn rejects_oversized_namesize() {
+        let hdr = newc_header(0xFFFF_FFFF, 0);
+        let mut dev = MemoryBackend::new(4096);
+        dev.write_at(0, &hdr).unwrap();
+        assert!(matches!(scan(&mut dev), Err(Error::InvalidImage(_))));
+    }
+
+    #[test]
+    fn rejects_filesize_past_end() {
+        // Small valid namesize ("a\0" padded), huge filesize.
+        let hdr = newc_header(2, 0xFFFF_FFF0);
+        let mut dev = MemoryBackend::new(4096);
+        dev.write_at(0, &hdr).unwrap();
+        dev.write_at(NEWC_HEADER_LEN, b"a\0").unwrap();
+        assert!(matches!(scan(&mut dev), Err(Error::InvalidImage(_))));
+    }
 }
